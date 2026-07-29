@@ -121,6 +121,12 @@ export interface ModelProfile {
   hasApiKey: boolean;
 }
 
+export interface ModelAvailability {
+  status: "unknown" | "checking" | "available" | "unavailable";
+  reason: string;
+  checkedAt?: string;
+}
+
 export interface AuditEvent {
   id: string;
   category: "task" | "model" | "command" | "system";

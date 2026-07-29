@@ -4,6 +4,7 @@ import type {
   AuditEvent,
   FileEntry,
   Metrics,
+  ModelAvailability,
   ModelProfile,
   OpsTask,
   PermissionLevel,
@@ -79,15 +80,6 @@ const defaultModels: ModelProfile[] = [
     enabled: true,
     hasApiKey: false,
   },
-  {
-    id: "model-local",
-    name: "本地演示模型",
-    provider: "Built-in",
-    model: "deterministic-planner",
-    endpoint: "local://planner",
-    enabled: true,
-    hasApiKey: true,
-  },
 ];
 
 function readSaved<T>(key: string, fallback: T): T {
@@ -102,6 +94,12 @@ function readSaved<T>(key: string, fallback: T): T {
 function initialServers() {
   const saved = readSaved<ServerProfile[]>("opsark.servers", [demoServer, testServer]);
   return saved.some((server) => server.host === testServer.host) ? saved : [...saved, testServer];
+}
+
+function initialModels() {
+  const saved = readSaved<ModelProfile[]>("opsark.models", defaultModels)
+    .filter((model) => model.provider !== "Built-in" && model.id !== "model-local");
+  return saved.length ? saved : defaultModels.map((model) => ({ ...model }));
 }
 
 function initialTasks() {
@@ -125,7 +123,8 @@ export const useOpsStore = defineStore("ops", {
   state: () => ({
     servers: initialServers(),
     tasks: initialTasks(),
-    models: readSaved<ModelProfile[]>("opsark.models", defaultModels),
+    models: initialModels(),
+    modelAvailability: {} as Record<string, ModelAvailability>,
     logs: readSaved<AuditEvent[]>("opsark.logs", []),
     files: demoFiles,
     filesLoading: false,
@@ -165,6 +164,11 @@ export const useOpsStore = defineStore("ops", {
     },
     enabledModels(state) {
       return state.models.filter((model) => model.enabled);
+    },
+    availableModels(state) {
+      return state.models.filter(
+        (model) => model.enabled && state.modelAvailability[model.id]?.status === "available",
+      );
     },
   },
 
@@ -995,8 +999,9 @@ export const useOpsStore = defineStore("ops", {
     },
 
     async saveModels() {
+      this.models = this.models.filter((model) => model.provider !== "Built-in" && model.id !== "model-local");
       const credentials = this.models
-        .filter((model) => model.provider !== "Built-in" && this.modelApiKeys[model.id])
+        .filter((model) => this.modelApiKeys[model.id])
         .map(async (model) => {
           await backend.saveCredential("model", model.id, this.modelApiKeys[model.id]);
           model.hasApiKey = true;
@@ -1010,6 +1015,49 @@ export const useOpsStore = defineStore("ops", {
       } finally {
         this.persist(true);
       }
+      await this.refreshModelAvailability();
+    },
+
+    async refreshModelAvailability() {
+      await this.hydrateCredentials();
+      await Promise.all(this.models.map(async (model) => {
+        if (!model.enabled) {
+          this.modelAvailability[model.id] = { status: "unavailable", reason: "模型已停用", checkedAt: now() };
+          return;
+        }
+        const apiKey = this.modelApiKeys[model.id] ?? "";
+        if (!apiKey) {
+          this.modelAvailability[model.id] = { status: "unavailable", reason: "未配置 API Key", checkedAt: now() };
+          return;
+        }
+        if (!model.endpoint.trim() || !model.model.trim()) {
+          this.modelAvailability[model.id] = {
+            status: "unavailable",
+            reason: !model.endpoint.trim() ? "未配置接口地址" : "未配置模型名称",
+            checkedAt: now(),
+          };
+          return;
+        }
+        this.modelAvailability[model.id] = { status: "checking", reason: "正在检查模型服务…" };
+        try {
+          const result = await backend.checkModel({
+            apiKey,
+            endpoint: model.endpoint,
+            model: model.model,
+          });
+          this.modelAvailability[model.id] = {
+            status: result.available ? "available" : "unavailable",
+            reason: result.reason,
+            checkedAt: now(),
+          };
+        } catch (error) {
+          this.modelAvailability[model.id] = {
+            status: "unavailable",
+            reason: String(error),
+            checkedAt: now(),
+          };
+        }
+      }));
     },
   },
 });

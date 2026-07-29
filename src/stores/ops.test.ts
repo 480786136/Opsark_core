@@ -62,11 +62,16 @@ describe("智能任务状态机", () => {
     vi.spyOn(backend, "loadCredential").mockResolvedValue(null);
     vi.spyOn(backend, "saveCredential").mockResolvedValue();
     vi.spyOn(backend, "deleteCredential").mockResolvedValue();
+    vi.spyOn(backend, "checkModel").mockResolvedValue({
+      available: true,
+      reason: "接口、鉴权和模型名称均可用",
+    });
+    useOpsStore().modelApiKeys["model-deepseek"] = "test-model-api-key";
   });
 
   it("安全模式自动执行低风险步骤，并在中风险步骤前暂停确认", async () => {
     const store = useOpsStore();
-    await store.submitRequirement("srv-production-01", "检查并重新加载 Nginx", "safe", "model-local");
+    await store.submitRequirement("srv-production-01", "检查并重新加载 Nginx", "safe", "model-deepseek");
 
     expect(store.activeTask?.status).toBe("awaiting_plan_approval");
     await store.approvePlan(store.activeTask!.id);
@@ -85,7 +90,7 @@ describe("智能任务状态机", () => {
 
   it("新建任务返回状态树中的响应式对象，异步计划返回后可立即刷新界面", () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "safe", "model-local");
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
 
     expect(task).toBe(store.tasks[0]);
     task.plan = structuredClone(plan);
@@ -106,7 +111,7 @@ describe("智能任务状态机", () => {
 
   it("高风险步骤只有单独批准后才携带后端放行标记", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-local");
+    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
     task.status = "awaiting_plan_approval";
     task.plan = [{ ...structuredClone(plan[0]), risk: "high", command: "rm -rf /tmp/explicit-target" }];
 
@@ -124,7 +129,7 @@ describe("智能任务状态机", () => {
 
   it("敏感变量缺失时暂停输入，合并执行后对终端和日志脱敏", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-local");
+    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
     task.status = "running";
     task.plan = [{
       ...plan[0],
@@ -200,7 +205,7 @@ describe("智能任务状态机", () => {
 
   it("选中已有任务后可继续多轮需求，不会强制创建新任务", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "safe", "model-local");
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
     task.status = "completed";
     task.plan = structuredClone(plan);
     task.plan.forEach((step) => { step.status = "completed"; });
@@ -208,7 +213,7 @@ describe("智能任务状态机", () => {
     store.pushMessage(task, { role: "assistant", kind: "message", content: "已生成 3 个执行步骤" });
     store.pushMessage(task, { role: "assistant", kind: "summary", content: "第一轮已完成" });
 
-    await store.submitRequirement("srv-production-01", "继续检查 Java 进程", "safe", "model-local");
+    await store.submitRequirement("srv-production-01", "继续检查 Java 进程", "safe", "model-deepseek");
 
     expect(store.tasks).toHaveLength(1);
     expect(store.activeTaskId).toBe(task.id);
@@ -232,7 +237,7 @@ describe("智能任务状态机", () => {
       emptyResult: true,
     });
 
-    await store.submitRequirement("srv-production-01", "查看 Java 服务", "safe", "model-local");
+    await store.submitRequirement("srv-production-01", "查看 Java 服务", "safe", "model-deepseek");
     await store.approvePlan(store.activeTask!.id);
 
     expect(store.activeTask?.status).toBe("completed");
@@ -247,7 +252,7 @@ describe("智能任务状态机", () => {
 
   it("校验命令会合并敏感变量，保存的输出仍保持脱敏", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-local");
+    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
     task.status = "running";
     task.plan = [{
       ...structuredClone(plan[0]),
@@ -299,6 +304,7 @@ describe("智能任务状态机", () => {
 
   it("远程模型缺少 API Key 时明确失败，不静默生成本地通用计划", async () => {
     const store = useOpsStore();
+    delete store.modelApiKeys["model-deepseek"];
 
     await store.submitRequirement(
       "srv-production-01",
@@ -312,6 +318,27 @@ describe("智能任务状态机", () => {
     expect(store.activeTask?.plan).toHaveLength(0);
     expect(store.activeTask?.summary).toContain("API Key 未恢复");
     expect(store.activeTask?.summary).toContain("模型与设置");
+  });
+
+  it("默认模型列表不再包含本地演示模型", () => {
+    const store = useOpsStore();
+    expect(store.models.some((model) => model.id === "model-local" || model.provider === "Built-in")).toBe(false);
+  });
+
+  it("刷新可用性后仅暴露实测可用且已启用的模型", async () => {
+    const store = useOpsStore();
+    await store.refreshModelAvailability();
+
+    expect(backend.checkModel).toHaveBeenCalledWith(expect.objectContaining({
+      model: "deepseek-v4-flash",
+    }));
+    expect(store.modelAvailability["model-deepseek"]?.status).toBe("available");
+    expect(store.availableModels.map((model) => model.id)).toEqual(["model-deepseek"]);
+
+    vi.mocked(backend.checkModel).mockResolvedValueOnce({ available: false, reason: "模型不在可用列表中" });
+    await store.refreshModelAvailability();
+    expect(store.modelAvailability["model-deepseek"]?.status).toBe("unavailable");
+    expect(store.availableModels).toHaveLength(0);
   });
 
   it("创建数据库前的状态检查允许已存在和不存在两种有效分支", () => {
@@ -366,7 +393,7 @@ describe("智能任务状态机", () => {
 
   it("程序校验通过后由模型复核决定暂停调整", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-local");
+    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
     task.status = "running";
     task.plan = [structuredClone(plan[0]), structuredClone(plan[2])];
     vi.mocked(backend.reviewStep).mockResolvedValueOnce({
@@ -387,7 +414,7 @@ describe("智能任务状态机", () => {
 
   it("模型确认整体目标已达成时跳过剩余步骤并完成任务", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-local");
+    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
     task.status = "running";
     task.plan = [structuredClone(plan[0]), structuredClone(plan[2])];
     vi.mocked(backend.reviewStep).mockResolvedValueOnce({
@@ -407,7 +434,7 @@ describe("智能任务状态机", () => {
 
   it("程序校验失败时不会调用模型复核", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-local");
+    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
     task.status = "running";
     task.plan = [structuredClone(plan[0])];
     vi.mocked(backend.validateStep).mockResolvedValueOnce({

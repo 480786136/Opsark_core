@@ -38,7 +38,7 @@ async function saveSettings() {
     </header>
     <div class="settings-layout">
       <section class="settings-card">
-        <div class="settings-title"><SlidersHorizontal :size="18" /><div><h2>大模型配置</h2><p>首版支持 OpenAI-compatible 接口与本地演示规划器。</p></div><button class="icon-button"><Plus :size="16" /></button></div>
+        <div class="settings-title"><SlidersHorizontal :size="18" /><div><h2>大模型配置</h2><p>支持 OpenAI-compatible 远程模型接口，保存后自动检查可用性。</p></div></div>
         <div v-for="model in store.models" :key="model.id" class="model-row">
           <label class="toggle"><input v-model="model.enabled" type="checkbox" /><i></i></label>
           <div class="model-fields">

@@ -121,6 +121,12 @@ struct AiStepReview {
     summary: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ModelCheckResult {
+    available: bool,
+    reason: String,
+}
+
 fn connect_ssh(host: &str, port: u16, username: &str, password: &str) -> Result<Session, String> {
     let address = format!("{host}:{port}")
         .to_socket_addrs()
@@ -918,6 +924,67 @@ async fn generate_ai_plan(
 }
 
 #[tauri::command]
+async fn check_ai_model(
+    api_key: String,
+    endpoint: String,
+    model: String,
+) -> Result<ModelCheckResult, String> {
+    if api_key.trim().is_empty() || endpoint.trim().is_empty() || model.trim().is_empty() {
+        return Ok(ModelCheckResult {
+            available: false,
+            reason: "模型配置不完整".into(),
+        });
+    }
+    let url = format!("{}/models", endpoint.trim_end_matches('/'));
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?
+        .get(url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|error| format!("无法连接模型服务：{error}"))?;
+    let status = response.status();
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("模型服务响应不是有效 JSON：{error}"))?;
+    if !status.is_success() {
+        let message = payload
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("鉴权或接口检查失败");
+        return Ok(ModelCheckResult {
+            available: false,
+            reason: format!("接口返回 {status}：{message}"),
+        });
+    }
+    let model_ids: Vec<&str> = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .collect();
+    if model_ids.iter().any(|id| *id == model) {
+        Ok(ModelCheckResult {
+            available: true,
+            reason: "接口、鉴权和模型名称均可用".into(),
+        })
+    } else {
+        Ok(ModelCheckResult {
+            available: false,
+            reason: if model_ids.is_empty() {
+                "接口未返回可用模型".into()
+            } else {
+                format!("接口可访问，但模型 {model} 不在可用列表中")
+            },
+        })
+    }
+}
+
+#[tauri::command]
 async fn generate_ai_summary(
     api_key: String,
     endpoint: String,
@@ -1188,6 +1255,7 @@ pub fn run() {
             get_ssh_metrics,
             generate_plan,
             generate_ai_plan,
+            check_ai_model,
             generate_ai_summary,
             review_ai_step,
             execute_command,

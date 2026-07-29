@@ -306,6 +306,18 @@ export const backend = {
     return normalizePlanPreconditions(buildDemoPlan(requirement));
   },
 
+  async checkModel(runtimeModel: Omit<RuntimeModel, "context">): Promise<{ available: boolean; reason: string }> {
+    if (!runtimeModel.apiKey) return { available: false, reason: "未配置 API Key" };
+    if (!runtimeModel.endpoint.trim()) return { available: false, reason: "未配置接口地址" };
+    if (!runtimeModel.model.trim()) return { available: false, reason: "未配置模型名称" };
+    if (!isTauri()) return { available: true, reason: "模型配置完整" };
+    return invoke("check_ai_model", {
+      apiKey: runtimeModel.apiKey,
+      endpoint: runtimeModel.endpoint,
+      model: runtimeModel.model,
+    });
+  },
+
   async generateSummary(requirement: string, steps: PlanStep[], runtimeModel?: RuntimeModel) {
     const fallback = buildExecutionSummary(requirement, steps);
     if (isTauri() && runtimeModel?.apiKey) {

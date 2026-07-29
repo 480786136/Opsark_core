@@ -24,13 +24,16 @@ import {
 } from "lucide-vue-next";
 import { useOpsStore } from "@/stores/ops";
 import type { PermissionLevel, PlanStep } from "@/types";
+import ModelSettingsModal from "@/components/ModelSettingsModal.vue";
 
 const props = defineProps<{ serverId: string }>();
 const store = useOpsStore();
 const input = ref("");
 const permission = ref<PermissionLevel>("safe");
-const modelId = ref(store.enabledModels[0]?.id ?? "model-local");
+const modelId = ref("");
 const automationEnabled = ref(false);
+const checkingModels = ref(false);
+const showModelSettings = ref(false);
 const showTasks = ref(true);
 const expandedSteps = ref<string[]>([]);
 const expandedRounds = ref<string[]>([]);
@@ -79,11 +82,43 @@ function toggleStep(id: string) {
 
 async function submit() {
   const value = input.value.trim();
-  if (!value || !automationEnabled.value || isBusy.value) return;
+  if (!value || !automationEnabled.value || isBusy.value || !modelId.value) return;
   showTasks.value = false;
   input.value = "";
   await store.submitRequirement(props.serverId, value, permission.value, modelId.value, terminalReference.value);
   terminalReference.value = "";
+}
+
+function selectFirstAvailableModel() {
+  if (!store.availableModels.some((model) => model.id === modelId.value)) {
+    modelId.value = store.availableModels[0]?.id ?? "";
+  }
+}
+
+async function enableAutomation() {
+  automationEnabled.value = true;
+  checkingModels.value = true;
+  await store.refreshModelAvailability();
+  selectFirstAvailableModel();
+  checkingModels.value = false;
+}
+
+function handleModelSelection(event: Event) {
+  const value = (event.target as HTMLSelectElement).value;
+  if (value !== "__manage_models__") return;
+  showModelSettings.value = true;
+  selectFirstAvailableModel();
+}
+
+function modelOptionText(modelIdValue: string, name: string) {
+  const availability = store.modelAvailability[modelIdValue];
+  if (availability?.status === "available") return `${name} · 可用`;
+  if (availability?.status === "checking") return `${name} · 检查中`;
+  return `${name} · ${availability?.reason ?? "不可用"}`;
+}
+
+function handleModelsSaved() {
+  selectFirstAvailableModel();
 }
 
 function referenceTerminal() {
@@ -144,7 +179,7 @@ function toggleRecords(id: string) {
         <span><Check :size="14" />实时资源指标</span>
         <span><Check :size="14" />安全工具与变量元数据</span>
       </div>
-      <button class="button primary wide" @click="automationEnabled = true"><Play :size="15" />开启智能运维</button>
+      <button class="button primary wide" @click="enableAutomation"><Play :size="15" />开启智能运维</button>
       <small>{{ store.connectedServerIds.includes(serverId) ? "已连接真实 SSH；所有变更仍受授权与风险规则约束" : "未连接 SSH 时使用安全演示执行器，不会修改真实服务器" }}</small>
     </div>
 
@@ -359,17 +394,30 @@ function toggleRecords(id: string) {
         ></textarea>
         <div class="composer-tools">
           <button class="context-button" type="button" title="引用终端最近输出" @click="referenceTerminal"><Quote :size="13" />终端</button>
-          <select v-model="modelId" title="模型">
-            <option v-for="model in store.enabledModels" :key="model.id" :value="model.id">{{ model.name }}</option>
+          <select v-model="modelId" title="模型" :class="{ 'model-select-empty': !modelId }" @change="handleModelSelection">
+            <option v-if="checkingModels" value="" disabled>正在检查模型可用性…</option>
+            <option v-else-if="!store.availableModels.length" value="" disabled>没有可用模型</option>
+            <option
+              v-for="model in store.models"
+              :key="model.id"
+              :value="model.id"
+              :disabled="store.modelAvailability[model.id]?.status !== 'available'"
+            >{{ modelOptionText(model.id, model.name) }}</option>
+            <option value="__manage_models__">管理模型…</option>
           </select>
           <select v-model="permission" title="授权等级">
             <option value="observe">逐步确认</option>
             <option value="safe">安全模式</option>
             <option value="autonomous">自动执行</option>
           </select>
-          <button class="send-button" type="submit" :disabled="!input.trim() || Boolean(isBusy)"><Send :size="16" /></button>
+          <button class="send-button" type="submit" :disabled="!input.trim() || Boolean(isBusy) || !modelId"><Send :size="16" /></button>
         </div>
       </form>
     </template>
+    <ModelSettingsModal
+      :open="showModelSettings"
+      @close="showModelSettings = false"
+      @saved="handleModelsSaved"
+    />
   </section>
 </template>
