@@ -1,0 +1,24 @@
+#!/bin/bash
+set -e
+
+output=""
+objects=()
+for argument in "$@"; do
+  case "$argument" in
+    /OUT:*|/out:*|-OUT:*|-out:*)
+      output="${argument#*:}"
+      ;;
+    /MACHINE:*|/machine:*|-MACHINE:*|-machine:*|-nologo|/nologo)
+      ;;
+    *)
+      objects+=("$argument")
+      ;;
+  esac
+done
+
+if [[ -z "$output" ]]; then
+  echo "llvm-lib compatibility wrapper: missing /OUT:path" >&2
+  exit 2
+fi
+
+exec /usr/bin/ar rcs "$output" "${objects[@]}"
