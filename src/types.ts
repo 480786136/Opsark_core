@@ -23,6 +23,51 @@ export type StepStatus =
 export type RiskLevel = "low" | "medium" | "high";
 export type PermissionLevel = "observe" | "safe" | "autonomous";
 export type StepReviewDecision = "continue" | "adjust" | "complete";
+export type ExecutionStatus = "success" | "failed" | "cancelled" | "blocked";
+export type ObservationStatus =
+  | "matched"
+  | "not_found"
+  | "healthy"
+  | "unhealthy"
+  | "warning"
+  | "unknown";
+export type ValidatorType =
+  | "command"
+  | "platform"
+  | "runtime"
+  | "process"
+  | "service"
+  | "port-owner"
+  | "http"
+  | "file"
+  | "sql-query"
+  | "docker"
+  | "log";
+
+export interface StepValidator {
+  type: ValidatorType;
+  command: string;
+  validStates: ObservationStatus[];
+}
+
+export interface ExecutionEvidence {
+  id: string;
+  type: ValidatorType | "command-output";
+  source: "main" | "validation";
+  facts: Record<string, unknown>;
+  rawOutput: string;
+  collectedAt: string;
+}
+
+export interface StepResult {
+  executionStatus: ExecutionStatus;
+  observationStatus: ObservationStatus;
+  exitCode?: number;
+  facts: Record<string, unknown>;
+  warnings: string[];
+  evidenceIds: string[];
+  failureReason?: string;
+}
 
 export interface StepReview {
   decision: StepReviewDecision;
@@ -71,9 +116,15 @@ export interface PlanStep {
   risk: RiskLevel;
   expected: string;
   validation: string;
+  validator?: StepValidator;
   status: StepStatus;
   output?: string;
   review?: StepReview;
+  result?: StepResult;
+  evidence?: ExecutionEvidence[];
+  startedAt?: string;
+  elapsedSeconds?: number;
+  progressMessage?: string;
 }
 
 export interface TaskMessage {
@@ -84,6 +135,15 @@ export interface TaskMessage {
   createdAt: string;
 }
 
+export interface ExecutionConstraints {
+  changePolicy: "unspecified" | "read_only" | "requested_changes_only" | "allow_necessary_changes";
+  environmentPolicy: "unspecified" | "preserve" | "allow_isolated_changes" | "allow_host_changes";
+  failurePolicy: "unspecified" | "strict" | "best_effort";
+  prohibitedActions: string[];
+  requiredConditions: string[];
+  userDirectives: string[];
+}
+
 export interface TaskPlanHistory {
   id: string;
   requirement: string;
@@ -92,6 +152,8 @@ export interface TaskPlanHistory {
   response?: TaskMessage;
   records?: TaskMessage[];
   summary?: string;
+  pauseReason?: string;
+  executionConstraints?: ExecutionConstraints;
   createdAt: string;
   completedAt: string;
 }
@@ -107,6 +169,12 @@ export interface OpsTask {
   plan: PlanStep[];
   planHistory?: TaskPlanHistory[];
   summary?: string;
+  pauseReason?: string;
+  executionConstraints?: ExecutionConstraints;
+  adjustmentCount?: number;
+  discoveryRefined?: boolean;
+  currentExecutionId?: string;
+  cancelRequested?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -125,6 +193,13 @@ export interface ModelAvailability {
   status: "unknown" | "checking" | "available" | "unavailable";
   reason: string;
   checkedAt?: string;
+}
+
+export interface RequirementProcessingResult {
+  intent: "answer" | "execute";
+  answer?: string;
+  plan: PlanStep[];
+  constraints?: ExecutionConstraints;
 }
 
 export interface AuditEvent {

@@ -20,7 +20,7 @@
 - 真实 SFTP 目录浏览、20 MB 内小文件上传/下载、建目录、重命名、安全删除。
 - 远程 CPU、内存、磁盘、网络指标采集。
 - DeepSeek Chat Completions 结构化计划适配器，API Key 仅驻留本次应用会话。
-- 独立只读校验命令、失败暂停与模型调整计划。
+- 独立只读校验、执行/观察双状态、结构化证据和异常时模型复核。
 - 敏感变量元数据、`${secret.KEY}` 指令合并、执行前输入和全链路脱敏。
 
 ## 快速启动
@@ -68,4 +68,7 @@ cd src-tauri && cargo check
 - SQLite 持久化、任务断点恢复与回滚能力。
 
 详细范围和路线见 [实施计划](docs/IMPLEMENTATION_PLAN.md)。
+
+步骤校验、证据链和模型复核的分阶段优化方案见
+[步骤校验优化方案](docs/STEP_VALIDATION_OPTIMIZATION.md)。
 # Opsark_core

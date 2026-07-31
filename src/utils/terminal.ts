@@ -12,7 +12,7 @@ function applyBackspaces(value: string) {
 }
 
 export function sanitizeTerminalOutput(value: string) {
-  return applyBackspaces(
+  const cleaned = applyBackspaces(
     value
       .replace(OSC_SEQUENCE, "")
       .replace(CSI_SEQUENCE, "")
@@ -21,4 +21,21 @@ export function sanitizeTerminalOutput(value: string) {
       .replace(/\r\n/g, "\n")
       .replace(/\r/g, "\n"),
   );
+  const lines = cleaned.split("\n");
+  const compacted: string[] = [];
+  let pendingProgress: string | undefined;
+  for (const line of lines) {
+    const progress = /^\s*[#=*>.\-]*\s*\d{1,3}(?:\.\d+)?%\s*$/.test(line);
+    if (progress) {
+      pendingProgress = line;
+      continue;
+    }
+    if (pendingProgress !== undefined) {
+      compacted.push(pendingProgress);
+      pendingProgress = undefined;
+    }
+    compacted.push(line);
+  }
+  if (pendingProgress !== undefined) compacted.push(pendingProgress);
+  return compacted.join("\n");
 }

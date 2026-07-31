@@ -21,9 +21,11 @@ import {
   Square,
   Sparkles,
   TerminalSquare,
+  Trash2,
 } from "lucide-vue-next";
 import { useOpsStore } from "@/stores/ops";
-import type { PermissionLevel, PlanStep } from "@/types";
+import { observationText } from "@/services/validation";
+import type { OpsTask, PermissionLevel, PlanStep } from "@/types";
 import ModelSettingsModal from "@/components/ModelSettingsModal.vue";
 
 const props = defineProps<{ serverId: string }>();
@@ -45,10 +47,19 @@ const timeline = ref<HTMLElement>();
 const serverTasks = computed(() => store.tasks.filter((task) => task.serverId === props.serverId));
 const task = computed(() => store.activeTask?.serverId === props.serverId ? store.activeTask : undefined);
 const pendingApproval = computed(() => task.value?.plan.find((step) => step.status === "awaiting_approval"));
+const failedStep = computed(() => task.value?.plan.find((step) => step.status === "failed"));
+const adjustmentLabel = computed(() =>
+  failedStep.value?.result?.executionStatus === "failed"
+    ? "步骤执行失败，任务已暂停"
+    : "证据校验未通过，任务已暂停",
+);
 const pendingSecretRequest = computed(() =>
   store.pendingSecret?.taskId === task.value?.id ? store.pendingSecret : undefined,
 );
 const isBusy = computed(() => task.value && ["planning", "running", "validating"].includes(task.value.status));
+const canTerminate = computed(() =>
+  Boolean(task.value && !["draft", "completed", "failed", "cancelled"].includes(task.value.status)),
+);
 const currentConversationMessages = computed(() => {
   if (!task.value) return [];
   const start = task.value.messages
@@ -129,6 +140,26 @@ function riskText(step: PlanStep) {
   return step.risk === "low" ? "低风险" : step.risk === "medium" ? "中风险" : "高风险";
 }
 
+function executionText(step: PlanStep) {
+  const labels = {
+    success: "执行成功",
+    failed: "执行失败",
+    cancelled: "已终止",
+    blocked: "已拦截",
+  };
+  return step.result ? labels[step.result.executionStatus] : "尚未执行";
+}
+
+function factsText(step: PlanStep) {
+  return JSON.stringify(step.result?.facts ?? {}, null, 2);
+}
+
+function stepObservationText(step: PlanStep) {
+  return step.result?.executionStatus === "failed"
+    ? "未形成观察结果"
+    : observationText(step.result?.observationStatus);
+}
+
 function statusText(status?: string) {
   const labels: Record<string, string> = {
     draft: "草稿",
@@ -146,6 +177,16 @@ function statusText(status?: string) {
   return status ? labels[status] ?? status : "";
 }
 
+function summaryTitle(status?: string) {
+  const labels: Record<string, string> = {
+    completed: "本轮成功总结",
+    failed: "本轮失败总结",
+    cancelled: "本轮终止总结",
+    needs_adjustment: "当前阶段结论",
+  };
+  return status ? labels[status] ?? "本轮结果总结" : "本轮结果总结";
+}
+
 function messageAuthor(role: "user" | "assistant" | "system") {
   return role === "user" ? "你" : role === "assistant" ? "Opsark" : "执行记录";
 }
@@ -160,6 +201,17 @@ function toggleRecords(id: string) {
   expandedRecords.value = expandedRecords.value.includes(id)
     ? expandedRecords.value.filter((item) => item !== id)
     : [...expandedRecords.value, id];
+}
+
+function taskCanBeDeleted(item: OpsTask) {
+  return !item.currentExecutionId && !["planning", "running", "validating"].includes(item.status);
+}
+
+async function deleteTaskItem(item: OpsTask) {
+  if (!taskCanBeDeleted(item)) {
+    await store.terminateTask(item.id);
+  }
+  store.deleteTask(item.id);
 }
 </script>
 
@@ -185,15 +237,23 @@ function toggleRecords(id: string) {
 
     <template v-else>
       <div v-if="showTasks && serverTasks.length" class="task-strip">
-        <button
+        <div
           v-for="item in serverTasks"
           :key="item.id"
-          :class="{ active: item.id === task?.id }"
-          @click="store.selectTask(item.id); showTasks = false"
+          :class="['task-strip-item', { active: item.id === task?.id }]"
         >
-          <span :class="['task-status-mini', item.status]"></span>
-          <span><strong>{{ item.title }}</strong><small>{{ (item.planHistory?.length ?? 0) + (item.plan.length ? 1 : 0) }} 轮 · {{ statusText(item.status) }}</small></span>
-        </button>
+          <button class="task-select" @click="store.selectTask(item.id); showTasks = false">
+            <span :class="['task-status-mini', item.status]"></span>
+            <span><strong>{{ item.title }}</strong><small>{{ (item.planHistory?.length ?? 0) + (item.messages.some((message) => message.role === 'user' && message.kind === 'message') ? 1 : 0) }} 轮 · {{ statusText(item.status) }}</small></span>
+          </button>
+          <button
+            class="task-delete"
+            type="button"
+            title="删除任务"
+            :aria-label="`删除任务 ${item.title}`"
+            @click.stop="deleteTaskItem(item)"
+          ><Trash2 :size="13" /></button>
+        </div>
         <button class="new-task" @click="store.activeTaskId = null; showTasks = false"><MessageSquarePlus :size="14" />新任务</button>
       </div>
 
@@ -229,7 +289,7 @@ function toggleRecords(id: string) {
               </div>
             </div>
 
-            <div class="plan-card archived-plan">
+            <div v-if="round.plan.length" :class="['plan-card', 'archived-plan', `task-card-${round.status}`]">
               <button class="plan-card-head archived-head" @click="toggleRound(round.id)">
                 <span>
                   <ClipboardCheck :size="15" />
@@ -248,6 +308,7 @@ function toggleRecords(id: string) {
                     <button class="step-main" @click="toggleStep(`history-${round.id}-${step.id}`)">
                       <span class="step-icon"><CheckCircle2 v-if="step.status === 'completed'" :size="17" /><Circle v-else :size="17" /></span>
                       <span class="step-copy"><strong>{{ index + 1 }}. {{ step.title }}</strong><small>{{ step.description }}</small></span>
+                      <span v-if="step.result" :class="['observation-tag', step.result.observationStatus]">{{ stepObservationText(step) }}</span>
                       <span :class="['risk-tag', step.risk]">{{ riskText(step) }}</span>
                       <ChevronDown v-if="expandedSteps.includes(`history-${round.id}-${step.id}`)" :size="15" />
                       <ChevronRight v-else :size="15" />
@@ -255,6 +316,14 @@ function toggleRecords(id: string) {
                     <div v-if="expandedSteps.includes(`history-${round.id}-${step.id}`)" class="step-detail">
                       <label>执行命令</label><code>{{ step.command }}</code>
                       <label>期望 / 校验</label><p>{{ step.expected }} · {{ step.validation }}</p>
+                      <template v-if="step.result">
+                        <label>执行 / 观察状态</label>
+                        <div class="step-result-line">
+                          <span :class="['execution-tag', step.result.executionStatus]">{{ executionText(step) }}</span>
+                          <span :class="['observation-tag', step.result.observationStatus]">{{ stepObservationText(step) }}</span>
+                        </div>
+                        <label>结构化证据</label><pre>{{ factsText(step) }}</pre>
+                      </template>
                       <template v-if="step.review"><label>结果复核</label><p class="review-result">{{ step.review.summary }}（{{ step.review.reason }}）</p></template>
                     </div>
                   </div>
@@ -279,9 +348,16 @@ function toggleRecords(id: string) {
               </div>
             </div>
 
-            <div v-if="round.summary" class="summary-card archived-summary">
-              <div class="summary-card-icon"><Sparkles :size="17" /></div>
-              <div><span>本轮结果总结</span><p>{{ round.summary }}</p></div>
+            <div
+              v-if="(round.summary || round.pauseReason) && ['completed', 'failed', 'cancelled', 'needs_adjustment'].includes(round.status)"
+              :class="['summary-card', 'archived-summary', `summary-${round.status}`]"
+            >
+              <div class="summary-card-icon">
+                <Sparkles v-if="round.status === 'completed'" :size="17" />
+                <ShieldAlert v-else-if="['failed', 'needs_adjustment'].includes(round.status)" :size="17" />
+                <Square v-else :size="15" />
+              </div>
+              <div><span>{{ summaryTitle(round.status) }}</span><p>{{ round.summary ?? round.pauseReason }}</p></div>
             </div>
           </template>
 
@@ -303,14 +379,23 @@ function toggleRecords(id: string) {
             </div>
           </div>
 
-          <div v-if="task.plan.length" class="plan-card">
+          <div v-if="task.plan.length" :class="['plan-card', `task-card-${task.status}`]">
             <div class="plan-card-head">
-              <span><strong>当前执行计划</strong><small>{{ task.plan.filter((s) => ["completed", "skipped"].includes(s.status)).length }}/{{ task.plan.length }} 已处理</small></span>
-              <span :class="['task-state-pill', task.status]">
-                <LoaderCircle v-if="isBusy" class="spin" :size="13" />
-                <Clock3 v-else-if="task.status.includes('awaiting')" :size="13" />
-                <CheckCircle2 v-else-if="task.status === 'completed'" :size="13" />
-                {{ statusText(task.status) }}
+              <span><strong>当前执行计划</strong><small>{{ task.plan.filter((s) => ["completed", "skipped", "failed"].includes(s.status)).length }}/{{ task.plan.length }} 已处理</small></span>
+              <span class="plan-head-actions">
+                <button
+                  v-if="canTerminate"
+                  class="terminate-business"
+                  type="button"
+                  title="终止当前业务和正在运行的远程命令"
+                  @click.stop="store.terminateTask(task.id)"
+                ><Square :size="11" />终止业务</button>
+                <span :class="['task-state-pill', task.status]">
+                  <LoaderCircle v-if="isBusy" class="spin" :size="13" />
+                  <Clock3 v-else-if="task.status.includes('awaiting')" :size="13" />
+                  <CheckCircle2 v-else-if="task.status === 'completed'" :size="13" />
+                  {{ statusText(task.status) }}
+                </span>
               </span>
             </div>
             <div class="steps">
@@ -324,6 +409,7 @@ function toggleRecords(id: string) {
                     <Circle v-else :size="17" />
                   </span>
                   <span class="step-copy"><strong>{{ index + 1 }}. {{ step.title }}</strong><small>{{ step.description }}</small></span>
+                  <span v-if="step.result" :class="['observation-tag', step.result.observationStatus]">{{ stepObservationText(step) }}</span>
                   <span :class="['risk-tag', step.risk]">{{ riskText(step) }}</span>
                   <ChevronDown v-if="expandedSteps.includes(step.id)" :size="15" />
                   <ChevronRight v-else :size="15" />
@@ -331,7 +417,19 @@ function toggleRecords(id: string) {
                 <div v-if="expandedSteps.includes(step.id)" class="step-detail">
                   <label>将执行</label><code>{{ step.command }}</code>
                   <label>期望 / 校验</label><p>{{ step.expected }} · {{ step.validation }}</p>
+                  <template v-if="step.result">
+                    <label>执行 / 观察状态</label>
+                    <div class="step-result-line">
+                      <span :class="['execution-tag', step.result.executionStatus]">{{ executionText(step) }}</span>
+                      <span :class="['observation-tag', step.result.observationStatus]">{{ stepObservationText(step) }}</span>
+                    </div>
+                    <label>结构化证据</label><pre>{{ factsText(step) }}</pre>
+                    <p v-if="step.result.warnings.length" class="evidence-warning">{{ step.result.warnings.join("；") }}</p>
+                  </template>
                   <template v-if="step.output"><label>执行输出</label><pre>{{ step.output }}</pre></template>
+                  <p v-if="step.status === 'running' && step.progressMessage" class="step-progress">
+                    <LoaderCircle class="spin" :size="13" />{{ step.progressMessage }}
+                  </p>
                   <template v-if="step.review"><label>结果复核</label><p class="review-result">{{ step.review.summary }}（{{ step.review.reason }}）</p></template>
                 </div>
               </div>
@@ -351,9 +449,14 @@ function toggleRecords(id: string) {
               <button class="button primary" type="submit" :disabled="!secretInput">安全提交</button>
             </form>
             <div v-else-if="task.status === 'needs_adjustment'" class="approval-bar warning">
-              <span><ShieldAlert :size="15" />校验未通过，任务已暂停</span>
+              <span class="adjustment-copy">
+                <ShieldAlert :size="15" />
+                <span><strong>{{ adjustmentLabel }}</strong><small v-if="task.pauseReason">{{ task.pauseReason }}</small></span>
+              </span>
               <button class="button secondary" @click="store.rejectTask(task.id)">结束任务</button>
-              <button class="button primary" @click="store.adjustTask(task.id)">生成调整计划</button>
+              <button class="button primary" @click="store.requestAdjustment(task.id)">
+                {{ (task.adjustmentCount ?? 0) < 1 ? "生成一次精简调整计划" : "再次生成解决方案" }}
+              </button>
             </div>
           </div>
 
@@ -374,9 +477,16 @@ function toggleRecords(id: string) {
             </div>
           </div>
 
-          <div v-if="task.summary" class="summary-card">
-            <div class="summary-card-icon"><Sparkles :size="17" /></div>
-            <div><span>本轮结果总结</span><p>{{ task.summary }}</p></div>
+          <div
+            v-if="(task.summary || task.pauseReason) && ['completed', 'failed', 'cancelled', 'needs_adjustment'].includes(task.status)"
+            :class="['summary-card', `summary-${task.status}`]"
+          >
+            <div class="summary-card-icon">
+              <Sparkles v-if="task.status === 'completed'" :size="17" />
+              <ShieldAlert v-else-if="['failed', 'needs_adjustment'].includes(task.status)" :size="17" />
+              <Square v-else :size="15" />
+            </div>
+            <div><span>{{ summaryTitle(task.status) }}</span><p>{{ task.summary ?? task.pauseReason }}</p></div>
           </div>
         </template>
       </div>

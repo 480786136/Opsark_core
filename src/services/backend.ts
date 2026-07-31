@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { FileEntry, Metrics, PlanStep, ServerInfo, StepReview } from "@/types";
+import type { FileEntry, Metrics, PlanStep, RequirementProcessingResult, ServerInfo, StepReview } from "@/types";
+import { ensureStepValidator, isMutatingStepCommand } from "@/services/validation";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -26,6 +27,12 @@ export interface SshProbe {
 
 export interface TerminalOutputEvent {
   terminalId: string;
+  data: string;
+  stream: "stdout" | "stderr" | "system" | "error";
+}
+
+export interface CommandOutputEvent {
+  executionId: string;
   data: string;
   stream: "stdout" | "stderr" | "system" | "error";
 }
@@ -83,8 +90,20 @@ function buildDemoPlan(requirement: string): PlanStep[] {
   }));
 }
 
-export function normalizePlanPreconditions(steps: PlanStep[]) {
+export function normalizePlanPreconditions(steps: PlanStep[], requirement = "") {
   const normalized = steps.map((step) => ({ ...step }));
+  const userExplicitlyRequestedCleanup = /清理|删除|移除|卸载|清空|purge|remove|delete|uninstall/i
+    .test(requirement);
+  if (requirement && !userExplicitlyRequestedCleanup) {
+    for (let index = normalized.length - 1; index >= 0; index -= 1) {
+      const step = normalized[index];
+      const speculativeCleanup =
+        /清理|残留|删除.*(?:安装|目录|文件)|cleanup|remove residual/i
+          .test(`${step.title}\n${step.description}`)
+        && /\brm\s+-[^\n]*r[^\n]*f|\brm\s+-[^\n]*f[^\n]*r/i.test(step.command);
+      if (speculativeCleanup) normalized.splice(index, 1);
+    }
+  }
   for (let index = 0; index < normalized.length - 1; index += 1) {
     const probe = normalized[index];
     const remediation = normalized[index + 1];
@@ -112,7 +131,89 @@ export function normalizePlanPreconditions(steps: PlanStep[]) {
     probe.expected = `成功读取数据库 ${database} 的存在状态（0 为不存在，1 为已存在）`;
     probe.validation = `${mysqlPrefix} -Nse "${statusQuery}" 2>/dev/null | grep -Eq '^[01]$'`;
   }
-  return normalized;
+
+  const dependencyIndex = normalized.findIndex((step) =>
+    /\b(?:npm|pnpm|yarn)\s+(?:install|ci)\b/i.test(step.command),
+  );
+  const dependencyStep = dependencyIndex >= 0 ? normalized[dependencyIndex] : undefined;
+  const workingDirectoryMatch = dependencyStep?.command.match(
+    /(?:^|&&)\s*cd\s+('(?:[^']+)'|"(?:[^"]+)"|[^&;]+?)\s*&&/i,
+  );
+  const rawDirectory = workingDirectoryMatch?.[1]?.trim() ?? ".";
+  const directory = rawDirectory.replace(/^(['"])(.*)\1$/, "$2");
+  const quotedDirectory = `'${directory.replace(/'/g, "'\"'\"'")}'`;
+  const runtimeCheckCommand = `cd ${quotedDirectory} && node -e 'const fs=require("fs");const p=require("./package.json");let l={};try{l=require("./package-lock.json")}catch{};const v=l.packages?.["node_modules/vite"];console.log("OPSARK_RUNTIME_CHECK "+JSON.stringify({currentNode:process.version,requiredNode:v?.engines?.node||p.engines?.node||"unspecified",packageManager:p.packageManager||"unspecified",lockFiles:["package-lock.json","pnpm-lock.yaml","yarn.lock"].filter(x=>fs.existsSync(x))}))'`;
+  const semanticRuntimeCheckIndex = normalized
+    .slice(0, dependencyIndex < 0 ? 0 : dependencyIndex)
+    .findIndex((step) =>
+      /package\.json/i.test(step.command)
+      && /engines|node(?:\.js)?(?:\s*版本)?|运行时|构建脚本/i
+        .test(`${step.title}\n${step.description}\n${step.command}`),
+    );
+  const hasStructuredRuntimeCheck = normalized
+    .slice(0, dependencyIndex < 0 ? 0 : dependencyIndex)
+    .some((step) => /OPSARK_RUNTIME_CHECK/.test(step.command));
+  if (dependencyIndex >= 0 && !hasStructuredRuntimeCheck && semanticRuntimeCheckIndex >= 0) {
+    const existing = normalized[semanticRuntimeCheckIndex];
+    existing.title = "检查前端项目运行时精确要求";
+    existing.description = "读取 package.json 和锁文件；项目未声明 engines 也是有效状态，此时继续采用实际构建工具的版本要求。";
+    existing.command = runtimeCheckCommand;
+    existing.expected = "输出当前 Node.js、项目或构建工具要求、包管理器和锁文件信息";
+    existing.validation = `cd ${quotedDirectory} && node -e 'require("./package.json")'`;
+  } else if (dependencyIndex >= 0 && !hasStructuredRuntimeCheck) {
+    normalized.splice(dependencyIndex, 0, {
+      id: `runtime-preflight-${Date.now()}`,
+      title: "检查前端项目运行时精确要求",
+      description: "在安装依赖前读取 package.json 和锁文件；项目未声明 engines 也是有效状态，此时继续采用实际构建工具的版本要求。",
+      command: runtimeCheckCommand,
+      expected: "输出当前 Node.js、项目或构建工具要求、包管理器和锁文件信息",
+      validation: `cd ${quotedDirectory} && node -e 'require("./package.json")'`,
+      risk: "low",
+      status: "pending",
+    });
+  }
+
+  const runtimeChangeIndex = normalized.findIndex((step) => {
+    const semantic = `${step.title}\n${step.description}`.toLowerCase();
+    return isMutatingStepCommand(step.command) && (
+      /\b(?:nvm|fnm|volta|asdf)\s+(?:install|use|global)\b/i.test(step.command)
+      || /(?:node(?:\.js)?|java|python|golang|rust).*(?:安装|升级|切换)|(?:安装|升级|切换).*(?:运行时|node|java|python)/i.test(semantic)
+      || /curl\b[\s\S]*\|\s*(?:ba)?sh\b/i.test(step.command)
+    );
+  });
+  const hasPlatformCheck = normalized
+    .slice(0, runtimeChangeIndex < 0 ? 0 : runtimeChangeIndex)
+    .some((step) => /OPSARK_PLATFORM_CHECK/.test(step.command));
+  if (runtimeChangeIndex >= 0 && !hasPlatformCheck) {
+    normalized.splice(runtimeChangeIndex, 0, {
+      id: `platform-preflight-${Date.now()}`,
+      title: "检查主机平台与运行时兼容基础",
+      description: "在安装或切换运行时前采集操作系统、架构、libc、C++ ABI 与容器能力，供后续方案选择使用。",
+      command: "os_id=$(sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '\"' | head -1); os_version=$(sed -n 's/^VERSION_ID=//p' /etc/os-release 2>/dev/null | tr -d '\"' | head -1); arch=$(uname -m); libc=$(getconf GNU_LIBC_VERSION 2>/dev/null || true); glibcxx=$(strings /usr/lib64/libstdc++.so.6 /usr/lib/*/libstdc++.so.6 2>/dev/null | grep -E '^GLIBCXX_[0-9]+(\\.[0-9]+)+$' | sed 's/^GLIBCXX_//' | sort -V | tail -1); cxxabi=$(strings /usr/lib64/libstdc++.so.6 /usr/lib/*/libstdc++.so.6 2>/dev/null | grep -E '^CXXABI_[0-9]+(\\.[0-9]+)+$' | sed 's/^CXXABI_//' | sort -V | tail -1); container=$(command -v docker || command -v podman || true); printf 'OPSARK_PLATFORM_CHECK {\"osId\":\"%s\",\"osVersion\":\"%s\",\"arch\":\"%s\",\"libc\":\"%s\",\"maxGlibcxx\":\"%s\",\"maxCxxabi\":\"%s\",\"container\":\"%s\"}\\n' \"$os_id\" \"$os_version\" \"$arch\" \"$libc\" \"$glibcxx\" \"$cxxabi\" \"$container\"",
+      expected: "输出可用于选择兼容安装方式的主机平台事实",
+      validation: "test -r /etc/os-release && uname -m >/dev/null",
+      risk: "low",
+      status: "pending",
+    });
+  }
+  const platformIndexes = normalized
+    .map((step, index) => ({
+      index,
+      structured: step.command.includes("OPSARK_PLATFORM_CHECK"),
+      completed: step.status === "completed",
+      semantic: /主机平台与运行时兼容|平台兼容基础/.test(`${step.title}\n${step.description}`),
+    }))
+    .filter((item) => item.structured || item.semantic);
+  if (platformIndexes.length > 1) {
+    const keeper = platformIndexes.find((item) => item.completed)
+      ?? platformIndexes.find((item) => item.structured)
+      ?? platformIndexes[0];
+    platformIndexes
+      .filter((item) => item.index !== keeper.index)
+      .sort((left, right) => right.index - left.index)
+      .forEach((item) => normalized.splice(item.index, 1));
+  }
+  return normalized.map(ensureStepValidator);
 }
 
 function resultLines(step: PlanStep) {
@@ -131,6 +232,26 @@ function resultLines(step: PlanStep) {
 
 export function buildExecutionSummary(requirement: string, steps: PlanStep[]) {
   const completed = steps.filter((step) => step.status === "completed");
+  const failed = steps.filter((step) => step.status === "failed");
+  if (failed.length) {
+    const lastFailure = failed[failed.length - 1];
+    const failureDetail =
+      lastFailure.review?.summary
+      ?? lastFailure.result?.failureReason
+      ?? resultLines(lastFailure).slice(-3).join("；")
+      ?? "最后执行步骤未达到预期";
+    const verifiedResults = completed
+      .slice(-3)
+      .map((step) => {
+        const output = resultLines(step).slice(-2).join("；");
+        return output ? `${step.title}：${output}` : step.title;
+      });
+    return [
+      `本轮任务未完成。共处理 ${completed.length + failed.length} 个步骤，失败步骤为“${lastFailure.title}”：${failureDetail}。`,
+      verifiedResults.length ? `失败前已确认的结果：${verifiedResults.join("；")}。` : "",
+      `用户目标“${requirement}”尚未由最终证据证明完成。`,
+    ].filter(Boolean).join("\n");
+  }
   const dataStep = [...completed].reverse().find((step) =>
     /show\s+(databases|tables)/i.test(step.command) ||
     /查询.*(数据库|数据表)|数据库.*列表|哪些表/i.test(step.title),
@@ -146,14 +267,27 @@ export function buildExecutionSummary(requirement: string, steps: PlanStep[]) {
     return `查询完成，当前没有返回可识别的${isTableQuery ? "数据表" : "数据库"}名称。`;
   }
 
-  const emptySteps = completed.filter((step) => step.output?.includes("未发现匹配项"));
+  const emptySteps = completed.filter((step) =>
+    step.result?.observationStatus === "not_found"
+    || step.output?.includes("未发现匹配项"),
+  );
+  const unhealthySteps = completed.filter((step) =>
+    step.result?.observationStatus === "unhealthy"
+    || step.result?.observationStatus === "warning",
+  );
+  if (unhealthySteps.length) {
+    const details = unhealthySteps
+      .map((step) => `${step.title}：${step.result?.warnings[0] ?? "观察到异常状态"}`)
+      .join("；");
+    return `本轮执行完成，共处理 ${completed.length} 个步骤，发现 ${unhealthySteps.length} 个需要关注的状态。${details}。`;
+  }
   if (emptySteps.length) {
-    return `本轮处理完成，共执行 ${completed.length} 个步骤。其中 ${emptySteps.length} 个查询没有匹配数据，其余步骤均已通过校验。`;
+    return `本轮处理完成，共执行 ${completed.length} 个步骤。其中 ${emptySteps.length} 个查询正常完成但没有匹配数据或发现目标，其余步骤证据有效。`;
   }
   const finalResult = completed.length ? resultLines(completed[completed.length - 1]).slice(0, 5) : [];
   return finalResult.length
-    ? `本轮处理完成，共执行 ${completed.length} 个步骤，所有校验均通过。最终结果：${finalResult.join("；")}。`
-    : `本轮处理完成，共执行 ${completed.length} 个步骤，所有校验均通过。`;
+    ? `本轮处理完成，共执行 ${completed.length} 个步骤，程序证据均有效。最终结果：${finalResult.join("；")}。`
+    : `本轮处理完成，共执行 ${completed.length} 个步骤，程序证据均有效。`;
 }
 
 export const backend = {
@@ -299,11 +433,33 @@ export const backend = {
         requirement,
         context: runtimeModel.context,
       });
-      return normalizePlanPreconditions(steps);
+      return normalizePlanPreconditions(steps, requirement);
     }
-    if (isTauri()) return normalizePlanPreconditions(await invoke<PlanStep[]>("generate_plan", { requirement }));
+    if (isTauri()) return normalizePlanPreconditions(await invoke<PlanStep[]>("generate_plan", { requirement }), requirement);
     await pause(900);
-    return normalizePlanPreconditions(buildDemoPlan(requirement));
+    return normalizePlanPreconditions(buildDemoPlan(requirement), requirement);
+  },
+
+  async processRequirement(
+    requirement: string,
+    runtimeModel: RuntimeModel,
+  ): Promise<RequirementProcessingResult> {
+    if (isTauri()) {
+      const result = await invoke<RequirementProcessingResult>("process_ai_requirement", {
+        apiKey: runtimeModel.apiKey,
+        endpoint: runtimeModel.endpoint,
+        model: runtimeModel.model,
+        requirement,
+        context: runtimeModel.context,
+      });
+      return { ...result, plan: normalizePlanPreconditions(result.plan, requirement) };
+    }
+    await pause(300);
+    const inquiry = /(什么是|为什么|有什么风险|有何风险|区别|原理|如何理解|是否建议|能否解释)/i.test(requirement)
+      && !/(当前|服务器|查看|查询|列出|检查|创建|删除|修改|启动|停止|重启|部署)/i.test(requirement);
+    return inquiry
+      ? { intent: "answer", answer: "这是一个咨询类问题，应直接提供说明而不执行服务器操作。", plan: [] }
+      : { intent: "execute", plan: normalizePlanPreconditions(buildDemoPlan(requirement), requirement) };
   },
 
   async checkModel(runtimeModel: Omit<RuntimeModel, "context">): Promise<{ available: boolean; reason: string }> {
@@ -328,7 +484,15 @@ export const backend = {
           model: runtimeModel.model,
           requirement,
           executionContext: JSON.stringify(
-            steps.map(({ title, command, expected, status, output }) => ({ title, command, expected, status, output })),
+            steps.map(({ title, command, expected, status, output, result, evidence }) => ({
+              title,
+              command,
+              expected,
+              status,
+              output,
+              result,
+              evidence: evidence?.map(({ type, source, facts }) => ({ type, source, facts })),
+            })),
           ),
         });
       } catch {
@@ -367,7 +531,12 @@ export const backend = {
     }
   },
 
-  async executeCommand(command: string, connection?: RuntimeConnection, approvedHighRisk = false): Promise<{
+  async executeCommand(
+    command: string,
+    connection?: RuntimeConnection,
+    approvedHighRisk = false,
+    options?: { executionId: string; onProgress?: (event: CommandOutputEvent) => void },
+  ): Promise<{
     output: string;
     success: boolean;
     simulated: boolean;
@@ -375,7 +544,22 @@ export const backend = {
     emptyResult?: boolean;
   }> {
     if (isTauri() && connection?.password) {
-      return invoke("execute_ssh_command", { ...connection, command, approvedHighRisk });
+      let unlisten: (() => void) | undefined;
+      if (options?.onProgress) {
+        unlisten = await listen<CommandOutputEvent>("command-output", (event) => {
+          if (event.payload.executionId === options.executionId) options.onProgress?.(event.payload);
+        });
+      }
+      try {
+        return await invoke("execute_ssh_command", {
+          ...connection,
+          command,
+          approvedHighRisk,
+          executionId: options?.executionId ?? `exec-${Date.now()}`,
+        });
+      } finally {
+        unlisten?.();
+      }
     }
     if (isTauri()) return invoke("execute_command", { command, approvedHighRisk });
     await pause(700);
@@ -386,17 +570,31 @@ export const backend = {
     };
   },
 
+  async cancelCommand(connection: RuntimeConnection, executionId: string) {
+    if (!isTauri()) return;
+    await invoke("cancel_ssh_execution", { ...connection, executionId });
+  },
+
   async validateStep(
     step: PlanStep,
     connection?: RuntimeConnection,
-  ): Promise<{ passed: boolean; detail: string; output?: string }> {
+    options?: { executionId: string; onProgress?: (event: CommandOutputEvent) => void },
+  ): Promise<{
+    passed: boolean;
+    detail: string;
+    output?: string;
+    exitCode?: number;
+    emptyResult?: boolean;
+  }> {
     if (isTauri() && connection) {
-      const result = await this.executeCommand(step.validation, connection);
+      const result = await this.executeCommand(step.validation, connection, false, options);
       const passed = result.exitCode === undefined ? result.success : result.exitCode === 0;
       return {
         passed,
         detail: passed ? `独立校验通过：${step.expected}` : "独立校验命令未达到预期",
         output: result.output,
+        exitCode: result.exitCode,
+        emptyResult: result.emptyResult,
       };
     }
     if (isTauri()) return invoke("validate_step", { expected: step.expected, output: step.output ?? "" });
