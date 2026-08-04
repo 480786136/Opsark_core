@@ -519,6 +519,7 @@ async function deleteTaskItem(item: OpsTask) {
             <option value="observe">逐步确认</option>
             <option value="safe">安全模式</option>
             <option value="autonomous">自动执行</option>
+            <option value="managed">完全托管</option>
           </select>
           <button class="send-button" type="submit" :disabled="!input.trim() || Boolean(isBusy) || !modelId"><Send :size="16" /></button>
         </div>

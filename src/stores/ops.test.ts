@@ -48,6 +48,32 @@ describe("智能任务状态机", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     localStorage.clear();
+    localStorage.setItem("opsark.servers", JSON.stringify([
+      {
+        id: "srv-production-01",
+        name: "测试服务器",
+        host: "example.invalid",
+        port: 22,
+        username: "tester",
+        group: "测试",
+        status: "offline",
+        environment: [],
+        info: { os: "Test OS", kernel: "test", cpu: "test", cores: 1, memoryGb: 1, diskGb: 1, uptime: "test" },
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+      {
+        id: "srv-tencent-test",
+        name: "凭据恢复测试服务器",
+        host: "example.invalid",
+        port: 22,
+        username: "tester",
+        group: "测试",
+        status: "offline",
+        environment: [],
+        info: { os: "Test OS", kernel: "test", cpu: "test", cores: 1, memoryGb: 1, diskGb: 1, uptime: "test" },
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]));
     setActivePinia(createPinia());
     vi.spyOn(backend, "generatePlan").mockResolvedValue(structuredClone(plan));
     vi.spyOn(backend, "processRequirement").mockResolvedValue({
@@ -108,6 +134,38 @@ describe("智能任务状态机", () => {
     expect(store.activeTask?.messages.some((message) => message.content.includes("自动执行模式已批准计划"))).toBe(true);
   });
 
+  it("完全托管模式自动批准计划和低中风险步骤，但高风险必须审批", async () => {
+    const managedPlan: PlanStep[] = [
+      { ...structuredClone(plan[0]), id: "managed-low", risk: "low" },
+      { ...structuredClone(plan[1]), id: "managed-medium", risk: "medium" },
+      {
+        ...structuredClone(plan[2]),
+        id: "managed-high",
+        title: "发布生产版本",
+        command: "release-tool publish production",
+        risk: "high",
+      },
+    ];
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({
+      intent: "execute",
+      plan: managedPlan,
+    });
+    const store = useOpsStore();
+
+    await store.submitRequirement("srv-production-01", "托管发布生产版本", "managed", "model-deepseek");
+
+    expect(store.activeTask?.status).toBe("awaiting_step_approval");
+    expect(store.activeTask?.plan[0].status).toBe("completed");
+    expect(store.activeTask?.plan[1].status).toBe("completed");
+    expect(store.activeTask?.plan[2].status).toBe("awaiting_approval");
+    expect(store.activeTask?.messages.some((message) => message.content.includes("完全托管模式已自动批准计划"))).toBe(true);
+    expect(backend.executeCommand).toHaveBeenCalledTimes(2);
+
+    await store.approveStep(store.activeTask!.id, "managed-high");
+    expect(store.activeTask?.status).toBe("completed");
+    expect(backend.executeCommand).toHaveBeenCalledTimes(3);
+  });
+
   it("远程输出到达时同步更新步骤详情和终端", async () => {
     const store = useOpsStore();
     vi.mocked(backend.executeCommand).mockImplementation(async (_command, _connection, _approved, options) => {
@@ -122,6 +180,81 @@ describe("智能任务状态机", () => {
 
     expect(store.terminalLines).toContain("download 42%");
     expect(task.plan[0].output).toContain("download 42%");
+  });
+
+  it("远程命令长时间未返回时定期获取状态并交给模型复核", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = useOpsStore();
+      const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+      store.serverPasswords[task.serverId] = "test-password";
+      store.pushMessage(task, {
+        role: "user",
+        kind: "message",
+        content: "启动服务并验证实际页面",
+      });
+      task.status = "running";
+      task.plan = [ensureStepValidator({
+        ...structuredClone(plan[0]),
+        id: "long-running-service",
+        title: "启动容器服务",
+        command: "docker run --name app image",
+        validation: "docker ps --filter name=app --format '{{.Status}}' | grep -q Up",
+      })];
+      let finishExecution!: (value: {
+        output: string;
+        success: boolean;
+        simulated: boolean;
+        exitCode: number;
+      }) => void;
+      vi.mocked(backend.executeCommand).mockImplementationOnce((_command, _connection, _approved, options) => {
+        options?.onProgress?.({
+          executionId: options.executionId,
+          data: "service ready\n",
+          stream: "stdout",
+        });
+        return new Promise((resolve) => {
+          finishExecution = resolve;
+        });
+      });
+      vi.mocked(backend.validateStep).mockResolvedValue({
+        passed: true,
+        exitCode: 0,
+        detail: "容器已运行",
+        output: "$ docker ps\napp Up 30 seconds\n[exit: 0]",
+      });
+      vi.mocked(backend.reviewStep).mockResolvedValueOnce({
+        decision: "complete",
+        reason: "独立校验已证明服务运行，无需继续等待前台进程",
+        summary: "停止等待并进入正式校验。",
+        source: "model",
+      });
+      vi.spyOn(backend, "cancelCommand").mockImplementationOnce(async () => {
+        finishExecution({
+          output: "$ docker run\nservice ready\n[exit: 130]",
+          success: false,
+          simulated: false,
+          exitCode: 130,
+        });
+      });
+
+      const running = store.runStep(task.id, "long-running-service");
+      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.advanceTimersByTimeAsync(500);
+      await running;
+
+      expect(backend.validateStep).toHaveBeenCalledTimes(2);
+      expect(backend.reviewStep).toHaveBeenCalledTimes(1);
+      const reviewContext = JSON.parse(vi.mocked(backend.reviewStep).mock.calls[0][1]);
+      expect(reviewContext.reviewPolicy.periodicLongRunningReview).toBe(true);
+      expect(reviewContext.periodicObservation.passed).toBe(true);
+      expect(reviewContext.fullPlan).toHaveLength(1);
+      expect(backend.cancelCommand).toHaveBeenCalledTimes(1);
+      expect(task.plan[0].status).toBe("completed");
+      expect(task.status).toBe("completed");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("终止业务会取消当前执行并跳过活动步骤", async () => {
@@ -152,7 +285,7 @@ describe("智能任务状态机", () => {
     expect(backend.generatePlan).not.toHaveBeenCalled();
   });
 
-  it("调整计划生成失败时仍生成独立的失败总结", async () => {
+  it("调整计划格式失败时保留证据并维持可恢复状态", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "safe", "model-deepseek");
     task.status = "needs_adjustment";
@@ -178,12 +311,11 @@ describe("智能任务状态机", () => {
 
     await store.adjustTask(task.id);
 
-    expect(task.status).toBe("failed");
-    expect(task.summary).toContain("本轮任务未完成");
-    expect(task.summary).toContain("HTTP 虽返回 200");
-    expect(task.messages.some((message) =>
-      message.kind === "summary" && message.content === task.summary,
-    )).toBe(true);
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.summary).toBeUndefined();
+    expect(task.pauseReason).toContain("调整计划生成失败");
+    expect(task.pauseReason).toContain("可再次生成解决方案");
+    expect(task.plan[0].review?.summary).toContain("HTTP 虽返回 200");
   });
 
   it("达到自动调整上限后用户仍可明确发起新的人工调整周期", async () => {
@@ -252,6 +384,18 @@ describe("智能任务状态机", () => {
     expect(store.needsApproval("observe", highRisk)).toBe(true);
     expect(store.needsApproval("safe", highRisk)).toBe(true);
     expect(store.needsApproval("autonomous", highRisk)).toBe(true);
+    expect(store.needsApproval("managed", highRisk)).toBe(true);
+  });
+
+  it("完全托管模式只对高风险步骤要求审批", () => {
+    const store = useOpsStore();
+    expect(store.needsApproval("managed", { ...plan[0], risk: "low" })).toBe(false);
+    expect(store.needsApproval("managed", { ...plan[1], risk: "medium" })).toBe(false);
+    expect(store.needsApproval("managed", {
+      ...plan[2],
+      risk: "high",
+      command: "release-tool publish production",
+    })).toBe(true);
   });
 
   it("自动执行模式不会因编译部署类高风险标签暂停，但破坏性命令仍需确认", () => {
@@ -316,10 +460,29 @@ describe("智能任务状态机", () => {
     expect(store.logs.map((event) => event.detail).join("\n")).not.toContain("test-secret-value");
   });
 
+  it("新一轮任务不会静默复用上一轮敏感变量", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    task.status = "running";
+    task.plan = [{
+      ...structuredClone(plan[0]),
+      id: "reconfirm-secret-step",
+      command: "tool --password ${secret.DB_PASSWORD}",
+    }];
+    store.secretValues.DB_PASSWORD = "previous-account-password";
+
+    await store.runStep(task.id, "reconfirm-secret-step");
+
+    expect(task.status).toBe("awaiting_input");
+    expect(store.pendingSecret?.key).toBe("DB_PASSWORD");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
   it("启动时恢复服务器密码和模型 API Key，并按需自动连接", async () => {
     vi.mocked(backend.loadCredential).mockImplementation(async (kind, id) => {
       if (kind === "server" && id === "srv-tencent-test") return "remembered-ssh-password";
       if (kind === "model" && id === "model-deepseek") return "remembered-model-key";
+      if (kind === "secret" && id === "DB_PASSWORD") return "remembered-db-password";
       return null;
     });
     vi.spyOn(backend, "probeSsh").mockResolvedValue({
@@ -350,6 +513,7 @@ describe("智能任务状态机", () => {
 
     expect(store.serverPasswords["srv-tencent-test"]).toBe("remembered-ssh-password");
     expect(store.modelApiKeys["model-deepseek"]).toBe("remembered-model-key");
+    expect(store.secretValues.DB_PASSWORD).toBe("remembered-db-password");
     expect(store.models.find((model) => model.id === "model-deepseek")?.hasApiKey).toBe(true);
     expect(await store.ensureServerConnected("srv-tencent-test")).toBe(true);
     expect(store.connectedServerIds).toContain("srv-tencent-test");
@@ -364,6 +528,26 @@ describe("智能任务状态机", () => {
 
     expect(backend.saveCredential).toHaveBeenCalledWith("model", "model-deepseek", "new-model-key");
     expect(localStorage.getItem("opsark.models")).toContain("model-deepseek");
+  });
+
+  it("敏感信息支持保存、重命名和直接删除", async () => {
+    const store = useOpsStore();
+    store.secretValues.DB_PASSWORD = "current-real-value";
+
+    await store.saveSecretSettings();
+    expect(backend.saveCredential).toHaveBeenCalledWith("secret", "DB_PASSWORD", "current-real-value");
+
+    expect(await store.renameSecretMetadata("DB_PASSWORD", "MYSQL_ROOT_PASSWORD")).toBe(true);
+    expect(store.secretMetadata.some((item) => item.key === "MYSQL_ROOT_PASSWORD")).toBe(true);
+    expect(store.secretValues.MYSQL_ROOT_PASSWORD).toBe("current-real-value");
+    expect(store.secretValues.DB_PASSWORD).toBeUndefined();
+    expect(backend.saveCredential).toHaveBeenCalledWith("secret", "MYSQL_ROOT_PASSWORD", "current-real-value");
+    expect(backend.deleteCredential).toHaveBeenCalledWith("secret", "DB_PASSWORD");
+
+    await store.removeSecretMetadata("MYSQL_ROOT_PASSWORD");
+    expect(store.secretMetadata.some((item) => item.key === "MYSQL_ROOT_PASSWORD")).toBe(false);
+    expect(store.secretValues.MYSQL_ROOT_PASSWORD).toBeUndefined();
+    expect(backend.deleteCredential).toHaveBeenCalledWith("secret", "MYSQL_ROOT_PASSWORD");
   });
 
   it("选中已有任务后可继续多轮需求，不会强制创建新任务", async () => {
@@ -399,6 +583,8 @@ describe("智能任务状态机", () => {
     expect(runtimeContext.previousExecution.requirement).toBe("第一轮需求");
     expect(runtimeContext.previousExecution.summary).toContain("PID 5149");
     expect(runtimeContext.previousExecution.steps[0].output).toContain("/opt/O2OA");
+    expect(runtimeContext.knownExecutionFacts.workingDirectories).toContain("/opt/O2OA/o2server/start.sh");
+    expect(runtimeContext.knownExecutionFacts.instruction).toContain("必须优先复用");
   });
 
   it("暂停后输入进行调整会直接触发本轮调整而不是交给模型当咨询", async () => {
@@ -465,10 +651,11 @@ describe("智能任务状态机", () => {
       validation: "mysql -p'${secret.DB_PASSWORD}' -e 'SELECT 1' | grep -q 1",
     }];
     store.secretValues.DB_PASSWORD = "private-validation-value";
+    task.confirmedSecretKeys = ["DB_PASSWORD"];
     vi.mocked(backend.validateStep).mockImplementation(async (step) => ({
       passed: true,
       detail: "独立校验通过",
-      output: `$ ${step.validation}\n[exit: 0]`,
+      output: `$ ${step.validation}\npassword: legacy-password-from-file\n[exit: 0]`,
     }));
 
     await store.runStep(task.id, "validation-secret-step");
@@ -482,10 +669,12 @@ describe("智能任务状态机", () => {
       }),
     );
     expect(task.plan[0].output).not.toContain("private-validation-value");
+    expect(task.plan[0].output).not.toContain("legacy-password-from-file");
+    expect(task.plan[0].output).toContain("password: ••••••••");
     expect(store.logs.map((event) => event.detail).join("\n")).not.toContain("private-validation-value");
   });
 
-  it("数据库查询总结会列出实际返回的数据库名称", () => {
+  it("无模型时的通用总结会展示最后步骤的真实输出", () => {
     const databaseStep: PlanStep = {
       ...structuredClone(plan[0]),
       title: "查询 MySQL 数据库列表",
@@ -506,8 +695,10 @@ describe("智能任务状态机", () => {
       ].join("\n"),
     };
 
-    expect(buildExecutionSummary("MySQL 有哪些数据库", [databaseStep]))
-      .toBe("查询完成，共找到 4 个数据库：information_schema、ffp、mysql、performance_schema。");
+    const summary = buildExecutionSummary("列出目标资源", [databaseStep]);
+    expect(summary).toContain("最终结果");
+    expect(summary).toContain("information_schema");
+    expect(summary).toContain("performance_schema");
   });
 
   it("远程模型缺少 API Key 时明确失败，不静默生成本地通用计划", async () => {
@@ -605,141 +796,45 @@ describe("智能任务状态机", () => {
     expect(store.availableModels).toHaveLength(0);
   });
 
-  it("创建数据库前的状态检查允许已存在和不存在两种有效分支", () => {
-    const steps: PlanStep[] = [
-      {
-        ...structuredClone(plan[0]),
-        title: "检查数据库是否存在",
-        command: "mysql -u root -p${secret.DB_PASSWORD} -e 'SHOW DATABASES;' 2>&1",
-        expected: "输出包含应用配置中的数据库名称",
-        validation: "mysql -u root -p${secret.DB_PASSWORD} -e 'SHOW DATABASES;' 2>&1 | grep -w 'ffp' && exit 0 || exit 1",
-      },
-      {
-        ...structuredClone(plan[1]),
-        title: "创建缺失的数据库并授权",
-        command: "mysql -u root -p${secret.DB_PASSWORD} -e \"CREATE DATABASE IF NOT EXISTS ffp CHARACTER SET utf8mb4;\"",
-      },
+  it("通用核心保留模型生成的业务语义，不按特定技术栈改写计划", () => {
+    const steps: PlanStep[] = [{
+      ...structuredClone(plan[0]),
+      title: "检查目标状态",
+      command: "custom-tool inspect target-a",
+      expected: "返回目标的当前状态",
+      validation: "custom-tool inspect target-a >/dev/null",
+    }];
+
+    const normalized = normalizePlanPreconditions(steps);
+
+    expect(normalized).toHaveLength(1);
+    expect(normalized[0]).toEqual(expect.objectContaining(steps[0]));
+    expect(normalized[0].validator?.command).toBe(steps[0].validation);
+  });
+
+  it("会移除模型误加在敏感变量占位符前的反斜杠", () => {
+    const normalized = normalizePlanPreconditions([{
+      ...structuredClone(plan[0]),
+      command: "sed -i 's/password:.*/password: \\${secret.DB_PASSWORD}/' application.yml",
+      validation: "grep -F 'password: \\${secret.DB_PASSWORD}' application.yml",
+    }]);
+
+    expect(normalized[0].command).toContain("password: ${secret.DB_PASSWORD}");
+    expect(normalized[0].validation).toContain("password: ${secret.DB_PASSWORD}");
+    expect(normalized[0].command).not.toContain("\\${secret.DB_PASSWORD}");
+    expect(normalized[0].validation).not.toContain("\\${secret.DB_PASSWORD}");
+  });
+
+  it("通用核心不自动注入任何技术栈的预检或替换原命令", () => {
+    const steps = [
+      { ...structuredClone(plan[0]), id: "discover", command: "custom-tool inspect", validation: "custom-tool inspect >/dev/null" },
+      { ...structuredClone(plan[1]), id: "change", command: "custom-tool apply", validation: "custom-tool verify" },
     ];
 
     const normalized = normalizePlanPreconditions(steps);
 
-    expect(normalized[0].title).toBe("检查数据库 ffp 当前状态");
-    expect(normalized[0].expected).toContain("0 为不存在，1 为已存在");
-    expect(normalized[0].command).toContain("-Nse");
-    expect(normalized[0].validation).toContain("information_schema.schemata");
-    expect(normalized[0].validation).toContain("schema_name='ffp'");
-    expect(normalized[0].validation).toMatch(/grep -Eq '\^\[01\]\$'$/);
-    expect(normalized[1]).toEqual(expect.objectContaining(steps[1]));
-    expect(normalized[1].validator?.type).toBe("sql-query");
-  });
-
-  it("会修正模型直接用 grep 断言数据库不存在的前置命令", () => {
-    const steps: PlanStep[] = [
-      {
-        ...structuredClone(plan[0]),
-        title: "检查数据库 ffp 是否已存在",
-        command: "mysql -u root -p${secret.DB_PASSWORD} -e \"SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = 'ffp';\" 2>/dev/null | grep -qx '0'",
-        expected: "数据库不存在",
-        validation: "mysql -u root -p${secret.DB_PASSWORD} -e \"SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = 'ffp';\" 2>/dev/null | grep -qx '0'",
-      },
-      {
-        ...structuredClone(plan[1]),
-        title: "创建数据库 ffp",
-        command: "mysql -u root -p${secret.DB_PASSWORD} -e \"CREATE DATABASE IF NOT EXISTS ffp CHARACTER SET utf8mb4;\"",
-      },
-    ];
-
-    const normalized = normalizePlanPreconditions(steps);
-
-    expect(normalized[0].command).not.toContain("grep");
-    expect(normalized[0].command).not.toContain("2>/dev/null");
-    expect(normalized[0].validation).toContain("grep -Eq '^[01]$'");
-  });
-
-  it("部署计划会在安装前自动补充锁文件和运行时精确检查", () => {
-    const deploymentPlan: PlanStep[] = [
-      {
-        ...structuredClone(plan[0]),
-        id: "clone-project",
-        title: "克隆项目",
-        command: "git clone https://example.com/app.git /opt/app",
-        validation: "test -d /opt/app/.git",
-      },
-      {
-        ...structuredClone(plan[1]),
-        id: "install-dependencies",
-        title: "安装依赖",
-        command: "cd /opt/app && npm install",
-        validation: "test -d /opt/app/node_modules",
-      },
-      {
-        ...structuredClone(plan[2]),
-        id: "build-project",
-        title: "构建项目",
-        command: "cd /opt/app && npm run build",
-        validation: "test -d /opt/app/dist",
-      },
-    ];
-
-    const normalized = normalizePlanPreconditions(deploymentPlan);
-    const preflight = normalized.find((step) => step.command.includes("OPSARK_RUNTIME_CHECK"));
-
-    expect(preflight?.title).toContain("运行时精确要求");
-    expect(preflight?.command).toContain('l.packages?.["node_modules/vite"]');
-    expect(preflight?.command).toContain("packageManager");
-    expect(normalized.indexOf(preflight!)).toBeLessThan(
-      normalized.findIndex((step) => step.id === "install-dependencies"),
-    );
-    expect(normalizePlanPreconditions(normalized).filter((step) =>
-      step.command.includes("OPSARK_RUNTIME_CHECK"),
-    )).toHaveLength(1);
-  });
-
-  it("模型已有清单检查时会语义合并且 engines 缺失不再导致校验失败", () => {
-    const deploymentPlan: PlanStep[] = [
-      {
-        ...structuredClone(plan[0]),
-        id: "inspect-manifest",
-        title: "检查项目构建脚本的 Node 要求",
-        description: "查看 package.json 中的 engines 字段和 lock 文件",
-        command: "cd /tmp/app && node -e \"const p=require('./package.json');console.log(JSON.stringify({engines:p.engines,scripts:p.scripts}))\"",
-        validation: "cd /tmp/app && node -e \"const p=require('./package.json');process.exit(p.engines?.node ? 0 : 1)\"",
-      },
-      {
-        ...structuredClone(plan[1]),
-        id: "install-dependencies",
-        title: "安装依赖",
-        command: "cd /tmp/app && npm install",
-        validation: "test -d /tmp/app/node_modules",
-      },
-    ];
-
-    const normalized = normalizePlanPreconditions(deploymentPlan);
-    const runtimeChecks = normalized.filter((step) => step.command.includes("OPSARK_RUNTIME_CHECK"));
-
-    expect(runtimeChecks).toHaveLength(1);
-    expect(runtimeChecks[0].id).toBe("inspect-manifest");
-    expect(runtimeChecks[0].validation).toBe("cd '/tmp/app' && node -e 'require(\"./package.json\")'");
-    expect(runtimeChecks[0].description).toContain("未声明 engines 也是有效状态");
-    expect(normalized).toHaveLength(2);
-
-    const classified = classifyStepResult(
-      runtimeChecks[0],
-      {
-        success: true,
-        exitCode: 0,
-        output: [
-          "$ inspect",
-          'OPSARK_RUNTIME_CHECK {"currentNode":"v16.20.2","requiredNode":"unspecified","packageManager":"unspecified","lockFiles":[]}',
-          "[exit: 0]",
-        ].join("\n"),
-      },
-      { passed: true, exitCode: 0, detail: "清单可解析", output: "$ validate\n[exit: 0]" },
-    );
-
-    expect(classified.accepted).toBe(true);
-    expect(classified.result.observationStatus).toBe("matched");
-    expect(classified.result.facts.requiredNodeVersion).toBe("unspecified");
+    expect(normalized.map((step) => step.id)).toEqual(["discover", "change"]);
+    expect(normalized.map((step) => step.command)).toEqual(steps.map((step) => step.command));
   });
 
   it("部署计划会移除用户未要求且没有证据支撑的破坏性残留清理", () => {
@@ -747,201 +842,74 @@ describe("智能任务状态机", () => {
       ...structuredClone(plan[0]),
       id: "cleanup-runtime",
       title: "清理失败的安装残留",
-      description: "删除之前尝试安装的 Node.js 二进制目录",
-      command: "rm -rf /usr/local/node-v22",
+      description: "删除之前尝试安装的工具目录",
+      command: "rm -rf /opt/tool-cache",
       risk: "high" as const,
     };
 
     expect(normalizePlanPreconditions(
-      [cleanup, { ...structuredClone(plan[1]), command: "node --version" }],
-      "使用之前的 Node.js 版本尝试部署项目",
+      [cleanup, { ...structuredClone(plan[1]), command: "custom-tool --version" }],
+      "使用当前环境尝试执行任务",
     ).some((step) => step.id === cleanup.id)).toBe(false);
 
     expect(normalizePlanPreconditions(
       [cleanup],
-      "清理并删除失败的 Node.js 安装残留",
+      "清理并删除失败的工具安装残留",
     ).some((step) => step.id === cleanup.id)).toBe(true);
   });
 
-  it("运行时变更前自动补充通用平台兼容性检查且保持幂等", () => {
-    const steps: PlanStep[] = [{
-      ...structuredClone(plan[1]),
-      id: "upgrade-runtime",
-      title: "升级 Node.js 运行时",
-      description: "安装满足项目要求的运行时",
-      command: "nvm install 22 && nvm use 22",
-      validation: "node --version",
-    }];
-
-    const normalized = normalizePlanPreconditions(steps);
-    const platform = normalized.find((step) => step.command.includes("OPSARK_PLATFORM_CHECK"));
-
-    expect(platform?.validator?.type).toBe("platform");
-    expect(platform?.command).toContain("GNU_LIBC_VERSION");
-    expect(platform?.command).toContain("grep -E '^GLIBCXX_[0-9]+");
-    expect(platform?.command).toContain("grep -E '^CXXABI_[0-9]+");
-    expect(platform?.command).not.toContain("sed -n 's/^GLIBCXX_//p'");
-    expect(normalized.indexOf(platform!)).toBeLessThan(
-      normalized.findIndex((step) => step.id === "upgrade-runtime"),
-    );
-    expect(normalizePlanPreconditions(normalized).filter((step) =>
-      step.command.includes("OPSARK_PLATFORM_CHECK"),
-    )).toHaveLength(1);
-  });
-
-  it("模型平台检查与程序平台检查重复时只保留结构化步骤", () => {
-    const normalized = normalizePlanPreconditions([
-      {
-        ...structuredClone(plan[0]),
-        id: "model-platform-check",
-        title: "检查主机平台与运行时兼容基础",
-        description: "读取系统版本和架构",
-        command: "cat /etc/os-release && uname -m",
-        validation: "test -r /etc/os-release",
-      },
-      {
-        ...structuredClone(plan[1]),
-        id: "install-runtime-after-platform",
-        title: "安装 Node.js 运行时",
-        command: "nvm install 22",
-        validation: "node --version",
-      },
-    ]);
-    const platformSteps = normalized.filter((step) =>
-      /主机平台与运行时兼容|OPSARK_PLATFORM_CHECK/.test(`${step.title}\n${step.command}`),
-    );
-
-    expect(platformSteps).toHaveLength(1);
-    expect(platformSteps[0].command).toContain("OPSARK_PLATFORM_CHECK");
-  });
-
-  it("发现阶段后只细化一次后续变更计划且不占用失败调整次数", async () => {
+  it("核心执行流程不再因发现步骤自动重新生成计划", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "safe", "model-deepseek");
     task.status = "running";
     task.plan = [
-      ensureStepValidator({
-        ...structuredClone(plan[0]),
-        id: "platform-discovery",
-        title: "检查主机平台与运行时兼容基础",
-        command: "echo 'OPSARK_PLATFORM_CHECK {\"osId\":\"centos\",\"arch\":\"x86_64\",\"libc\":\"glibc 2.17\"}'",
-        validation: "test -r /etc/os-release",
-        status: "completed",
-        result: {
-          executionStatus: "success",
-          observationStatus: "matched",
-          facts: { platformCheck: { osId: "centos", arch: "x86_64", libc: "glibc 2.17" } },
-          warnings: [],
-          evidenceIds: [],
-        },
-      }),
-      ensureStepValidator({
-        ...structuredClone(plan[1]),
-        id: "upgrade-runtime",
-        title: "升级 Node.js 运行时",
-        description: "安装满足项目要求的运行时",
-        command: "nvm install 22 && nvm use 22",
-        validation: "node --version",
-        status: "pending",
-      }),
+      ensureStepValidator({ ...structuredClone(plan[0]), id: "discovery", status: "completed" }),
+      ensureStepValidator({ ...structuredClone(plan[1]), id: "approved-change", status: "pending" }),
     ];
-    vi.mocked(backend.generatePlan).mockResolvedValueOnce([
-      ensureStepValidator({
-        ...structuredClone(plan[1]),
-        id: "container-runtime",
-        title: "使用兼容容器运行构建环境",
-        command: "docker pull node:22",
-        validation: "docker image inspect node:22 >/dev/null",
-        status: "pending",
-      }),
-    ]);
 
     await store.advanceTask(task.id);
 
-    expect(task.discoveryRefined).toBe(true);
-    expect(task.adjustmentCount).toBe(0);
-    expect(task.status).toBe("awaiting_plan_approval");
-    expect(task.plan.map((step) => step.id)).toEqual(["platform-discovery", "container-runtime"]);
-    expect(backend.generatePlan).toHaveBeenCalledTimes(1);
-  });
-
-  it("发现后计划细化解析失败会自动重试一次", async () => {
-    const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
-    task.status = "running";
-    task.plan = [
-      ensureStepValidator({
-        ...structuredClone(plan[0]),
-        id: "platform-discovery-retry",
-        title: "检查主机平台与运行时兼容基础",
-        command: "echo 'OPSARK_PLATFORM_CHECK {\"osId\":\"centos\"}'",
-        validation: "test -r /etc/os-release",
-        status: "completed",
-      }),
-      ensureStepValidator({
-        ...structuredClone(plan[1]),
-        id: "original-runtime-change",
-        title: "安装 Node.js 运行时",
-        command: "nvm install 22",
-        risk: "medium",
-        status: "pending",
-      }),
-    ];
-    vi.mocked(backend.generatePlan)
-      .mockRejectedValueOnce(new Error("模型计划结构解析失败"))
-      .mockResolvedValueOnce([
-        ensureStepValidator({
-          ...structuredClone(plan[1]),
-          id: "retried-runtime-change",
-          title: "使用兼容容器",
-          command: "docker pull node:22",
-          risk: "medium",
-          status: "pending",
-        }),
-      ]);
-
-    await store.advanceTask(task.id);
-
-    expect(backend.generatePlan).toHaveBeenCalledTimes(2);
-    expect(task.status).toBe("awaiting_plan_approval");
-    expect(task.plan.map((step) => step.id)).toContain("retried-runtime-change");
-    expect(task.messages.some((message) => message.content.includes("自动重试一次"))).toBe(true);
-  });
-
-  it("计划细化连续解析失败会保留原批准计划继续而不是暂停业务", async () => {
-    const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
-    task.status = "running";
-    task.plan = [
-      ensureStepValidator({
-        ...structuredClone(plan[0]),
-        id: "platform-discovery-fallback",
-        title: "检查主机平台与运行时兼容基础",
-        command: "echo 'OPSARK_PLATFORM_CHECK {\"osId\":\"centos\"}'",
-        validation: "test -r /etc/os-release",
-        status: "completed",
-      }),
-      ensureStepValidator({
-        ...structuredClone(plan[1]),
-        id: "approved-runtime-change",
-        title: "重试安装 nvm",
-        command: "command -v nvm || curl -fsSL https://example.com/install.sh | bash",
-        risk: "medium",
-        status: "pending",
-      }),
-    ];
-    vi.mocked(backend.generatePlan)
-      .mockRejectedValueOnce(new Error("第一次结构解析失败"))
-      .mockRejectedValueOnce(new Error("第二次结构解析失败"));
-
-    await store.advanceTask(task.id);
-
-    expect(backend.generatePlan).toHaveBeenCalledTimes(2);
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(task.status).toBe("awaiting_step_approval");
-    expect(task.plan.map((step) => step.id)).toContain("approved-runtime-change");
-    expect(task.pauseReason).toBeUndefined();
-    expect(task.adjustmentCount).toBe(0);
-    expect(task.messages.some((message) => message.content.includes("保留原批准计划继续执行"))).toBe(true);
+    expect(task.plan.map((step) => step.id)).toEqual(["discovery", "approved-change"]);
+  });
+
+  it("变更目标的纯发现阶段完成后只生成一次证据化后续计划", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    task.status = "running";
+    task.executionConstraints = {
+      changePolicy: "allow_necessary_changes",
+      environmentPolicy: "preserve",
+      failurePolicy: "best_effort",
+      prohibitedActions: [],
+      requiredConditions: [],
+      userDirectives: ["目标未达成时完成必要变更"],
+    };
+    task.plan = [ensureStepValidator({
+      ...structuredClone(plan[0]),
+      id: "completed-discovery",
+      status: "completed",
+      output: "$ custom-tool inspect\ntarget_path=/srv/target\n[exit: 0]",
+    })];
+    vi.mocked(backend.generatePlan).mockResolvedValueOnce([ensureStepValidator({
+      ...structuredClone(plan[1]),
+      id: "evidence-based-change",
+      title: "应用必要变更",
+      command: "custom-tool apply /srv/target",
+      validation: "custom-tool verify /srv/target",
+      status: "pending",
+    })]);
+
+    await store.advanceTask(task.id);
+
+    expect(backend.generatePlan).toHaveBeenCalledTimes(1);
+    expect(task.discoveryRefined).toBe(true);
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(task.plan.map((step) => step.id)).toEqual([
+      "completed-discovery",
+      "evidence-based-change",
+    ]);
   });
 
   it("正常程序证据一致时跳过逐步骤模型复核", async () => {
@@ -1325,7 +1293,7 @@ describe("智能任务状态机", () => {
     expect(port.result.facts.ownershipConfirmed).toBe(true);
   });
 
-  it("把 TOO_OLD 和 EBADENGINE 识别为运行时兼容性阻断", () => {
+  it("通用核心不解释领域工具的私有错误标记", () => {
     const compatibilityStep = ensureStepValidator({
       ...structuredClone(plan[0]),
       title: "诊断 Node.js 环境兼容性",
@@ -1343,9 +1311,9 @@ describe("智能任务状态机", () => {
     );
 
     expect(classified.accepted).toBe(true);
-    expect(classified.result.observationStatus).toBe("unhealthy");
-    expect(classified.result.facts.blockingSignal).toBe(true);
-    expect(classified.needsModelReview).toBe(true);
+    expect(classified.result.observationStatus).toBe("warning");
+    expect(classified.result.facts.blockingSignal).toBe(false);
+    expect(classified.needsModelReview).toBe(false);
   });
 
   it("复合安装命令按运行时目标校验且 ABI 失败不改写主命令状态", () => {
@@ -1385,7 +1353,7 @@ describe("智能任务状态机", () => {
     expect(classified.result.failureReason).toContain("ABI");
   });
 
-  it("普通 npm 配置弃用提示只记录事实而不标记异常线索", () => {
+  it("通用核心将工具警告保留为可复核证据", () => {
     const runtimeStep = ensureStepValidator({
       ...structuredClone(plan[0]),
       title: "确认当前 Node.js 版本可用",
@@ -1409,11 +1377,9 @@ describe("智能任务状态机", () => {
     );
 
     expect(classified.accepted).toBe(true);
-    expect(classified.result.observationStatus).toBe("matched");
-    expect(classified.result.warnings).toEqual([]);
+    expect(classified.result.observationStatus).toBe("warning");
+    expect(classified.result.warnings.length).toBeGreaterThanOrEqual(1);
     expect(classified.result.facts.warningCount).toBe(1);
-    expect(classified.result.facts.benignWarningCount).toBe(1);
-    expect(classified.result.facts.actionableWarningCount).toBe(0);
   });
 
   it("远程安装脚本属于变更操作且网络失败不能被管道退出码掩盖", () => {
@@ -1485,7 +1451,7 @@ describe("智能任务状态机", () => {
     expect(cleaned.split("\n").length).toBeLessThan(8);
   });
 
-  it("结构化运行时检查会按照锁定 Vite engines 阻断不兼容版本", () => {
+  it("通用核心不再识别历史场景的专用结构化标记", () => {
     const preflight = ensureStepValidator({
       ...structuredClone(plan[0]),
       title: "检查前端项目运行时精确要求",
@@ -1506,51 +1472,52 @@ describe("智能任务状态机", () => {
       { passed: true, exitCode: 0, detail: "通过", output: "$ test\n[exit: 0]" },
     );
 
-    expect(classified.result.observationStatus).toBe("unhealthy");
-    expect(classified.result.facts.currentNodeVersion).toBe("v16.20.2");
-    expect(classified.result.facts.requiredNodeVersion).toBe("^20.19.0 || >=22.12.0");
-    expect(classified.result.facts.blockingSignal).toBe(true);
+    expect(classified.result.observationStatus).toBe("matched");
+    expect(classified.result.facts).not.toHaveProperty("currentNodeVersion");
+    expect(classified.result.facts.blockingSignal).toBe(false);
   });
 
-  it("运行时阻断未被剩余计划修复时停止继续安装依赖", async () => {
+  it("通用阻断证据未被剩余计划处理时停止后续变更", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
     task.status = "running";
     task.plan = [
       ensureStepValidator({
         ...structuredClone(plan[0]),
-        id: "node-compatibility",
-        title: "诊断 Node.js 环境兼容性",
-        command: "node -v && echo TOO_OLD",
-        validation: "test -f /opt/app/package.json",
+        id: "blocking-observation",
+        title: "检查目标前置条件",
+        command: "custom-tool inspect",
+        validation: "custom-tool inspect >/dev/null",
+        status: "completed",
+        result: {
+          executionStatus: "success",
+          observationStatus: "unhealthy",
+          facts: { blockingSignal: true },
+          warnings: ["前置条件不满足"],
+          evidenceIds: [],
+        },
       }),
       {
         ...structuredClone(plan[1]),
-        id: "npm-install",
-        title: "安装项目依赖",
-        command: "cd /opt/app && npm install",
+        id: "unrelated-change",
+        title: "重启目标服务",
+        command: "systemctl restart target-service",
       },
     ];
-    vi.mocked(backend.executeCommand).mockResolvedValueOnce({
-      output: "$ node -v\nv16.20.2\nTOO_OLD\n[exit: 0]",
-      success: true,
-      simulated: false,
-      exitCode: 0,
-    });
     vi.mocked(backend.reviewStep).mockResolvedValueOnce({
-      decision: "continue",
-      reason: "继续后续步骤",
-      summary: "继续执行。",
+      decision: "adjust",
+      reason: "当前变更无法解决已知阻断",
+      summary: "需要先调整计划。",
       source: "model",
     });
 
-    await store.runStep(task.id, "node-compatibility");
+    await store.advanceTask(task.id);
 
     expect(task.status).toBe("needs_adjustment");
-    expect(task.plan[0].status).toBe("failed");
+    expect(task.plan[0].status).toBe("completed");
     expect(task.plan[1].status).toBe("pending");
-    expect(backend.executeCommand).toHaveBeenCalledTimes(1);
-    expect(task.pauseReason).toContain("运行时兼容性阻断");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(task.pauseReason).toContain("前置条件复核");
     expect(task.summary).toBeUndefined();
     expect(task.messages.some((message) => message.kind === "summary")).toBe(false);
   });
@@ -1717,15 +1684,11 @@ describe("智能任务状态机", () => {
     expect(task.status).toBe("awaiting_step_approval");
   });
 
-  it("构建失败总结能提取 Node.js 精确版本根因", () => {
-    const failure = analyzeCommandFailure([
-      "You are using Node.js 16.20.2. Vite requires Node.js version 20.19+ or 22.12+. Please upgrade your Node.js version.",
-      "TypeError: crypto.getRandomValues is not a function",
-    ].join("\n"));
+  it("未安装领域 Skill 时未知工具失败保留为通用失败", () => {
+    const failure = analyzeCommandFailure("tool-specific compatibility error");
 
-    expect(failure.reason).toContain("Node.js 16.20.2");
-    expect(failure.reason).toContain("20.19+ or 22.12+");
-    expect(failure.facts.category).toBe("runtime_incompatible");
+    expect(failure.reason).toBe("命令执行未成功");
+    expect(failure.facts.category).toBe("command_failed");
   });
 
   it("单步构建失败只显示暂停原因，不提前生成本轮总结", async () => {
@@ -1742,7 +1705,7 @@ describe("智能任务状态机", () => {
     vi.mocked(backend.executeCommand).mockResolvedValueOnce({
       output: [
         "$ npm run build",
-        "You are using Node.js 16.20.2. Vite requires Node.js version 20.19+ or 22.12+. Please upgrade your Node.js version.",
+        "tool-specific compatibility error",
         "[exit: 1]",
       ].join("\n"),
       success: false,
@@ -1753,7 +1716,7 @@ describe("智能任务状态机", () => {
     await store.runStep(task.id, "failed-build");
 
     expect(task.status).toBe("needs_adjustment");
-    expect(task.pauseReason).toContain("Node.js 16.20.2");
+    expect(task.pauseReason).toContain("命令执行未成功");
     expect(task.summary).toBeUndefined();
     expect(task.messages.some((message) => message.kind === "summary")).toBe(false);
     expect(backend.reviewStep).toHaveBeenCalledTimes(1);

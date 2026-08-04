@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use ssh2::Session;
 use std::collections::HashMap;
@@ -118,40 +118,95 @@ struct CommandOutputEvent {
 
 static METRIC_SAMPLES: OnceLock<Mutex<HashMap<String, (f64, f64, Instant)>>> = OnceLock::new();
 const KEYCHAIN_SERVICE: &str = "com.opsark.desktop";
+const STRICT_JSON_OUTPUT_RULE: &str = "输出格式是强制协议：必须只返回一个完整、可由标准 JSON 解析器直接解析的对象；禁止 Markdown 代码块、前后说明、注释、尾随逗号、NaN/Infinity 和未转义的反斜杠。必须严格使用系统消息指定的字段、类型和枚举值，不得增加或省略必填字段。返回前请自检 JSON 语法和结构。";
+const PLAN_STEP_OUTPUT_CONTRACT: &str = r#"输出必须是 {"steps":[...]} 对象，steps 必须至少有 1 个元素。
+每个元素必须严格包含且只包含：{"title":"非空字符串","description":"非空字符串","command":"非空字符串","expected":"非空字符串","validation":"非空字符串","risk":"low|medium|high"}。
+字段内容应清晰、直接并保持完成任务所需的完整信息。command 和 validation 可以包含换行，但必须按标准 JSON 规则转义。
+Shell 反斜杠在 JSON 字符串内必须写成双反斜杠，例如 Shell 的 \( 必须输出为 \\( 的 JSON 文本。
+输出前逐个检查六个字段，必须保证整个 JSON 对象完整闭合，不得截断任何字段。"#;
+const REQUIREMENT_CLASSIFICATION_CONTRACT: &str = r#"本阶段只做需求分类和约束提取，禁止输出 steps、command、validation 或执行计划。咨询类必须严格输出：{"intent":"answer","answer":"非空回答","constraints":null}。执行类必须严格输出：{"intent":"execute","answer":"","constraints":{"changePolicy":"unspecified|read_only|requested_changes_only|allow_necessary_changes","environmentPolicy":"unspecified|preserve|allow_isolated_changes|allow_host_changes","failurePolicy":"unspecified|strict|best_effort","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]}}。顶层只允许 intent、answer、constraints 三个字段。"#;
+const SECRET_PLACEHOLDER_RULE: &str = "敏感变量规则：${secret.NAME} 是 Opsark 的执行时传输占位符，不是要保留在远端文件里的字面量。必须原样写成 ${secret.NAME}，绝对不得在美元符号前添加反斜杠。程序会在 SSH 执行前注入真实值，并在输出、日志和模型上下文中脱敏。模型看到的 •••••••• 只表示真实值已被脱敏：它既不是远端文件的实际内容，也不能证明具体密码正确或错误，更不能据此声称占位符未解析。选择变量时名称和说明必须与目标凭据语义一致；若现有变量无法区分目标账户或用途，应使用新的、用途明确的变量名，由界面向用户索取，不能静默借用含义模糊的旧值。写入远端配置后应使用不泄露秘密的功能性后置条件校验；校验命令中仍可使用同一占位符供程序注入。不得要求远端保留 Opsark 占位符，也不得因脱敏标记判定泄露、写入失败或密码错误。除非用户明确禁止持久化密码，不得自行增加该限制。";
+const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
 
-#[derive(Debug, Deserialize)]
+目标：仅根据用户需求、当前上下文和已验证证据，生成当前确实可执行的最小计划。
+
+决策顺序：
+1. 先识别用户的整体目标、明确约束和现有证据。
+2. 不得预设技术栈、工具、路径、端口、服务名或资源名。
+3. 证据不足时，只生成最少必要的只读发现步骤；不得同时生成依赖未知发现结果的推测性变更。
+4. 证据充足时，按“必要确认→变更→最终验收”生成最少必要的计划。
+5. 每步在独立非交互 Shell 中运行，所需目录和环境必须在当步建立。
+6. 用户只要求修改已有资源的部分字段时，必须保留无关内容并做可恢复备份；不得用新模板覆盖整个结构化配置，除非用户明确要求整体替换或证据证明这是完整目标内容。
+
+校验规则：
+- validation 必须独立、只读且可执行，退出码 0 表示已获得足够判断 expected 的证据。
+- 对象不存在、查询无匹配或观察到异常可以是有效发现，不等于命令失败。
+- 不得重复已完成步骤，不得生成超出用户授权的不可逆操作。
+
+输出：只返回符合计划输出契约的 JSON 对象。"#;
+const GENERAL_DISCOVERY_RULES: &str = "对于需要发现实际实现方式的任务，先读取目标自带的说明、声明、配置、入口和已有状态，由证据确定依赖、运行方式、构建方式、部署方式和验收标准。核心不提供任何领域工具或技术栈的默认方案；只能使用当前证据明确展示的能力。发现步骤的校验只确认证据可获得，不要把可选信息缺失判为失败。";
+const GENERAL_REQUIREMENT_SYSTEM: &str = "你是通用运维需求分类器，本阶段不生成计划。判断用户是仅需要不依赖当前环境的知识性回答，还是需要读取或改变真实目标环境。需要当前状态、真实数据或任何环境变更时必须返回 execute。结构化约束只能来自用户明确表达，不得猜测或自行增加。";
+const GENERAL_SUMMARY_SYSTEM: &str = "你是通用运维结果总结器。仅根据用户目标和脱敏的真实执行证据总结。结构化 result 和 evidence.facts 优先于预期文本和旧总结。有效的“未发现”、“非健康”或“警告”是观察结果，不等于命令执行失败。若存在关键失败且无后续证据证明目标已达成，必须明确说明任务未完成、最终阻断、已确认结果和尚未满足的目标。若目标已达成，必须直接给出用户所需的具体结果。不得把某个中间信号自动归因给目标对象，除非证据已建立关联。不得虚构、输出命令或泄露敏感信息。使用一至三段中文纯文本。";
+const GENERAL_REVIEW_SYSTEM: &str = "你是通用运维执行复核员。根据原始用户目标、executionConstraints、完整计划、已完成记录、当前步骤真实证据和剩余步骤，判断工作流应 continue、adjust 或 complete。只返回包含 decision、reason、summary 的 JSON 对象。不得把真实失败改写为成功，不得虚构证据、新命令或新的用户授权。当前异常若不阻断整体目标，或剩余计划有明确且符合约束的恢复路径，返回 continue；若已阻断目标、证据不足或剩余计划无法处理，返回 adjust；只有用户整体目标已被真实证据充分证明时才返回 complete。对只读发现，得到“不存在”或异常状态是有效结果，应根据剩余计划判断。对变更步骤，后置条件未满足时不得 complete。当 trigger 为长时间运行定期复核时，continue 表示继续等待，adjust 表示停止并调整，complete 仅在 periodicObservation.passed=true 时表示停止等待并进入正式校验。安全拦截、用户审批、真实执行结果和程序门禁不可被覆盖。";
+const MODEL_RESPONSE_ATTEMPTS: usize = 3;
+const STRUCTURED_OUTPUT_ATTEMPTS: usize = 2;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AiPlanStep {
+    #[serde(default)]
     title: String,
+    #[serde(default)]
     description: String,
+    #[serde(default)]
     command: String,
+    #[serde(default)]
     expected: String,
+    #[serde(default)]
     validation: String,
+    #[serde(default)]
     risk: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct AiGenerationSettings {
+    limit_output: bool,
+    max_plan_steps: usize,
+    max_output_tokens: u64,
+    max_text_chars: usize,
+    max_command_chars: usize,
+}
+
+impl Default for AiGenerationSettings {
+    fn default() -> Self {
+        Self {
+            limit_output: false,
+            max_plan_steps: 6,
+            max_output_tokens: 5000,
+            max_text_chars: 200,
+            max_command_chars: 4000,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AiRequirementDecision {
     intent: String,
-    answer: Option<String>,
-    constraints: Option<ExecutionConstraints>,
-    #[serde(default)]
-    steps: Vec<AiPlanStep>,
+    answer: String,
+    constraints: Value,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 struct ExecutionConstraints {
-    #[serde(default)]
     change_policy: String,
-    #[serde(default)]
     environment_policy: String,
-    #[serde(default)]
     failure_policy: String,
-    #[serde(default)]
     prohibited_actions: Vec<String>,
-    #[serde(default)]
     required_conditions: Vec<String>,
-    #[serde(default)]
     user_directives: Vec<String>,
 }
 
@@ -435,11 +490,111 @@ fn repair_invalid_json_escapes(content: &str) -> String {
     repaired
 }
 
-fn parse_ai_plan_steps(content: &str) -> Result<Vec<AiPlanStep>, serde_json::Error> {
-    serde_json::from_str(content).or_else(|_| {
-        let object: Value = serde_json::from_str(content)?;
-        serde_json::from_value(object.get("steps").cloned().unwrap_or(Value::Null))
-    })
+fn parse_model_json<T: DeserializeOwned>(content: &str) -> Result<T, String> {
+    let cleaned = clean_json_content(content);
+    let repaired = repair_invalid_json_escapes(cleaned);
+    serde_json::from_str(cleaned)
+        .or_else(|_| serde_json::from_str(&repaired))
+        .map_err(|strict_error| strict_error.to_string())
+        .or_else(|strict_error| {
+            json5::from_str(cleaned)
+                .or_else(|_| json5::from_str(&repaired))
+                .map_err(|lenient_error| {
+                    format!("标准 JSON 解析失败：{strict_error}；宽松解析也失败：{lenient_error}")
+                })
+        })
+}
+
+fn parse_ai_plan_steps(content: &str) -> Result<Vec<AiPlanStep>, String> {
+    if let Ok(steps) = parse_model_json::<Vec<AiPlanStep>>(content) {
+        return Ok(steps);
+    }
+    let object: Value = parse_model_json(content)?;
+    serde_json::from_value(object.get("steps").cloned().unwrap_or(Value::Null))
+        .map_err(|error| error.to_string())
+}
+
+async fn post_model_request(
+    url: &str,
+    api_key: &str,
+    body: &Value,
+    request_name: &str,
+    timeout_seconds: u64,
+) -> Result<Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_seconds))
+        .build()
+        .map_err(|error| format!("{request_name}客户端初始化失败：{error}"))?;
+    let mut last_retryable_error = String::new();
+
+    for attempt in 1..=MODEL_RESPONSE_ATTEMPTS {
+        let response = match client
+            .post(url)
+            .bearer_auth(api_key)
+            .json(body)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_retryable_error = format!("{request_name}请求失败：{error}");
+                if attempt < MODEL_RESPONSE_ATTEMPTS {
+                    continue;
+                }
+                break;
+            }
+        };
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("未提供")
+            .to_string();
+        let response_bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                last_retryable_error = format!("{request_name}接口响应读取不完整：{error}");
+                if attempt < MODEL_RESPONSE_ATTEMPTS {
+                    continue;
+                }
+                break;
+            }
+        };
+        let payload: Value = match serde_json::from_slice(&response_bytes) {
+            Ok(payload) => payload,
+            Err(error) => {
+                last_retryable_error = format!(
+                    "{request_name}接口返回了无法解析的 HTTP 响应（状态 {status}，Content-Type {content_type}，{} 字节）：{error}",
+                    response_bytes.len()
+                );
+                if attempt < MODEL_RESPONSE_ATTEMPTS {
+                    continue;
+                }
+                break;
+            }
+        };
+
+        if status.is_success() {
+            return Ok(payload);
+        }
+        let message = payload
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("未知接口错误");
+        let error = format!("{request_name}接口返回 {status}：{message}");
+        if (status.as_u16() == 429 || status.is_server_error()) && attempt < MODEL_RESPONSE_ATTEMPTS
+        {
+            last_retryable_error = error;
+            continue;
+        }
+        return Err(error);
+    }
+
+    Err(format!(
+        "{last_retryable_error}（已自动重试 {} 次）",
+        MODEL_RESPONSE_ATTEMPTS - 1
+    ))
 }
 
 fn unix_seconds() -> u64 {
@@ -450,7 +605,7 @@ fn unix_seconds() -> u64 {
 }
 
 fn credential_account(kind: &str, id: &str) -> Result<String, String> {
-    if !matches!(kind, "server" | "model") {
+    if !matches!(kind, "server" | "model" | "secret") {
         return Err("不支持的凭据类型".into());
     }
     if id.trim().is_empty() || id.len() > 160 {
@@ -518,15 +673,56 @@ fn risk_for(command: &str) -> &'static str {
 }
 
 fn convert_ai_plan_steps(raw_steps: Vec<AiPlanStep>) -> Result<Vec<PlanStep>, String> {
-    if raw_steps.is_empty() || raw_steps.len() > 12 {
-        return Err("模型计划步骤数量不合理".into());
+    if raw_steps.is_empty() {
+        return Err("模型计划至少需要一个步骤".into());
     }
-    Ok(raw_steps
+    raw_steps
         .into_iter()
         .enumerate()
         .map(|(index, item)| {
+            let command = item.command.trim().to_string();
+            let validation = item.validation.trim().to_string();
+            if command.is_empty() || validation.is_empty() {
+                return Err(format!(
+                    "第 {} 个计划步骤缺少非空 command 或 validation",
+                    index + 1
+                ));
+            }
+            let description = if item.description.trim().is_empty() {
+                item.title.trim().to_string()
+            } else {
+                item.description.trim().to_string()
+            };
+            let title = if item.title.trim().is_empty() {
+                let candidate = description
+                    .split(['。', '；', '\n'])
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if candidate.is_empty() {
+                    format!("执行步骤 {}", index + 1)
+                } else {
+                    candidate.chars().take(36).collect()
+                }
+            } else {
+                item.title.trim().to_string()
+            };
+            let description = if description.is_empty() {
+                title.clone()
+            } else {
+                description
+            };
+            let expected = if item.expected.trim().is_empty() {
+                "获得可用于判断用户目标的执行证据".to_string()
+            } else {
+                item.expected.trim().to_string()
+            };
             let computed = risk_for(&item.command);
-            let supplied = item.risk.as_deref().unwrap_or("low");
+            let supplied = item
+                .risk
+                .as_deref()
+                .filter(|value| matches!(*value, "low" | "medium" | "high"))
+                .ok_or_else(|| format!("第 {} 个计划步骤缺少合法 risk", index + 1))?;
             let risk = if computed == "high" || supplied == "high" {
                 "high"
             } else if computed == "medium" || supplied == "medium" {
@@ -534,19 +730,91 @@ fn convert_ai_plan_steps(raw_steps: Vec<AiPlanStep>) -> Result<Vec<PlanStep>, St
             } else {
                 "low"
             };
-            PlanStep {
+            Ok(PlanStep {
                 id: format!("ai-step-{}-{index}", unix_seconds()),
-                title: item.title,
-                description: item.description,
-                command: item.command,
+                title,
+                description,
+                command,
                 risk: risk.into(),
-                expected: item.expected,
-                validation: item.validation,
+                expected,
+                validation,
                 status: "pending".into(),
                 output: None,
-            }
+            })
         })
-        .collect())
+        .collect()
+}
+
+fn validate_ai_plan_contract(
+    raw_steps: &[AiPlanStep],
+    settings: &AiGenerationSettings,
+) -> Result<(), String> {
+    if raw_steps.is_empty() {
+        return Err("计划 steps 至少需要 1 个元素".into());
+    }
+    if settings.limit_output && raw_steps.len() > settings.max_plan_steps.max(1) {
+        return Err(format!(
+            "计划 steps 数量不能超过配置的 {} 个",
+            settings.max_plan_steps.max(1)
+        ));
+    }
+    for (index, item) in raw_steps.iter().enumerate() {
+        let mut missing = Vec::new();
+        if item.title.trim().is_empty() {
+            missing.push("title");
+        }
+        if item.description.trim().is_empty() {
+            missing.push("description");
+        }
+        if item.command.trim().is_empty() {
+            missing.push("command");
+        }
+        if item.expected.trim().is_empty() {
+            missing.push("expected");
+        }
+        if item.validation.trim().is_empty() {
+            missing.push("validation");
+        }
+        if !missing.is_empty() {
+            return Err(format!(
+                "第 {} 个计划步骤缺少非空字段：{}",
+                index + 1,
+                missing.join("、")
+            ));
+        }
+        if settings.limit_output
+            && (item.title.chars().count() > settings.max_text_chars.max(1)
+                || item.description.chars().count() > settings.max_text_chars.max(1)
+                || item.expected.chars().count() > settings.max_text_chars.max(1))
+        {
+            return Err(format!(
+                "第 {} 个计划步骤的文本字段超过配置的 {} 字符",
+                index + 1,
+                settings.max_text_chars.max(1)
+            ));
+        }
+        if settings.limit_output
+            && (item.command.chars().count() > settings.max_command_chars.max(1)
+                || item.validation.chars().count() > settings.max_command_chars.max(1))
+        {
+            return Err(format!(
+                "第 {} 个计划步骤的 command 或 validation 超过配置的 {} 字符",
+                index + 1,
+                settings.max_command_chars.max(1)
+            ));
+        }
+        if !item
+            .risk
+            .as_deref()
+            .is_some_and(|value| matches!(value, "low" | "medium" | "high"))
+        {
+            return Err(format!(
+                "第 {} 个计划步骤 risk 必须是 low、medium 或 high",
+                index + 1
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn is_valid_empty_result(command: &str, status: i32, output: &str) -> bool {
@@ -614,7 +882,7 @@ fn probe_ssh_server(
     let session = connect_ssh(&host, port, &username, &password)?;
     let (raw, status) = ssh_exec(
         &session,
-        "printf '%s\\n' \"$(hostname)\" \"$(uname -srm)\" \"$(. /etc/os-release 2>/dev/null; echo ${PRETTY_NAME:-Unknown})\" \"$(nproc 2>/dev/null || echo 1)\" \"$(free -m 2>/dev/null | awk '/Mem:/{printf \\\"%.1f\\\", $2/1024}' || echo 0)\" \"$(df -BG / 2>/dev/null | awk 'NR==2{gsub(/G/,\\\"\\\",$2); print $2}' || echo 0)\" \"$(uptime -p 2>/dev/null || uptime)\"; for x in docker nginx node python3 mysql psql redis-server; do if command -v $x >/dev/null 2>&1; then printf '%s: ' \"$x\"; ($x --version 2>&1 || $x -v 2>&1) | head -1; fi; done",
+        "printf '%s\\n' \"$(hostname)\" \"$(uname -srm)\" \"$(. /etc/os-release 2>/dev/null; echo ${PRETTY_NAME:-Unknown})\" \"$(nproc 2>/dev/null || echo 1)\" \"$(free -m 2>/dev/null | awk '/Mem:/{printf \\\"%.1f\\\", $2/1024}' || echo 0)\" \"$(df -BG / 2>/dev/null | awk 'NR==2{gsub(/G/,\\\"\\\",$2); print $2}' || echo 0)\" \"$(uptime -p 2>/dev/null || uptime)\"",
     )?;
     if status != 0 {
         return Err(format!("服务器信息采集失败：{raw}"));
@@ -1129,51 +1397,109 @@ async fn generate_ai_plan(
     model: String,
     requirement: String,
     context: String,
+    generation_settings: Option<AiGenerationSettings>,
 ) -> Result<Vec<PlanStep>, String> {
+    let generation_settings = generation_settings.unwrap_or_default();
+    let limit_rule = if generation_settings.limit_output {
+        format!(
+            "已启用用户配置的输出限制：steps 不超过 {} 个；title、description、expected 各不超过 {} 字符；command、validation 各不超过 {} 字符。",
+            generation_settings.max_plan_steps.max(1),
+            generation_settings.max_text_chars.max(1),
+            generation_settings.max_command_chars.max(1),
+        )
+    } else {
+        "用户未启用计划输出限制：不得因步骤数、字段长度或命令换行而省略必要内容；仍应保持计划最少且完整。".to_string()
+    };
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
-    let system = "你是一位谨慎的资深 Linux 运维工程师。请根据服务器上下文，为用户需求生成可审查且精简的执行计划。只返回一个合法 JSON 对象，固定格式为 {\"steps\":[...]}，不要 Markdown。通常生成 3 至 7 步；把同类环境检查合并为一个诊断步骤，不要再创建与每步 validation 重复的复查步骤。Shell 命令中出现的反斜杠必须按 JSON 规范转义为双反斜杠。steps 中每个对象必须包含 title、description、command、expected、validation、risk；risk 只能是 low、medium、high。validation 必须是独立、只读、可执行的 Shell 校验命令，退出码 0 代表成功获得了足够判断 expected 的结果，不要填写自然语言。状态探测不能把业务分支当成执行失败：如果下一步会创建或安装资源，前置检查应同时允许“已存在”和“不存在”两种有效结果，并把状态输出交给执行后的模型复核决定继续还是提前完成；只有检查命令本身失败或输出无效时，validation 才应退出非 0。诊断查询发现无匹配、未监听、HTTP 非 2xx 或日志中存在 ERROR，都是需要记录的有效状态，不等于检查命令执行失败。端口监听本身不能证明属于目标项目：必须结合 PID/进程、容器端口映射、Nginx upstream、项目配置或 HTTP 响应内容建立归属；Docker proxy 或 Nginx 监听也不能单独证明目标页面可访问。只有实际 curl 得到可识别的目标页面响应，才能给出已验证访问地址。用户仅报告空白页、打不开、超时、报错或要求检查状态时，首轮计划必须全部为只读诊断，禁止擅自重启、安装、升级或修改配置；只有用户明确要求修复或变更时才生成变更步骤。不要假设项目使用默认端口，排查页面问题应依次核实进程/容器、监听归属、反向代理、HTTP 状态与内容、目标项目日志及依赖关系。先诊断后变更，最后复查；禁止生成 rm -rf、格式化磁盘、删除账号等不可逆命令。上下文中的 secretVariables 只有名称和说明，没有值；命令需要这些值时必须原样使用对应 placeholder（例如 ${secret.DB_PASSWORD}），严禁猜测或要求模型读取真实值。";
-    let deployment_rules = "生成代码项目部署计划时必须遵守：先生成只读发现步骤，克隆后读取 README、清单、锁文件、构建脚本和 engines，并采集操作系统版本、处理器架构、libc、C++ ABI、包管理器和容器能力；禁止把环境检查与依赖安装、构建或服务变更合并。发现步骤的 validation 只验证文件可读、JSON 可解析和证据可获得，不能要求 engines 等可选字段必须存在；字段缺失是有效观察状态，应继续从锁文件和实际构建工具推断要求。相同目的的运行时或清单检查只能生成一步。每个远程步骤运行在独立的非交互 Shell 中，cd、export、source、alias 和 PATH 修改不会自动保留到下一步；依赖这些环境的命令和 validation 必须在各自命令内显式初始化。发现证据齐全后再选择与真实平台兼容的变更方案。若运行时不满足要求，必须在依赖安装和构建之前安排兼容的升级或隔离切换步骤及复查；不得笼统假设最低版本，也不能只依据安装器退出码判断成功，必须在同一主机实际执行新二进制并验证版本与 ABI。禁止 curl|bash 远程脚本安装；不要在新二进制验证可运行前修改全局默认运行时。宿主平台无法支持时优先采用兼容容器或隔离构建环境，不得强行升级系统 libc/libstdc++。除非用户明确要求清理，并且前序真实证据确认了精确残留路径及其确实阻断当前目标，否则禁止生成 rm、删除安装目录或“清理残留”步骤。存在锁文件时优先采用项目指定包管理器及冻结安装方式。不要手动安装单个依赖绕过 404，不要永久修改全局镜像源。构建成功后再配置服务，最终验证产物、进程或静态目录、端口/代理归属及实际 HTTP 内容。";
-    let body = json!({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": format!("{system}\n{deployment_rules}")},
-            {"role": "user", "content": format!("服务器上下文：\n{context}\n\n用户需求：\n{requirement}")}
-        ],
-        "thinking": {"type": "disabled"},
-        "response_format": {"type": "json_object"},
-        "max_tokens": 1800
-    });
-    let response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(45))
-        .build()
-        .map_err(|error| error.to_string())?
-        .post(url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| format!("DeepSeek 请求失败：{error}"))?;
-    let status = response.status();
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("模型响应不是有效 JSON：{error}"))?;
-    if !status.is_success() {
-        let message = payload
-            .pointer("/error/message")
+    let system = GENERAL_PLAN_SYSTEM;
+    let deployment_rules = GENERAL_DISCOVERY_RULES;
+    let mut last_error = "模型未返回计划".to_string();
+    let mut last_repairable_steps = None;
+    for attempt in 0..STRUCTURED_OUTPUT_ATTEMPTS {
+        let correction = if attempt == 0 {
+            String::new()
+        } else {
+            format!(
+                "\n\n上次输出未通过结构校验：{last_error}。请丢弃上次输出并重新返回完整对象，保持内容必要且完整，不得截断 JSON，逐步补齐所有必填字段。"
+            )
+        };
+        let mut body = json!({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": format!("{system}\n{deployment_rules}\n{PLAN_STEP_OUTPUT_CONTRACT}\n{limit_rule}\n{SECRET_PLACEHOLDER_RULE}\n{STRICT_JSON_OUTPUT_RULE}")},
+                {"role": "user", "content": format!("服务器上下文：\n{context}\n\n用户需求：\n{requirement}\n\n返回前再次确认：{PLAN_STEP_OUTPUT_CONTRACT}\n{limit_rule}\n{STRICT_JSON_OUTPUT_RULE}{correction}")}
+            ],
+            "thinking": {"type": "disabled"},
+            "response_format": {"type": "json_object"}
+        });
+        if generation_settings.limit_output {
+            body["max_tokens"] = json!(generation_settings.max_output_tokens.max(256));
+        }
+        let payload = post_model_request(&url, &api_key, &body, "计划生成", 60).await?;
+        let finish_reason = payload
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str);
+        if finish_reason.is_some_and(|reason| reason != "stop") {
+            last_error = if finish_reason == Some("length") {
+                "模型计划因达到输出长度上限而被截断".to_string()
+            } else {
+                format!(
+                    "模型计划未正常完成，finish_reason={}",
+                    finish_reason.unwrap_or("未知")
+                )
+            };
+            continue;
+        }
+        let parsed = payload
+            .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
-            .unwrap_or("未知接口错误");
-        return Err(format!("DeepSeek 接口返回 {status}：{message}"));
+            .ok_or_else(|| "模型响应缺少计划内容".to_string())
+            .and_then(|content| {
+                parse_ai_plan_steps(content)
+                    .map_err(|error| format!("模型计划结构解析失败：{error}"))
+            });
+        match parsed {
+            Ok(raw_steps) => {
+                last_repairable_steps = Some(raw_steps.clone());
+                match validate_ai_plan_contract(&raw_steps, &generation_settings)
+                    .and_then(|_| convert_ai_plan_steps(raw_steps))
+                {
+                    Ok(plan) => return Ok(plan),
+                    Err(error) => last_error = error,
+                }
+            }
+            Err(error) => last_error = error,
+        }
     }
-    let content = payload
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "模型响应缺少计划内容".to_string())?;
-    let cleaned = clean_json_content(content);
-    let raw_steps = parse_ai_plan_steps(cleaned)
-        .or_else(|_| parse_ai_plan_steps(&repair_invalid_json_escapes(cleaned)))
-        .map_err(|error| format!("模型计划结构解析失败：{error}"))?;
-    convert_ai_plan_steps(raw_steps)
+    if let Some(raw_steps) = last_repairable_steps {
+        let only_presentational_fields_missing = raw_steps.iter().all(|item| {
+            !item.command.trim().is_empty()
+                && !item.validation.trim().is_empty()
+                && item
+                    .risk
+                    .as_deref()
+                    .is_some_and(|value| matches!(value, "low" | "medium" | "high"))
+        });
+        let within_enabled_limits = !generation_settings.limit_output
+            || (raw_steps.len() <= generation_settings.max_plan_steps.max(1)
+                && raw_steps.iter().all(|item| {
+                    item.title.chars().count() <= generation_settings.max_text_chars.max(1)
+                        && item.description.chars().count()
+                            <= generation_settings.max_text_chars.max(1)
+                        && item.expected.chars().count()
+                            <= generation_settings.max_text_chars.max(1)
+                        && item.command.chars().count()
+                            <= generation_settings.max_command_chars.max(1)
+                        && item.validation.chars().count()
+                            <= generation_settings.max_command_chars.max(1)
+                }));
+        if only_presentational_fields_missing && within_enabled_limits {
+            return convert_ai_plan_steps(raw_steps);
+        }
+    }
+    Err(format!(
+        "{last_error}（已要求模型按严格 JSON 格式重试一次）"
+    ))
 }
 
 #[tauri::command]
@@ -1183,72 +1509,102 @@ async fn process_ai_requirement(
     model: String,
     requirement: String,
     context: String,
+    generation_settings: Option<AiGenerationSettings>,
 ) -> Result<RequirementProcessingResult, String> {
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
-    let system = "你是智能运维控制台的需求理解与规划模型。先判断用户是在咨询，还是要求读取/操作真实服务器，并提取可供整个任务生命周期复用的结构化执行约束。只返回合法 JSON 对象，不要 Markdown。两种固定格式：1）无需读取服务器即可回答的知识解释、风险咨询、方案讨论，返回 {\"intent\":\"answer\",\"answer\":\"准确简洁的中文回答\",\"constraints\":null,\"steps\":[]}；2）需要查询当前服务器状态、读取真实数据、检查服务/文件/数据库，或要求执行任何变更，返回 {\"intent\":\"execute\",\"answer\":\"\",\"constraints\":{\"changePolicy\":\"unspecified|read_only|requested_changes_only|allow_necessary_changes\",\"environmentPolicy\":\"unspecified|preserve|allow_isolated_changes|allow_host_changes\",\"failurePolicy\":\"unspecified|strict|best_effort\",\"prohibitedActions\":[\"用户禁止的动作\"],\"requiredConditions\":[\"继续执行必须满足的条件\"],\"userDirectives\":[\"需要在后续计划和复核中原样遵守的用户指令\"]},\"steps\":[...]}。constraints 必须根据语义提取，不能依赖固定句式：preserve 表示保持当前宿主环境或版本；best_effort 表示用户接受在保留已知风险的前提下进行真实尝试；禁止升级、删除、重启等要求写入 prohibitedActions；版本、路径、范围、工具选择等要求写入 requiredConditions 或 userDirectives。没有明确约束时使用 unspecified 和空数组，不得虚构。不能只根据句式判断：例如“当前 MySQL 有哪些数据库”虽是问句，但必须读取服务器，应为 execute；“删除数据库有什么风险”只是在咨询，应为 answer；“删除 ffp 数据库”应为 execute。询问“如何查看当前这个项目的页面”依赖实际部署结果：只有 previousExecution 中已经存在经 HTTP 验证的明确地址时才可直接回答，否则必须 execute 以核实真实监听归属和页面响应。不得把普通 8080、Docker proxy 或 Nginx 80 端口猜成目标项目端口；端口归属至少要由 PID/进程、容器映射、代理 upstream、项目配置或可识别的 HTTP 内容之一证明，外部可访问还必须有真实 HTTP 验证。previousExecution 是上一轮真实执行证据，后续回答必须以它为准，不能仅依据聊天中的旧总结猜测。execute 计划通常控制在 3 至 7 步，把同类环境检查合并，禁止拆出与每一步 validation 重复的复查步骤。每个步骤必须包含 title、description、command、expected、validation、risk，risk 只能是 low、medium、high。Shell 反斜杠必须按 JSON 规范双写。validation 必须是独立、只读、可执行的 Shell 校验命令，退出码 0 表示校验命令成功获得有效状态；无匹配、未监听、HTTP 异常和发现 ERROR 日志是诊断结果，不是命令执行失败。用户只说页面空白、打不开、超时、报错、为什么或检查运行情况时，首轮只生成只读诊断步骤，禁止擅自加入重启、安装、升级、创建或修改；只有用户明确要求修复/变更时才允许相应操作。诊断页面问题应核实进程或容器、端口实际归属、代理链、HTTP 状态/响应内容、目标项目日志和依赖关系，不假设默认端口。状态探测应允许有效业务分支，不能把“资源不存在”误判为命令失败。先诊断后变更，最后复查；禁止生成 rm -rf、格式化磁盘、删除账号等不可逆命令。敏感变量只能使用上下文提供的 ${secret.NAME} 占位符，严禁猜测值。";
-    let deployment_rules = "代码项目部署采用“只读发现→一次计划细化→变更→确定性验收”流程。发现阶段必须检查仓库文档、清单、锁文件、构建脚本、engines、当前运行时、操作系统、架构、libc、C++ ABI、包管理器和容器能力，且不能与依赖安装或服务变更合并。发现步骤的 validation 只验证文件可读、结构可解析、证据可获得；package.json 没有 engines 等可选字段是有效结果，必须继续读取锁文件，不能判为失败。同一目的的清单或运行时检查只能保留一步。每个执行步骤都是独立非交互 Shell，source、export、cd、alias 和 PATH 修改不会跨步骤保留；使用 nvm 等工具时，安装、加载、使用和 validation 都必须在各自命令内显式加载对应环境。运行时不兼容时，方案必须适配真实平台；禁止 curl|bash，禁止在新二进制于同一主机验证版本和 ABI 前修改全局默认值。宿主无法支持时使用兼容容器或隔离构建环境，不得强行升级系统 ABI。用户未明确要求且没有前序证据证明精确路径阻断目标时，禁止生成 rm 或清理安装残留。不要手动安装单个依赖绕过下载错误，不要永久修改全局镜像源。构建成功前不得配置或重载线上服务，最终验证产物、代理归属和真实 HTTP 内容。";
-    let body = json!({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": format!("{system}\n{deployment_rules}")},
-            {"role": "user", "content": format!("服务器上下文：\n{context}\n\n用户输入：\n{requirement}")}
-        ],
-        "thinking": {"type": "disabled"},
-        "response_format": {"type": "json_object"},
-        "max_tokens": 1900
-    });
-    let response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(45))
-        .build()
-        .map_err(|error| error.to_string())?
-        .post(url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| format!("需求理解请求失败：{error}"))?;
-    let status = response.status();
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("需求理解响应不是有效 JSON：{error}"))?;
-    if !status.is_success() {
-        let message = payload
-            .pointer("/error/message")
+    let system = GENERAL_REQUIREMENT_SYSTEM;
+    let mut last_error = "模型未返回需求理解结果".to_string();
+    let mut valid_decision = None;
+    for attempt in 0..STRUCTURED_OUTPUT_ATTEMPTS {
+        let correction = if attempt == 0 {
+            String::new()
+        } else {
+            format!(
+                "\n\n上次输出未通过需求分类结构校验：{last_error}。请丢弃上次输出，严格按分类契约重新返回完整对象，不得输出 steps 或计划字段。"
+            )
+        };
+        let body = json!({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": format!("{system}\n{SECRET_PLACEHOLDER_RULE}\n{REQUIREMENT_CLASSIFICATION_CONTRACT}\n{STRICT_JSON_OUTPUT_RULE}")},
+                {"role": "user", "content": format!("服务器上下文：\n{context}\n\n用户输入：\n{requirement}\n\n返回前再次确认：{REQUIREMENT_CLASSIFICATION_CONTRACT}\n{STRICT_JSON_OUTPUT_RULE}{correction}")}
+            ],
+            "thinking": {"type": "disabled"},
+            "response_format": {"type": "json_object"},
+            "max_tokens": 700
+        });
+        let payload = post_model_request(&url, &api_key, &body, "需求理解", 45).await?;
+        let parsed = payload
+            .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
-            .unwrap_or("未知接口错误");
-        return Err(format!("需求理解接口返回 {status}：{message}"));
-    }
-    let content = payload
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "模型响应缺少需求理解结果".to_string())?;
-    let cleaned = clean_json_content(content);
-    let decision: AiRequirementDecision = serde_json::from_str(cleaned)
-        .or_else(|_| serde_json::from_str(&repair_invalid_json_escapes(cleaned)))
-        .map_err(|error| format!("需求理解结构解析失败：{error}"))?;
-    match decision.intent.as_str() {
-        "answer" => {
-            let answer = decision
-                .answer
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| "咨询类响应缺少回答内容".to_string())?;
-            Ok(RequirementProcessingResult {
-                intent: "answer".into(),
-                answer: Some(answer),
-                plan: Vec::new(),
-                constraints: None,
-            })
+            .ok_or_else(|| "模型响应缺少需求理解结果".to_string())
+            .and_then(|content| {
+                parse_model_json(content).map_err(|error| format!("需求理解结构解析失败：{error}"))
+            });
+        let decision: AiRequirementDecision = match parsed {
+            Ok(decision) => decision,
+            Err(error) => {
+                last_error = error;
+                continue;
+            }
+        };
+        let contract_error = match decision.intent.as_str() {
+            "answer" if !decision.answer.trim().is_empty() && decision.constraints.is_null() => {
+                None
+            }
+            "answer" => Some("咨询类响应的 answer 必须是非空字符串".to_string()),
+            "execute"
+                if decision.answer.trim().is_empty()
+                    && serde_json::from_value::<ExecutionConstraints>(
+                        decision.constraints.clone(),
+                    )
+                    .is_ok() =>
+            {
+                None
+            }
+            "execute" => {
+                Some("执行类响应的 answer 必须为空字符串，constraints 必须包含合法字段".to_string())
+            }
+            _ => Some("需求分类 intent 只能是 answer 或 execute".to_string()),
+        };
+        if let Some(error) = contract_error {
+            last_error = error;
+            continue;
         }
-        "execute" => Ok(RequirementProcessingResult {
-            intent: "execute".into(),
-            answer: None,
-            plan: convert_ai_plan_steps(decision.steps)?,
-            constraints: Some(normalize_execution_constraints(decision.constraints)),
-        }),
-        _ => Err("需求理解 intent 只能是 answer 或 execute".into()),
+        valid_decision = Some(decision);
+        break;
     }
+    let decision = valid_decision
+        .ok_or_else(|| format!("{last_error}（已要求模型按严格 JSON 格式重试一次）"))?;
+    if decision.intent == "answer" {
+        return Ok(RequirementProcessingResult {
+            intent: "answer".into(),
+            answer: Some(decision.answer.trim().to_string()),
+            plan: Vec::new(),
+            constraints: None,
+        });
+    }
+
+    let constraints = serde_json::from_value::<ExecutionConstraints>(decision.constraints)
+        .map(Some)
+        .map(normalize_execution_constraints)
+        .map_err(|error| format!("需求分类 constraints 结构无效：{error}"))?;
+    let plan = generate_ai_plan(
+        api_key,
+        endpoint,
+        model,
+        requirement,
+        context,
+        generation_settings,
+    )
+    .await
+    .map_err(|error| format!("需求已判定为执行类，但计划生成失败：{error}"))?;
+    Ok(RequirementProcessingResult {
+        intent: "execute".into(),
+        answer: None,
+        plan,
+        constraints: Some(constraints),
+    })
 }
 
 #[tauri::command]
@@ -1264,20 +1620,56 @@ async fn check_ai_model(
         });
     }
     let url = format!("{}/models", endpoint.trim_end_matches('/'));
-    let response = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
-        .map_err(|error| error.to_string())?
-        .get(url)
-        .bearer_auth(api_key)
-        .send()
-        .await
-        .map_err(|error| format!("无法连接模型服务：{error}"))?;
-    let status = response.status();
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("模型服务响应不是有效 JSON：{error}"))?;
+        .map_err(|error| error.to_string())?;
+    let mut decoded = None;
+    let mut last_error = String::new();
+    for attempt in 1..=MODEL_RESPONSE_ATTEMPTS {
+        let response = match client.get(&url).bearer_auth(&api_key).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("无法连接模型服务：{error}");
+                if attempt < MODEL_RESPONSE_ATTEMPTS {
+                    continue;
+                }
+                break;
+            }
+        };
+        let status = response.status();
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                last_error = format!("模型列表接口响应读取不完整：{error}");
+                if attempt < MODEL_RESPONSE_ATTEMPTS {
+                    continue;
+                }
+                break;
+            }
+        };
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(payload) => {
+                decoded = Some((status, payload));
+                break;
+            }
+            Err(error) => {
+                last_error = format!(
+                    "模型列表接口返回了无法解析的 HTTP 响应（状态 {status}，{} 字节）：{error}",
+                    bytes.len()
+                );
+                if attempt < MODEL_RESPONSE_ATTEMPTS {
+                    continue;
+                }
+            }
+        }
+    }
+    let (status, payload) = decoded.ok_or_else(|| {
+        format!(
+            "{last_error}（已自动重试 {} 次）",
+            MODEL_RESPONSE_ATTEMPTS - 1
+        )
+    })?;
     if !status.is_success() {
         let message = payload
             .pointer("/error/message")
@@ -1321,38 +1713,17 @@ async fn generate_ai_summary(
     execution_context: String,
 ) -> Result<String, String> {
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
-    let system = "你是一位专业的 Linux 运维工程师。请仅根据用户需求和真实执行结果生成简洁、准确的中文总结。执行结果中的 result 和 evidence.facts 是程序提取的结构化事实，应优先于自然语言预期和旧总结；observationStatus 为 not_found、unhealthy 或 warning 都可能是命令正常完成后的真实观察状态，不能改写成执行失败。只要存在 status=failed 或 executionStatus=failed 的关键步骤，并且没有后续证据证明用户目标已达成，必须明确写“任务未完成”，说明最终阻断、失败前已经确认的有效结果以及尚未满足的目标；不得用 HTTP 200、进程存在或部分文件生成掩盖最终内容校验失败。必须回答用户真正关心的结果：例如查询数据库时列出数据库名称，查询表时列出表名，查询进程时说明进程名称或明确未发现。端口监听不等于属于目标项目：除非输出已经用 PID/进程、容器映射、代理 upstream、项目配置或可识别 HTTP 内容证明归属，否则必须写“端口归属尚未确认”。只有真实 HTTP 校验成功且内容能对应目标项目时，才能说外部访问已就绪并提供地址。不得把 Docker proxy 或 Nginx 的监听直接归因给目标项目。发现任意 ERROR 日志只能作为线索，必须说明其文件/服务来源以及是否有证据与当前症状相关；证据不足时不得断言为根因。只有日志搜索命令执行成功且覆盖了项目配置目录、服务日志或 journal 等合理位置时，才能说未发现相关日志，否则应说日志位置尚未确认。不要只说执行了几步，不要虚构，不要输出命令，不要泄露或猜测敏感信息。使用一到三段纯文本。";
+    let system = GENERAL_SUMMARY_SYSTEM;
     let body = json!({
         "model": model,
         "messages": [
-            {"role": "system", "content": system},
+            {"role": "system", "content": format!("{system}\n{SECRET_PLACEHOLDER_RULE}")},
             {"role": "user", "content": format!("用户需求：\n{requirement}\n\n已脱敏的执行结果：\n{execution_context}")}
         ],
         "thinking": {"type": "disabled"},
         "max_tokens": 700
     });
-    let response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|error| error.to_string())?
-        .post(url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| format!("总结请求失败：{error}"))?;
-    let status = response.status();
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("总结响应不是有效 JSON：{error}"))?;
-    if !status.is_success() {
-        let message = payload
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .unwrap_or("未知接口错误");
-        return Err(format!("模型总结接口返回 {status}：{message}"));
-    }
+    let payload = post_model_request(&url, &api_key, &body, "模型总结", 30).await?;
     payload
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
@@ -1371,149 +1742,67 @@ async fn review_ai_step(
     review_context: String,
 ) -> Result<AiStepReview, String> {
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
-    let system = "你是一位谨慎的 Linux 运维执行结果复核员。请依据原始用户目标、结构化 executionConstraints、完整计划、已完成执行记录、当前步骤的脱敏真实输出与结构化证据、剩余计划，判断工作流下一步。只返回 JSON 对象，必须包含 decision、reason、summary。decision 只能是 continue、adjust、complete。你的决定表示工作流是否继续，不得把真实失败改写为成功。executionConstraints 是需求理解阶段提取并贯穿任务的权威约束：changePolicy 限制允许的变更范围，environmentPolicy 限制宿主环境或隔离环境变更，failurePolicy 表示严格停止还是允许保留风险的 best_effort 尝试，prohibitedActions、requiredConditions、userDirectives 必须逐项遵守。不得依赖用户使用某个固定句式，应根据这些结构化约束和原始需求共同判断。当前步骤失败或后置校验未通过，但剩余计划明确能够处理该原因且不违反执行约束时用 continue；失败阻断目标、剩余步骤无法修复、计划偏离约束或证据不足时用 adjust；只有用户整体目标已经由真实证据充分达成时才用 complete。触发前置条件门禁时，如果 failurePolicy 为 best_effort，当前步骤符合 changePolicy、environmentPolicy，且不违反 prohibitedActions 和 requiredConditions，可以 continue 进行一次真实尝试；否则应 adjust。当主命令成功但后置校验失败时必须比较两组证据：只读查询若主输出明确而校验可能受瞬时网络、环境加载或校验表达式影响，可以 continue；变更命令只有在剩余计划明确包含加载环境、修复、重试或再次验证该后置条件时才可 continue，不能直接 complete。当主命令执行失败时，必须保留失败事实；只读诊断已经获得用户需要的有效状态，或剩余计划明确包含针对该失败的恢复路径时可以 continue，否则 adjust。平台或 ABI 不兼容时，只有剩余计划包含符合 executionConstraints 的兼容容器、隔离环境或已证明兼容的运行时方案才可 continue。只读日志查询成功发现 ERROR，代表获得了诊断证据，不是步骤失败；不能仅因为存在 ERROR 就 adjust。某个可选依赖连接失败不能直接认定为用户症状根因。端口监听不能证明属于目标项目，需结合 PID、容器映射、代理 upstream、配置和 HTTP 内容。对于“确保资源存在”类目标，状态检查返回不存在时应 continue 执行创建，返回已存在时可 complete。不得因为有效诊断状态反复重拟计划，不得虚构输出、输出新命令、索取或猜测敏感信息。安全拦截、用户审批、明确的平台硬事实和真实执行结果不可被覆盖；最终是否允许继续仍由程序安全门禁决定。reason 简洁说明判定依据；summary 用一句中文概括本步真实结果。";
-    let body = json!({
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": format!("用户目标：\n{requirement}\n\n执行复核上下文：\n{review_context}")}
-        ],
-        "thinking": {"type": "disabled"},
-        "response_format": {"type": "json_object"},
-        "max_tokens": 500
-    });
-    let response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(25))
-        .build()
-        .map_err(|error| error.to_string())?
-        .post(url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| format!("结果复核请求失败：{error}"))?;
-    let status = response.status();
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("结果复核响应不是有效 JSON：{error}"))?;
-    if !status.is_success() {
-        let message = payload
-            .pointer("/error/message")
+    let system = GENERAL_REVIEW_SYSTEM;
+    let mut last_error = "模型未返回复核结果".to_string();
+    for attempt in 0..STRUCTURED_OUTPUT_ATTEMPTS {
+        let correction = if attempt == 0 {
+            String::new()
+        } else {
+            format!(
+                "\n\n上次输出未通过结构校验：{last_error}。请重新返回同时包含 decision、reason、summary 三个非空字符串的完整 JSON 对象。"
+            )
+        };
+        let body = json!({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": format!("{system}\n{SECRET_PLACEHOLDER_RULE}\n{STRICT_JSON_OUTPUT_RULE}")},
+                {"role": "user", "content": format!("用户目标：\n{requirement}\n\n执行复核上下文：\n{review_context}\n\n返回前再次确认：必须为 {{\"decision\":\"continue|adjust|complete\",\"reason\":\"非空字符串\",\"summary\":\"非空字符串\"}}。{STRICT_JSON_OUTPUT_RULE}{correction}")}
+            ],
+            "thinking": {"type": "disabled"},
+            "response_format": {"type": "json_object"},
+            "max_tokens": 500
+        });
+        let payload = post_model_request(&url, &api_key, &body, "结果复核", 25).await?;
+        let parsed = payload
+            .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
-            .unwrap_or("未知接口错误");
-        return Err(format!("模型结果复核接口返回 {status}：{message}"));
+            .ok_or_else(|| "模型结果复核缺少内容".to_string())
+            .and_then(|content| {
+                parse_model_json(content)
+                    .map_err(|error| format!("模型结果复核结构解析失败：{error}"))
+            });
+        let review: AiStepReview = match parsed {
+            Ok(review) => review,
+            Err(error) => {
+                last_error = error;
+                continue;
+            }
+        };
+        if !matches!(review.decision.as_str(), "continue" | "adjust" | "complete") {
+            last_error = "模型结果复核 decision 不合法".into();
+            continue;
+        }
+        if review.reason.trim().is_empty() || review.summary.trim().is_empty() {
+            last_error = "模型结果复核缺少判定依据或摘要".into();
+            continue;
+        }
+        return Ok(review);
     }
-    let content = payload
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "模型结果复核缺少内容".to_string())?;
-    let cleaned = clean_json_content(content);
-    let review: AiStepReview = serde_json::from_str(cleaned)
-        .or_else(|_| serde_json::from_str(&repair_invalid_json_escapes(cleaned)))
-        .map_err(|error| format!("模型结果复核结构解析失败：{error}"))?;
-    if !matches!(review.decision.as_str(), "continue" | "adjust" | "complete") {
-        return Err("模型结果复核 decision 不合法".into());
-    }
-    if review.reason.trim().is_empty() || review.summary.trim().is_empty() {
-        return Err("模型结果复核缺少判定依据或摘要".into());
-    }
-    Ok(review)
+    Err(format!(
+        "{last_error}（已要求模型按严格 JSON 格式重试一次）"
+    ))
 }
 
 #[tauri::command]
 fn generate_plan(requirement: String) -> Vec<PlanStep> {
-    let lower = requirement.to_lowercase();
-    if lower.contains("nginx") || lower.contains("网站") || lower.contains("反向代理") {
-        vec![
-            step(
-                0,
-                "检查运行环境",
-                "确认 Nginx 版本和当前服务状态",
-                "nginx -v && systemctl is-active nginx",
-                "识别版本与服务状态",
-                "systemctl is-active nginx",
-            ),
-            step(
-                1,
-                "校验配置",
-                "在变更前检查配置语法",
-                "nginx -t",
-                "配置语法检查通过",
-                "nginx -t",
-            ),
-            step(
-                2,
-                "应用服务变更",
-                "无中断重新加载 Nginx",
-                "sudo systemctl reload nginx",
-                "服务完成重载",
-                "systemctl is-active nginx",
-            ),
-            step(
-                3,
-                "复查服务",
-                "检查本机 HTTP 响应",
-                "curl -I --max-time 5 http://127.0.0.1",
-                "返回有效 HTTP 状态",
-                "curl -fsS --max-time 5 http://127.0.0.1 >/dev/null",
-            ),
-        ]
-    } else if lower.contains("磁盘") || lower.contains("空间") || lower.contains("清理") {
-        vec![
-            step(
-                0,
-                "分析磁盘使用",
-                "读取挂载点容量",
-                "df -h",
-                "定位高占用挂载点",
-                "df -P / >/dev/null",
-            ),
-            step(
-                1,
-                "定位大目录",
-                "分析日志目录空间占用",
-                "du -xh /var/log --max-depth=1 | sort -h | tail",
-                "得到占用排序",
-                "test -d /var/log",
-            ),
-            step(
-                2,
-                "检查日志轮转",
-                "检查日志轮转定时器",
-                "systemctl status logrotate.timer --no-pager",
-                "确认轮转状态",
-                "systemctl is-enabled logrotate.timer >/dev/null 2>&1",
-            ),
-        ]
-    } else {
-        vec![
-            step(
-                0,
-                "采集当前状态",
-                "获取负载、内存和磁盘概况",
-                "uptime && free -h && df -h",
-                "建立执行前基线",
-                "test -r /proc/loadavg && test -r /proc/meminfo",
-            ),
-            step(
-                1,
-                "检查相关服务",
-                "列出异常系统服务",
-                "systemctl --failed --no-pager",
-                "识别服务异常",
-                "systemctl is-system-running >/dev/null 2>&1 || test $? -eq 1",
-            ),
-            step(
-                2,
-                "输出诊断结论",
-                "复查高资源占用进程",
-                "ps aux --sort=-%cpu | head -8",
-                "得到进程清单",
-                "ps -e >/dev/null",
-            ),
-        ]
-    }
+    vec![step(
+        0,
+        "采集目标相关事实",
+        &format!("仅读取执行环境基础信息，供后续理解用户需求：{requirement}"),
+        "uname -a && pwd",
+        "获得可用于后续判断的基础事实",
+        "uname -a >/dev/null && pwd >/dev/null",
+    )]
 }
 
 #[tauri::command]
@@ -1613,6 +1902,10 @@ mod live_tests {
             credential_account("model", "model-1").unwrap(),
             "model:model-1"
         );
+        assert_eq!(
+            credential_account("secret", "DB_PASSWORD").unwrap(),
+            "secret:DB_PASSWORD"
+        );
         assert!(credential_account("other", "id").is_err());
         assert!(credential_account("server", " ").is_err());
     }
@@ -1629,23 +1922,103 @@ mod live_tests {
     }
 
     #[test]
+    fn parses_lenient_model_plan_when_standard_json_is_not_available() {
+        let loose = r#"{steps:[{title:'检查',description:'读取状态',command:'pwd',expected:'返回目录',validation:'pwd >/dev/null',risk:'low',}],}"#;
+        let steps = parse_ai_plan_steps(loose).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].command, "pwd");
+    }
+
+    #[test]
+    fn repairs_missing_presentational_plan_fields_but_rejects_missing_execution_fields() {
+        let missing_title = r#"{"steps":[{"description":"检查目标是否正常。","command":"custom-tool inspect","expected":"","validation":"custom-tool inspect >/dev/null","risk":"low"}]}"#;
+        let repairable = parse_ai_plan_steps(missing_title).unwrap();
+        assert!(
+            validate_ai_plan_contract(&repairable, &AiGenerationSettings::default())
+                .unwrap_err()
+                .contains("title")
+        );
+        let normalized = convert_ai_plan_steps(repairable).unwrap();
+        assert_eq!(normalized[0].title, "检查目标是否正常");
+        assert!(!normalized[0].expected.is_empty());
+
+        let missing_command = r#"{"steps":[{"title":"检查","description":"检查目标","expected":"返回状态","validation":"custom-tool inspect >/dev/null","risk":"low"}]}"#;
+        let error =
+            convert_ai_plan_steps(parse_ai_plan_steps(missing_command).unwrap()).unwrap_err();
+        assert!(error.contains("command 或 validation"));
+    }
+
+    #[test]
+    fn plan_length_limits_are_optional_and_allow_multiline_commands() {
+        let long_command = format!("echo start\n{}", "x".repeat(1500));
+        let steps = vec![AiPlanStep {
+            title: "一个超过旧标题长度限制但依然是合法计划步骤的完整标题".into(),
+            description: "读取并处理真实环境信息".into(),
+            command: long_command,
+            expected: "获得完整结果".into(),
+            validation: "test -f /tmp/result\nprintf 'ok\\n'".into(),
+            risk: Some("low".into()),
+        }];
+        assert!(validate_ai_plan_contract(&steps, &AiGenerationSettings::default()).is_ok());
+
+        let limited = AiGenerationSettings {
+            limit_output: true,
+            max_text_chars: 10,
+            max_command_chars: 100,
+            ..AiGenerationSettings::default()
+        };
+        assert!(validate_ai_plan_contract(&steps, &limited).is_err());
+    }
+
+    #[test]
+    fn plan_step_count_limit_is_only_applied_when_enabled() {
+        let steps = (0..8)
+            .map(|index| AiPlanStep {
+                title: format!("步骤 {}", index + 1),
+                description: "执行必要操作".into(),
+                command: format!("echo {index}"),
+                expected: "命令正常完成".into(),
+                validation: "true".into(),
+                risk: Some("low".into()),
+            })
+            .collect::<Vec<_>>();
+
+        let unlimited = AiGenerationSettings::default();
+        assert!(validate_ai_plan_contract(&steps, &unlimited).is_ok());
+        assert_eq!(convert_ai_plan_steps(steps.clone()).unwrap().len(), 8);
+
+        let limited = AiGenerationSettings {
+            limit_output: true,
+            max_plan_steps: 6,
+            ..AiGenerationSettings::default()
+        };
+        assert!(validate_ai_plan_contract(&steps, &limited)
+            .unwrap_err()
+            .contains("不能超过配置的 6 个"));
+    }
+
+    #[test]
     fn parses_answer_and_execute_requirement_intents() {
-        let answer: AiRequirementDecision =
-            serde_json::from_str(r#"{"intent":"answer","answer":"这是风险咨询。","steps":[]}"#)
-                .unwrap();
+        let answer: AiRequirementDecision = serde_json::from_str(
+            r#"{"intent":"answer","answer":"这是风险咨询。","constraints":null}"#,
+        )
+        .unwrap();
         assert_eq!(answer.intent, "answer");
-        assert!(answer.steps.is_empty());
 
         let execute: AiRequirementDecision = serde_json::from_str(
-            r#"{"intent":"execute","answer":"","constraints":{"changePolicy":"requested_changes_only","environmentPolicy":"preserve","failurePolicy":"best_effort","prohibitedActions":["升级宿主运行时"],"requiredConditions":["保留当前环境"],"userDirectives":["尽力尝试"]},"steps":[{"title":"检查","description":"读取状态","command":"uptime","expected":"返回负载","validation":"uptime >/dev/null","risk":"low"}]}"#,
+            r#"{"intent":"execute","answer":"","constraints":{"changePolicy":"requested_changes_only","environmentPolicy":"preserve","failurePolicy":"best_effort","prohibitedActions":["升级宿主运行时"],"requiredConditions":["保留当前环境"],"userDirectives":["尽力尝试"]}}"#,
         )
         .unwrap();
         assert_eq!(execute.intent, "execute");
-        assert_eq!(execute.steps.len(), 1);
-        let constraints = normalize_execution_constraints(execute.constraints);
+        let constraints = normalize_execution_constraints(Some(
+            serde_json::from_value(execute.constraints).unwrap(),
+        ));
         assert_eq!(constraints.environment_policy, "preserve");
         assert_eq!(constraints.failure_policy, "best_effort");
         assert_eq!(constraints.prohibited_actions, vec!["升级宿主运行时"]);
+
+        let mixed_stage = r#"{"intent":"execute","answer":"","constraints":null,"steps":[]}"#;
+        assert!(serde_json::from_str::<AiRequirementDecision>(mixed_stage).is_err());
     }
 
     #[test]
@@ -1777,6 +2150,7 @@ mod live_tests {
             "deepseek-v4-flash".into(),
             "只读检查服务器磁盘空间".into(),
             r#"{"os":"CentOS 7","diskUsage":"82%","permission":"safe"}"#.into(),
+            None,
         ))
         .expect("DeepSeek plan generation failed");
         assert!(!plan.is_empty());

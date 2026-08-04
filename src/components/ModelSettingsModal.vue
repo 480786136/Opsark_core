@@ -63,6 +63,21 @@ async function recheck() {
         </span>
       </div>
 
+      <div class="modal-section-title limit-section-title">
+        <SlidersHorizontal :size="16" />
+        <div><strong>计划输出限制</strong><small>默认关闭；开启后才限制步骤数、输出预算和字段长度。</small></div>
+      </div>
+      <div class="generation-limit-head compact">
+        <div><strong>启用限制</strong><small>关闭不会影响 JSON 协议与安全校验。</small></div>
+        <label class="toggle"><input v-model="store.aiGenerationSettings.limitOutput" type="checkbox" /><i></i></label>
+      </div>
+      <div v-if="store.aiGenerationSettings.limitOutput" class="generation-limit-grid modal-limit-grid">
+        <label><span>最多步骤</span><input v-model.number="store.aiGenerationSettings.maxPlanSteps" type="number" min="1" /></label>
+        <label><span>输出 tokens</span><input v-model.number="store.aiGenerationSettings.maxOutputTokens" type="number" min="256" step="256" /></label>
+        <label><span>文本字符</span><input v-model.number="store.aiGenerationSettings.maxTextChars" type="number" min="1" /></label>
+        <label><span>命令字符</span><input v-model.number="store.aiGenerationSettings.maxCommandChars" type="number" min="1" step="100" /></label>
+      </div>
+
       <p class="security-hint"><Shield :size="14" />模型只能接收脱敏后的服务器上下文和执行结果，无法读取系统钥匙串中的原始凭据。</p>
       <p v-if="saveState === 'error'" class="settings-error">保存失败：{{ store.credentialError }}</p>
       <div class="modal-actions">

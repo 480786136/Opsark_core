@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { backend, buildExecutionSummary, normalizePlanPreconditions } from "@/services/backend";
+import { backend, buildExecutionSummary, normalizePlanPreconditions, normalizeSecretPlaceholders } from "@/services/backend";
 import {
   analyzeCommandFailure,
   classifyStepResult,
@@ -9,6 +9,7 @@ import {
 } from "@/services/validation";
 import { sanitizeTerminalOutput } from "@/utils/terminal";
 import type {
+  AiGenerationSettings,
   AuditEvent,
   FileEntry,
   Metrics,
@@ -25,6 +26,7 @@ import type {
 const now = () => new Date().toISOString();
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const LONG_RUNNING_REVIEW_INTERVAL_MS = 30_000;
 const isProgressFrame = (line: string) => /^\s*[#=*>.\-]*\s*\d{1,3}(?:\.\d+)?%\s*$/.test(line);
 let persistTimer: number | undefined;
 let credentialHydration: Promise<void> | undefined;
@@ -47,23 +49,53 @@ function trimEvidence(value: string | undefined, limit = 3200) {
   return value.length > limit ? `${value.slice(0, limit)}\n…（输出已截断）` : value;
 }
 
-function remainingPlanResolvesBlockingSignal(step: PlanStep, remainingSteps: PlanStep[]) {
-  if (step.result?.facts.engineIncompatible || step.result?.facts.explicitTooOld) {
-    return remainingSteps.some((item) =>
-      /(?:nvm|fnm|volta|asdf)\s+(?:install|use)|(?:apt|yum|dnf)\s+.*nodejs|安装.*Node|升级.*Node|切换.*Node/i
-        .test(`${item.title}\n${item.description}\n${item.command}`),
-    );
+function extractKnownExecutionFacts(task: OpsTask) {
+  const steps = [
+    ...(task.planHistory ?? []).flatMap((round) => round.plan),
+    ...task.plan,
+  ].filter((step) => step.status === "completed");
+  const repositoryUrls = new Set<string>();
+  const workingDirectories = new Set<string>();
+
+  for (const step of steps) {
+    const text = `${step.command}\n${step.output ?? ""}`;
+    for (const match of text.matchAll(/https?:\/\/[^\s'"<>]+?\.git\b/gi)) {
+      repositoryUrls.add(match[0]);
+    }
+    for (const match of step.command.matchAll(/\bgit\s+clone\b[^;&\n]*?\s+(\/[^\s;&'"\n]+)/gi)) {
+      workingDirectories.add(match[1].replace(/[),]+$/, ""));
+    }
+    for (const match of step.command.matchAll(/(?:^|[;&]\s*)cd\s+(?:'([^']+)'|"([^"]+)"|(\/[^\s;&]+))/gi)) {
+      const directory = match[1] ?? match[2] ?? match[3];
+      if (directory?.startsWith("/")) workingDirectories.add(directory.replace(/[),]+$/, ""));
+    }
+    for (const match of text.matchAll(/\/(?:tmp|opt|home|srv|var\/www)\/[A-Za-z0-9._@%+~/-]+/g)) {
+      workingDirectories.add(match[0].replace(/[),.]+$/, ""));
+    }
   }
-  return false;
+
+  return {
+    repositoryUrls: [...repositoryUrls].slice(0, 8),
+    workingDirectories: [...workingDirectories].slice(0, 16),
+    completedSteps: steps.slice(-12).map((step) => ({
+      title: step.title,
+      command: step.command,
+      result: step.result,
+    })),
+    instruction: "这些路径和仓库来自同一任务的已完成执行证据。后续需求必须优先复用，不得在无新证据时改猜其他目录。",
+  };
 }
 
 function remainingPlanCanRepairPostcondition(remainingSteps: PlanStep[]) {
   return remainingSteps.some((item) =>
-    isMutatingStepCommand(item.command)
-    || /安装|升级|创建|修复|调整|配置|切换|设置|加载|重载|重启|重新执行|重新安装|授权/.test(
+    /修复|解决|恢复|替代|调整|准备|应用|变更|重试|重新|安装|升级|创建|配置|设置|授权|启动|部署|加载/.test(
       `${item.title}\n${item.description}`,
     ),
   );
+}
+
+function remainingPlanResolvesBlockingSignal(_step: PlanStep, remainingSteps: PlanStep[]) {
+  return remainingPlanCanRepairPostcondition(remainingSteps);
 }
 
 function postconditionHasHardBlocker(
@@ -90,72 +122,20 @@ function postconditionHasHardBlocker(
 }
 
 function remainingPlanCanRecoverExecutionFailure(
-  category: unknown,
+  _category: unknown,
   remainingSteps: PlanStep[],
 ) {
-  const text = remainingSteps
-    .map((item) => `${item.title}\n${item.description}\n${item.command}`)
-    .join("\n");
-  if (!text) return false;
-  switch (category) {
-    case "platform_incompatible":
-      return /docker|podman|容器|隔离构建|兼容运行时|兼容镜像/i.test(text);
-    case "runtime_incompatible":
-      return /(?:nvm|fnm|volta|asdf)\s+(?:install|use)|安装.*(?:Node|Java|Python)|升级.*运行时|切换.*运行时/i
-        .test(text);
-    case "disk_full":
-      return /扩容|释放空间|清理.*(?:缓存|临时文件)|docker\s+(?:system|builder)\s+prune/i.test(text);
-    case "permission_denied":
-      return /\bsudo\b|\bchmod\b|\bchown\b|调整.*权限|授权/i.test(text);
-    case "command_not_found":
-      return /(?:apt|yum|dnf|npm|pnpm|yarn|pip)\s+install|安装.*(?:工具|命令|依赖)/i.test(text);
-    case "registry_not_found":
-      return /核对.*(?:锁文件|版本)|重新生成.*锁文件|更换.*(?:包版本|下载源)/i.test(text);
-    default:
-      return remainingPlanCanRepairPostcondition(remainingSteps);
-  }
+  return remainingPlanCanRepairPostcondition(remainingSteps);
 }
 
-const demoServer: ServerProfile = {
-  id: "srv-production-01",
-  name: "生产环境 · Web-01",
-  host: "10.24.8.16",
-  port: 22,
-  username: "ops",
-  group: "生产环境",
-  status: "online",
-  environment: ["Docker 26.1", "Nginx 1.24", "Node.js 22", "PostgreSQL 16"],
-  info: {
-    os: "Ubuntu 24.04 LTS",
-    kernel: "6.8.0-44-generic",
-    cpu: "Intel Xeon Gold 6338N",
-    cores: 8,
-    memoryGb: 16,
-    diskGb: 160,
-    uptime: "16 天 4 小时",
-  },
-  createdAt: now(),
-};
-
-const testServer: ServerProfile = {
-  id: "srv-tencent-test",
-  name: "腾讯云测试服务器",
-  host: "111.231.1.58",
-  port: 22,
-  username: "root",
-  group: "测试环境",
-  status: "offline",
-  environment: ["Docker 26.1.4", "Node.js 16.20.2", "Python 3.9.12", "MySQL 8.0.44", "Nginx"],
-  info: {
-    os: "CentOS Linux 7 (Core)",
-    kernel: "Linux 3.10.0-1160.119.1.el7.x86_64",
-    cpu: "远程服务器 CPU",
-    cores: 2,
-    memoryGb: 4,
-    diskGb: 59,
-    uptime: "4 周 6 天",
-  },
-  createdAt: now(),
+const emptyServerInfo = {
+  os: "等待采集…",
+  kernel: "—",
+  cpu: "—",
+  cores: 0,
+  memoryGb: 0,
+  diskGb: 0,
+  uptime: "—",
 };
 
 const demoFiles: FileEntry[] = [
@@ -178,6 +158,34 @@ const defaultModels: ModelProfile[] = [
   },
 ];
 
+const defaultAiGenerationSettings: AiGenerationSettings = {
+  limitOutput: false,
+  maxPlanSteps: 6,
+  maxOutputTokens: 5000,
+  maxTextChars: 200,
+  maxCommandChars: 4000,
+};
+
+function normalizeAiGenerationSettings(settings: Partial<AiGenerationSettings>) {
+  const positiveInteger = (value: unknown, fallback: number, minimum = 1) => {
+    const parsed = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(parsed) ? Math.max(minimum, Math.trunc(parsed)) : fallback;
+  };
+  return {
+    limitOutput: settings.limitOutput === true,
+    maxPlanSteps: positiveInteger(settings.maxPlanSteps, defaultAiGenerationSettings.maxPlanSteps),
+    maxOutputTokens: positiveInteger(settings.maxOutputTokens, defaultAiGenerationSettings.maxOutputTokens, 256),
+    maxTextChars: positiveInteger(settings.maxTextChars, defaultAiGenerationSettings.maxTextChars),
+    maxCommandChars: positiveInteger(settings.maxCommandChars, defaultAiGenerationSettings.maxCommandChars),
+  };
+}
+
+function initialAiGenerationSettings() {
+  return normalizeAiGenerationSettings(
+    readSaved<Partial<AiGenerationSettings>>("opsark.aiGenerationSettings", {}),
+  );
+}
+
 function readSaved<T>(key: string, fallback: T): T {
   try {
     const value = localStorage.getItem(key);
@@ -187,9 +195,23 @@ function readSaved<T>(key: string, fallback: T): T {
   }
 }
 
+function redactExecutionOutput(value: string, secretValues: Record<string, string>) {
+  let output = Object.values(secretValues).reduce(
+    (current, secret) => secret ? current.split(secret).join("••••••••") : current,
+    value,
+  );
+  output = output.replace(
+    /^(\s*[\w.-]*(?:password|passwd|pwd|api[_-]?key|access[_-]?token|secret)[\w.-]*\s*[:=]\s*).+$/gim,
+    "$1••••••••",
+  );
+  return output.replace(
+    /([?&](?:password|passwd|pwd|api[_-]?key|access[_-]?token|secret)=)[^&\s]+/gi,
+    "$1••••••••",
+  );
+}
+
 function initialServers() {
-  const saved = readSaved<ServerProfile[]>("opsark.servers", [demoServer, testServer]);
-  return saved.some((server) => server.host === testServer.host) ? saved : [...saved, testServer];
+  return readSaved<ServerProfile[]>("opsark.servers", []);
 }
 
 function initialModels() {
@@ -200,6 +222,7 @@ function initialModels() {
 
 function initialTasks() {
   return readSaved<OpsTask[]>("opsark.tasks", []).map((task) => {
+    task.confirmedSecretKeys = [];
     task.plan = task.plan.map(ensureStepValidator);
     task.planHistory?.forEach((round) => {
       round.plan = round.plan.map(ensureStepValidator);
@@ -232,6 +255,7 @@ export const useOpsStore = defineStore("ops", {
     servers: initialServers(),
     tasks: initialTasks(),
     models: initialModels(),
+    aiGenerationSettings: initialAiGenerationSettings(),
     modelAvailability: {} as Record<string, ModelAvailability>,
     logs: readSaved<AuditEvent[]>("opsark.logs", []),
     files: demoFiles,
@@ -288,6 +312,7 @@ export const useOpsStore = defineStore("ops", {
         localStorage.setItem("opsark.servers", JSON.stringify(store.servers));
         localStorage.setItem("opsark.tasks", JSON.stringify(store.tasks));
         localStorage.setItem("opsark.models", JSON.stringify(store.models));
+        localStorage.setItem("opsark.aiGenerationSettings", JSON.stringify(store.aiGenerationSettings));
         localStorage.setItem("opsark.logs", JSON.stringify(store.logs.slice(0, 500)));
         localStorage.setItem("opsark.secretMetadata", JSON.stringify(store.secretMetadata));
         persistTimer = undefined;
@@ -316,6 +341,12 @@ export const useOpsStore = defineStore("ops", {
               value: await backend.loadCredential("model", model.id),
             })),
         );
+        const secretCredentials = await Promise.allSettled(
+          this.secretMetadata.map(async (secret) => ({
+            id: secret.key,
+            value: await backend.loadCredential("secret", secret.key),
+          })),
+        );
         for (const result of serverCredentials) {
           if (result.status === "fulfilled" && result.value.value) {
             this.serverPasswords[result.value.id] = result.value.value;
@@ -328,7 +359,13 @@ export const useOpsStore = defineStore("ops", {
             if (model) model.hasApiKey = true;
           }
         }
-        const rejected = [...serverCredentials, ...modelCredentials].find((result) => result.status === "rejected");
+        for (const result of secretCredentials) {
+          if (result.status === "fulfilled" && result.value.value) {
+            this.secretValues[result.value.id] = result.value.value;
+          }
+        }
+        const rejected = [...serverCredentials, ...modelCredentials, ...secretCredentials]
+          .find((result) => result.status === "rejected");
         if (rejected?.status === "rejected") this.credentialError = String(rejected.reason);
         this.credentialsHydrated = true;
         this.credentialsLoading = false;
@@ -521,7 +558,7 @@ export const useOpsStore = defineStore("ops", {
         id: uid("srv"),
         status: password ? "testing" : "offline",
         environment: [],
-        info: { ...demoServer.info, os: "等待采集…", uptime: "—" },
+        info: { ...emptyServerInfo },
         createdAt: now(),
       };
       this.servers.push(server);
@@ -552,6 +589,7 @@ export const useOpsStore = defineStore("ops", {
         createdAt: now(),
         updatedAt: now(),
         adjustmentCount: 0,
+        confirmedSecretKeys: [],
       };
       this.tasks.unshift(task);
       const reactiveTask = this.tasks[0];
@@ -724,6 +762,7 @@ export const useOpsStore = defineStore("ops", {
       task.summary = undefined;
       task.pauseReason = undefined;
       task.executionConstraints = undefined;
+      task.confirmedSecretKeys = [];
       task.adjustmentCount = 0;
       task.discoveryRefined = false;
       task.cancelRequested = false;
@@ -761,6 +800,7 @@ export const useOpsStore = defineStore("ops", {
           terminalReference: terminalReference || undefined,
           conversationHistory: priorConversation,
           previousExecution,
+          knownExecutionFacts: extractKnownExecutionFacts(task),
           tools: ["服务器基础信息", "实时指标", "安全命令执行", "敏感变量占位符"],
           secretVariables: this.secretMetadata
             .filter((item) => item.scope === "global" || item.serverId === serverId)
@@ -768,7 +808,13 @@ export const useOpsStore = defineStore("ops", {
         });
         const processed = await backend.processRequirement(
           content,
-          { apiKey: apiKey!, endpoint: model.endpoint, model: model.model, context },
+          {
+            apiKey: apiKey!,
+            endpoint: model.endpoint,
+            model: model.model,
+            context,
+            generationSettings: this.aiGenerationSettings,
+          },
         );
         if (processed.intent === "answer") {
           task.plan = [];
@@ -818,8 +864,10 @@ export const useOpsStore = defineStore("ops", {
         this.pushMessage(task, {
           role: "assistant",
           kind: "message",
-          content: permission === "autonomous"
-            ? `已生成 ${task.plan.length} 个执行步骤，自动执行模式已开始运行。`
+          content: permission === "managed"
+            ? `已生成 ${task.plan.length} 个执行步骤，完全托管模式已自动批准计划并开始运行。`
+            : permission === "autonomous"
+              ? `已生成 ${task.plan.length} 个执行步骤，自动执行模式已开始运行。`
             : `已生成 ${task.plan.length} 个执行步骤。请检查风险、命令和预期结果后确认计划。`,
         });
         this.persist();
@@ -827,7 +875,7 @@ export const useOpsStore = defineStore("ops", {
           task.status = "cancelled";
           return;
         }
-        if (permission === "autonomous") {
+        if (["autonomous", "managed"].includes(permission)) {
           await this.approvePlan(task.id, true);
         }
       } catch (error) {
@@ -876,9 +924,10 @@ export const useOpsStore = defineStore("ops", {
         metrics: this.metrics,
         permission: task.permission,
         executionConstraints: task.executionConstraints,
+        knownExecutionFacts: extractKnownExecutionFacts(task),
         previousPlan: task.plan,
         failedStep: failed,
-        instruction: "基于失败输出仅生成必要的替代步骤，最多 6 步。先提取真正的阻断根因，运行时版本、平台 ABI、网络、磁盘和权限等硬阻断优先于镜像、单个依赖或普通警告。发现步骤的 validation 只验证证据是否可获得；可选字段缺失、资源不存在或版本不匹配是有效观察，不得当成校验命令失败。每一步是独立非交互 Shell，source、export、cd 和 PATH 修改不会跨步骤保留；后续命令及 validation 必须自行初始化所需环境。运行时修复必须适配已知 OS、架构、libc 和 C++ ABI；禁止 curl|bash，禁止在新二进制于同一主机实际运行验证前修改全局默认版本。宿主不兼容时应使用兼容容器或隔离构建环境，不得强行升级系统 ABI。用户未明确要求且没有前序证据证明精确路径阻断目标时，不得生成 rm 或清理残留。不要手动安装单个依赖绕过 404，不要永久修改全局镜像源。不要重复已完成步骤或已确认前置条件，并以最终复查结束。",
+        instruction: "仅根据已有证据和未完成目标生成最少必要的替代步骤。先确定上一步是执行失败、观察到有效异常，还是主命令与后置校验冲突。目标已被真实证据证明时不得再变更；未达成时必须更换有实质区别的方法，不得对已失败命令仅做表面改写后重复执行。发现步骤只验证证据可获得；可选信息缺失或目标不存在是有效观察。每步是独立非交互 Shell，必须在当步建立所需目录和环境。不得预设技术栈、工具、路径、端口或服务名，不得重复已完成步骤，并以对用户目标的独立验收结束。",
         secretVariables: this.secretMetadata
           .filter((item) => item.scope === "global" || item.serverId === task.serverId)
           .map(({ key, description }) => ({ key, description, placeholder: `\${secret.${key}}` })),
@@ -890,16 +939,21 @@ export const useOpsStore = defineStore("ops", {
         const replacement = await backend.generatePlan(
           `${originalRequirement}\n\n上次执行未达到预期，请生成安全的调整计划。`,
           model.provider !== "Built-in"
-            ? { apiKey: apiKey!, endpoint: model.endpoint, model: model.model, context }
+            ? {
+                apiKey: apiKey!, endpoint: model.endpoint, model: model.model, context,
+                generationSettings: this.aiGenerationSettings,
+              }
             : undefined,
         );
         const completed = task.plan.filter((step) => step.status === "completed").slice(-4);
-        task.plan = [...completed, ...replacement.slice(0, 6)];
+        task.plan = [...completed, ...replacement];
         task.status = "awaiting_plan_approval";
         this.pushMessage(task, {
           role: "assistant",
           kind: "message",
-          content: `已根据失败结果生成 ${replacement.length} 个调整步骤，请重新审查并批准。`,
+          content: task.permission === "managed"
+            ? `已根据失败结果生成 ${replacement.length} 个调整步骤，完全托管模式将自动批准并继续。`
+            : `已根据失败结果生成 ${replacement.length} 个调整步骤，请重新审查并批准。`,
         });
         this.addLog({
           category: "model",
@@ -912,9 +966,22 @@ export const useOpsStore = defineStore("ops", {
       } catch (error) {
         const reason = `调整计划生成失败：${String(error)}`;
         this.pushMessage(task, { role: "system", kind: "event", content: reason });
-        await this.finalizeFailedTask(task.id, reason);
+        task.status = "needs_adjustment";
+        task.pauseReason = `${reason}。原执行证据和未完成目标已保留，可再次生成解决方案。`;
+        task.summary = undefined;
+        this.addLog({
+          category: "model",
+          level: "warning",
+          title: "调整计划格式异常，任务保持可恢复",
+          detail: task.pauseReason,
+          serverId: task.serverId,
+          taskId,
+        });
       }
       this.persist();
+      if (task.status === "awaiting_plan_approval" && task.permission === "managed") {
+        await this.approvePlan(task.id, true);
+      }
     },
 
     async requestAdjustment(taskId: string) {
@@ -942,7 +1009,11 @@ export const useOpsStore = defineStore("ops", {
       this.pushMessage(task, {
         role: automatic ? "system" : "user",
         kind: "event",
-        content: automatic ? "自动执行模式已批准计划，开始执行。" : "计划已批准，开始执行。",
+        content: automatic
+          ? task.permission === "managed"
+            ? "完全托管模式已自动批准计划，开始执行。"
+            : "自动执行模式已批准计划，开始执行。"
+          : "计划已批准，开始执行。",
       });
       this.addLog({
         category: "task",
@@ -1014,6 +1085,7 @@ export const useOpsStore = defineStore("ops", {
       const explicitlyDestructive = /(rm\s+-rf|mkfs|fdisk|parted|userdel|DROP\s+(?:DATABASE|TABLE)|TRUNCATE\s+TABLE|iptables\s+-F|shutdown|reboot)/i
         .test(step.command);
       if (explicitlyDestructive) return true;
+      if (permission === "managed") return step.risk === "high";
       if (step.risk === "high") return permission !== "autonomous";
       if (permission === "observe") return true;
       return permission === "safe" && step.risk === "medium";
@@ -1024,6 +1096,92 @@ export const useOpsStore = defineStore("ops", {
       if (!task || !["running", "awaiting_step_approval"].includes(task.status)) return;
       const step = task.plan.find((item) => item.status === "pending");
       if (!step) {
+        const discoveryOnly = task.plan.length > 0
+          && task.plan.every((item) => item.status === "completed" && isReadOnlyDiagnosticStep(item));
+        const changeStillExpected = ["requested_changes_only", "allow_necessary_changes"]
+          .includes(task.executionConstraints?.changePolicy ?? "");
+        if (discoveryOnly && changeStillExpected && !task.discoveryRefined) {
+          task.discoveryRefined = true;
+          task.status = "planning";
+          const requirement = [...task.messages]
+            .reverse()
+            .find((message) => message.role === "user" && message.kind === "message")?.content ?? task.title;
+          const model = this.models.find((item) => item.id === task.modelId);
+          const apiKey = this.modelApiKeys[task.modelId];
+          if (!model || (model.provider !== "Built-in" && !apiKey)) {
+            task.status = "needs_adjustment";
+            task.pauseReason = "发现阶段已完成，但模型不可用，无法依据真实证据生成后续变更计划。";
+            this.persist();
+            return;
+          }
+          const server = this.servers.find((item) => item.id === task.serverId);
+          const context = JSON.stringify({
+            workflowPhase: "continue_after_discovery",
+            server: server ? { name: server.name, host: server.host, info: server.info, environment: server.environment } : undefined,
+            permission: task.permission,
+            executionConstraints: task.executionConstraints,
+            completedDiscovery: task.plan.map(({ title, description, command, expected, result, evidence, output }) => ({
+              title,
+              description,
+              command,
+              expected,
+              result,
+              evidence: evidence?.map(({ type, source, facts, rawOutput }) => ({
+                type,
+                source,
+                facts,
+                rawOutput: trimEvidence(rawOutput),
+              })),
+              output: trimEvidence(output),
+            })),
+            knownExecutionFacts: extractKnownExecutionFacts(task),
+            instruction: "只使用本轮已完成发现的真实证据，生成完成用户剩余目标所需的最少变更和最终验收。不得重复发现步骤或猜测路径、工具、端口和服务名。",
+            secretVariables: this.secretMetadata
+              .filter((item) => item.scope === "global" || item.serverId === task.serverId)
+              .map(({ key, description }) => ({ key, description, placeholder: `\${secret.${key}}` })),
+          });
+          this.pushMessage(task, {
+            role: "system",
+            kind: "event",
+            content: "发现阶段已完成，正在依据真实证据生成一次后续变更与验收计划…",
+          });
+          this.persist();
+          try {
+            const continuation = await backend.generatePlan(
+              `${requirement}\n\n发现阶段已完成，请仅规划尚未完成的变更与最终验收。`,
+              model.provider !== "Built-in"
+                ? {
+                    apiKey: apiKey!, endpoint: model.endpoint, model: model.model, context,
+                    generationSettings: this.aiGenerationSettings,
+                  }
+                : undefined,
+            );
+            const completedCommands = new Set(task.plan.map((item) => item.command));
+            const pending = continuation.filter((item) => !completedCommands.has(item.command));
+            if (!pending.length) throw new Error("模型未返回可执行的后续步骤");
+            task.plan = [...task.plan, ...pending];
+            task.status = "awaiting_plan_approval";
+            this.pushMessage(task, {
+              role: "assistant",
+              kind: "message",
+              content: task.permission === "managed"
+                ? `已根据发现证据生成 ${pending.length} 个后续步骤，完全托管模式自动批准并继续。`
+                : task.permission === "autonomous"
+                  ? `已根据发现证据生成 ${pending.length} 个后续步骤，自动执行继续。`
+                : `已根据发现证据生成 ${pending.length} 个后续步骤，请审批后继续。`,
+            });
+            this.persist();
+            if (["autonomous", "managed"].includes(task.permission)) {
+              await this.approvePlan(task.id, true);
+            }
+          } catch (error) {
+            task.status = "needs_adjustment";
+            task.pauseReason = `发现后续计划生成失败：${String(error)}`;
+            this.pushMessage(task, { role: "assistant", kind: "event", content: task.pauseReason });
+            this.persist();
+          }
+          return;
+        }
         task.status = "validating";
         this.pushMessage(task, { role: "system", kind: "event", content: "执行步骤已完成，正在根据实际输出整理本轮结果…" });
         this.persist();
@@ -1085,43 +1243,35 @@ export const useOpsStore = defineStore("ops", {
       }
 
       const stepIndex = task.plan.indexOf(step);
-      let runtimeBlockerIndex = -1;
+      let blockerIndex = -1;
       for (let index = 0; index < stepIndex; index += 1) {
         const candidate = task.plan[index];
         if (
           candidate.status === "completed"
-          && candidate.validator?.type === "runtime"
           && candidate.result?.facts.blockingSignal
-        ) runtimeBlockerIndex = index;
+        ) blockerIndex = index;
       }
-      const runtimeBlockerResolved = runtimeBlockerIndex >= 0 && task.plan
-        .slice(runtimeBlockerIndex + 1, stepIndex)
+      const blockerResolved = blockerIndex >= 0 && task.plan
+        .slice(blockerIndex + 1, stepIndex)
         .some((candidate) =>
           candidate.status === "completed"
-          && candidate.validator?.type === "runtime"
           && !isReadOnlyStep(candidate)
           && !candidate.result?.facts.blockingSignal
           && candidate.result?.executionStatus === "success",
         );
-      const requiresCompatibleRuntime =
-        !/\b(?:docker|podman)\s+(?:run|exec|compose)\b/i.test(step.command)
-        && (
-          /\b(?:npm|pnpm|yarn)\s+(?:install|ci|run\s+build|build)\b/i.test(step.command)
-          || /\b(?:vite|webpack|vue-tsc|tsc)\b/i.test(step.command)
-        );
-      if (runtimeBlockerIndex >= 0 && !runtimeBlockerResolved && requiresCompatibleRuntime) {
+      if (blockerIndex >= 0 && !blockerResolved && isMutatingStepCommand(step.command)) {
         const requirement = [...task.messages]
           .reverse()
           .find((message) => message.role === "user" && message.kind === "message")?.content ?? task.title;
         const model = this.models.find((item) => item.id === task.modelId);
         const apiKey = this.modelApiKeys[task.modelId];
-        const blockerStep = task.plan[runtimeBlockerIndex];
+        const blockerStep = task.plan[blockerIndex];
         const reviewContext = JSON.stringify({
-          trigger: "运行时前置条件不满足，即将执行依赖安装或构建，需要结合用户目标决定继续尝试还是调整",
+          trigger: "已发现未解决的阻断条件，即将执行变更操作，需结合用户目标和已有证据决定继续还是调整",
           reviewPolicy: {
             preconditionGate: true,
-            runtimeIncompatible: true,
-            userMayExplicitlyAuthorizeCompatibilityAttempt: true,
+            unresolvedBlockingSignal: true,
+            userMayExplicitlyAuthorizeAttempt: true,
             failureFactsCannotBeRewritten: true,
           },
           userRequirement: requirement,
@@ -1181,7 +1331,7 @@ export const useOpsStore = defineStore("ops", {
         this.pushMessage(task, {
           role: "assistant",
           kind: "event",
-          content: "发现当前运行时不满足项目要求，正在结合用户需求、执行记录和剩余计划进行一次前置条件模型复核…",
+          content: "发现未解决的前置条件，正在结合用户需求、执行记录、完整计划和剩余步骤进行一次模型复核…",
         });
         this.persist();
         const modelDecision = await backend.reviewStep(
@@ -1201,7 +1351,7 @@ export const useOpsStore = defineStore("ops", {
           : {
               decision: "adjust",
               reason: modelDecision.source !== "model"
-                ? "运行时前置条件不满足且模型复核不可用，不能自动继续安装或构建。"
+                ? "前置条件尚未满足且模型复核不可用，不能自动继续变更操作。"
                 : modelDecision.reason,
               summary: modelDecision.summary,
               source: modelDecision.source === "model" ? "model" : "rules",
@@ -1209,7 +1359,7 @@ export const useOpsStore = defineStore("ops", {
         this.addLog({
           category: "model",
           level: allowAfterReview ? "info" : "warning",
-          title: `${step.title} · 运行时前置条件异常复核`,
+          title: `${step.title} · 前置条件异常复核`,
           detail: JSON.stringify({
             input: JSON.parse(reviewContext),
             modelDecision,
@@ -1220,7 +1370,7 @@ export const useOpsStore = defineStore("ops", {
         });
         if (!allowAfterReview) {
           task.status = "needs_adjustment";
-          task.pauseReason = `运行时前置条件复核建议调整：${step.review.reason}`;
+          task.pauseReason = `前置条件复核建议调整：${step.review.reason}`;
           this.pushMessage(task, {
             role: "assistant",
             kind: "event",
@@ -1237,156 +1387,6 @@ export const useOpsStore = defineStore("ops", {
           content: `模型结合用户需求、执行约束、完整计划和执行记录复核后同意继续；当前风险将保留并由后续真实执行结果判断。${step.review.summary}`,
         });
         this.persist();
-      }
-
-      const completedPlatformDiscovery = task.plan.some((item) =>
-        item.status === "completed" && item.command.includes("OPSARK_PLATFORM_CHECK"),
-      );
-      const environmentSensitiveChange = isMutatingStepCommand(step.command) && (
-        /\b(?:nvm|fnm|volta|asdf)\s+(?:install|use|global)\b/i.test(step.command)
-        || /curl\b[\s\S]*\|\s*(?:ba)?sh\b/i.test(step.command)
-        || /(?:node(?:\.js)?|java|python|golang|rust).*(?:安装|升级|切换)|(?:安装|升级|切换).*(?:运行时|node|java|python)/i
-          .test(`${step.title}\n${step.description}`)
-      );
-      if (completedPlatformDiscovery && environmentSensitiveChange && !task.discoveryRefined) {
-        task.discoveryRefined = true;
-        task.status = "planning";
-        const approvedPlan = task.plan;
-        const completed = task.plan.filter((item) => item.status === "completed");
-        const requirement = [...task.messages]
-          .reverse()
-          .find((message) => message.role === "user" && message.kind === "message")?.content ?? task.title;
-        const model = this.models.find((item) => item.id === task.modelId);
-        const apiKey = this.modelApiKeys[task.modelId];
-        if (!model || (model.provider !== "Built-in" && !apiKey)) {
-          task.status = "running";
-          task.pauseReason = undefined;
-          this.pushMessage(task, {
-            role: "system",
-            kind: "event",
-            content: "发现后的辅助计划细化不可用，保留已批准的原计划继续执行。",
-          });
-          this.persist();
-          await this.advanceTask(taskId);
-          return;
-        }
-        const server = this.servers.find((item) => item.id === task.serverId);
-        const context = JSON.stringify({
-          workflowPhase: "refine_after_discovery",
-          server: server ? {
-            name: server.name,
-            host: server.host,
-            info: server.info,
-            environment: server.environment,
-          } : undefined,
-          permission: task.permission,
-          executionConstraints: task.executionConstraints,
-          completedDiscovery: completed.map(({ title, description, command, expected, result, evidence }) => ({
-            title,
-            description,
-            command,
-            expected,
-            result,
-            evidence: evidence?.map(({ type, source, facts, rawOutput }) => ({
-              type,
-              source,
-              facts,
-              rawOutput,
-            })),
-          })),
-          pendingPlan: task.plan
-            .filter((item) => item.status === "pending")
-            .map(({ title, description, command, expected, validation, risk }) => ({
-              title,
-              description,
-              command,
-              expected,
-              validation,
-              risk,
-            })),
-          instruction: "这是发现阶段后的唯一一次计划细化。只生成尚未执行的必要变更和最终验收步骤，最多 6 步；不得重复已经完成的诊断。运行时或工具安装方案必须与已采集的 OS、架构、libc、C++ ABI 和容器能力兼容。禁止 curl|bash；不要先修改全局默认版本，必须先在同一主机实际运行新二进制并验证 ABI，再决定是否切换。若宿主平台无法支持目标运行时，应选择兼容的容器或隔离构建环境；没有安全可行方案时生成只读阻断确认步骤，不得强行升级系统 ABI。",
-          secretVariables: this.secretMetadata
-            .filter((item) => item.scope === "global" || item.serverId === task.serverId)
-            .map(({ key, description }) => ({ key, description, placeholder: `\${secret.${key}}` })),
-        });
-        this.pushMessage(task, {
-          role: "system",
-          kind: "event",
-          content: "发现阶段已完成，正在依据真实平台证据细化一次后续变更与验收计划…",
-        });
-        this.persist();
-        try {
-          let replacement: PlanStep[] | undefined;
-          let lastRefinementError: unknown;
-          for (let attempt = 0; attempt < 2 && !replacement; attempt += 1) {
-            try {
-              replacement = await backend.generatePlan(
-                `${requirement}\n\n发现阶段已完成。请依据上下文中的真实证据，仅细化尚未执行的变更与验收计划。${attempt > 0 ? "\n上次响应无法解析；本次必须只返回严格合法 JSON，Shell 引号和反斜杠必须正确转义。" : ""}`,
-                model.provider !== "Built-in"
-                  ? { apiKey: apiKey!, endpoint: model.endpoint, model: model.model, context }
-                  : undefined,
-              );
-            } catch (error) {
-              lastRefinementError = error;
-              if (attempt === 0) {
-                this.pushMessage(task, {
-                  role: "system",
-                  kind: "event",
-                  content: "计划细化响应格式无效，正在自动重试一次…",
-                });
-                this.persist();
-              }
-            }
-          }
-          if (!replacement) throw lastRefinementError ?? new Error("计划细化没有返回结果");
-          const completedCommands = new Set(completed.map((item) => item.command));
-          const refined = replacement
-            .filter((item) =>
-              !completedCommands.has(item.command)
-              && !item.command.includes("OPSARK_PLATFORM_CHECK"),
-            )
-            .slice(0, 6);
-          if (!refined.length) throw new Error("模型没有返回可执行的后续变更或验收步骤");
-          task.plan = [...completed, ...refined];
-          task.status = task.permission === "autonomous" ? "running" : "awaiting_plan_approval";
-          this.pushMessage(task, {
-            role: "assistant",
-            kind: "message",
-            content: task.permission === "autonomous"
-              ? `已依据发现证据完成一次计划细化，共 ${refined.length} 个后续步骤，自动执行继续。`
-              : `已依据发现证据完成一次计划细化，共 ${refined.length} 个后续步骤，请确认后继续。`,
-          });
-          this.addLog({
-            category: "model",
-            level: "info",
-            title: "发现阶段后续计划已细化",
-            detail: JSON.stringify({ context: JSON.parse(context), replacement: refined }, null, 2),
-            serverId: task.serverId,
-            taskId,
-          });
-          this.persist();
-          if (task.permission === "autonomous") await this.advanceTask(taskId);
-        } catch (error) {
-          task.plan = approvedPlan;
-          task.status = "running";
-          task.pauseReason = undefined;
-          this.pushMessage(task, {
-            role: "system",
-            kind: "event",
-            content: `计划细化连续两次未返回有效结构，已保留原批准计划继续执行。详情：${String(error)}`,
-          });
-          this.addLog({
-            category: "model",
-            level: "warning",
-            title: "计划细化失败，已回退原计划",
-            detail: String(error),
-            serverId: task.serverId,
-            taskId,
-          });
-          this.persist();
-          await this.advanceTask(taskId);
-        }
-        return;
       }
 
       if (this.needsApproval(task.permission, step)) {
@@ -1416,15 +1416,16 @@ export const useOpsStore = defineStore("ops", {
       const step = task?.plan.find((item) => item.id === stepId);
       if (!task || !step) return;
       const requiredKeys = [...step.command.matchAll(/\$\{secret\.([A-Z0-9_]+)\}/g)].map((match) => match[1]);
-      const missingKey = requiredKeys.find((key) => !this.secretValues[key]);
-      if (missingKey) {
+      const unconfirmedKey = requiredKeys.find((key) => !task.confirmedSecretKeys?.includes(key));
+      if (unconfirmedKey) {
         step.status = "awaiting_input";
         task.status = "awaiting_input";
-        this.pendingSecret = { taskId, stepId, key: missingKey };
+        this.pendingSecret = { taskId, stepId, key: unconfirmedKey };
+        const metadata = this.secretMetadata.find((item) => item.key === unconfirmedKey);
         this.pushMessage(task, {
           role: "assistant",
           kind: "event",
-          content: `执行需要敏感变量 ${missingKey}。请输入后由后端合并，变量值不会发送给模型。`,
+          content: `本轮执行需要确认敏感变量 ${unconfirmedKey}${metadata?.description ? `（${metadata.description}）` : ""}。请输入本轮应使用的值；不会发送给模型。`,
         });
         this.persist();
         return;
@@ -1444,15 +1445,31 @@ export const useOpsStore = defineStore("ops", {
         const connection = server && password
           ? { host: server.host, port: server.port, username: server.username, password }
           : undefined;
+        step.command = normalizeSecretPlaceholders(step.command);
+        step.validation = normalizeSecretPlaceholders(step.validation);
         const resolvedCommand = step.command.replace(/\$\{secret\.([A-Z0-9_]+)\}/g, (_match, key: string) => this.secretValues[key] ?? "");
+        const resolvedValidation = step.validation.replace(
+          /\$\{secret\.([A-Z0-9_]+)\}/g,
+          (_match, key: string) => this.secretValues[key] ?? "",
+        );
         const executionId = uid("exec");
         task.currentExecutionId = executionId;
         let streamedOutput = "";
         let lastLongTaskNotice = 0;
+        let executionFinished = false;
+        let monitorBusy = false;
+        let monitorRound = 0;
+        let monitorValidationPassed = false;
+        let monitorDecision: NonNullable<PlanStep["review"]> | undefined;
+        const requirement = [...task.messages]
+          .reverse()
+          .find((message) => message.role === "user" && message.kind === "message")?.content ?? task.title;
+        const runtimeModel = this.models.find((item) => item.id === task.modelId);
+        const runtimeApiKey = this.modelApiKeys[task.modelId];
         const heartbeat = window.setInterval(() => {
           step.elapsedSeconds = Math.max(0, Math.floor((Date.now() - new Date(step.startedAt!).getTime()) / 1000));
           step.progressMessage = step.elapsedSeconds >= 10
-            ? `远程命令仍在运行（${step.elapsedSeconds} 秒），下载或编译期间会持续等待`
+            ? `远程命令仍在运行（${step.elapsedSeconds} 秒），系统会每 ${LONG_RUNNING_REVIEW_INTERVAL_MS / 1000} 秒获取状态并复核`
             : "远程命令正在执行";
           if (step.elapsedSeconds >= 30 && step.elapsedSeconds - lastLongTaskNotice >= 60) {
             lastLongTaskNotice = step.elapsedSeconds;
@@ -1463,15 +1480,176 @@ export const useOpsStore = defineStore("ops", {
             });
           }
         }, 1000);
+        const longRunningMonitor = connection && runtimeModel && runtimeApiKey
+          ? window.setInterval(async () => {
+              if (executionFinished || monitorBusy || task.cancelRequested) return;
+              if (monitorDecision) {
+                try {
+                  await backend.cancelCommand(connection, executionId);
+                } catch (error) {
+                  this.addLog({
+                    category: "system",
+                    level: "warning",
+                    title: `${step.title} · 重试停止长驻命令失败`,
+                    detail: String(error),
+                    serverId: task.serverId,
+                    taskId,
+                  });
+                }
+                return;
+              }
+              monitorBusy = true;
+              monitorRound += 1;
+              const elapsedSeconds = Math.max(
+                0,
+                Math.floor((Date.now() - new Date(step.startedAt!).getTime()) / 1000),
+              );
+              this.pushMessage(task, {
+                role: "system",
+                kind: "event",
+                content: `${step.title}已持续运行 ${elapsedSeconds} 秒，正在获取最新状态并进行第 ${monitorRound} 次长任务复核…`,
+              });
+              this.persist();
+              try {
+                const observation = await backend.validateStep(
+                  { ...step, validation: resolvedValidation },
+                  connection,
+                  { executionId: uid("long-observation") },
+                );
+                if (executionFinished || task.cancelRequested) return;
+                let safeObservationOutput = observation.output ?? "";
+                safeObservationOutput = redactExecutionOutput(safeObservationOutput, this.secretValues);
+                const remainingSteps = task.plan
+                  .filter((item) => item.status === "pending")
+                  .map(({ title, description, command, expected, validation, risk }) => ({
+                    title,
+                    description,
+                    command,
+                    expected,
+                    validation,
+                    risk,
+                  }));
+                const reviewContext = JSON.stringify({
+                  trigger: "远程命令长时间未返回，定期获取状态并判断继续等待、停止等待进入正式校验或调整计划",
+                  reviewPolicy: {
+                    periodicLongRunningReview: true,
+                    decisionContinueMeansWait: true,
+                    decisionCompleteRequiresValidationPassed: true,
+                    decisionAdjustMeansStopAndPause: true,
+                    actualExecutionFactsCannotBeRewritten: true,
+                  },
+                  reviewRound: monitorRound,
+                  elapsedSeconds,
+                  userRequirement: requirement,
+                  executionConstraints: task.executionConstraints,
+                  currentStep: {
+                    title: step.title,
+                    description: step.description,
+                    command: step.command,
+                    expected: step.expected,
+                    validation: step.validation,
+                    risk: step.risk,
+                    streamedOutput: trimEvidence(step.output ?? streamedOutput, 5000),
+                  },
+                  periodicObservation: {
+                    passed: observation.passed,
+                    detail: observation.detail,
+                    exitCode: observation.exitCode,
+                    output: trimEvidence(safeObservationOutput, 3000),
+                  },
+                  executionHistory: task.plan
+                    .filter((item) => item !== step && item.status !== "pending")
+                    .map(({ title, description, command, expected, status, result, output }) => ({
+                      title,
+                      description,
+                      command,
+                      expected,
+                      status,
+                      result,
+                      output: trimEvidence(output, 1200),
+                    })),
+                  fullPlan: task.plan.map(({ title, description, command, expected, validation, risk, status }) => ({
+                    title,
+                    description,
+                    command,
+                    expected,
+                    validation,
+                    risk,
+                    status,
+                  })),
+                  remainingSteps,
+                });
+                const review = await backend.reviewStep(
+                  requirement,
+                  reviewContext,
+                  remainingSteps.length > 0,
+                  { apiKey: runtimeApiKey, endpoint: runtimeModel.endpoint, model: runtimeModel.model, context: "" },
+                );
+                if (executionFinished || task.cancelRequested) return;
+                const acceptedDecision = review.source === "model"
+                  && (
+                    review.decision === "continue"
+                    || review.decision === "adjust"
+                    || (review.decision === "complete" && observation.passed)
+                  );
+                this.addLog({
+                  category: "model",
+                  level: review.decision === "adjust" ? "warning" : "info",
+                  title: `${step.title} · 长任务定期复核 #${monitorRound}`,
+                  detail: JSON.stringify({
+                    input: JSON.parse(reviewContext),
+                    modelDecision: review,
+                    acceptedDecision,
+                  }, null, 2),
+                  serverId: task.serverId,
+                  taskId,
+                });
+                if (!acceptedDecision || review.decision === "continue") {
+                  this.pushMessage(task, {
+                    role: "system",
+                    kind: "event",
+                    content: review.source !== "model"
+                      ? `第 ${monitorRound} 次长任务复核时模型不可用，保持执行并继续等待。`
+                      : review.decision === "complete" && !observation.passed
+                        ? `模型建议停止等待，但程序校验尚未通过，本轮继续等待。`
+                        : `第 ${monitorRound} 次复核建议继续等待：${review.summary}`,
+                  });
+                  this.persist();
+                  return;
+                }
+                monitorDecision = review;
+                monitorValidationPassed = observation.passed;
+                this.pushMessage(task, {
+                  role: "assistant",
+                  kind: "event",
+                  content: review.decision === "complete"
+                    ? `定期校验已满足后置条件，模型建议停止持续等待并进入正式校验：${review.summary}`
+                    : `长任务复核建议停止当前命令并调整：${review.summary}`,
+                });
+                this.persist();
+                await backend.cancelCommand(connection, executionId);
+              } catch (error) {
+                if (!executionFinished) {
+                  this.addLog({
+                    category: "system",
+                    level: "warning",
+                    title: `${step.title} · 长任务状态获取失败`,
+                    detail: String(error),
+                    serverId: task.serverId,
+                    taskId,
+                  });
+                }
+              } finally {
+                monitorBusy = false;
+              }
+            }, LONG_RUNNING_REVIEW_INTERVAL_MS)
+          : undefined;
         let result;
         try {
           result = await backend.executeCommand(resolvedCommand, connection, step.risk === "high", {
             executionId,
             onProgress: ({ data }) => {
-              const safeChunk = Object.values(this.secretValues).reduce(
-                (output, secret) => secret ? output.split(secret).join("••••••••") : output,
-                sanitizeTerminalOutput(data),
-              );
+              const safeChunk = redactExecutionOutput(sanitizeTerminalOutput(data), this.secretValues);
               if (!safeChunk) return;
               streamedOutput = sanitizeTerminalOutput(streamedOutput + safeChunk);
               step.output = `$ ${step.command}\n${streamedOutput}`;
@@ -1490,14 +1668,26 @@ export const useOpsStore = defineStore("ops", {
             },
           });
         } finally {
+          executionFinished = true;
           window.clearInterval(heartbeat);
+          if (longRunningMonitor !== undefined) window.clearInterval(longRunningMonitor);
           task.currentExecutionId = undefined;
         }
         if (task.cancelRequested) return;
-        const safeOutput = Object.values(this.secretValues).reduce(
-          (output, secret) => secret ? output.split(secret).join("••••••••") : output,
-          sanitizeTerminalOutput(result.output),
-        );
+        if (
+          monitorDecision?.decision === "complete"
+          && monitorValidationPassed
+          && !result.success
+          && result.exitCode === 130
+        ) {
+          result = {
+            ...result,
+            success: true,
+            exitCode: 0,
+            output: `${result.output}\n[长任务复核：定期校验已通过，已停止等待并进入正式校验]`,
+          };
+        }
+        const safeOutput = redactExecutionOutput(sanitizeTerminalOutput(result.output), this.secretValues);
         step.output = safeOutput;
         if (!streamedOutput) {
           const terminalOutput = safeOutput.split("\n");
@@ -1515,6 +1705,45 @@ export const useOpsStore = defineStore("ops", {
           serverId: task.serverId,
           taskId,
         });
+        if (monitorDecision?.decision === "adjust") {
+          step.status = "failed";
+          step.review = monitorDecision;
+          step.result = {
+            executionStatus: "failed",
+            observationStatus: "unknown",
+            exitCode: result.exitCode,
+            facts: {
+              commandCompleted: false,
+              stoppedByPeriodicReview: true,
+              reviewRound: monitorRound,
+            },
+            warnings: [],
+            evidenceIds: [],
+            failureReason: monitorDecision.reason,
+          };
+          step.evidence = [{
+            id: uid("evidence-long-review"),
+            type: "command-output",
+            source: "main",
+            facts: {
+              stoppedByPeriodicReview: true,
+              elapsedSeconds: step.elapsedSeconds,
+              validationPassed: monitorValidationPassed,
+            },
+            rawOutput: safeOutput,
+            collectedAt: now(),
+          }];
+          step.result.evidenceIds = step.evidence.map((item) => item.id);
+          task.status = "needs_adjustment";
+          task.pauseReason = `长任务定期复核建议调整：${monitorDecision.reason}`;
+          this.pushMessage(task, {
+            role: "assistant",
+            kind: "event",
+            content: `${monitorDecision.summary}\n${task.pauseReason}`,
+          });
+          this.persist();
+          return;
+        }
         if (!result.success) {
           if (result.exitCode === 130 || task.cancelRequested) return;
           const failure = analyzeCommandFailure(safeOutput);
@@ -1620,10 +1849,7 @@ export const useOpsStore = defineStore("ops", {
           );
           if (task.cancelRequested) return;
           const mutatingStep = isMutatingStepCommand(step.command);
-          const operationalCommand =
-            /\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:build|deploy|start)|\bmvn\b.*\b(?:package|install|deploy)|\b(?:make|cmake|gradle|cargo)\s+(?:build|install)|\b(?:node|java|python)\s+\S+\.(?:js|jar|py)\b/i
-              .test(step.command);
-          const diagnosticStep = isReadOnlyDiagnosticStep(step) && !operationalCommand;
+          const diagnosticStep = isReadOnlyDiagnosticStep(step) && !mutatingStep;
           const hasRecoveryStep = remainingPlanCanRecoverExecutionFailure(
             failure.facts.category,
             remainingSteps,
@@ -1654,17 +1880,6 @@ export const useOpsStore = defineStore("ops", {
               summary: "当前计划无法从本次执行失败中安全恢复。",
               source: "rules",
             };
-          } else if (
-            step.review.decision === "continue"
-            && failure.facts.category === "platform_incompatible"
-            && !hasRecoveryStep
-          ) {
-            step.review = {
-              decision: "adjust",
-              reason: "当前二进制与系统平台不兼容，剩余计划没有容器或兼容运行时方案。",
-              summary: "平台兼容性阻断尚未得到处理。",
-              source: "rules",
-            };
           }
           this.addLog({
             category: "model",
@@ -1675,7 +1890,6 @@ export const useOpsStore = defineStore("ops", {
               modelDecision: originalReview,
               diagnosticStep,
               mutatingStep,
-              operationalCommand,
               recoveryStepFound: hasRecoveryStep,
               finalDecision: step.review,
             }, null, 2),
@@ -1719,10 +1933,6 @@ export const useOpsStore = defineStore("ops", {
         step.status = "validating";
         task.status = "validating";
         this.persist();
-        const resolvedValidation = step.validation.replace(
-          /\$\{secret\.([A-Z0-9_]+)\}/g,
-          (_match, key: string) => this.secretValues[key] ?? "",
-        );
         const validationExecutionId = uid("validation");
         task.currentExecutionId = validationExecutionId;
         let validation = await backend.validateStep(
@@ -1731,10 +1941,7 @@ export const useOpsStore = defineStore("ops", {
           {
             executionId: validationExecutionId,
             onProgress: ({ data }) => {
-              const safeChunk = Object.values(this.secretValues).reduce(
-                (output, secret) => secret ? output.split(secret).join("••••••••") : output,
-                sanitizeTerminalOutput(data),
-              );
+              const safeChunk = redactExecutionOutput(sanitizeTerminalOutput(data), this.secretValues);
               if (safeChunk) this.terminalLines.push(...safeChunk.split(/\r?\n/).filter(Boolean));
             },
           },
@@ -1747,10 +1954,7 @@ export const useOpsStore = defineStore("ops", {
           && ensureStepValidator(step).validator?.type === "http";
         if (retryReadOnlyHttpValidation) {
           let firstValidationOutput = validation.output ?? "";
-          firstValidationOutput = Object.values(this.secretValues).reduce(
-            (output, secret) => secret ? output.split(secret).join("••••••••") : output,
-            firstValidationOutput,
-          );
+          firstValidationOutput = redactExecutionOutput(firstValidationOutput, this.secretValues);
           if (firstValidationOutput) {
             step.output = `${step.output}\n\n--- 独立校验（首次未通过） ---\n${firstValidationOutput}`;
           }
@@ -1767,10 +1971,7 @@ export const useOpsStore = defineStore("ops", {
             {
               executionId: retryExecutionId,
               onProgress: ({ data }) => {
-                const safeChunk = Object.values(this.secretValues).reduce(
-                  (output, secret) => secret ? output.split(secret).join("••••••••") : output,
-                  sanitizeTerminalOutput(data),
-                );
+                const safeChunk = redactExecutionOutput(sanitizeTerminalOutput(data), this.secretValues);
                 if (safeChunk) this.terminalLines.push(...safeChunk.split(/\r?\n/).filter(Boolean));
               },
             },
@@ -1780,10 +1981,7 @@ export const useOpsStore = defineStore("ops", {
         }
         let safeValidationOutput = validation.output ?? "";
         if (validation.output) {
-          safeValidationOutput = Object.values(this.secretValues).reduce(
-            (output, secret) => secret ? output.split(secret).join("••••••••") : output,
-            validation.output,
-          );
+          safeValidationOutput = redactExecutionOutput(validation.output, this.secretValues);
           step.output = `${step.output}\n\n--- 独立校验 ---\n${safeValidationOutput}`;
           this.terminalLines.push(`验证 › ${step.validation}`, ...safeValidationOutput.split("\n"));
         }
@@ -2095,6 +2293,8 @@ export const useOpsStore = defineStore("ops", {
       const task = this.tasks.find((item) => item.id === request.taskId);
       const step = task?.plan.find((item) => item.id === request.stepId);
       if (!task || !step) return;
+      task.confirmedSecretKeys ??= [];
+      if (!task.confirmedSecretKeys.includes(request.key)) task.confirmedSecretKeys.push(request.key);
       step.status = "pending";
       task.status = "running";
       this.pushMessage(task, { role: "user", kind: "event", content: `已安全提供变量 ${request.key}。` });
@@ -2102,11 +2302,45 @@ export const useOpsStore = defineStore("ops", {
       await this.runStep(request.taskId, request.stepId);
     },
 
-    addSecretMetadata(key: string, description: string) {
+    addSecretMetadata(key: string, description: string, value = "") {
       const normalized = key.trim().toUpperCase().replace(/[^A-Z0-9_]/g, "_");
       if (!normalized || this.secretMetadata.some((item) => item.key === normalized)) return;
       this.secretMetadata.push({ key: normalized, description: description.trim() || "敏感变量", scope: "global" });
+      if (value) this.secretValues[normalized] = value;
       this.persist();
+    },
+
+    async renameSecretMetadata(oldKey: string, nextKey: string) {
+      const normalized = nextKey.trim().toUpperCase().replace(/[^A-Z0-9_]/g, "_");
+      if (!normalized || normalized === oldKey) return normalized === oldKey;
+      if (this.secretMetadata.some((item) => item.key === normalized)) return false;
+      const secret = this.secretMetadata.find((item) => item.key === oldKey);
+      if (!secret) return false;
+      const value = this.secretValues[oldKey] ?? "";
+      if (value) await backend.saveCredential("secret", normalized, value);
+      await backend.deleteCredential("secret", oldKey);
+      secret.key = normalized;
+      if (value) this.secretValues[normalized] = value;
+      delete this.secretValues[oldKey];
+      this.persist(true);
+      return true;
+    },
+
+    async removeSecretMetadata(key: string) {
+      await backend.deleteCredential("secret", key);
+      this.secretMetadata = this.secretMetadata.filter((item) => item.key !== key);
+      delete this.secretValues[key];
+      this.persist(true);
+    },
+
+    async saveSecretSettings() {
+      await Promise.all(this.secretMetadata.map((secret) => {
+        const value = this.secretValues[secret.key] ?? "";
+        return value
+          ? backend.saveCredential("secret", secret.key, value)
+          : backend.deleteCredential("secret", secret.key);
+      }));
+      this.persist(true);
     },
 
     async runTerminalCommand(command: string, serverId?: string) {
@@ -2132,6 +2366,7 @@ export const useOpsStore = defineStore("ops", {
     },
 
     async saveModels() {
+      this.aiGenerationSettings = normalizeAiGenerationSettings(this.aiGenerationSettings);
       this.models = this.models.filter((model) => model.provider !== "Built-in" && model.id !== "model-local");
       const credentials = this.models
         .filter((model) => this.modelApiKeys[model.id])

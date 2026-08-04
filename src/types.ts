@@ -21,7 +21,7 @@ export type StepStatus =
   | "failed"
   | "skipped";
 export type RiskLevel = "low" | "medium" | "high";
-export type PermissionLevel = "observe" | "safe" | "autonomous";
+export type PermissionLevel = "observe" | "safe" | "autonomous" | "managed";
 export type StepReviewDecision = "continue" | "adjust" | "complete";
 export type ExecutionStatus = "success" | "failed" | "cancelled" | "blocked";
 export type ObservationStatus =
@@ -175,6 +175,7 @@ export interface OpsTask {
   discoveryRefined?: boolean;
   currentExecutionId?: string;
   cancelRequested?: boolean;
+  confirmedSecretKeys?: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -193,6 +194,14 @@ export interface ModelAvailability {
   status: "unknown" | "checking" | "available" | "unavailable";
   reason: string;
   checkedAt?: string;
+}
+
+export interface AiGenerationSettings {
+  limitOutput: boolean;
+  maxPlanSteps: number;
+  maxOutputTokens: number;
+  maxTextChars: number;
+  maxCommandChars: number;
 }
 
 export interface RequirementProcessingResult {

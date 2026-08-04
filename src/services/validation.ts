@@ -49,88 +49,12 @@ interface OutputSignals {
   blocking: boolean;
 }
 
-function compareVersion(left: number[], right: number[]) {
-  for (let index = 0; index < 3; index += 1) {
-    const difference = (left[index] ?? 0) - (right[index] ?? 0);
-    if (difference !== 0) return difference > 0 ? 1 : -1;
-  }
-  return 0;
-}
-
-function parseVersion(value: string) {
-  const match = value.match(/(\d+)(?:\.(\d+))?(?:\.(\d+))?/);
-  return match ? [Number(match[1]), Number(match[2] ?? 0), Number(match[3] ?? 0)] : undefined;
-}
-
-function satisfiesNodeRequirement(currentValue: string, requirement: string) {
-  if (!requirement || requirement === "unspecified" || requirement === "*") return true;
-  const current = parseVersion(currentValue);
-  if (!current) return false;
-  return requirement.split("||").some((alternative) => {
-    const conditions = alternative.trim().split(/\s+/).filter(Boolean);
-    return conditions.every((condition) => {
-      const required = parseVersion(condition);
-      if (!required) return true;
-      const comparison = compareVersion(current, required);
-      if (condition.startsWith(">=")) return comparison >= 0;
-      if (condition.startsWith(">")) return comparison > 0;
-      if (condition.startsWith("<=")) return comparison <= 0;
-      if (condition.startsWith("<")) return comparison < 0;
-      if (condition.startsWith("^")) return current[0] === required[0] && comparison >= 0;
-      if (condition.startsWith("~")) {
-        return current[0] === required[0] && current[1] === required[1] && comparison >= 0;
-      }
-      return current[0] === required[0] && comparison >= 0;
-    });
-  });
-}
-
 function analyzeOutputSignals(output: string): OutputSignals {
   const lines = outputLines(output);
   const text = lines.join("\n");
-  const platformCheckLine = lines.find((line) => line.startsWith("OPSARK_PLATFORM_CHECK "));
-  let platformCheck: Record<string, unknown> | undefined;
-  if (platformCheckLine) {
-    try {
-      platformCheck = JSON.parse(platformCheckLine.slice("OPSARK_PLATFORM_CHECK ".length));
-    } catch {
-      platformCheck = undefined;
-    }
-  }
-  const runtimeCheckLine = lines.find((line) => line.startsWith("OPSARK_RUNTIME_CHECK "));
-  let runtimeCheck: {
-    currentNode?: string;
-    requiredNode?: string;
-    packageManager?: string;
-    lockFiles?: string[];
-  } | undefined;
-  if (runtimeCheckLine) {
-    try {
-      runtimeCheck = JSON.parse(runtimeCheckLine.slice("OPSARK_RUNTIME_CHECK ".length));
-    } catch {
-      runtimeCheck = undefined;
-    }
-  }
-  const structuredRuntimeIncompatible = Boolean(
-    runtimeCheck?.currentNode
-    && runtimeCheck.requiredNode
-    && !satisfiesNodeRequirement(runtimeCheck.currentNode, runtimeCheck.requiredNode),
-  );
-  const engineLines = lines.filter((line) =>
-    /TOO_OLD|EBADENGINE|unsupported engine|requires Node\.js version/i.test(line),
-  );
   const warningLines = lines.filter((line) =>
-    /\bWARN(?:ING)?\b|deprecated|vulnerabilit(?:y|ies)/i.test(line),
+    /\bWARN(?:ING)?\b|\bdeprecated\b|\bdeprecation\b/i.test(line),
   );
-  const benignWarningLines = warningLines.filter((line) =>
-    /npm WARN config\b.*\bUse\s+`?--[^`\s]+`?\s+instead/i.test(line),
-  );
-  const actionableWarningLines = warningLines.filter((line) => !benignWarningLines.includes(line));
-  const vulnerabilityMatch = text.match(/(\d+)\s+vulnerabilit(?:y|ies)/i);
-  const nodeRequirement = text.match(
-    /using Node\.js\s+([0-9][0-9A-Za-z.+-]*).*?requires Node\.js version\s+([^\n]+?)(?:\.\s+Please|$)/i,
-  );
-  const explicitTooOld = /TOO_OLD/i.test(text);
   const missingAbiSymbols = [...new Set(
     [...text.matchAll(/(?:version\s+[`']?)((?:GLIBCXX|GLIBC|CXXABI)_[0-9.]+)(?:['`]?\s+not found)/gi)]
       .map((match) => match[1]),
@@ -142,19 +66,8 @@ function analyzeOutputSignals(output: string): OutputSignals {
       .test(line),
   );
   const networkFailure = networkFailureLines.length > 0;
-  const engineIncompatible = engineLines.length > 0 || structuredRuntimeIncompatible;
   const warnings: string[] = [];
-  if (engineIncompatible) {
-    warnings.push(
-      nodeRequirement
-        ? `当前 Node.js ${nodeRequirement[1]} 不满足构建工具要求 ${nodeRequirement[2].replace(/\.$/, "")}。`
-        : runtimeCheck?.currentNode && runtimeCheck.requiredNode
-          ? `当前 Node.js ${runtimeCheck.currentNode} 不满足项目或构建工具要求 ${runtimeCheck.requiredNode}。`
-        : "当前运行时版本与项目依赖声明不兼容。",
-    );
-  }
-  if (vulnerabilityMatch) warnings.push(`依赖审计报告 ${vulnerabilityMatch[1]} 个安全漏洞，需要单独评估。`);
-  else if (actionableWarningLines.length && !engineIncompatible) {
+  if (warningLines.length) {
     warnings.push("命令成功完成，但输出中包含需要关注的警告信息。");
   }
   if (platformIncompatible) {
@@ -166,18 +79,12 @@ function analyzeOutputSignals(output: string): OutputSignals {
   }
   if (networkFailure) warnings.push("下载或网络连接失败，目标文件或安装脚本未可靠获取。");
   return {
-    status: engineIncompatible || explicitTooOld || platformIncompatible || networkFailure
+    status: platformIncompatible || networkFailure
       ? "unhealthy"
-      : actionableWarningLines.length
+      : warningLines.length
         ? "warning"
         : undefined,
     facts: {
-      engineIncompatible,
-      explicitTooOld,
-      currentNodeVersion: nodeRequirement?.[1] ?? runtimeCheck?.currentNode,
-      requiredNodeVersion: nodeRequirement?.[2]?.replace(/\.$/, "") ?? runtimeCheck?.requiredNode,
-      runtimeCheck,
-      platformCheck,
       category: platformIncompatible
         ? "platform_incompatible"
         : networkFailure
@@ -188,14 +95,10 @@ function analyzeOutputSignals(output: string): OutputSignals {
       networkFailure,
       networkFailureSamples: networkFailureLines.slice(0, 5),
       warningCount: warningLines.length,
-      actionableWarningCount: actionableWarningLines.length,
-      benignWarningCount: benignWarningLines.length,
-      vulnerabilityCount: vulnerabilityMatch ? Number(vulnerabilityMatch[1]) : undefined,
-      warningSamples: [...new Set([...engineLines, ...actionableWarningLines])].slice(0, 8),
-      benignWarningSamples: [...new Set(benignWarningLines)].slice(0, 5),
+      warningSamples: [...new Set(warningLines)].slice(0, 8),
     },
     warnings,
-    blocking: engineIncompatible || explicitTooOld || platformIncompatible || networkFailure,
+    blocking: platformIncompatible || networkFailure,
   };
 }
 
@@ -217,33 +120,6 @@ export function analyzeCommandFailure(output: string) {
       },
     };
   }
-  const nodeRequirement = text.match(
-    /using Node\.js\s+([0-9][0-9A-Za-z.+-]*).*?requires Node\.js version\s+([^\n]+?)(?:\.\s+Please|$)/i,
-  );
-  if (nodeRequirement) {
-    const required = nodeRequirement[2].replace(/\.$/, "");
-    return {
-      reason: `当前 Node.js ${nodeRequirement[1]} 不满足构建要求 ${required}`,
-      facts: {
-        category: "runtime_incompatible",
-        runtime: "node",
-        currentVersion: nodeRequirement[1],
-        requiredVersion: required,
-      },
-    };
-  }
-  const engine = text.match(/EBADENGINE[\s\S]*?required:\s*\{\s*node:\s*'([^']+)'[\s\S]*?current:\s*\{\s*node:\s*'([^']+)'/i);
-  if (engine) {
-    return {
-      reason: `当前 Node.js ${engine[2]} 不满足依赖要求 ${engine[1]}`,
-      facts: {
-        category: "runtime_incompatible",
-        runtime: "node",
-        currentVersion: engine[2],
-        requiredVersion: engine[1],
-      },
-    };
-  }
   if (/ENOSPC|no space left on device/i.test(text)) {
     return { reason: "服务器磁盘空间不足", facts: { category: "disk_full" } };
   }
@@ -253,18 +129,18 @@ export function analyzeCommandFailure(output: string) {
   if (/command not found|not recognized as an internal/i.test(text)) {
     return { reason: "命令或必要工具未安装", facts: { category: "command_not_found" } };
   }
-  const registry404 = text.match(/(?:404|E404)[^\n]*(https?:\/\/\S+)/i);
-  if (registry404) {
+  const unavailableResource = text.match(/(?:404|not found)[^\n]*(https?:\/\/\S+)/i);
+  if (unavailableResource) {
     return {
-      reason: "依赖下载地址返回 404，需要核对锁文件、包版本或镜像源",
-      facts: { category: "registry_not_found", url: registry404[1] },
+      reason: "请求的远程资源不存在或地址无效",
+      facts: { category: "resource_not_found", url: unavailableResource[1] },
     };
   }
   return { reason: "命令执行未成功", facts: { category: "command_failed" } };
 }
 
 export function isMutatingStepCommand(command: string) {
-  return /(?:^|[;&|]\s*|\bsudo\s+)(?:apt(?:-get)?|yum|dnf|rpm|dpkg|npm|pnpm|yarn|pip)\s+(?:install|remove|upgrade|update)|\b(?:nvm|fnm|volta|asdf)\s+(?:install|use|global|alias|default)\b|\bcurl\b[\s\S]*\|\s*(?:ba)?sh\b|\bmvn\b.*\b(?:install|deploy)\b|\bsystemctl\s+(?:start|stop|restart|reload|enable|disable)|\bservice\s+\S+\s+(?:start|stop|restart|reload)|\b(?:reboot|shutdown|kill|pkill|killall)\b|\b(?:rm|mv|cp|chmod|chown|ln)\s|\bsed\s+-i\b|\b(?:tee|truncate)\s|\bdocker\s+(?:run|start|stop|restart|rm|compose\s+up)|\b(?:CREATE|ALTER|DROP|TRUNCATE|INSERT|UPDATE|DELETE|GRANT|REVOKE)\b/i
+  return /(?:^|[;&|]\s*|\bsudo\s+)(?:apt(?:-get)?|yum|dnf|rpm|dpkg|npm|pnpm|yarn|pip)\s+(?:install|ci|add|remove|upgrade|update|run|build)|\b(?:nvm|fnm|volta|asdf)\s+(?:install|use|global|alias|default)\b|\bcurl\b[\s\S]*\|\s*(?:ba)?sh\b|\bmvn\b.*\b(?:install|deploy)\b|\bsystemctl\s+(?:start|stop|restart|reload|enable|disable)|\bservice\s+\S+\s+(?:start|stop|restart|reload)|\b(?:reboot|shutdown|kill|pkill|killall)\b|\b(?:rm|mv|cp|chmod|chown|ln)\s|\bsed\s+-i\b|\b(?:tee|truncate)\s|\bdocker\s+(?:run|start|stop|restart|rm|compose\s+up)|\b(?:CREATE|ALTER|DROP|TRUNCATE|INSERT|UPDATE|DELETE|GRANT|REVOKE)\b/i
     .test(command);
 }
 
@@ -276,11 +152,10 @@ export function inferValidatorType(step: Pick<PlanStep, "title" | "description" 
   const semantic = `${step.title}\n${step.description}`.toLowerCase();
   const validation = step.validation.toLowerCase();
   const text = `${semantic}\n${step.command}\n${validation}`.toLowerCase();
-  if (/opsark_platform_check|平台兼容|系统兼容|操作系统.*架构|glibc|glibcxx|cxxabi/.test(text)) return "platform";
+  if (/平台兼容|系统兼容|操作系统.*架构|abi 兼容/.test(text)) return "platform";
   if (
-    /运行时|runtime|node(?:\.js)?(?:\s*版本)?|java(?:\s*版本)?|python(?:\s*版本)?|golang|rustc/.test(semantic)
-    || /\b(?:node\s+--?v(?:ersion)?|java\s+-version|python\d*\s+--version|go\s+version|rustc\s+--version)\b/.test(validation)
-    || /opsark_runtime_check/.test(text)
+    /运行时|runtime|版本兼容|可执行文件版本/.test(semantic)
+    || /(?:^|[;&|]\s*)\S+\s+(?:--version|-version|-V)(?:\s|$)/.test(validation)
   ) return "runtime";
   if (/\bmysql\b|\bpsql\b|\bsqlite3\b|show\s+(databases|tables)|information_schema/.test(text)) return "sql-query";
   if (
