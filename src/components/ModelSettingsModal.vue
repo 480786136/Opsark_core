@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref } from "vue";
-import { KeyRound, RefreshCw, Save, Shield, SlidersHorizontal, X } from "lucide-vue-next";
+import { KeyRound, Plus, RefreshCw, Save, Shield, SlidersHorizontal, Trash2, X } from "lucide-vue-next";
 import { useOpsStore } from "@/stores/ops";
 
 defineProps<{ open: boolean }>();
@@ -25,6 +25,17 @@ async function recheck() {
   saveState.value = "idle";
   emit("saved");
 }
+
+async function removeModel(modelId: string) {
+  saveState.value = "saving";
+  try {
+    await store.removeModel(modelId);
+    saveState.value = "idle";
+    emit("saved");
+  } catch {
+    saveState.value = "error";
+  }
+}
 </script>
 
 <template>
@@ -44,6 +55,7 @@ async function recheck() {
         <div class="model-fields">
           <input v-model="model.name" aria-label="配置名称" />
           <div>
+            <input v-model="model.provider" aria-label="供应商" />
             <input v-model="model.model" aria-label="模型名" />
             <input v-model="model.endpoint" aria-label="接口地址" />
           </div>
@@ -58,10 +70,12 @@ async function recheck() {
             @input="model.hasApiKey = Boolean(store.modelApiKeys[model.id])"
           />
         </label>
+        <button class="icon-button danger" type="button" title="删除模型" @click="removeModel(model.id)"><Trash2 :size="14" /></button>
         <span :class="['model-check-state', store.modelAvailability[model.id]?.status ?? 'unknown']">
           {{ store.modelAvailability[model.id]?.reason ?? "尚未检查" }}
         </span>
       </div>
+      <button class="button secondary add-model-button" type="button" @click="store.addModel()"><Plus :size="14" />增加模型</button>
 
       <div class="modal-section-title limit-section-title">
         <SlidersHorizontal :size="16" />

@@ -530,6 +530,42 @@ describe("智能任务状态机", () => {
     expect(localStorage.getItem("opsark.models")).toContain("model-deepseek");
   });
 
+  it("大模型配置支持增加、修改、禁用和删除", async () => {
+    const store = useOpsStore();
+    const added = store.addModel();
+    added.name = "自定义模型";
+    added.provider = "Custom Provider";
+    added.model = "custom-model-v1";
+    added.endpoint = "https://model.example.invalid/v1";
+    store.modelApiKeys[added.id] = "custom-api-key";
+    store.modelAvailability[added.id] = { status: "available", reason: "可用" };
+
+    expect(store.availableModels.some((model) => model.id === added.id)).toBe(true);
+    added.enabled = false;
+    expect(store.availableModels.some((model) => model.id === added.id)).toBe(false);
+
+    await store.saveModels();
+    expect(backend.saveCredential).toHaveBeenCalledWith("model", added.id, "custom-api-key");
+    expect(localStorage.getItem("opsark.models")).toContain("custom-model-v1");
+
+    await store.removeModel(added.id);
+    expect(store.models.some((model) => model.id === added.id)).toBe(false);
+    expect(store.modelApiKeys[added.id]).toBeUndefined();
+    expect(store.modelAvailability[added.id]).toBeUndefined();
+    expect(backend.deleteCredential).toHaveBeenCalledWith("model", added.id);
+  });
+
+  it("清空模型 API Key 后保存会删除钥匙串旧值", async () => {
+    const store = useOpsStore();
+    store.models[0].hasApiKey = true;
+    store.modelApiKeys[store.models[0].id] = "";
+
+    await store.saveModels();
+
+    expect(backend.deleteCredential).toHaveBeenCalledWith("model", store.models[0].id);
+    expect(store.models[0].hasApiKey).toBe(false);
+  });
+
   it("敏感信息支持保存、重命名和直接删除", async () => {
     const store = useOpsStore();
     store.secretValues.DB_PASSWORD = "current-real-value";

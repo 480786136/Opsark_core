@@ -2343,6 +2343,33 @@ export const useOpsStore = defineStore("ops", {
       this.persist(true);
     },
 
+    addModel() {
+      const model: ModelProfile = {
+        id: uid("model"),
+        name: "新模型",
+        provider: "OpenAI Compatible",
+        model: "",
+        endpoint: "",
+        enabled: true,
+        hasApiKey: false,
+      };
+      this.models.push(model);
+      this.modelAvailability[model.id] = { status: "unknown", reason: "请完成配置后保存" };
+      this.persist(true);
+      return this.models[this.models.length - 1];
+    },
+
+    async removeModel(modelId: string) {
+      await backend.deleteCredential("model", modelId);
+      this.models = this.models.filter((model) => model.id !== modelId);
+      delete this.modelApiKeys[modelId];
+      delete this.modelAvailability[modelId];
+      this.tasks.forEach((task) => {
+        if (task.modelId === modelId) task.modelId = this.availableModels[0]?.id ?? "";
+      });
+      this.persist(true);
+    },
+
     async runTerminalCommand(command: string, serverId?: string) {
       if (!command.trim()) return;
       const activeServer = this.servers.find((item) => item.id === serverId);
@@ -2368,12 +2395,12 @@ export const useOpsStore = defineStore("ops", {
     async saveModels() {
       this.aiGenerationSettings = normalizeAiGenerationSettings(this.aiGenerationSettings);
       this.models = this.models.filter((model) => model.provider !== "Built-in" && model.id !== "model-local");
-      const credentials = this.models
-        .filter((model) => this.modelApiKeys[model.id])
-        .map(async (model) => {
-          await backend.saveCredential("model", model.id, this.modelApiKeys[model.id]);
-          model.hasApiKey = true;
-        });
+      const credentials = this.models.map(async (model) => {
+        const apiKey = this.modelApiKeys[model.id] ?? "";
+        if (apiKey) await backend.saveCredential("model", model.id, apiKey);
+        else await backend.deleteCredential("model", model.id);
+        model.hasApiKey = Boolean(apiKey);
+      });
       try {
         await Promise.all(credentials);
         this.credentialError = "";

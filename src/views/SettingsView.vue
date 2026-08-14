@@ -36,6 +36,14 @@ async function removeSecret(key: string) {
   }
 }
 
+async function removeModel(modelId: string) {
+  try {
+    await store.removeModel(modelId);
+  } catch {
+    saveState.value = "error";
+  }
+}
+
 async function saveSettings() {
   saveState.value = "saving";
   try {
@@ -65,7 +73,7 @@ async function saveSettings() {
           <label class="toggle"><input v-model="model.enabled" type="checkbox" /><i></i></label>
           <div class="model-fields">
             <input v-model="model.name" aria-label="配置名称" />
-            <div><input v-model="model.model" aria-label="模型名" /><input v-model="model.endpoint" aria-label="接口地址" /></div>
+            <div><input v-model="model.provider" aria-label="供应商" /><input v-model="model.model" aria-label="模型名" /><input v-model="model.endpoint" aria-label="接口地址" /></div>
           </div>
           <label v-if="model.provider !== 'Built-in'" class="runtime-key">
             <KeyRound :size="13" />
@@ -78,7 +86,9 @@ async function saveSettings() {
             />
           </label>
           <span v-else class="key-state configured"><KeyRound :size="13" />内置</span>
+          <button class="icon-button danger" type="button" title="删除模型" @click="removeModel(model.id)"><Trash2 :size="14" /></button>
         </div>
+        <button class="button secondary" type="button" @click="store.addModel()"><Plus :size="14" />增加模型</button>
       </section>
       <section class="settings-card">
         <div class="settings-title"><SlidersHorizontal :size="18" /><div><h2>计划输出限制</h2><p>默认不限制步骤数、输出预算和字段长度；仅在需要控制模型成本或响应体积时开启。</p></div></div>
