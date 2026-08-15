@@ -3,8 +3,11 @@ import type {
   ObservationStatus,
   PlanStep,
   StepResult,
+  StepValidator,
   ValidatorType,
 } from "@/types";
+
+export type NormalizedPlanStep = PlanStep & { validator: StepValidator };
 
 export interface CommandSnapshot {
   output: string;
@@ -178,7 +181,7 @@ function defaultValidStates(type: ValidatorType): ObservationStatus[] {
   return ["matched", "not_found", "unknown"];
 }
 
-export function ensureStepValidator(step: PlanStep): PlanStep {
+export function ensureStepValidator(step: PlanStep): NormalizedPlanStep {
   if (step.validator) {
     return {
       ...step,
@@ -323,7 +326,7 @@ function parseObservation(
   step: PlanStep,
   execution: CommandSnapshot,
 ): { facts: Record<string, unknown>; status: ObservationStatus } {
-  const validator = step.validator ?? ensureStepValidator(step).validator!;
+  const validator = step.validator ?? ensureStepValidator(step).validator;
   const output = mainOutput(execution.output);
   const lines = outputLines(output);
   const emptyResult = Boolean(execution.emptyResult || output.includes("未发现匹配项"));
@@ -360,7 +363,7 @@ export function classifyStepResult(
   validation: ValidationSnapshot,
 ): { result: StepResult; evidence: ExecutionEvidence[]; accepted: boolean; needsModelReview: boolean } {
   const step = ensureStepValidator(rawStep);
-  const validator = step.validator!;
+  const validator = step.validator;
   const mainParsed = parseObservation(step, execution);
   const mainSignals = analyzeOutputSignals(mainOutput(execution.output));
   const validationSignals = analyzeOutputSignals(validation.output ?? "");

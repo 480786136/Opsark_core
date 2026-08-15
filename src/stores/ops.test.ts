@@ -10,6 +10,7 @@ import {
   ensureStepValidator,
   isMutatingStepCommand,
 } from "@/services/validation";
+import { useTerminalSessionStore } from "@/features/terminal/terminalSessionStore";
 
 const plan: PlanStep[] = [
   {
@@ -102,6 +103,15 @@ describe("智能任务状态机", () => {
       available: true,
       reason: "接口、鉴权和模型名称均可用",
     });
+    vi.spyOn(backend, "getRemoteFileStructure").mockResolvedValue({
+      rootPath: "/opt/app",
+      nodes: [{ name: "package.json", relativePath: "package.json", kind: "file", size: 128 }],
+      excludedDirectories: ["node_modules"],
+      totalNodes: 1,
+      maxDepthReached: false,
+      truncated: false,
+      warnings: [],
+    });
     useOpsStore().modelApiKeys["model-deepseek"] = "test-model-api-key";
   });
 
@@ -124,14 +134,70 @@ describe("智能任务状态机", () => {
     expect(store.logs.some((event) => event.category === "command")).toBe(true);
   });
 
+  it("将当前启用工具的模型可见说明写入需求上下文", async () => {
+    const store = useOpsStore();
+    const fileTool = store.tools.find((tool) => tool.id === "files.get_structure")!;
+    fileTool.description = "读取项目目录结构用于部署分析";
+
+    await store.submitRequirement("srv-production-01", "查看项目结构", "safe", "model-deepseek");
+
+    const runtimeModel = vi.mocked(backend.processRequirement).mock.calls[0][1];
+    const context = JSON.parse(runtimeModel.context);
+    expect(context.tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "files.get_structure",
+        description: "读取项目目录结构用于部署分析",
+      }),
+    ]));
+    expect(context.tools[0]).not.toHaveProperty("implementation");
+  });
+
   it("自动执行模式会自动批准计划并连续执行低中风险步骤", async () => {
     const store = useOpsStore();
+    const terminalSessions = useTerminalSessionStore();
+    terminalSessions.ensureWorkspace("srv-production-01");
+    const firstTerminalId = terminalSessions.sessionsByServer["srv-production-01"][0].id;
+    const initiatingTerminal = terminalSessions.addSession("srv-production-01")!;
 
     await store.submitRequirement("srv-production-01", "自动检查并重新加载 Nginx", "autonomous", "model-deepseek");
 
     expect(store.activeTask?.status).toBe("completed");
     expect(store.activeTask?.plan.every((step) => step.status === "completed")).toBe(true);
     expect(store.activeTask?.messages.some((message) => message.content.includes("自动执行模式已批准计划"))).toBe(true);
+    const agentPaneId = terminalSessions.resolveTaskPaneId("srv-production-01", store.activeTask!.id)!;
+    expect(agentPaneId).toBe(initiatingTerminal.activePaneId);
+    expect(terminalSessions.sessionsByServer["srv-production-01"]
+      .find(({ id }) => id === firstTerminalId)?.panes[0].agentTaskId).toBeUndefined();
+    const agentOutput = terminalSessions.agentOutputByPane[agentPaneId].map(({ data }) => data).join("");
+    expect(agentOutput).toContain("正在理解需求并汇总服务器上下文");
+    expect(agentOutput).toContain("[Agent]");
+    expect(agentOutput).toContain("执行步骤已完成");
+  });
+
+  it("继续提交既有任务时保持最初发起终端绑定", async () => {
+    const store = useOpsStore();
+    const terminalSessions = useTerminalSessionStore();
+    terminalSessions.ensureWorkspace("srv-production-01");
+    const initiatingSession = terminalSessions.sessionsByServer["srv-production-01"][0];
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    const taskId = task.id;
+    const initiatingPaneId = initiatingSession.panes[0].id;
+    terminalSessions.bindAgentTask("srv-production-01", taskId);
+    expect(terminalSessions.resolveTaskPaneId("srv-production-01", taskId)).toBe(initiatingPaneId);
+
+    const otherSession = terminalSessions.addSession("srv-production-01")!;
+    expect(terminalSessions.activeSessionByServer["srv-production-01"]).toBe(otherSession.id);
+    await store.submitRequirement(
+      "srv-production-01",
+      "继续检查日志",
+      "safe",
+      "model-deepseek",
+      "",
+      taskId,
+    );
+
+    expect(terminalSessions.resolveTaskPaneId("srv-production-01", taskId)).toBe(initiatingPaneId);
+    expect(otherSession.panes[0].agentTaskId).toBeUndefined();
   });
 
   it("完全托管模式自动批准计划和低中风险步骤，但高风险必须审批", async () => {
@@ -168,8 +234,15 @@ describe("智能任务状态机", () => {
 
   it("远程输出到达时同步更新步骤详情和终端", async () => {
     const store = useOpsStore();
+    const terminalSessions = useTerminalSessionStore();
+    terminalSessions.ensureWorkspace("srv-production-01");
+    const firstSession = terminalSessions.sessionsByServer["srv-production-01"][0];
+    const secondSession = terminalSessions.addSession("srv-production-01")!;
+    terminalSessions.activateSession("srv-production-01", firstSession.id);
     vi.mocked(backend.executeCommand).mockImplementation(async (_command, _connection, _approved, options) => {
       options?.onProgress?.({ executionId: options.executionId, data: "download 42%\n", stream: "stdout" });
+      terminalSessions.activateSession("srv-production-01", secondSession.id);
+      options?.onProgress?.({ executionId: options.executionId, data: "download complete\n", stream: "stdout" });
       return { output: "$ download\ndownload 42%\n[exit: 0]", success: true, simulated: false, exitCode: 0 };
     });
     const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
@@ -180,6 +253,72 @@ describe("智能任务状态机", () => {
 
     expect(store.terminalLines).toContain("download 42%");
     expect(task.plan[0].output).toContain("download 42%");
+    const agentPaneId = terminalSessions.resolveTaskPaneId("srv-production-01", task.id)!;
+    expect(terminalSessions.agentOutputByPane[agentPaneId].map(({ data }) => data).join(""))
+      .toContain("download complete");
+    expect(agentPaneId).toBe(firstSession.activePaneId);
+    expect(terminalSessions.agentOutputByPane[secondSession.activePaneId]).toBeUndefined();
+  });
+
+  it("模型工具命令由工具执行器处理，不发送到远端 shell", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    store.serverPasswords[task.serverId] = "test-password";
+    task.status = "running";
+    task.plan = [{
+      ...structuredClone(plan[0]),
+      id: "tool-step",
+      title: "获取项目文件结构",
+      command: 'opsark-tool files.get_structure {"rootPath":"/opt/app","excludeDirectories":["uploads"]}',
+      validation: "true",
+    }];
+
+    await store.runStep(task.id, "tool-step");
+
+    expect(backend.getRemoteFileStructure).toHaveBeenCalledWith(
+      expect.objectContaining({ host: "example.invalid", username: "tester" }),
+      expect.objectContaining({ rootPath: "/opt/app", excludeDirectories: expect.arrayContaining(["uploads"]) }),
+    );
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(task.plan[0].status).toBe("completed");
+    expect(task.plan[0].evidence?.[0].facts.toolId).toBe("files.get_structure");
+    expect(task.status).toBe("completed");
+  });
+
+  it("文件结构工具结果会作为真实证据生成后续部署计划", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    store.serverPasswords[task.serverId] = "test-password";
+    store.pushMessage(task, { role: "user", kind: "message", content: "部署 /opt/app 项目" });
+    task.status = "running";
+    task.executionConstraints = {
+      changePolicy: "requested_changes_only",
+      environmentPolicy: "preserve",
+      failurePolicy: "strict",
+      prohibitedActions: [],
+      requiredConditions: [],
+      userDirectives: [],
+    };
+    task.plan = [{
+      ...structuredClone(plan[0]),
+      id: "discovery-tool-step",
+      title: "获取项目文件结构",
+      command: 'opsark-tool files.get_structure {"rootPath":"/opt/app"}',
+      validation: "true",
+    }];
+
+    await store.runStep(task.id, "discovery-tool-step");
+
+    expect(backend.generatePlan).toHaveBeenCalledTimes(1);
+    const runtimeModel = vi.mocked(backend.generatePlan).mock.calls[0][1]!;
+    const continuationContext = JSON.parse(runtimeModel.context);
+    expect(JSON.stringify(continuationContext.completedDiscovery)).toContain("package.json");
+    expect(continuationContext.tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "files.get_structure" }),
+    ]));
+    expect(task.discoveryRefined).toBe(true);
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(task.plan.length).toBeGreaterThan(1);
   });
 
   it("远程命令长时间未返回时定期获取状态并交给模型复核", async () => {
@@ -252,6 +391,7 @@ describe("智能任务状态机", () => {
       expect(backend.cancelCommand).toHaveBeenCalledTimes(1);
       expect(task.plan[0].status).toBe("completed");
       expect(task.status).toBe("completed");
+      expect(task.currentExecutionId).toBeUndefined();
     } finally {
       vi.useRealTimers();
     }
@@ -268,7 +408,27 @@ describe("智能任务状态机", () => {
 
     expect(task.status).toBe("cancelled");
     expect(task.plan[0].status).toBe("skipped");
+    expect(task.plan[0].result).toMatchObject({
+      executionStatus: "cancelled",
+      facts: { cancelled: true },
+      failureReason: "用户终止",
+    });
     expect(task.summary).toContain("用户终止");
+  });
+
+  it("远程执行抛出异常时会清理执行 ID 并写入失败结果", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    task.status = "running";
+    task.plan = [{ ...structuredClone(plan[0]), id: "execution-error" }];
+    vi.mocked(backend.executeCommand).mockRejectedValueOnce(new Error("connection closed"));
+
+    await store.runStep(task.id, "execution-error");
+
+    expect(task.currentExecutionId).toBeUndefined();
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.plan[0].status).toBe("failed");
+    expect(task.plan[0].result?.facts.category).toBe("execution_exception");
   });
 
   it("调整计划最多生成一次，避免反复扩张", async () => {
@@ -398,13 +558,13 @@ describe("智能任务状态机", () => {
     })).toBe(true);
   });
 
-  it("自动执行模式不会因编译部署类高风险标签暂停，但破坏性命令仍需确认", () => {
+  it("自动执行模式对所有高风险步骤要求确认", () => {
     const store = useOpsStore();
     expect(store.needsApproval("autonomous", {
       ...plan[0],
       risk: "high",
       command: "cd /opt/O2OA && mvn clean install -DskipTests",
-    })).toBe(false);
+    })).toBe(true);
     expect(store.needsApproval("autonomous", {
       ...plan[0],
       risk: "high",
@@ -432,6 +592,57 @@ describe("智能任务状态机", () => {
         onProgress: expect.any(Function),
       }),
     );
+  });
+
+  it("高风险步骤批准后可以等待敏感输入并恢复执行", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    task.status = "awaiting_plan_approval";
+    task.plan = [{
+      ...structuredClone(plan[0]),
+      id: "approved-secret-step",
+      risk: "high",
+      command: "deploy --token ${secret.DEPLOY_TOKEN}",
+    }];
+
+    await store.approvePlan(task.id);
+    await store.approveStep(task.id, "approved-secret-step");
+
+    expect(task.status).toBe("awaiting_input");
+    expect(task.plan[0].status).toBe("awaiting_input");
+    expect(store.pendingSecret?.key).toBe("DEPLOY_TOKEN");
+
+    await store.provideSecret("temporary-deploy-token");
+
+    expect(task.status).toBe("completed");
+    expect(task.plan[0].status).toBe("completed");
+    expect(backend.executeCommand).toHaveBeenCalledWith(
+      "deploy --token temporary-deploy-token",
+      undefined,
+      true,
+      expect.objectContaining({ executionId: expect.any(String) }),
+    );
+  });
+
+  it("工具命令解析失败时写入稳定失败结果", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    task.status = "running";
+    task.plan = [{
+      ...structuredClone(plan[0]),
+      id: "invalid-tool-step",
+      command: "opsark-tool files.get_structure []",
+    }];
+
+    await store.runStep(task.id, "invalid-tool-step");
+
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.plan[0].status).toBe("failed");
+    expect(task.plan[0].result).toMatchObject({
+      executionStatus: "failed",
+      facts: { category: "tool_command_parse" },
+    });
+    expect(task.pauseReason).toContain("工具命令解析失败");
   });
 
   it("敏感变量缺失时暂停输入，合并执行后对终端和日志脱敏", async () => {
@@ -1253,6 +1464,7 @@ describe("智能任务状态机", () => {
     expect(task.plan[0].result?.facts.evidenceConflict).toBe(true);
     expect(task.status).toBe("completed");
     expect(task.plan[0].output).toContain("首次未通过");
+    expect(task.currentExecutionId).toBeUndefined();
   });
 
   it("结构化校验器区分 SQL 不存在、HTTP 异常和进程无匹配", () => {

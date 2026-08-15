@@ -1,17 +1,47 @@
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+mod command_guard;
+mod credential;
+mod file_tree;
+mod json_contract;
+mod metrics;
+mod model;
+mod sftp;
+mod sftp_transfer;
+mod ssh;
+mod terminal;
+
+#[cfg(test)]
+mod live_tests;
+#[cfg(test)]
+mod tests;
+
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use ssh2::Session;
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
-use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc, Mutex, OnceLock,
+    Arc, Mutex,
 };
-use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager, State};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::{AppHandle, Emitter, State};
+
+use command_guard::{requires_high_risk_approval, risk_for};
+use credential::{delete_credential, load_credential, save_credential};
+use file_tree::{scan_sftp, FileStructureResult};
+use json_contract::{parse_model_array_field, parse_model_json};
+use metrics::{get_realtime_metrics, get_ssh_metrics};
+use model::{check_model_availability, message_content, post_model_request};
+use sftp::{
+    create_sftp_directory, delete_sftp_entry, list_sftp_directory, read_sftp_file,
+    rename_sftp_entry, write_sftp_file,
+};
+use sftp_transfer::{
+    cancel_sftp_transfer, download_sftp_transfer, upload_sftp_transfer, SftpTransferManager,
+};
+use ssh::{connect_ssh, execution_pid_file, shell_quote, ssh_exec, ssh_exec_streaming};
+use terminal::{
+    close_ssh_terminal, resize_ssh_terminal, start_ssh_terminal, write_ssh_terminal,
+    TerminalManager,
+};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,17 +53,6 @@ struct ServerInfo {
     memory_gb: u16,
     disk_gb: u16,
     uptime: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Metrics {
-    cpu: u8,
-    memory: u8,
-    disk: u8,
-    network_in: f32,
-    network_out: f32,
-    sampled_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,38 +93,9 @@ struct SshProbe {
     hostname: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RemoteFileEntry {
-    name: String,
-    path: String,
-    kind: String,
-    size: String,
-    modified: String,
-}
-
-#[derive(Default)]
-struct TerminalManager {
-    sessions: Mutex<HashMap<String, mpsc::Sender<TerminalInput>>>,
-}
-
 #[derive(Default)]
 struct ExecutionManager {
     executions: Mutex<HashMap<String, Arc<AtomicBool>>>,
-}
-
-enum TerminalInput {
-    Data(Vec<u8>),
-    Resize(u32, u32),
-    Close,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TerminalEvent {
-    terminal_id: String,
-    data: String,
-    stream: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -116,8 +106,6 @@ struct CommandOutputEvent {
     stream: String,
 }
 
-static METRIC_SAMPLES: OnceLock<Mutex<HashMap<String, (f64, f64, Instant)>>> = OnceLock::new();
-const KEYCHAIN_SERVICE: &str = "com.opsark.desktop";
 const STRICT_JSON_OUTPUT_RULE: &str = "输出格式是强制协议：必须只返回一个完整、可由标准 JSON 解析器直接解析的对象；禁止 Markdown 代码块、前后说明、注释、尾随逗号、NaN/Infinity 和未转义的反斜杠。必须严格使用系统消息指定的字段、类型和枚举值，不得增加或省略必填字段。返回前请自检 JSON 语法和结构。";
 const PLAN_STEP_OUTPUT_CONTRACT: &str = r#"输出必须是 {"steps":[...]} 对象，steps 必须至少有 1 个元素。
 每个元素必须严格包含且只包含：{"title":"非空字符串","description":"非空字符串","command":"非空字符串","expected":"非空字符串","validation":"非空字符串","risk":"low|medium|high"}。
@@ -148,7 +136,6 @@ const GENERAL_DISCOVERY_RULES: &str = "对于需要发现实际实现方式的�
 const GENERAL_REQUIREMENT_SYSTEM: &str = "你是通用运维需求分类器，本阶段不生成计划。判断用户是仅需要不依赖当前环境的知识性回答，还是需要读取或改变真实目标环境。需要当前状态、真实数据或任何环境变更时必须返回 execute。结构化约束只能来自用户明确表达，不得猜测或自行增加。";
 const GENERAL_SUMMARY_SYSTEM: &str = "你是通用运维结果总结器。仅根据用户目标和脱敏的真实执行证据总结。结构化 result 和 evidence.facts 优先于预期文本和旧总结。有效的“未发现”、“非健康”或“警告”是观察结果，不等于命令执行失败。若存在关键失败且无后续证据证明目标已达成，必须明确说明任务未完成、最终阻断、已确认结果和尚未满足的目标。若目标已达成，必须直接给出用户所需的具体结果。不得把某个中间信号自动归因给目标对象，除非证据已建立关联。不得虚构、输出命令或泄露敏感信息。使用一至三段中文纯文本。";
 const GENERAL_REVIEW_SYSTEM: &str = "你是通用运维执行复核员。根据原始用户目标、executionConstraints、完整计划、已完成记录、当前步骤真实证据和剩余步骤，判断工作流应 continue、adjust 或 complete。只返回包含 decision、reason、summary 的 JSON 对象。不得把真实失败改写为成功，不得虚构证据、新命令或新的用户授权。当前异常若不阻断整体目标，或剩余计划有明确且符合约束的恢复路径，返回 continue；若已阻断目标、证据不足或剩余计划无法处理，返回 adjust；只有用户整体目标已被真实证据充分证明时才返回 complete。对只读发现，得到“不存在”或异常状态是有效结果，应根据剩余计划判断。对变更步骤，后置条件未满足时不得 complete。当 trigger 为长时间运行定期复核时，continue 表示继续等待，adjust 表示停止并调整，complete 仅在 periodicObservation.passed=true 时表示停止等待并进入正式校验。安全拦截、用户审批、真实执行结果和程序门禁不可被覆盖。";
-const MODEL_RESPONSE_ATTEMPTS: usize = 3;
 const STRUCTURED_OUTPUT_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -280,68 +267,6 @@ struct ModelCheckResult {
     reason: String,
 }
 
-fn connect_ssh(host: &str, port: u16, username: &str, password: &str) -> Result<Session, String> {
-    let address = format!("{host}:{port}")
-        .to_socket_addrs()
-        .map_err(|error| format!("无法解析服务器地址：{error}"))?
-        .next()
-        .ok_or_else(|| "服务器地址没有可用解析结果".to_string())?;
-    let tcp = TcpStream::connect_timeout(&address, std::time::Duration::from_secs(10))
-        .map_err(|error| format!("SSH 网络连接失败：{error}"))?;
-    tcp.set_read_timeout(Some(std::time::Duration::from_secs(20)))
-        .ok();
-    tcp.set_write_timeout(Some(std::time::Duration::from_secs(20)))
-        .ok();
-    let mut session = Session::new().map_err(|error| format!("SSH 会话创建失败：{error}"))?;
-    session.set_tcp_stream(tcp);
-    session
-        .handshake()
-        .map_err(|error| format!("SSH 握手失败：{error}"))?;
-    session
-        .userauth_password(username, password)
-        .map_err(|_| "SSH 用户名或密码不正确".to_string())?;
-    if !session.authenticated() {
-        return Err("SSH 身份认证失败".into());
-    }
-    Ok(session)
-}
-
-fn ssh_exec(session: &Session, command: &str) -> Result<(String, i32), String> {
-    let mut channel = session
-        .channel_session()
-        .map_err(|error| format!("无法创建 SSH 命令通道：{error}"))?;
-    channel
-        .exec(command)
-        .map_err(|error| format!("无法执行远程命令：{error}"))?;
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    channel
-        .read_to_string(&mut stdout)
-        .map_err(|error| error.to_string())?;
-    channel
-        .stderr()
-        .read_to_string(&mut stderr)
-        .map_err(|error| error.to_string())?;
-    channel.wait_close().map_err(|error| error.to_string())?;
-    let status = channel.exit_status().unwrap_or(1);
-    if !stderr.trim().is_empty() {
-        stdout.push_str("\n");
-        stdout.push_str(stderr.trim());
-    }
-    Ok((stdout.trim().to_string(), status))
-}
-
-fn emit_terminal(app: &AppHandle, terminal_id: &str, data: impl Into<String>, stream: &str) {
-    let _ = app.emit(
-        "terminal-output",
-        TerminalEvent {
-            terminal_id: terminal_id.to_string(),
-            data: data.into(),
-            stream: stream.to_string(),
-        },
-    );
-}
-
 fn emit_command_output(app: &AppHandle, execution_id: &str, data: impl Into<String>, stream: &str) {
     let _ = app.emit(
         "command-output",
@@ -353,323 +278,11 @@ fn emit_command_output(app: &AppHandle, execution_id: &str, data: impl Into<Stri
     );
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-fn execution_pid_file(execution_id: &str) -> Result<String, String> {
-    if execution_id.is_empty()
-        || execution_id.len() > 160
-        || !execution_id
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-    {
-        return Err("执行标识不合法".into());
-    }
-    Ok(format!("/tmp/opsark-{execution_id}.pid"))
-}
-
-fn ssh_exec_streaming(
-    app: &AppHandle,
-    session: &Session,
-    execution_id: &str,
-    command: &str,
-    cancelled: &AtomicBool,
-) -> Result<(String, i32), String> {
-    let pid_file = execution_pid_file(execution_id)?;
-    let wrapped = format!(
-        "pid_file={}; setsid sh -lc {} & child=$!; printf '%s' \"$child\" > \"$pid_file\"; wait \"$child\"; code=$?; rm -f \"$pid_file\"; exit \"$code\"",
-        shell_quote(&pid_file),
-        shell_quote(command),
-    );
-    let mut channel = session
-        .channel_session()
-        .map_err(|error| format!("无法创建 SSH 命令通道：{error}"))?;
-    channel
-        .exec(&wrapped)
-        .map_err(|error| format!("无法执行远程命令：{error}"))?;
-    session.set_blocking(false);
-    let mut combined = String::new();
-    let mut stdout_buffer = [0_u8; 8192];
-    let mut stderr_buffer = [0_u8; 8192];
-    loop {
-        if cancelled.load(Ordering::Relaxed) {
-            let _ = channel.close();
-            return Ok((combined.trim().to_string(), 130));
-        }
-        let mut received = false;
-        match channel.read(&mut stdout_buffer) {
-            Ok(size) if size > 0 => {
-                received = true;
-                let chunk = String::from_utf8_lossy(&stdout_buffer[..size]).to_string();
-                combined.push_str(&chunk);
-                emit_command_output(app, execution_id, chunk, "stdout");
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(format!("读取远程标准输出失败：{error}")),
-        }
-        match channel.stderr().read(&mut stderr_buffer) {
-            Ok(size) if size > 0 => {
-                received = true;
-                let chunk = String::from_utf8_lossy(&stderr_buffer[..size]).to_string();
-                if !combined.is_empty() && !combined.ends_with('\n') {
-                    combined.push('\n');
-                }
-                combined.push_str(&chunk);
-                emit_command_output(app, execution_id, chunk, "stderr");
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(format!("读取远程错误输出失败：{error}")),
-        }
-        if channel.eof() {
-            break;
-        }
-        if !received {
-            thread::sleep(std::time::Duration::from_millis(35));
-        }
-    }
-    session.set_blocking(true);
-    channel.wait_close().map_err(|error| error.to_string())?;
-    Ok((
-        combined.trim().to_string(),
-        channel.exit_status().unwrap_or(1),
-    ))
-}
-
-fn clean_json_content(content: &str) -> &str {
-    let trimmed = content.trim();
-    let without_open = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .unwrap_or(trimmed);
-    without_open
-        .strip_suffix("```")
-        .unwrap_or(without_open)
-        .trim()
-}
-
-fn repair_invalid_json_escapes(content: &str) -> String {
-    let chars: Vec<char> = content.chars().collect();
-    let mut repaired = String::with_capacity(content.len());
-    let mut in_string = false;
-    let mut index = 0;
-    while index < chars.len() {
-        let current = chars[index];
-        if !in_string {
-            repaired.push(current);
-            if current == '"' {
-                in_string = true;
-            }
-            index += 1;
-            continue;
-        }
-        if current == '"' {
-            repaired.push(current);
-            in_string = false;
-            index += 1;
-            continue;
-        }
-        if current == '\\' {
-            let next = chars.get(index + 1).copied();
-            if next.is_some_and(|value| {
-                matches!(value, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u')
-            }) {
-                repaired.push(current);
-            } else {
-                repaired.push('\\');
-                repaired.push('\\');
-            }
-            index += 1;
-            continue;
-        }
-        repaired.push(current);
-        index += 1;
-    }
-    repaired
-}
-
-fn parse_model_json<T: DeserializeOwned>(content: &str) -> Result<T, String> {
-    let cleaned = clean_json_content(content);
-    let repaired = repair_invalid_json_escapes(cleaned);
-    serde_json::from_str(cleaned)
-        .or_else(|_| serde_json::from_str(&repaired))
-        .map_err(|strict_error| strict_error.to_string())
-        .or_else(|strict_error| {
-            json5::from_str(cleaned)
-                .or_else(|_| json5::from_str(&repaired))
-                .map_err(|lenient_error| {
-                    format!("标准 JSON 解析失败：{strict_error}；宽松解析也失败：{lenient_error}")
-                })
-        })
-}
-
-fn parse_ai_plan_steps(content: &str) -> Result<Vec<AiPlanStep>, String> {
-    if let Ok(steps) = parse_model_json::<Vec<AiPlanStep>>(content) {
-        return Ok(steps);
-    }
-    let object: Value = parse_model_json(content)?;
-    serde_json::from_value(object.get("steps").cloned().unwrap_or(Value::Null))
-        .map_err(|error| error.to_string())
-}
-
-async fn post_model_request(
-    url: &str,
-    api_key: &str,
-    body: &Value,
-    request_name: &str,
-    timeout_seconds: u64,
-) -> Result<Value, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_seconds))
-        .build()
-        .map_err(|error| format!("{request_name}客户端初始化失败：{error}"))?;
-    let mut last_retryable_error = String::new();
-
-    for attempt in 1..=MODEL_RESPONSE_ATTEMPTS {
-        let response = match client
-            .post(url)
-            .bearer_auth(api_key)
-            .json(body)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                last_retryable_error = format!("{request_name}请求失败：{error}");
-                if attempt < MODEL_RESPONSE_ATTEMPTS {
-                    continue;
-                }
-                break;
-            }
-        };
-        let status = response.status();
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("未提供")
-            .to_string();
-        let response_bytes = match response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                last_retryable_error = format!("{request_name}接口响应读取不完整：{error}");
-                if attempt < MODEL_RESPONSE_ATTEMPTS {
-                    continue;
-                }
-                break;
-            }
-        };
-        let payload: Value = match serde_json::from_slice(&response_bytes) {
-            Ok(payload) => payload,
-            Err(error) => {
-                last_retryable_error = format!(
-                    "{request_name}接口返回了无法解析的 HTTP 响应（状态 {status}，Content-Type {content_type}，{} 字节）：{error}",
-                    response_bytes.len()
-                );
-                if attempt < MODEL_RESPONSE_ATTEMPTS {
-                    continue;
-                }
-                break;
-            }
-        };
-
-        if status.is_success() {
-            return Ok(payload);
-        }
-        let message = payload
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .unwrap_or("未知接口错误");
-        let error = format!("{request_name}接口返回 {status}：{message}");
-        if (status.as_u16() == 429 || status.is_server_error()) && attempt < MODEL_RESPONSE_ATTEMPTS
-        {
-            last_retryable_error = error;
-            continue;
-        }
-        return Err(error);
-    }
-
-    Err(format!(
-        "{last_retryable_error}（已自动重试 {} 次）",
-        MODEL_RESPONSE_ATTEMPTS - 1
-    ))
-}
-
 fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn credential_account(kind: &str, id: &str) -> Result<String, String> {
-    if !matches!(kind, "server" | "model" | "secret") {
-        return Err("不支持的凭据类型".into());
-    }
-    if id.trim().is_empty() || id.len() > 160 {
-        return Err("凭据标识无效".into());
-    }
-    Ok(format!("{kind}:{}", id.trim()))
-}
-
-fn credential_entry(kind: &str, id: &str) -> Result<keyring::Entry, String> {
-    let account = credential_account(kind, id)?;
-    keyring::Entry::new(KEYCHAIN_SERVICE, &account)
-        .map_err(|error| format!("无法访问系统钥匙串：{error}"))
-}
-
-#[tauri::command(async)]
-fn save_credential(kind: String, id: String, value: String) -> Result<(), String> {
-    if value.is_empty() {
-        return delete_credential(kind, id);
-    }
-    credential_entry(&kind, &id)?
-        .set_password(&value)
-        .map_err(|error| format!("保存系统凭据失败：{error}"))
-}
-
-#[tauri::command(async)]
-fn load_credential(kind: String, id: String) -> Result<Option<String>, String> {
-    match credential_entry(&kind, &id)?.get_password() {
-        Ok(value) => Ok(Some(value)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(format!("读取系统凭据失败：{error}")),
-    }
-}
-
-#[tauri::command(async)]
-fn delete_credential(kind: String, id: String) -> Result<(), String> {
-    match credential_entry(&kind, &id)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(format!("删除系统凭据失败：{error}")),
-    }
-}
-
-fn risk_for(command: &str) -> &'static str {
-    let lower = command.to_lowercase();
-    if ["rm -rf", "mkfs", "fdisk", "userdel", "drop table"]
-        .iter()
-        .any(|needle| lower.contains(needle))
-    {
-        "high"
-    } else if [
-        "install",
-        "restart",
-        "reload",
-        "chmod",
-        "chown",
-        "apt ",
-        "docker run",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-    {
-        "medium"
-    } else {
-        "low"
-    }
 }
 
 fn convert_ai_plan_steps(raw_steps: Vec<AiPlanStep>) -> Result<Vec<PlanStep>, String> {
@@ -859,19 +472,6 @@ fn collect_server_info() -> ServerInfo {
     }
 }
 
-#[tauri::command]
-fn get_realtime_metrics() -> Metrics {
-    let tick = unix_seconds();
-    Metrics {
-        cpu: 22 + (tick % 26) as u8,
-        memory: 49 + (tick % 11) as u8,
-        disk: 68,
-        network_in: 2.4 + (tick % 70) as f32 / 10.0,
-        network_out: 0.8 + (tick % 28) as f32 / 10.0,
-        sampled_at: format!("{}", tick),
-    }
-}
-
 #[tauri::command(async)]
 fn probe_ssh_server(
     host: String,
@@ -939,8 +539,14 @@ async fn execute_ssh_command(
     let id = execution_id.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let session = connect_ssh(&host, port, &username, &password)?;
-        ssh_exec_streaming(&app_handle, &session, &id, &command, cancel_flag.as_ref())
-            .map(|(output, status)| (command, output, status))
+        ssh_exec_streaming(
+            &session,
+            &id,
+            &command,
+            cancel_flag.as_ref(),
+            |chunk, stream| emit_command_output(&app_handle, &id, chunk, stream),
+        )
+        .map(|(output, status)| (command, output, status))
     })
     .await
     .map_err(|error| format!("远程执行线程异常：{error}"))?;
@@ -998,396 +604,30 @@ async fn cancel_ssh_execution(
     .map_err(|error| format!("终止执行线程异常：{error}"))?
 }
 
-#[tauri::command]
-fn start_ssh_terminal(
-    app: AppHandle,
-    manager: State<'_, TerminalManager>,
-    terminal_id: String,
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-) -> Result<(), String> {
-    let (sender, receiver) = mpsc::channel();
-    {
-        let mut sessions = manager.sessions.lock().map_err(|_| "终端状态锁异常")?;
-        if sessions.contains_key(&terminal_id) {
-            return Ok(());
-        }
-        sessions.insert(terminal_id.clone(), sender);
-    }
-
-    let app_handle = app.clone();
-    let id = terminal_id.clone();
-    thread::spawn(move || {
-        let result = (|| -> Result<(), String> {
-            let session = connect_ssh(&host, port, &username, &password)?;
-            let mut channel = session
-                .channel_session()
-                .map_err(|error| format!("无法创建终端通道：{error}"))?;
-            channel
-                .request_pty("xterm-256color", None, Some((120, 32, 0, 0)))
-                .map_err(|error| format!("无法申请远程 PTY：{error}"))?;
-            channel
-                .shell()
-                .map_err(|error| format!("无法启动远程 Shell：{error}"))?;
-            session.set_blocking(false);
-            emit_terminal(
-                &app_handle,
-                &id,
-                format!("\r\n[Opsark] 已建立真实 SSH PTY：{username}@{host}\r\n"),
-                "system",
-            );
-
-            let mut buffer = [0_u8; 8192];
-            loop {
-                loop {
-                    match receiver.try_recv() {
-                        Ok(TerminalInput::Data(data)) => {
-                            if let Err(error) = channel.write_all(&data) {
-                                if error.kind() != std::io::ErrorKind::WouldBlock {
-                                    return Err(format!("终端输入发送失败：{error}"));
-                                }
-                            }
-                            let _ = channel.flush();
-                        }
-                        Ok(TerminalInput::Resize(cols, rows)) => {
-                            let _ = channel.request_pty_size(cols, rows, None, None);
-                        }
-                        Ok(TerminalInput::Close) | Err(mpsc::TryRecvError::Disconnected) => {
-                            let _ = channel.close();
-                            return Ok(());
-                        }
-                        Err(mpsc::TryRecvError::Empty) => break,
-                    }
-                }
-
-                match channel.read(&mut buffer) {
-                    Ok(size) if size > 0 => {
-                        emit_terminal(
-                            &app_handle,
-                            &id,
-                            String::from_utf8_lossy(&buffer[..size]).to_string(),
-                            "stdout",
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(error) => return Err(format!("终端输出读取失败：{error}")),
-                }
-
-                match channel.stderr().read(&mut buffer) {
-                    Ok(size) if size > 0 => {
-                        emit_terminal(
-                            &app_handle,
-                            &id,
-                            String::from_utf8_lossy(&buffer[..size]).to_string(),
-                            "stderr",
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(error) => return Err(format!("终端错误输出读取失败：{error}")),
-                }
-
-                if channel.eof() {
-                    return Ok(());
-                }
-                thread::sleep(std::time::Duration::from_millis(18));
-            }
-        })();
-
-        if let Err(error) = result {
-            emit_terminal(
-                &app_handle,
-                &id,
-                format!("\r\n[Opsark] {error}\r\n"),
-                "error",
-            );
-        } else {
-            emit_terminal(
-                &app_handle,
-                &id,
-                "\r\n[Opsark] SSH PTY 已关闭\r\n",
-                "system",
-            );
-        }
-        if let Ok(mut sessions) = app_handle.state::<TerminalManager>().sessions.lock() {
-            sessions.remove(&id);
-        }
-    });
-    Ok(())
-}
-
-#[tauri::command]
-fn write_ssh_terminal(
-    manager: State<'_, TerminalManager>,
-    terminal_id: String,
-    data: String,
-) -> Result<(), String> {
-    let sessions = manager.sessions.lock().map_err(|_| "终端状态锁异常")?;
-    let sender = sessions
-        .get(&terminal_id)
-        .ok_or_else(|| "SSH PTY 尚未连接".to_string())?;
-    sender
-        .send(TerminalInput::Data(data.into_bytes()))
-        .map_err(|_| "SSH PTY 已断开".to_string())
-}
-
-#[tauri::command]
-fn resize_ssh_terminal(
-    manager: State<'_, TerminalManager>,
-    terminal_id: String,
-    cols: u32,
-    rows: u32,
-) -> Result<(), String> {
-    let sessions = manager.sessions.lock().map_err(|_| "终端状态锁异常")?;
-    let sender = sessions
-        .get(&terminal_id)
-        .ok_or_else(|| "SSH PTY 尚未连接".to_string())?;
-    sender
-        .send(TerminalInput::Resize(cols, rows))
-        .map_err(|_| "SSH PTY 已断开".to_string())
-}
-
-#[tauri::command]
-fn close_ssh_terminal(
-    manager: State<'_, TerminalManager>,
-    terminal_id: String,
-) -> Result<(), String> {
-    let mut sessions = manager.sessions.lock().map_err(|_| "终端状态锁异常")?;
-    if let Some(sender) = sessions.remove(&terminal_id) {
-        let _ = sender.send(TerminalInput::Close);
-    }
-    Ok(())
-}
-
 #[tauri::command(async)]
-fn list_sftp_directory(
+fn get_remote_file_structure(
     host: String,
     port: u16,
     username: String,
     password: String,
-    path: String,
-) -> Result<Vec<RemoteFileEntry>, String> {
+    root_path: String,
+    exclude_directories: Option<Vec<String>>,
+    max_depth: Option<usize>,
+    max_nodes: Option<usize>,
+    include_hidden: Option<bool>,
+) -> Result<FileStructureResult, String> {
     let session = connect_ssh(&host, port, &username, &password)?;
     let sftp = session
         .sftp()
         .map_err(|error| format!("SFTP 会话创建失败：{error}"))?;
-    let entries = sftp
-        .readdir(Path::new(&path))
-        .map_err(|error| format!("无法读取远程目录 {path}：{error}"))?;
-    let mut result: Vec<RemoteFileEntry> = entries
-        .into_iter()
-        .filter_map(|(entry_path, stat)| {
-            let name = entry_path.file_name()?.to_string_lossy().to_string();
-            if name == "." || name == ".." {
-                return None;
-            }
-            let permission = stat.perm.unwrap_or(0);
-            let is_directory = permission & 0o170000 == 0o040000;
-            Some(RemoteFileEntry {
-                name,
-                path: entry_path.to_string_lossy().to_string(),
-                kind: if is_directory { "directory" } else { "file" }.into(),
-                size: if is_directory {
-                    "—".into()
-                } else {
-                    let bytes = stat.size.unwrap_or(0);
-                    if bytes >= 1_048_576 {
-                        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
-                    } else if bytes >= 1024 {
-                        format!("{:.1} KB", bytes as f64 / 1024.0)
-                    } else {
-                        format!("{bytes} B")
-                    }
-                },
-                modified: stat
-                    .mtime
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "—".into()),
-            })
-        })
-        .collect();
-    result.sort_by(|a, b| {
-        let a_dir = a.kind == "directory";
-        let b_dir = b.kind == "directory";
-        b_dir
-            .cmp(&a_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-    Ok(result)
-}
-
-#[tauri::command(async)]
-fn create_sftp_directory(
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-    path: String,
-) -> Result<(), String> {
-    let session = connect_ssh(&host, port, &username, &password)?;
-    let sftp = session
-        .sftp()
-        .map_err(|error| format!("SFTP 会话创建失败：{error}"))?;
-    sftp.mkdir(Path::new(&path), 0o755)
-        .map_err(|error| format!("创建目录失败：{error}"))
-}
-
-#[tauri::command(async)]
-fn rename_sftp_entry(
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-    from_path: String,
-    to_path: String,
-) -> Result<(), String> {
-    let session = connect_ssh(&host, port, &username, &password)?;
-    let sftp = session
-        .sftp()
-        .map_err(|error| format!("SFTP 会话创建失败：{error}"))?;
-    sftp.rename(Path::new(&from_path), Path::new(&to_path), None)
-        .map_err(|error| format!("重命名失败：{error}"))
-}
-
-#[tauri::command(async)]
-fn delete_sftp_entry(
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-    path: String,
-    kind: String,
-) -> Result<(), String> {
-    if path == "/" || path.trim().is_empty() {
-        return Err("安全策略禁止删除根目录".into());
-    }
-    let session = connect_ssh(&host, port, &username, &password)?;
-    let sftp = session
-        .sftp()
-        .map_err(|error| format!("SFTP 会话创建失败：{error}"))?;
-    if kind == "directory" {
-        sftp.rmdir(Path::new(&path))
-            .map_err(|error| format!("只能删除空目录：{error}"))
-    } else {
-        sftp.unlink(Path::new(&path))
-            .map_err(|error| format!("删除文件失败：{error}"))
-    }
-}
-
-#[tauri::command(async)]
-fn read_sftp_file(
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-    path: String,
-) -> Result<Vec<u8>, String> {
-    let session = connect_ssh(&host, port, &username, &password)?;
-    let sftp = session
-        .sftp()
-        .map_err(|error| format!("SFTP 会话创建失败：{error}"))?;
-    let mut file = sftp
-        .open(Path::new(&path))
-        .map_err(|error| format!("打开远程文件失败：{error}"))?;
-    let stat = file.stat().map_err(|error| error.to_string())?;
-    if stat.size.unwrap_or(0) > 20 * 1024 * 1024 {
-        return Err("首版下载限制为 20 MB，请使用终端或专业传输工具处理大文件".into());
-    }
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)
-        .map_err(|error| format!("读取远程文件失败：{error}"))?;
-    Ok(data)
-}
-
-#[tauri::command(async)]
-fn write_sftp_file(
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-    path: String,
-    data: Vec<u8>,
-) -> Result<(), String> {
-    if data.len() > 20 * 1024 * 1024 {
-        return Err("首版上传限制为 20 MB".into());
-    }
-    let session = connect_ssh(&host, port, &username, &password)?;
-    let sftp = session
-        .sftp()
-        .map_err(|error| format!("SFTP 会话创建失败：{error}"))?;
-    let mut file = sftp
-        .create(Path::new(&path))
-        .map_err(|error| format!("创建远程文件失败：{error}"))?;
-    file.write_all(&data)
-        .map_err(|error| format!("上传写入失败：{error}"))?;
-    file.flush()
-        .map_err(|error| format!("上传刷新失败：{error}"))
-}
-
-#[tauri::command(async)]
-fn get_ssh_metrics(
-    host: String,
-    port: u16,
-    username: String,
-    password: String,
-) -> Result<Metrics, String> {
-    let session = connect_ssh(&host, port, &username, &password)?;
-    let command = r#"cpu=$(LC_ALL=C top -bn1 | awk '/Cpu/{print 100-$8;exit}'); mem=$(free | awk '/Mem:/{print $3*100/$2}'); disk=$(df -P / | awk 'NR==2{gsub(/%/,"",$5);print $5}'); net=$(awk -F'[: ]+' '/:/{rx+=$3;tx+=$11}END{print rx" "tx}' /proc/net/dev); echo "$cpu"; echo "$mem"; echo "$disk"; echo "$net""#;
-    let (raw, status) = ssh_exec(&session, command)?;
-    if status != 0 {
-        return Err(format!("实时指标采集失败：{raw}"));
-    }
-    let lines: Vec<&str> = raw.lines().collect();
-    if lines.len() < 4 {
-        return Err("实时指标返回格式不完整".into());
-    }
-    let totals: Vec<f64> = lines[3]
-        .split_whitespace()
-        .filter_map(|value| value.parse().ok())
-        .collect();
-    let now = Instant::now();
-    let sample_key = format!("{username}@{host}:{port}");
-    let (network_in, network_out) = if totals.len() == 2 {
-        let samples = METRIC_SAMPLES.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut samples = samples.lock().map_err(|_| "指标采样状态锁异常")?;
-        let rates = samples.get(&sample_key).map(|(rx, tx, sampled_at)| {
-            let elapsed = now.duration_since(*sampled_at).as_secs_f64().max(0.1);
-            (
-                ((totals[0] - rx).max(0.0) / 1_048_576.0 / elapsed) as f32,
-                ((totals[1] - tx).max(0.0) / 1_048_576.0 / elapsed) as f32,
-            )
-        });
-        samples.insert(sample_key, (totals[0], totals[1], now));
-        rates.unwrap_or((0.0, 0.0))
-    } else {
-        (0.0, 0.0)
-    };
-    Ok(Metrics {
-        cpu: lines[0]
-            .trim()
-            .parse::<f32>()
-            .unwrap_or(0.0)
-            .round()
-            .clamp(0.0, 100.0) as u8,
-        memory: lines[1]
-            .trim()
-            .parse::<f32>()
-            .unwrap_or(0.0)
-            .round()
-            .clamp(0.0, 100.0) as u8,
-        disk: lines[2]
-            .trim()
-            .parse::<f32>()
-            .unwrap_or(0.0)
-            .round()
-            .clamp(0.0, 100.0) as u8,
-        network_in,
-        network_out,
-        sampled_at: unix_seconds().to_string(),
-    })
+    scan_sftp(
+        &sftp,
+        root_path,
+        exclude_directories.unwrap_or_default(),
+        max_depth.unwrap_or(6),
+        max_nodes.unwrap_or(2000),
+        include_hidden.unwrap_or(false),
+    )
 }
 
 #[tauri::command]
@@ -1450,14 +690,10 @@ async fn generate_ai_plan(
             };
             continue;
         }
-        let parsed = payload
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "模型响应缺少计划内容".to_string())
-            .and_then(|content| {
-                parse_ai_plan_steps(content)
-                    .map_err(|error| format!("模型计划结构解析失败：{error}"))
-            });
+        let parsed = message_content(&payload, "模型响应缺少计划内容").and_then(|content| {
+            parse_model_array_field(content, "steps")
+                .map_err(|error| format!("模型计划结构解析失败：{error}"))
+        });
         match parsed {
             Ok(raw_steps) => {
                 last_repairable_steps = Some(raw_steps.clone());
@@ -1534,13 +770,9 @@ async fn process_ai_requirement(
             "max_tokens": 700
         });
         let payload = post_model_request(&url, &api_key, &body, "需求理解", 45).await?;
-        let parsed = payload
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "模型响应缺少需求理解结果".to_string())
-            .and_then(|content| {
-                parse_model_json(content).map_err(|error| format!("需求理解结构解析失败：{error}"))
-            });
+        let parsed = message_content(&payload, "模型响应缺少需求理解结果").and_then(|content| {
+            parse_model_json(content).map_err(|error| format!("需求理解结构解析失败：{error}"))
+        });
         let decision: AiRequirementDecision = match parsed {
             Ok(decision) => decision,
             Err(error) => {
@@ -1613,95 +845,11 @@ async fn check_ai_model(
     endpoint: String,
     model: String,
 ) -> Result<ModelCheckResult, String> {
-    if api_key.trim().is_empty() || endpoint.trim().is_empty() || model.trim().is_empty() {
-        return Ok(ModelCheckResult {
-            available: false,
-            reason: "模型配置不完整".into(),
-        });
-    }
-    let url = format!("{}/models", endpoint.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
-    let mut decoded = None;
-    let mut last_error = String::new();
-    for attempt in 1..=MODEL_RESPONSE_ATTEMPTS {
-        let response = match client.get(&url).bearer_auth(&api_key).send().await {
-            Ok(response) => response,
-            Err(error) => {
-                last_error = format!("无法连接模型服务：{error}");
-                if attempt < MODEL_RESPONSE_ATTEMPTS {
-                    continue;
-                }
-                break;
-            }
-        };
-        let status = response.status();
-        let bytes = match response.bytes().await {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                last_error = format!("模型列表接口响应读取不完整：{error}");
-                if attempt < MODEL_RESPONSE_ATTEMPTS {
-                    continue;
-                }
-                break;
-            }
-        };
-        match serde_json::from_slice::<Value>(&bytes) {
-            Ok(payload) => {
-                decoded = Some((status, payload));
-                break;
-            }
-            Err(error) => {
-                last_error = format!(
-                    "模型列表接口返回了无法解析的 HTTP 响应（状态 {status}，{} 字节）：{error}",
-                    bytes.len()
-                );
-                if attempt < MODEL_RESPONSE_ATTEMPTS {
-                    continue;
-                }
-            }
-        }
-    }
-    let (status, payload) = decoded.ok_or_else(|| {
-        format!(
-            "{last_error}（已自动重试 {} 次）",
-            MODEL_RESPONSE_ATTEMPTS - 1
-        )
-    })?;
-    if !status.is_success() {
-        let message = payload
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .unwrap_or("鉴权或接口检查失败");
-        return Ok(ModelCheckResult {
-            available: false,
-            reason: format!("接口返回 {status}：{message}"),
-        });
-    }
-    let model_ids: Vec<&str> = payload
-        .get("data")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| item.get("id").and_then(Value::as_str))
-        .collect();
-    if model_ids.iter().any(|id| *id == model) {
-        Ok(ModelCheckResult {
-            available: true,
-            reason: "接口、鉴权和模型名称均可用".into(),
-        })
-    } else {
-        Ok(ModelCheckResult {
-            available: false,
-            reason: if model_ids.is_empty() {
-                "接口未返回可用模型".into()
-            } else {
-                format!("接口可访问，但模型 {model} 不在可用列表中")
-            },
-        })
-    }
+    let availability = check_model_availability(&api_key, &endpoint, &model).await?;
+    Ok(ModelCheckResult {
+        available: availability.available,
+        reason: availability.reason,
+    })
 }
 
 #[tauri::command]
@@ -1724,13 +872,12 @@ async fn generate_ai_summary(
         "max_tokens": 700
     });
     let payload = post_model_request(&url, &api_key, &body, "模型总结", 30).await?;
-    payload
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|content| !content.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| "模型总结为空".to_string())
+    let content = message_content(&payload, "模型总结为空")?.trim();
+    if content.is_empty() {
+        Err("模型总结为空".to_string())
+    } else {
+        Ok(content.to_owned())
+    }
 }
 
 #[tauri::command]
@@ -1763,14 +910,9 @@ async fn review_ai_step(
             "max_tokens": 500
         });
         let payload = post_model_request(&url, &api_key, &body, "结果复核", 25).await?;
-        let parsed = payload
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "模型结果复核缺少内容".to_string())
-            .and_then(|content| {
-                parse_model_json(content)
-                    .map_err(|error| format!("模型结果复核结构解析失败：{error}"))
-            });
+        let parsed = message_content(&payload, "模型结果复核缺少内容").and_then(|content| {
+            parse_model_json(content).map_err(|error| format!("模型结果复核结构解析失败：{error}"))
+        });
         let review: AiStepReview = match parsed {
             Ok(review) => review,
             Err(error) => {
@@ -1807,18 +949,7 @@ fn generate_plan(requirement: String) -> Vec<PlanStep> {
 
 #[tauri::command]
 fn execute_command(command: String, approved_high_risk: bool) -> CommandResult {
-    let blocked = [
-        "rm -rf",
-        "mkfs",
-        "fdisk",
-        "userdel",
-        "iptables -F",
-        "DROP TABLE",
-    ]
-    .iter()
-    .any(|needle| command.to_lowercase().contains(&needle.to_lowercase()));
-
-    if blocked && !approved_high_risk {
+    if requires_high_risk_approval(&command) && !approved_high_risk {
         return CommandResult {
             output: format!("$ {command}\n[安全策略] 高危命令已拦截，未发送至服务器"),
             success: false,
@@ -1854,6 +985,7 @@ fn validate_step(expected: String, output: String) -> ValidationResult {
 pub fn run() {
     tauri::Builder::default()
         .manage(TerminalManager::default())
+        .manage(SftpTransferManager::default())
         .manage(ExecutionManager::default())
         .invoke_handler(tauri::generate_handler![
             collect_server_info,
@@ -1866,11 +998,15 @@ pub fn run() {
             resize_ssh_terminal,
             close_ssh_terminal,
             list_sftp_directory,
+            get_remote_file_structure,
             create_sftp_directory,
             rename_sftp_entry,
             delete_sftp_entry,
             read_sftp_file,
             write_sftp_file,
+            upload_sftp_transfer,
+            download_sftp_transfer,
+            cancel_sftp_transfer,
             get_ssh_metrics,
             generate_plan,
             generate_ai_plan,
@@ -1886,274 +1022,4 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Opsark");
-}
-
-#[cfg(test)]
-mod live_tests {
-    use super::*;
-
-    #[test]
-    fn credential_accounts_are_namespaced_and_validated() {
-        assert_eq!(
-            credential_account("server", "srv-1").unwrap(),
-            "server:srv-1"
-        );
-        assert_eq!(
-            credential_account("model", "model-1").unwrap(),
-            "model:model-1"
-        );
-        assert_eq!(
-            credential_account("secret", "DB_PASSWORD").unwrap(),
-            "secret:DB_PASSWORD"
-        );
-        assert!(credential_account("other", "id").is_err());
-        assert!(credential_account("server", " ").is_err());
-    }
-
-    #[test]
-    fn repairs_unescaped_shell_backslashes_in_model_json() {
-        let invalid = r#"{"steps":[{"title":"检查","description":"检查输出","command":"grep -E '\s+java\.jar'","expected":"得到结果","validation":"grep -q '\d' /tmp/result","risk":"low"}]}"#;
-        assert!(serde_json::from_str::<Value>(invalid).is_err());
-
-        let steps = parse_ai_plan_steps(&repair_invalid_json_escapes(invalid)).unwrap();
-        assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0].command, "grep -E '\\s+java\\.jar'");
-        assert_eq!(steps[0].validation, "grep -q '\\d' /tmp/result");
-    }
-
-    #[test]
-    fn parses_lenient_model_plan_when_standard_json_is_not_available() {
-        let loose = r#"{steps:[{title:'检查',description:'读取状态',command:'pwd',expected:'返回目录',validation:'pwd >/dev/null',risk:'low',}],}"#;
-        let steps = parse_ai_plan_steps(loose).unwrap();
-        assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0].command, "pwd");
-    }
-
-    #[test]
-    fn repairs_missing_presentational_plan_fields_but_rejects_missing_execution_fields() {
-        let missing_title = r#"{"steps":[{"description":"检查目标是否正常。","command":"custom-tool inspect","expected":"","validation":"custom-tool inspect >/dev/null","risk":"low"}]}"#;
-        let repairable = parse_ai_plan_steps(missing_title).unwrap();
-        assert!(
-            validate_ai_plan_contract(&repairable, &AiGenerationSettings::default())
-                .unwrap_err()
-                .contains("title")
-        );
-        let normalized = convert_ai_plan_steps(repairable).unwrap();
-        assert_eq!(normalized[0].title, "检查目标是否正常");
-        assert!(!normalized[0].expected.is_empty());
-
-        let missing_command = r#"{"steps":[{"title":"检查","description":"检查目标","expected":"返回状态","validation":"custom-tool inspect >/dev/null","risk":"low"}]}"#;
-        let error =
-            convert_ai_plan_steps(parse_ai_plan_steps(missing_command).unwrap()).unwrap_err();
-        assert!(error.contains("command 或 validation"));
-    }
-
-    #[test]
-    fn plan_length_limits_are_optional_and_allow_multiline_commands() {
-        let long_command = format!("echo start\n{}", "x".repeat(1500));
-        let steps = vec![AiPlanStep {
-            title: "一个超过旧标题长度限制但依然是合法计划步骤的完整标题".into(),
-            description: "读取并处理真实环境信息".into(),
-            command: long_command,
-            expected: "获得完整结果".into(),
-            validation: "test -f /tmp/result\nprintf 'ok\\n'".into(),
-            risk: Some("low".into()),
-        }];
-        assert!(validate_ai_plan_contract(&steps, &AiGenerationSettings::default()).is_ok());
-
-        let limited = AiGenerationSettings {
-            limit_output: true,
-            max_text_chars: 10,
-            max_command_chars: 100,
-            ..AiGenerationSettings::default()
-        };
-        assert!(validate_ai_plan_contract(&steps, &limited).is_err());
-    }
-
-    #[test]
-    fn plan_step_count_limit_is_only_applied_when_enabled() {
-        let steps = (0..8)
-            .map(|index| AiPlanStep {
-                title: format!("步骤 {}", index + 1),
-                description: "执行必要操作".into(),
-                command: format!("echo {index}"),
-                expected: "命令正常完成".into(),
-                validation: "true".into(),
-                risk: Some("low".into()),
-            })
-            .collect::<Vec<_>>();
-
-        let unlimited = AiGenerationSettings::default();
-        assert!(validate_ai_plan_contract(&steps, &unlimited).is_ok());
-        assert_eq!(convert_ai_plan_steps(steps.clone()).unwrap().len(), 8);
-
-        let limited = AiGenerationSettings {
-            limit_output: true,
-            max_plan_steps: 6,
-            ..AiGenerationSettings::default()
-        };
-        assert!(validate_ai_plan_contract(&steps, &limited)
-            .unwrap_err()
-            .contains("不能超过配置的 6 个"));
-    }
-
-    #[test]
-    fn parses_answer_and_execute_requirement_intents() {
-        let answer: AiRequirementDecision = serde_json::from_str(
-            r#"{"intent":"answer","answer":"这是风险咨询。","constraints":null}"#,
-        )
-        .unwrap();
-        assert_eq!(answer.intent, "answer");
-
-        let execute: AiRequirementDecision = serde_json::from_str(
-            r#"{"intent":"execute","answer":"","constraints":{"changePolicy":"requested_changes_only","environmentPolicy":"preserve","failurePolicy":"best_effort","prohibitedActions":["升级宿主运行时"],"requiredConditions":["保留当前环境"],"userDirectives":["尽力尝试"]}}"#,
-        )
-        .unwrap();
-        assert_eq!(execute.intent, "execute");
-        let constraints = normalize_execution_constraints(Some(
-            serde_json::from_value(execute.constraints).unwrap(),
-        ));
-        assert_eq!(constraints.environment_policy, "preserve");
-        assert_eq!(constraints.failure_policy, "best_effort");
-        assert_eq!(constraints.prohibited_actions, vec!["升级宿主运行时"]);
-
-        let mixed_stage = r#"{"intent":"execute","answer":"","constraints":null,"steps":[]}"#;
-        assert!(serde_json::from_str::<AiRequirementDecision>(mixed_stage).is_err());
-    }
-
-    #[test]
-    fn grep_no_match_is_a_valid_empty_query_result() {
-        assert!(is_valid_empty_result(
-            "ps -ef | grep java | grep -v grep",
-            1,
-            ""
-        ));
-        assert!(!is_valid_empty_result("systemctl is-active nginx", 1, ""));
-        assert!(!is_valid_empty_result(
-            "grep java /missing/file",
-            2,
-            "No such file"
-        ));
-    }
-
-    #[test]
-    fn demo_high_risk_command_requires_explicit_approval() {
-        assert!(!execute_command("rm -rf /tmp/explicit-target".into(), false).success);
-        assert!(execute_command("rm -rf /tmp/explicit-target".into(), true).success);
-    }
-
-    #[test]
-    #[ignore = "requires explicitly supplied live SSH credentials"]
-    fn probe_live_ssh_adapter() {
-        let host = std::env::var("OPSARK_TEST_SSH_HOST").expect("missing SSH host");
-        let user = std::env::var("OPSARK_TEST_SSH_USER").expect("missing SSH user");
-        let password = std::env::var("OPSARK_TEST_SSH_PASSWORD").expect("missing SSH password");
-        let probe = probe_ssh_server(host.clone(), 22, user.clone(), password.clone())
-            .expect("SSH probe failed");
-        assert!(probe.info.cores > 0);
-        assert!(!probe.info.os.is_empty());
-        let files =
-            list_sftp_directory(host.clone(), 22, user.clone(), password.clone(), "/".into())
-                .expect("SFTP list failed");
-        assert!(!files.is_empty());
-        let metrics = get_ssh_metrics(host.clone(), 22, user.clone(), password.clone())
-            .expect("metrics collection failed");
-        assert!(metrics.disk > 0);
-        let command_session =
-            connect_ssh(&host, 22, &user, &password).expect("SSH command connection failed");
-        let (command_output, command_status) =
-            ssh_exec(&command_session, "printf OPSARK_SSH_OK").expect("SSH command failed");
-        assert_eq!(command_status, 0);
-        assert!(command_output.contains("OPSARK_SSH_OK"));
-        assert!(validate_step("marker".into(), command_output).passed);
-
-        let pty_session = connect_ssh(
-            &std::env::var("OPSARK_TEST_SSH_HOST").unwrap(),
-            22,
-            &std::env::var("OPSARK_TEST_SSH_USER").unwrap(),
-            &std::env::var("OPSARK_TEST_SSH_PASSWORD").unwrap(),
-        )
-        .expect("PTY SSH connection failed");
-        let mut pty = pty_session.channel_session().expect("PTY channel failed");
-        pty.request_pty("xterm-256color", None, Some((120, 32, 0, 0)))
-            .expect("PTY request failed");
-        pty.shell().expect("PTY shell failed");
-        pty.write_all(b"printf OPSARK_PTY_OK\nexit\n")
-            .expect("PTY input failed");
-        pty.flush().ok();
-        let mut pty_output = String::new();
-        pty.read_to_string(&mut pty_output)
-            .expect("PTY output failed");
-        assert!(pty_output.contains("OPSARK_PTY_OK"));
-
-        let host = std::env::var("OPSARK_TEST_SSH_HOST").unwrap();
-        let user = std::env::var("OPSARK_TEST_SSH_USER").unwrap();
-        let password = std::env::var("OPSARK_TEST_SSH_PASSWORD").unwrap();
-        let test_dir = format!("/tmp/opsark-sftp-test-{}", unix_seconds());
-        let file_path = format!("{test_dir}/hello.txt");
-        let renamed_path = format!("{test_dir}/renamed.txt");
-        create_sftp_directory(
-            host.clone(),
-            22,
-            user.clone(),
-            password.clone(),
-            test_dir.clone(),
-        )
-        .expect("SFTP mkdir failed");
-        write_sftp_file(
-            host.clone(),
-            22,
-            user.clone(),
-            password.clone(),
-            file_path.clone(),
-            b"OPSARK_SFTP_OK".to_vec(),
-        )
-        .expect("SFTP upload failed");
-        let downloaded = read_sftp_file(
-            host.clone(),
-            22,
-            user.clone(),
-            password.clone(),
-            file_path.clone(),
-        )
-        .expect("SFTP download failed");
-        assert_eq!(downloaded, b"OPSARK_SFTP_OK");
-        rename_sftp_entry(
-            host.clone(),
-            22,
-            user.clone(),
-            password.clone(),
-            file_path,
-            renamed_path.clone(),
-        )
-        .expect("SFTP rename failed");
-        delete_sftp_entry(
-            host.clone(),
-            22,
-            user.clone(),
-            password.clone(),
-            renamed_path,
-            "file".into(),
-        )
-        .expect("SFTP file delete failed");
-        delete_sftp_entry(host, 22, user, password, test_dir, "directory".into())
-            .expect("SFTP directory delete failed");
-    }
-
-    #[test]
-    #[ignore = "requires an explicitly supplied live model API key"]
-    fn generate_live_deepseek_plan() {
-        let api_key = std::env::var("OPSARK_TEST_MODEL_KEY").expect("missing model key");
-        let plan = tauri::async_runtime::block_on(generate_ai_plan(
-            api_key,
-            "https://api.deepseek.com".into(),
-            "deepseek-v4-flash".into(),
-            "只读检查服务器磁盘空间".into(),
-            r#"{"os":"CentOS 7","diskUsage":"82%","permission":"safe"}"#.into(),
-            None,
-        ))
-        .expect("DeepSeek plan generation failed");
-        assert!(!plan.is_empty());
-        assert!(plan.iter().all(|step| !step.command.trim().is_empty()));
-    }
 }

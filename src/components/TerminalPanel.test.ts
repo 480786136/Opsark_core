@@ -1,0 +1,222 @@
+// @vitest-environment happy-dom
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createApp, defineComponent, h, nextTick } from "vue";
+import { createPinia } from "pinia";
+import { i18n } from "@/features/preferences/i18n";
+import { useOpsStore } from "@/stores/ops";
+import { useWorkspaceLinkStore } from "@/features/workspace/workspaceLinkStore";
+import { useTerminalSessionStore } from "@/features/terminal/terminalSessionStore";
+
+const terminalBackend = vi.hoisted(() => ({
+  startTerminal: vi.fn<(terminalId: string, connection: unknown) => Promise<number>>(async () => 1),
+  closeTerminal: vi.fn<(terminalId: string) => Promise<void>>(async () => undefined),
+  resizeTerminal: vi.fn<(terminalId: string, columns: number, rows: number) => Promise<void>>(async () => undefined),
+  writeTerminal: vi.fn<(terminalId: string, data: string) => Promise<void>>(async () => undefined),
+  outputListeners: [] as Array<(event: { terminalId: string; data: string; stream: "stdout" }) => void>,
+  statusListeners: [] as Array<(event: { terminalId: string; generation: number; status: "connected"; retryable: boolean }) => void>,
+  inputListeners: [] as Array<(data: string) => void>,
+}));
+
+vi.mock("@/services/backend", () => ({
+  backend: {
+    startTerminal: terminalBackend.startTerminal,
+    closeTerminal: terminalBackend.closeTerminal,
+    resizeTerminal: terminalBackend.resizeTerminal,
+    writeTerminal: terminalBackend.writeTerminal,
+    onTerminalOutput: vi.fn(async (listener) => {
+      terminalBackend.outputListeners.push(listener);
+      return () => undefined;
+    }),
+    onTerminalStatus: vi.fn(async (listener) => {
+      terminalBackend.statusListeners.push(listener);
+      return () => undefined;
+    }),
+  },
+}));
+
+vi.mock("@xterm/xterm", () => ({
+  Terminal: class TerminalMock {
+    options: Record<string, unknown>;
+    cols = 80;
+    rows = 24;
+    buffer = { active: { cursorY: 0, getLine: () => ({ translateToString: () => "$ " }) } };
+    constructor(options: Record<string, unknown>) { this.options = options; }
+    loadAddon() {}
+    open() {}
+    attachCustomKeyEventHandler() {}
+    onData(listener: (data: string) => void) {
+      terminalBackend.inputListeners.push(listener);
+      return { dispose() {} };
+    }
+    write() {}
+    writeln() {}
+    focus() {}
+    clear() {}
+    dispose() {}
+    paste() {}
+    getSelection() { return ""; }
+  },
+}));
+vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
+vi.mock("@xterm/addon-search", () => ({ SearchAddon: class { findNext() {}; findPrevious() {} } }));
+vi.mock("@xterm/addon-web-links", () => ({ WebLinksAddon: class {} }));
+
+import TerminalPanel from "./TerminalPanel.vue";
+
+describe("TerminalPanel 多分屏隔离", () => {
+  let host: HTMLElement;
+
+  beforeEach(() => {
+    localStorage.clear();
+    terminalBackend.startTerminal.mockClear();
+    terminalBackend.closeTerminal.mockClear();
+    terminalBackend.writeTerminal.mockClear();
+    terminalBackend.outputListeners.length = 0;
+    terminalBackend.statusListeners.length = 0;
+    terminalBackend.inputListeners.length = 0;
+    vi.stubGlobal("ResizeObserver", class { observe() {}; disconnect() {} });
+    host = document.createElement("div");
+    document.body.append(host);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    host.remove();
+  });
+
+  it("后台分屏输出不覆盖活动上下文且重连只作用于目标 PTY", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    ops.servers.push({
+      id: "server-a",
+      name: "Test",
+      host: "127.0.0.1",
+      port: 22,
+      username: "ops",
+      group: "test",
+      status: "online",
+      environment: [],
+      info: { os: "Linux", kernel: "6", cpu: "CPU", cores: 1, memoryGb: 1, diskGb: 1, uptime: "1h" },
+      createdAt: new Date().toISOString(),
+    });
+    ops.serverPasswords["server-a"] = "secret";
+    ops.connectedServerIds.push("server-a");
+    const Wrapper = defineComponent(() => () => h("div", [
+      h(TerminalPanel, { serverId: "server-a", sessionId: "pane-a", active: true }),
+      h(TerminalPanel, { serverId: "server-a", sessionId: "pane-b", active: false }),
+    ]));
+    const app = createApp(Wrapper).use(pinia).use(i18n);
+    app.mount(host);
+    await nextTick();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    terminalBackend.outputListeners.forEach((listener) => listener({ terminalId: "pty-server-a-pane-a", data: "alpha\n", stream: "stdout" }));
+    terminalBackend.outputListeners.forEach((listener) => listener({ terminalId: "pty-server-a-pane-b", data: "beta\n", stream: "stdout" }));
+    expect(ops.terminalLines).toEqual(["alpha"]);
+
+    host.querySelectorAll<HTMLButtonElement>('button[title="更多终端操作"]')[0]?.click();
+    await nextTick();
+    host.querySelectorAll<HTMLButtonElement>('button[title="重新连接终端"]')[0]?.click();
+    await Promise.resolve();
+    await nextTick();
+    expect(terminalBackend.closeTerminal).toHaveBeenCalledWith("pty-server-a-pane-a");
+    expect(terminalBackend.closeTerminal).not.toHaveBeenCalledWith("pty-server-a-pane-b");
+    expect(terminalBackend.startTerminal.mock.calls.filter(([id]) => id === "pty-server-a-pane-a")).toHaveLength(2);
+    expect(terminalBackend.startTerminal.mock.calls.filter(([id]) => id === "pty-server-a-pane-b")).toHaveLength(1);
+    app.unmount();
+  });
+
+  it("只由已连接的活动分屏消费 SFTP 路径并将 OSC 7 目录同步回文件区", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    ops.servers.push({
+      id: "server-a",
+      name: "Test",
+      host: "127.0.0.1",
+      port: 22,
+      username: "ops",
+      group: "test",
+      status: "online",
+      environment: [],
+      info: { os: "Linux", kernel: "6", cpu: "CPU", cores: 1, memoryGb: 1, diskGb: 1, uptime: "1h" },
+      createdAt: new Date().toISOString(),
+    });
+    ops.serverPasswords["server-a"] = "secret";
+    ops.connectedServerIds.push("server-a");
+    const app = createApp(TerminalPanel, { serverId: "server-a", sessionId: "pane-a", active: true });
+    app.use(pinia).use(i18n).mount(host);
+    await nextTick();
+    await Promise.resolve();
+    const links = useWorkspaceLinkStore(pinia);
+    links.requestTerminalPath("server-a", "/srv/my app");
+    await nextTick();
+    expect(terminalBackend.writeTerminal).not.toHaveBeenCalled();
+
+    terminalBackend.statusListeners.forEach((listener) => listener({
+      terminalId: "pty-server-a-pane-a",
+      generation: 1,
+      status: "connected",
+      retryable: false,
+    }));
+    await nextTick();
+    expect(terminalBackend.writeTerminal).toHaveBeenCalledWith(
+      "pty-server-a-pane-a",
+      expect.stringContaining("cd -- '/srv/my app'"),
+    );
+
+    terminalBackend.outputListeners.forEach((listener) => listener({
+      terminalId: "pty-server-a-pane-a",
+      data: "\u001b]7;file://host/var/log\u0007",
+      stream: "stdout",
+    }));
+    host.querySelector<HTMLButtonElement>('button[title="更多终端操作"]')?.click();
+    await nextTick();
+    host.querySelector<HTMLButtonElement>('button[title="在 SFTP 中打开终端当前目录"]')?.click();
+    expect(links.sftpPathRequests["server-a"]?.path).toBe("/var/log");
+    app.unmount();
+  });
+
+  it("智能任务执行时显示实时记录并锁定发起终端输入", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    ops.servers.push({
+      id: "server-a",
+      name: "Test",
+      host: "127.0.0.1",
+      port: 22,
+      username: "ops",
+      group: "test",
+      status: "online",
+      environment: [],
+      info: { os: "Linux", kernel: "6", cpu: "CPU", cores: 1, memoryGb: 1, diskGb: 1, uptime: "1h" },
+      createdAt: new Date().toISOString(),
+    });
+    ops.connectedServerIds.push("server-a");
+    const task = ops.createTask("server-a", "autonomous", "model-deepseek");
+    task.status = "running";
+    const sessions = useTerminalSessionStore(pinia);
+    sessions.ensureWorkspace("server-a");
+    const paneId = sessions.bindAgentTask("server-a", task.id)!;
+    const app = createApp(TerminalPanel, {
+      serverId: "server-a",
+      sessionId: paneId,
+      active: true,
+      agentTaskId: task.id,
+    });
+    app.use(pinia).use(i18n).mount(host);
+    await nextTick();
+
+    sessions.publishAgentOutput(paneId, "执行 node --version\nv16.20.2\n");
+    await nextTick();
+    terminalBackend.inputListeners.forEach((listener) => listener("whoami\r"));
+
+    expect(host.querySelector(".terminal-agent-view")?.textContent).toContain("v16.20.2");
+    expect(host.querySelector(".terminal-agent-running")?.textContent).toContain("终端已锁定");
+    expect(host.querySelector<HTMLElement>(".terminal-host")?.style.display).toBe("none");
+    expect(terminalBackend.writeTerminal).not.toHaveBeenCalledWith(expect.anything(), "whoami\r");
+    app.unmount();
+  });
+
+});

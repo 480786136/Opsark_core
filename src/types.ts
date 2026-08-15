@@ -213,7 +213,7 @@ export interface RequirementProcessingResult {
 
 export interface AuditEvent {
   id: string;
-  category: "task" | "model" | "command" | "system";
+  category: "task" | "model" | "command" | "tool" | "system";
   level: "info" | "warning" | "error" | "success";
   title: string;
   detail: string;

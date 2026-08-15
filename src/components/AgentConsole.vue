@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from "vue";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
 import {
   Bot,
   Check,
@@ -23,20 +23,28 @@ import {
   TerminalSquare,
   Trash2,
 } from "lucide-vue-next";
+import { useI18n } from "vue-i18n";
 import { useOpsStore } from "@/stores/ops";
-import { observationText } from "@/services/validation";
-import type { OpsTask, PermissionLevel, PlanStep } from "@/types";
+import type { ObservationStatus, OpsTask, PlanStep } from "@/types";
 import ModelSettingsModal from "@/components/ModelSettingsModal.vue";
+import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
 
 const props = defineProps<{ serverId: string }>();
 const store = useOpsStore();
-const input = ref("");
-const permission = ref<PermissionLevel>("safe");
-const modelId = ref("");
-const automationEnabled = ref(false);
+const agentWorkspaces = useAgentWorkspaceStore();
+const { t, locale } = useI18n();
+const workspaceState = agentWorkspaces.ensureServer(props.serverId);
+const persistedField = <K extends keyof typeof workspaceState>(key: K) => computed({
+  get: () => workspaceState[key],
+  set: (value: typeof workspaceState[K]) => agentWorkspaces.updateServer(props.serverId, { [key]: value }),
+});
+const input = persistedField("draft");
+const permission = persistedField("permission");
+const modelId = persistedField("modelId");
+const automationEnabled = persistedField("automationEnabled");
 const checkingModels = ref(false);
 const showModelSettings = ref(false);
-const showTasks = ref(true);
+const showTasks = persistedField("showTasks");
 const expandedSteps = ref<string[]>([]);
 const expandedRounds = ref<string[]>([]);
 const expandedRecords = ref<string[]>([]);
@@ -45,13 +53,13 @@ const secretInput = ref("");
 const timeline = ref<HTMLElement>();
 
 const serverTasks = computed(() => store.tasks.filter((task) => task.serverId === props.serverId));
-const task = computed(() => store.activeTask?.serverId === props.serverId ? store.activeTask : undefined);
+const task = computed(() => serverTasks.value.find((item) => item.id === workspaceState.activeTaskId));
 const pendingApproval = computed(() => task.value?.plan.find((step) => step.status === "awaiting_approval"));
 const failedStep = computed(() => task.value?.plan.find((step) => step.status === "failed"));
 const adjustmentLabel = computed(() =>
   failedStep.value?.result?.executionStatus === "failed"
-    ? "步骤执行失败，任务已暂停"
-    : "证据校验未通过，任务已暂停",
+    ? t("agent.executionPaused")
+    : t("agent.validationPaused"),
 );
 const pendingSecretRequest = computed(() =>
   store.pendingSecret?.taskId === task.value?.id ? store.pendingSecret : undefined,
@@ -85,6 +93,12 @@ watch(
   },
 );
 
+watch(
+  () => serverTasks.value.map(({ id }) => id),
+  (taskIds) => agentWorkspaces.reconcileTasks(props.serverId, taskIds),
+  { immediate: true },
+);
+
 function toggleStep(id: string) {
   expandedSteps.value = expandedSteps.value.includes(id)
     ? expandedSteps.value.filter((item) => item !== id)
@@ -95,8 +109,20 @@ async function submit() {
   const value = input.value.trim();
   if (!value || !automationEnabled.value || isBusy.value || !modelId.value) return;
   showTasks.value = false;
+  let selectedTask = task.value;
+  if (!selectedTask) {
+    selectedTask = store.createTask(props.serverId, permission.value, modelId.value);
+    agentWorkspaces.updateServer(props.serverId, { activeTaskId: selectedTask.id });
+  }
   input.value = "";
-  await store.submitRequirement(props.serverId, value, permission.value, modelId.value, terminalReference.value);
+  await store.submitRequirement(
+    props.serverId,
+    value,
+    permission.value,
+    modelId.value,
+    terminalReference.value,
+    selectedTask.id,
+  );
   terminalReference.value = "";
 }
 
@@ -114,6 +140,14 @@ async function enableAutomation() {
   checkingModels.value = false;
 }
 
+async function restoreAutomation() {
+  if (!automationEnabled.value) return;
+  checkingModels.value = true;
+  await store.refreshModelAvailability();
+  selectFirstAvailableModel();
+  checkingModels.value = false;
+}
+
 function handleModelSelection(event: Event) {
   const value = (event.target as HTMLSelectElement).value;
   if (value !== "__manage_models__") return;
@@ -123,9 +157,9 @@ function handleModelSelection(event: Event) {
 
 function modelOptionText(modelIdValue: string, name: string) {
   const availability = store.modelAvailability[modelIdValue];
-  if (availability?.status === "available") return `${name} · 可用`;
-  if (availability?.status === "checking") return `${name} · 检查中`;
-  return `${name} · ${availability?.reason ?? "不可用"}`;
+  if (availability?.status === "available") return `${name} · ${t("agent.modelAvailable")}`;
+  if (availability?.status === "checking") return `${name} · ${t("agent.modelChecking")}`;
+  return `${name} · ${availability?.reason ?? t("agent.modelUnavailable")}`;
 }
 
 function handleModelsSaved() {
@@ -137,17 +171,17 @@ function referenceTerminal() {
 }
 
 function riskText(step: PlanStep) {
-  return step.risk === "low" ? "低风险" : step.risk === "medium" ? "中风险" : "高风险";
+  return t(`agent.risk${step.risk === "low" ? "Low" : step.risk === "medium" ? "Medium" : "High"}`);
 }
 
 function executionText(step: PlanStep) {
   const labels = {
-    success: "执行成功",
-    failed: "执行失败",
-    cancelled: "已终止",
-    blocked: "已拦截",
+    success: "agent.executionSuccess",
+    failed: "agent.executionFailed",
+    cancelled: "agent.executionCancelled",
+    blocked: "agent.executionBlocked",
   };
-  return step.result ? labels[step.result.executionStatus] : "尚未执行";
+  return step.result ? t(labels[step.result.executionStatus]) : t("agent.executionPending");
 }
 
 function factsText(step: PlanStep) {
@@ -155,40 +189,47 @@ function factsText(step: PlanStep) {
 }
 
 function stepObservationText(step: PlanStep) {
-  return step.result?.executionStatus === "failed"
-    ? "未形成观察结果"
-    : observationText(step.result?.observationStatus);
+  if (step.result?.executionStatus === "failed") return t("agent.observationMissing");
+  const keys: Record<ObservationStatus, string> = {
+    matched: "agent.observationMatched",
+    not_found: "agent.observationNotFound",
+    healthy: "agent.observationHealthy",
+    unhealthy: "agent.observationUnhealthy",
+    warning: "agent.observationWarning",
+    unknown: "agent.observationUnknown",
+  };
+  return step.result?.observationStatus ? t(keys[step.result.observationStatus]) : t("agent.observationNone");
 }
 
 function statusText(status?: string) {
   const labels: Record<string, string> = {
-    draft: "草稿",
-    planning: "正在规划",
-    awaiting_plan_approval: "等待批准计划",
-    running: "正在执行",
-    awaiting_step_approval: "等待步骤确认",
-    awaiting_input: "等待输入",
-    validating: "正在校验",
-    needs_adjustment: "需要调整",
-    completed: "已完成",
-    failed: "失败",
-    cancelled: "已取消",
+    draft: "agent.statusDraft",
+    planning: "agent.statusPlanning",
+    awaiting_plan_approval: "agent.statusAwaitingPlan",
+    running: "agent.statusRunning",
+    awaiting_step_approval: "agent.statusAwaitingStep",
+    awaiting_input: "agent.statusAwaitingInput",
+    validating: "agent.statusValidating",
+    needs_adjustment: "agent.statusAdjustment",
+    completed: "agent.statusCompleted",
+    failed: "agent.statusFailed",
+    cancelled: "agent.statusCancelled",
   };
-  return status ? labels[status] ?? status : "";
+  return status ? (labels[status] ? t(labels[status]) : status) : "";
 }
 
 function summaryTitle(status?: string) {
   const labels: Record<string, string> = {
-    completed: "本轮成功总结",
-    failed: "本轮失败总结",
-    cancelled: "本轮终止总结",
-    needs_adjustment: "当前阶段结论",
+    completed: "agent.summaryCompleted",
+    failed: "agent.summaryFailed",
+    cancelled: "agent.summaryCancelled",
+    needs_adjustment: "agent.summaryAdjustment",
   };
-  return status ? labels[status] ?? "本轮结果总结" : "本轮结果总结";
+  return t(status && labels[status] ? labels[status] : "agent.summaryDefault");
 }
 
 function messageAuthor(role: "user" | "assistant" | "system") {
-  return role === "user" ? "你" : role === "assistant" ? "Opsark" : "执行记录";
+  return role === "user" ? t("agent.you") : role === "assistant" ? "Opsark" : t("agent.executionRecord");
 }
 
 function toggleRound(id: string) {
@@ -212,27 +253,39 @@ async function deleteTaskItem(item: OpsTask) {
     await store.terminateTask(item.id);
   }
   store.deleteTask(item.id);
+  agentWorkspaces.reconcileTasks(props.serverId, serverTasks.value.map(({ id }) => id));
 }
+
+function selectTaskItem(taskId: string) {
+  store.selectTask(taskId);
+  agentWorkspaces.updateServer(props.serverId, { activeTaskId: taskId, showTasks: false });
+}
+
+function startNewTask() {
+  agentWorkspaces.updateServer(props.serverId, { activeTaskId: "", showTasks: false });
+}
+
+onMounted(() => void restoreAutomation());
 </script>
 
 <template>
   <section class="work-panel agent-panel">
     <header class="agent-header">
-      <div class="agent-title"><Bot :size="18" /><strong>智能需求处理</strong><span class="beta">CORE</span></div>
-      <button class="text-icon-button" @click="showTasks = !showTasks"><History :size="15" />任务</button>
+      <div class="agent-title"><Bot :size="18" /><strong>{{ t("agent.title") }}</strong><span class="beta">CORE</span></div>
+      <button class="text-icon-button" @click="showTasks = !showTasks"><History :size="15" />{{ t("agent.tasks") }}</button>
     </header>
 
     <div v-if="!automationEnabled" class="agent-welcome">
       <div class="agent-orb"><Bot :size="28" /></div>
-      <h2>开启智能运维</h2>
-      <p>系统将采集服务器环境，为需求生成可审查、可验证的执行计划。</p>
+      <h2>{{ t("agent.enableTitle") }}</h2>
+      <p>{{ t("agent.enableSubtitle") }}</p>
       <div class="context-list">
-        <span><Check :size="14" />系统与软件环境</span>
-        <span><Check :size="14" />实时资源指标</span>
-        <span><Check :size="14" />安全工具与变量元数据</span>
+        <span><Check :size="14" />{{ t("agent.contextEnvironment") }}</span>
+        <span><Check :size="14" />{{ t("agent.contextMetrics") }}</span>
+        <span><Check :size="14" />{{ t("agent.contextSecurity") }}</span>
       </div>
-      <button class="button primary wide" @click="enableAutomation"><Play :size="15" />开启智能运维</button>
-      <small>{{ store.connectedServerIds.includes(serverId) ? "已连接真实 SSH；所有变更仍受授权与风险规则约束" : "未连接 SSH 时使用安全演示执行器，不会修改真实服务器" }}</small>
+      <button class="button primary wide" @click="enableAutomation"><Play :size="15" />{{ t("agent.enableTitle") }}</button>
+      <small>{{ t(store.connectedServerIds.includes(serverId) ? "agent.liveHint" : "agent.demoHint") }}</small>
     </div>
 
     <template v-else>
@@ -242,29 +295,29 @@ async function deleteTaskItem(item: OpsTask) {
           :key="item.id"
           :class="['task-strip-item', { active: item.id === task?.id }]"
         >
-          <button class="task-select" @click="store.selectTask(item.id); showTasks = false">
+          <button class="task-select" @click="selectTaskItem(item.id)">
             <span :class="['task-status-mini', item.status]"></span>
-            <span><strong>{{ item.title }}</strong><small>{{ (item.planHistory?.length ?? 0) + (item.messages.some((message) => message.role === 'user' && message.kind === 'message') ? 1 : 0) }} 轮 · {{ statusText(item.status) }}</small></span>
+            <span><strong>{{ item.title }}</strong><small>{{ t("agent.rounds", { count: (item.planHistory?.length ?? 0) + (item.messages.some((message) => message.role === 'user' && message.kind === 'message') ? 1 : 0), status: statusText(item.status) }) }}</small></span>
           </button>
           <button
             class="task-delete"
             type="button"
-            title="删除任务"
-            :aria-label="`删除任务 ${item.title}`"
+            :title="t('agent.removeTask')"
+            :aria-label="t('agent.removeTaskNamed', { name: item.title })"
             @click.stop="deleteTaskItem(item)"
           ><Trash2 :size="13" /></button>
         </div>
-        <button class="new-task" @click="store.activeTaskId = null; showTasks = false"><MessageSquarePlus :size="14" />新任务</button>
+        <button class="new-task" @click="startNewTask"><MessageSquarePlus :size="14" />{{ t("agent.newTask") }}</button>
       </div>
 
       <div ref="timeline" class="agent-timeline">
         <div v-if="!task" class="empty-agent">
           <div class="mini-orb"><Bot :size="22" /></div>
-          <h3>今天想处理什么？</h3>
-          <p>描述目标即可。我会先给出计划，不会直接执行。</p>
-          <button @click="input = '检查服务器当前运行状态并给出优化建议'">检查系统状态</button>
-          <button @click="input = '检查 Nginx 配置并安全重新加载服务'">检查 Nginx</button>
-          <button @click="input = '分析磁盘空间占用并给出清理方案'">分析磁盘空间</button>
+          <h3>{{ t("agent.emptyTitle") }}</h3>
+          <p>{{ t("agent.emptyHint") }}</p>
+          <button @click="input = t('agent.requestSystem')">{{ t("agent.suggestSystem") }}</button>
+          <button @click="input = t('agent.requestNginx')">{{ t("agent.suggestNginx") }}</button>
+          <button @click="input = t('agent.requestDisk')">{{ t("agent.suggestDisk") }}</button>
         </div>
 
         <template v-else>
@@ -272,8 +325,8 @@ async function deleteTaskItem(item: OpsTask) {
             <div class="task-message user message user-aligned">
               <div class="message-body">
                 <div class="message-meta">
-                  <strong>你</strong>
-                  <time>{{ new Date(round.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) }}</time>
+                  <strong>{{ t("agent.you") }}</strong>
+                  <time>{{ new Date(round.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
                 </div>
                 <p>{{ round.requirement }}</p>
               </div>
@@ -283,9 +336,9 @@ async function deleteTaskItem(item: OpsTask) {
               <div class="message-body">
                 <div class="message-meta">
                   <strong>Opsark</strong>
-                  <time>{{ new Date(round.response?.createdAt ?? round.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) }}</time>
+                  <time>{{ new Date(round.response?.createdAt ?? round.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
                 </div>
-                <p>{{ round.response?.content ?? `已生成 ${round.plan.length} 个执行步骤。` }}</p>
+                <p>{{ round.response?.content ?? t("agent.generatedSteps", { count: round.plan.length }) }}</p>
               </div>
             </div>
 
@@ -293,10 +346,10 @@ async function deleteTaskItem(item: OpsTask) {
               <button class="plan-card-head archived-head" @click="toggleRound(round.id)">
                 <span>
                   <ClipboardCheck :size="15" />
-                  <span><strong>历史执行计划</strong><small>{{ round.requirement }}</small></span>
+                  <span><strong>{{ t("agent.archivedPlan") }}</strong><small>{{ round.requirement }}</small></span>
                 </span>
                 <span>
-                  <span class="history-time">{{ new Date(round.completedAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) }}</span>
+                  <span class="history-time">{{ new Date(round.completedAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</span>
                   <span :class="['task-state-pill', round.status]">{{ statusText(round.status) }}</span>
                   <ChevronDown v-if="expandedRounds.includes(round.id)" :size="15" />
                   <ChevronRight v-else :size="15" />
@@ -314,17 +367,17 @@ async function deleteTaskItem(item: OpsTask) {
                       <ChevronRight v-else :size="15" />
                     </button>
                     <div v-if="expandedSteps.includes(`history-${round.id}-${step.id}`)" class="step-detail">
-                      <label>执行命令</label><code>{{ step.command }}</code>
-                      <label>期望 / 校验</label><p>{{ step.expected }} · {{ step.validation }}</p>
+                      <label>{{ t("agent.command") }}</label><code>{{ step.command }}</code>
+                      <label>{{ t("agent.expectedValidation") }}</label><p>{{ step.expected }} · {{ step.validation }}</p>
                       <template v-if="step.result">
-                        <label>执行 / 观察状态</label>
+                        <label>{{ t("agent.executionObservation") }}</label>
                         <div class="step-result-line">
                           <span :class="['execution-tag', step.result.executionStatus]">{{ executionText(step) }}</span>
                           <span :class="['observation-tag', step.result.observationStatus]">{{ stepObservationText(step) }}</span>
                         </div>
-                        <label>结构化证据</label><pre>{{ factsText(step) }}</pre>
+                        <label>{{ t("agent.evidence") }}</label><pre>{{ factsText(step) }}</pre>
                       </template>
-                      <template v-if="step.review"><label>结果复核</label><p class="review-result">{{ step.review.summary }}（{{ step.review.reason }}）</p></template>
+                      <template v-if="step.review"><label>{{ t("agent.review") }}</label><p class="review-result">{{ step.review.summary }}（{{ step.review.reason }}）</p></template>
                     </div>
                   </div>
                 </div>
@@ -333,17 +386,17 @@ async function deleteTaskItem(item: OpsTask) {
 
             <div v-if="round.records?.length || round.plan.some((step) => step.output)" class="plan-card execution-record-card">
               <button class="plan-card-head archived-head" @click="toggleRecords(round.id)">
-                <span><ListTree :size="15" /><span><strong>历史执行记录</strong><small>{{ round.records?.length ?? 0 }} 条过程记录</small></span></span>
+                <span><ListTree :size="15" /><span><strong>{{ t("agent.archivedRecords") }}</strong><small>{{ t("agent.recordCount", { count: round.records?.length ?? 0 }) }}</small></span></span>
                 <span><ChevronDown v-if="expandedRecords.includes(round.id)" :size="15" /><ChevronRight v-else :size="15" /></span>
               </button>
               <div v-if="expandedRecords.includes(round.id)" class="execution-record-body">
                 <div v-for="record in round.records ?? []" :key="record.id" class="execution-event-row">
-                  <time>{{ new Date(record.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) }}</time>
+                  <time>{{ new Date(record.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
                   <span>{{ record.content }}</span>
                 </div>
                 <div v-for="step in round.plan.filter((item) => item.output)" :key="`output-${step.id}`" class="execution-output">
                   <strong>{{ step.title }}</strong><code>{{ step.command }}</code><pre>{{ step.output }}</pre>
-                  <p v-if="step.review" class="execution-review">结果复核 · {{ step.review.summary }}（{{ step.review.reason }}）</p>
+                  <p v-if="step.review" class="execution-review">{{ t("agent.reviewPrefix", { summary: step.review.summary, reason: step.review.reason }) }}</p>
                 </div>
               </div>
             </div>
@@ -373,7 +426,7 @@ async function deleteTaskItem(item: OpsTask) {
             <div class="message-body">
               <div class="message-meta">
                 <strong>{{ messageAuthor(message.role) }}</strong>
-                <time>{{ new Date(message.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) }}</time>
+                <time>{{ new Date(message.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
               </div>
               <p>{{ message.content }}</p>
             </div>
@@ -381,15 +434,15 @@ async function deleteTaskItem(item: OpsTask) {
 
           <div v-if="task.plan.length" :class="['plan-card', `task-card-${task.status}`]">
             <div class="plan-card-head">
-              <span><strong>当前执行计划</strong><small>{{ task.plan.filter((s) => ["completed", "skipped", "failed"].includes(s.status)).length }}/{{ task.plan.length }} 已处理</small></span>
+              <span><strong>{{ t("agent.currentPlan") }}</strong><small>{{ t("agent.processed", { done: task.plan.filter((step) => ["completed", "skipped", "failed"].includes(step.status)).length, total: task.plan.length }) }}</small></span>
               <span class="plan-head-actions">
                 <button
                   v-if="canTerminate"
                   class="terminate-business"
                   type="button"
-                  title="终止当前业务和正在运行的远程命令"
+                  :title="t('agent.terminateTitle')"
                   @click.stop="store.terminateTask(task.id)"
-                ><Square :size="11" />终止业务</button>
+                ><Square :size="11" />{{ t("agent.terminate") }}</button>
                 <span :class="['task-state-pill', task.status]">
                   <LoaderCircle v-if="isBusy" class="spin" :size="13" />
                   <Clock3 v-else-if="task.status.includes('awaiting')" :size="13" />
@@ -415,64 +468,64 @@ async function deleteTaskItem(item: OpsTask) {
                   <ChevronRight v-else :size="15" />
                 </button>
                 <div v-if="expandedSteps.includes(step.id)" class="step-detail">
-                  <label>将执行</label><code>{{ step.command }}</code>
-                  <label>期望 / 校验</label><p>{{ step.expected }} · {{ step.validation }}</p>
+                  <label>{{ t("agent.willExecute") }}</label><code>{{ step.command }}</code>
+                  <label>{{ t("agent.expectedValidation") }}</label><p>{{ step.expected }} · {{ step.validation }}</p>
                   <template v-if="step.result">
-                    <label>执行 / 观察状态</label>
+                    <label>{{ t("agent.executionObservation") }}</label>
                     <div class="step-result-line">
                       <span :class="['execution-tag', step.result.executionStatus]">{{ executionText(step) }}</span>
                       <span :class="['observation-tag', step.result.observationStatus]">{{ stepObservationText(step) }}</span>
                     </div>
-                    <label>结构化证据</label><pre>{{ factsText(step) }}</pre>
+                    <label>{{ t("agent.evidence") }}</label><pre>{{ factsText(step) }}</pre>
                     <p v-if="step.result.warnings.length" class="evidence-warning">{{ step.result.warnings.join("；") }}</p>
                   </template>
-                  <template v-if="step.output"><label>执行输出</label><pre>{{ step.output }}</pre></template>
+                  <template v-if="step.output"><label>{{ t("agent.output") }}</label><pre>{{ step.output }}</pre></template>
                   <p v-if="step.status === 'running' && step.progressMessage" class="step-progress">
                     <LoaderCircle class="spin" :size="13" />{{ step.progressMessage }}
                   </p>
-                  <template v-if="step.review"><label>结果复核</label><p class="review-result">{{ step.review.summary }}（{{ step.review.reason }}）</p></template>
+                  <template v-if="step.review"><label>{{ t("agent.review") }}</label><p class="review-result">{{ step.review.summary }}（{{ step.review.reason }}）</p></template>
                 </div>
               </div>
             </div>
             <div v-if="task.status === 'awaiting_plan_approval'" class="approval-bar">
-              <button class="button secondary" @click="store.rejectTask(task.id)"><Square :size="13" />取消</button>
-              <button class="button primary" @click="store.approvePlan(task.id)"><Play :size="13" />批准并执行</button>
+              <button class="button secondary" @click="store.rejectTask(task.id)"><Square :size="13" />{{ t("common.cancel") }}</button>
+              <button class="button primary" @click="store.approvePlan(task.id)"><Play :size="13" />{{ t("agent.approvePlan") }}</button>
             </div>
             <div v-else-if="pendingApproval" class="approval-bar warning">
-              <span><ShieldAlert :size="15" />此步骤需要确认</span>
-              <button class="button secondary" @click="store.rejectTask(task.id)">停止</button>
-              <button class="button primary" @click="store.approveStep(task.id, pendingApproval.id)">执行此步骤</button>
+              <span><ShieldAlert :size="15" />{{ t("agent.stepApproval") }}</span>
+              <button class="button secondary" @click="store.rejectTask(task.id)">{{ t("agent.stop") }}</button>
+              <button class="button primary" @click="store.approveStep(task.id, pendingApproval.id)">{{ t("agent.executeStep") }}</button>
             </div>
             <form v-else-if="pendingSecretRequest" class="secret-input-bar" @submit.prevent="store.provideSecret(secretInput); secretInput = ''">
               <span><KeyRound :size="14" />{{ pendingSecretRequest.key }}</span>
-              <input v-model="secretInput" type="password" autocomplete="off" placeholder="输入敏感值（仅本次会话）" autofocus />
-              <button class="button primary" type="submit" :disabled="!secretInput">安全提交</button>
+              <input v-model="secretInput" type="password" autocomplete="off" :placeholder="t('agent.secretPlaceholder')" autofocus />
+              <button class="button primary" type="submit" :disabled="!secretInput">{{ t("agent.submitSecret") }}</button>
             </form>
             <div v-else-if="task.status === 'needs_adjustment'" class="approval-bar warning">
               <span class="adjustment-copy">
                 <ShieldAlert :size="15" />
                 <span><strong>{{ adjustmentLabel }}</strong><small v-if="task.pauseReason">{{ task.pauseReason }}</small></span>
               </span>
-              <button class="button secondary" @click="store.rejectTask(task.id)">结束任务</button>
+              <button class="button secondary" @click="store.rejectTask(task.id)">{{ t("agent.endTask") }}</button>
               <button class="button primary" @click="store.requestAdjustment(task.id)">
-                {{ (task.adjustmentCount ?? 0) < 1 ? "生成一次精简调整计划" : "再次生成解决方案" }}
+                {{ t((task.adjustmentCount ?? 0) < 1 ? "agent.adjustOnce" : "agent.adjustAgain") }}
               </button>
             </div>
           </div>
 
           <div v-if="currentRecords.length || task.plan.some((step) => step.output)" class="plan-card execution-record-card">
             <button class="plan-card-head archived-head" @click="toggleRecords('current')">
-              <span><ListTree :size="15" /><span><strong>执行记录</strong><small>{{ currentRecords.length }} 条过程记录 · 下拉查看命令输出</small></span></span>
+              <span><ListTree :size="15" /><span><strong>{{ t("agent.executionRecord") }}</strong><small>{{ t("agent.recordsHint", { count: currentRecords.length }) }}</small></span></span>
               <span><ChevronDown v-if="expandedRecords.includes('current')" :size="15" /><ChevronRight v-else :size="15" /></span>
             </button>
             <div v-if="expandedRecords.includes('current')" class="execution-record-body">
               <div v-for="record in currentRecords" :key="record.id" class="execution-event-row">
-                <time>{{ new Date(record.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) }}</time>
+                <time>{{ new Date(record.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
                 <span>{{ record.content }}</span>
               </div>
               <div v-for="step in task.plan.filter((item) => item.output)" :key="`current-output-${step.id}`" class="execution-output">
                 <strong>{{ step.title }}</strong><code>{{ step.command }}</code><pre>{{ step.output }}</pre>
-                <p v-if="step.review" class="execution-review">结果复核 · {{ step.review.summary }}（{{ step.review.reason }}）</p>
+                <p v-if="step.review" class="execution-review">{{ t("agent.reviewPrefix", { summary: step.review.summary, reason: step.review.reason }) }}</p>
               </div>
             </div>
           </div>
@@ -493,33 +546,33 @@ async function deleteTaskItem(item: OpsTask) {
 
       <form class="composer" @submit.prevent="submit">
         <div v-if="terminalReference" class="context-chip">
-          <Quote :size="12" /><span>已引用终端最近 {{ terminalReference.split('\n').length }} 行</span>
+          <Quote :size="12" /><span>{{ t("agent.referencedTerminal", { count: terminalReference.split('\n').length }) }}</span>
           <button type="button" @click="terminalReference = ''">×</button>
         </div>
         <textarea
           v-model="input"
           :disabled="Boolean(isBusy)"
           rows="3"
-          :placeholder="task ? '继续补充需求或提出下一项操作；当前任务会保留上下文…' : '描述运维需求，Enter 换行…'"
+          :placeholder="t(task ? 'agent.continuePlaceholder' : 'agent.newPlaceholder')"
         ></textarea>
         <div class="composer-tools">
-          <button class="context-button" type="button" title="引用终端最近输出" @click="referenceTerminal"><Quote :size="13" />终端</button>
-          <select v-model="modelId" title="模型" :class="{ 'model-select-empty': !modelId }" @change="handleModelSelection">
-            <option v-if="checkingModels" value="" disabled>正在检查模型可用性…</option>
-            <option v-else-if="!store.availableModels.length" value="" disabled>没有可用模型</option>
+          <button class="context-button" type="button" :title="t('agent.referenceTerminal')" @click="referenceTerminal"><Quote :size="13" />{{ t("agent.terminal") }}</button>
+          <select v-model="modelId" :title="t('agent.model')" :class="{ 'model-select-empty': !modelId }" @change="handleModelSelection">
+            <option v-if="checkingModels" value="" disabled>{{ t("agent.checkingModels") }}</option>
+            <option v-else-if="!store.availableModels.length" value="" disabled>{{ t("agent.noModels") }}</option>
             <option
               v-for="model in store.models"
               :key="model.id"
               :value="model.id"
               :disabled="store.modelAvailability[model.id]?.status !== 'available'"
             >{{ modelOptionText(model.id, model.name) }}</option>
-            <option value="__manage_models__">管理模型…</option>
+            <option value="__manage_models__">{{ t("agent.manageModels") }}</option>
           </select>
-          <select v-model="permission" title="授权等级">
-            <option value="observe">逐步确认</option>
-            <option value="safe">安全模式</option>
-            <option value="autonomous">自动执行</option>
-            <option value="managed">完全托管</option>
+          <select v-model="permission" :title="t('agent.permission')">
+            <option value="observe">{{ t("agent.permissionObserve") }}</option>
+            <option value="safe">{{ t("agent.permissionSafe") }}</option>
+            <option value="autonomous">{{ t("agent.permissionAutonomous") }}</option>
+            <option value="managed">{{ t("agent.permissionManaged") }}</option>
           </select>
           <button class="send-button" type="submit" :disabled="!input.trim() || Boolean(isBusy) || !modelId"><Send :size="16" /></button>
         </div>

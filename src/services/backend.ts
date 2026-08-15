@@ -1,7 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { AiGenerationSettings, FileEntry, Metrics, PlanStep, RequirementProcessingResult, ServerInfo, StepReview } from "@/types";
-import { ensureStepValidator } from "@/services/validation";
+import {
+  normalizePlanPreconditions,
+  normalizeSecretPlaceholders,
+} from "@/features/agent/planNormalizer";
+import { buildExecutionSummary } from "@/features/agent/executionSummary";
+import {
+  buildDemoFileStructure,
+  normalizeFileStructureRequest,
+} from "@/features/tools/fileStructure";
+import type { FileStructureRequest, FileStructureResult } from "@/features/tools/types";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -32,6 +41,22 @@ export interface TerminalOutputEvent {
   stream: "stdout" | "stderr" | "system" | "error";
 }
 
+export interface TerminalStatusEvent {
+  terminalId: string;
+  generation: number;
+  status: "connecting" | "connected" | "disconnected" | "error";
+  reason?: string | null;
+  retryable: boolean;
+}
+
+export interface SftpTransferProgressEvent {
+  transferId: string;
+  direction: "upload" | "download";
+  transferredBytes: number;
+  totalBytes: number;
+  status: "running" | "completed";
+}
+
 export interface CommandOutputEvent {
   executionId: string;
   data: string;
@@ -40,11 +65,10 @@ export interface CommandOutputEvent {
 
 export type CredentialKind = "server" | "model" | "secret";
 
-export function normalizeSecretPlaceholders(value: string) {
-  return value.replace(/\\+\$\{secret\.([A-Z0-9_]+)\}/g, "\${secret.$1}");
-}
+export { buildExecutionSummary, normalizePlanPreconditions, normalizeSecretPlaceholders };
 
 const pause = (ms = 450) => new Promise((resolve) => setTimeout(resolve, ms));
+const demoCancelledTransfers = new Set<string>();
 
 const demoInfo: ServerInfo = {
   os: "Ubuntu 24.04 LTS",
@@ -79,85 +103,6 @@ function buildDemoPlan(requirement: string): PlanStep[] {
     risk: riskFrom(step.command),
     status: "pending",
   }));
-}
-
-export function normalizePlanPreconditions(steps: PlanStep[], requirement = "") {
-  const normalized = steps.map((step) => ({
-    ...step,
-    command: normalizeSecretPlaceholders(step.command),
-    validation: normalizeSecretPlaceholders(step.validation),
-  }));
-  const userExplicitlyRequestedCleanup = /清理|删除|移除|卸载|清空|purge|remove|delete|uninstall/i
-    .test(requirement);
-  if (requirement && !userExplicitlyRequestedCleanup) {
-    for (let index = normalized.length - 1; index >= 0; index -= 1) {
-      const step = normalized[index];
-      const speculativeCleanup =
-        /清理|残留|删除.*(?:安装|目录|文件)|cleanup|remove residual/i
-          .test(`${step.title}\n${step.description}`)
-        && /\brm\s+-[^\n]*r[^\n]*f|\brm\s+-[^\n]*f[^\n]*r/i.test(step.command);
-      if (speculativeCleanup) normalized.splice(index, 1);
-    }
-  }
-  return normalized.map(ensureStepValidator);
-}
-
-function resultLines(step: PlanStep) {
-  const mainOutput = (step.output ?? "").split("\n--- 独立校验 ---")[0];
-  return mainOutput
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) =>
-      line &&
-      !line.startsWith("$ ") &&
-      !line.startsWith("[exit:") &&
-      !line.includes("未发现匹配项"),
-    );
-}
-
-export function buildExecutionSummary(requirement: string, steps: PlanStep[]) {
-  const completed = steps.filter((step) => step.status === "completed");
-  const failed = steps.filter((step) => step.status === "failed");
-  if (failed.length) {
-    const lastFailure = failed[failed.length - 1];
-    const failureDetail =
-      lastFailure.review?.summary
-      ?? lastFailure.result?.failureReason
-      ?? resultLines(lastFailure).slice(-3).join("；")
-      ?? "最后执行步骤未达到预期";
-    const verifiedResults = completed
-      .slice(-3)
-      .map((step) => {
-        const output = resultLines(step).slice(-2).join("；");
-        return output ? `${step.title}：${output}` : step.title;
-      });
-    return [
-      `本轮任务未完成。共处理 ${completed.length + failed.length} 个步骤，失败步骤为“${lastFailure.title}”：${failureDetail}。`,
-      verifiedResults.length ? `失败前已确认的结果：${verifiedResults.join("；")}。` : "",
-      `用户目标“${requirement}”尚未由最终证据证明完成。`,
-    ].filter(Boolean).join("\n");
-  }
-  const emptySteps = completed.filter((step) =>
-    step.result?.observationStatus === "not_found"
-    || step.output?.includes("未发现匹配项"),
-  );
-  const unhealthySteps = completed.filter((step) =>
-    step.result?.observationStatus === "unhealthy"
-    || step.result?.observationStatus === "warning",
-  );
-  if (unhealthySteps.length) {
-    const details = unhealthySteps
-      .map((step) => `${step.title}：${step.result?.warnings[0] ?? "观察到异常状态"}`)
-      .join("；");
-    return `本轮执行完成，共处理 ${completed.length} 个步骤，发现 ${unhealthySteps.length} 个需要关注的状态。${details}。`;
-  }
-  if (emptySteps.length) {
-    return `本轮处理完成，共执行 ${completed.length} 个步骤。其中 ${emptySteps.length} 个查询正常完成但没有匹配数据或发现目标，其余步骤证据有效。`;
-  }
-  const finalResult = completed.length ? resultLines(completed[completed.length - 1]).slice(0, 5) : [];
-  return finalResult.length
-    ? `本轮处理完成，共执行 ${completed.length} 个步骤，程序证据均有效。最终结果：${finalResult.join("；")}。`
-    : `本轮处理完成，共执行 ${completed.length} 个步骤，程序证据均有效。`;
 }
 
 export const backend = {
@@ -196,8 +141,8 @@ export const backend = {
   },
 
   async startTerminal(terminalId: string, connection: RuntimeConnection) {
-    if (!isTauri()) return;
-    await invoke("start_ssh_terminal", { terminalId, ...connection });
+    if (!isTauri()) return 0;
+    return invoke<number>("start_ssh_terminal", { terminalId, ...connection });
   },
 
   async writeTerminal(terminalId: string, data: string) {
@@ -218,6 +163,11 @@ export const backend = {
   async onTerminalOutput(callback: (event: TerminalOutputEvent) => void) {
     if (!isTauri()) return () => {};
     return listen<TerminalOutputEvent>("terminal-output", (event) => callback(event.payload));
+  },
+
+  async onTerminalStatus(callback: (event: TerminalStatusEvent) => void) {
+    if (!isTauri()) return () => {};
+    return listen<TerminalStatusEvent>("terminal-status", (event) => callback(event.payload));
   },
 
   async getMetrics(): Promise<Metrics> {
@@ -268,6 +218,21 @@ export const backend = {
     }));
   },
 
+  async getRemoteFileStructure(
+    connection: RuntimeConnection,
+    request: FileStructureRequest,
+  ): Promise<FileStructureResult> {
+    const normalized = normalizeFileStructureRequest(request);
+    if (!isTauri()) {
+      await pause(180);
+      return buildDemoFileStructure(normalized);
+    }
+    return invoke<FileStructureResult>("get_remote_file_structure", {
+      ...connection,
+      ...normalized,
+    });
+  },
+
   async createSftpDirectory(connection: RuntimeConnection, path: string) {
     if (!isTauri()) return;
     await invoke("create_sftp_directory", { ...connection, path });
@@ -292,6 +257,76 @@ export const backend = {
   async writeSftpFile(connection: RuntimeConnection, path: string, data: Uint8Array) {
     if (!isTauri()) return;
     await invoke("write_sftp_file", { ...connection, path, data: Array.from(data) });
+  },
+
+  async uploadSftpTransfer(
+    connection: RuntimeConnection,
+    transferId: string,
+    path: string,
+    data: Uint8Array,
+    onProgress: (event: SftpTransferProgressEvent) => void,
+  ) {
+    if (!isTauri()) {
+      demoCancelledTransfers.delete(transferId);
+      const totalBytes = data.byteLength;
+      for (let transferredBytes = 0; transferredBytes < totalBytes; transferredBytes += 64 * 1024) {
+        await pause(8);
+        if (demoCancelledTransfers.has(transferId)) throw new Error("SFTP_TRANSFER_CANCELLED");
+        onProgress({
+          transferId,
+          direction: "upload",
+          transferredBytes: Math.min(totalBytes, transferredBytes + 64 * 1024),
+          totalBytes,
+          status: transferredBytes + 64 * 1024 >= totalBytes ? "completed" : "running",
+        });
+      }
+      return;
+    }
+    const unlisten = await listen<SftpTransferProgressEvent>("sftp-transfer-progress", (event) => {
+      if (event.payload.transferId === transferId) onProgress(event.payload);
+    });
+    try {
+      await invoke("upload_sftp_transfer", {
+        ...connection,
+        transferId,
+        path,
+        data: Array.from(data),
+      });
+    } finally {
+      unlisten();
+    }
+  },
+
+  async downloadSftpTransfer(
+    connection: RuntimeConnection,
+    transferId: string,
+    path: string,
+    onProgress: (event: SftpTransferProgressEvent) => void,
+  ) {
+    if (!isTauri()) {
+      demoCancelledTransfers.delete(transferId);
+      await pause(40);
+      if (demoCancelledTransfers.has(transferId)) throw new Error("SFTP_TRANSFER_CANCELLED");
+      onProgress({ transferId, direction: "download", transferredBytes: 0, totalBytes: 0, status: "completed" });
+      return new Uint8Array();
+    }
+    const unlisten = await listen<SftpTransferProgressEvent>("sftp-transfer-progress", (event) => {
+      if (event.payload.transferId === transferId) onProgress(event.payload);
+    });
+    try {
+      const bytes = await invoke<number[]>("download_sftp_transfer", { ...connection, transferId, path });
+      return new Uint8Array(bytes);
+    } finally {
+      unlisten();
+    }
+  },
+
+  async cancelSftpTransfer(transferId: string) {
+    if (!isTauri()) {
+      demoCancelledTransfers.add(transferId);
+      return true;
+    }
+    return invoke<boolean>("cancel_sftp_transfer", { transferId });
   },
 
   async generatePlan(requirement: string, runtimeModel?: RuntimeModel): Promise<PlanStep[]> {

@@ -1,9 +1,12 @@
 <script setup lang="ts">
+import { useI18n } from "vue-i18n";
+
 defineProps<{ status: "online" | "testing" | "offline" }>();
+const { t } = useI18n();
 </script>
 
 <template>
   <span :class="['status-dot', status]">
-    <span></span>{{ status === "online" ? "在线" : status === "testing" ? "检测中" : "离线" }}
+    <span></span>{{ t(`status.${status}`) }}
   </span>
 </template>
