@@ -314,7 +314,13 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
     </header>
 
     <div v-if="!automationEnabled" class="agent-welcome">
-      <div class="agent-orb"><Bot :size="28" /></div>
+      <div class="agent-welcome-ambient" aria-hidden="true"><i></i><i></i><i></i></div>
+      <div class="agent-orb">
+        <span class="agent-orb-ring ring-one" aria-hidden="true"></span>
+        <span class="agent-orb-ring ring-two" aria-hidden="true"></span>
+        <span class="agent-orb-scan" aria-hidden="true"></span>
+        <Bot :size="28" />
+      </div>
       <h2>{{ t("agent.enableTitle") }}</h2>
       <p>{{ t("agent.enableSubtitle") }}</p>
       <div class="context-list">
@@ -322,8 +328,8 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
         <span><Check :size="14" />{{ t("agent.contextMetrics") }}</span>
         <span><Check :size="14" />{{ t("agent.contextSecurity") }}</span>
       </div>
-      <button class="button primary wide" :disabled="!store.connectedServerIds.includes(serverId)" @click="enableAutomation"><Play :size="15" />{{ t("agent.enableTitle") }}</button>
-      <small>{{ t(store.connectedServerIds.includes(serverId) ? "agent.liveHint" : "agent.disconnectedHint") }}</small>
+      <button class="button primary wide agent-launch-button" :disabled="!store.connectedServerIds.includes(serverId)" @click="enableAutomation"><span class="agent-launch-shine" aria-hidden="true"></span><Play :size="15" />{{ t("agent.enableTitle") }}</button>
+      <small class="agent-connection-hint" :class="{ connected: store.connectedServerIds.includes(serverId) }"><i></i>{{ t(store.connectedServerIds.includes(serverId) ? "agent.liveHint" : "agent.disconnectedHint") }}</small>
     </div>
 
     <template v-else>
