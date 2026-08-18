@@ -24,20 +24,16 @@ describe("FileExplorer", () => {
     host.remove();
   });
 
-  it("切换紧凑视图后立即更新列表并持久化偏好", async () => {
+  it("仅保留统一文件列表并移除无效视图切换", () => {
     const pinia = createPinia();
     const app = createApp(FileExplorer, { serverId: "server-a" });
     app.use(pinia);
     app.use(i18n);
     app.mount(host);
 
-    const compactButton = host.querySelector<HTMLButtonElement>('button[title="紧凑视图"]');
-    compactButton?.click();
-    await nextTick();
-
-    expect(host.querySelector(".file-list")?.classList.contains("compact")).toBe(true);
-    expect(useFileWorkspaceStore(pinia).viewMode).toBe("compact");
-    expect(JSON.parse(localStorage.getItem("opsark.fileWorkspace.v1") ?? "{}").viewMode).toBe("compact");
+    expect(host.querySelector('button[title="列表视图"]')).toBeNull();
+    expect(host.querySelector('button[title="紧凑视图"]')).toBeNull();
+    expect(host.querySelector(".file-list")?.className).toBe("file-list");
     app.unmount();
   });
 

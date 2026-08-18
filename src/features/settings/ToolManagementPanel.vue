@@ -6,6 +6,7 @@ import { useOpsStore } from "@/stores/ops";
 import { validateToolDefinition } from "@/features/tools/toolValidation";
 
 const store = useOpsStore();
+defineProps<{ standalone?: boolean }>();
 const { t } = useI18n();
 const query = ref("");
 const selectedToolId = ref(store.tools[0]?.id ?? "");
@@ -37,7 +38,7 @@ function fieldError(field: string) {
 
 <template>
   <section class="settings-card tool-management-card">
-    <div class="settings-title">
+    <div v-if="!standalone" class="settings-title">
       <Wrench :size="18" />
       <div>
         <h2>{{ t("tools.title") }}</h2>

@@ -60,7 +60,7 @@ function serverSnapshot(server?: ServerProfile) {
 
 function secretVariableContext(secretMetadata: SecretMetadata[], serverId: string) {
   return secretMetadata
-    .filter((item) => item.scope === "global" || item.serverId === serverId)
+    .filter((item) => item.serverId === serverId)
     .map(({ key, description }) => ({ key, description, placeholder: `\${secret.${key}}` }));
 }
 
@@ -69,6 +69,13 @@ export interface AgentContextInput {
   metrics: Metrics;
   permission: PermissionLevel;
   terminalReference?: string;
+  terminalContext?: {
+    source: "automatic" | "selection";
+    totalLines: number;
+    includedLines: number;
+    hasMore: boolean;
+    content?: string;
+  };
   conversationHistory: unknown[];
   previousExecution?: unknown;
   knownExecutionFacts: unknown;
@@ -83,6 +90,7 @@ export function buildAgentContext(input: AgentContextInput) {
     metrics: input.metrics,
     permission: input.permission,
     terminalReference: input.terminalReference || undefined,
+    terminalContext: input.terminalContext,
     conversationHistory: input.conversationHistory,
     previousExecution: input.previousExecution,
     knownExecutionFacts: input.knownExecutionFacts,

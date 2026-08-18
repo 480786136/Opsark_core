@@ -26,13 +26,30 @@ describe("terminalSessionStore 终端选项卡", () => {
     expect(store.activeSessionByServer["server-1"]).toBe(firstId);
   });
 
-  it("关闭最后一个标签后保持空工作区", () => {
+  it("关闭最后一个标签后立即且只创建一个新终端", () => {
     const store = useTerminalSessionStore();
     store.ensureWorkspace("server-1");
-    store.removeSession("server-1", store.activeSessionByServer["server-1"]);
+    const closedId = store.activeSessionByServer["server-1"];
+    store.removeSession("server-1", closedId);
 
-    expect(store.sessionsByServer["server-1"]).toHaveLength(0);
-    expect(store.activeSessionByServer["server-1"]).toBeUndefined();
+    expect(store.sessionsByServer["server-1"]).toHaveLength(1);
+    expect(store.activeSessionByServer["server-1"]).not.toBe(closedId);
+    expect(store.activeSessionByServer["server-1"]).toBe(store.sessionsByServer["server-1"][0].id);
+
+    store.addSession("server-1");
+    expect(store.sessionsByServer["server-1"]).toHaveLength(2);
+  });
+
+  it("活动标签记录缺失时关闭最后一个标签仍自动补建终端", () => {
+    const store = useTerminalSessionStore();
+    store.ensureWorkspace("server-1");
+    const onlySession = store.sessionsByServer["server-1"][0];
+    delete store.activeSessionByServer["server-1"];
+
+    store.removeSession("server-1", onlySession.id);
+
+    expect(store.sessionsByServer["server-1"]).toHaveLength(1);
+    expect(store.activeSessionByServer["server-1"]).toBe(store.sessionsByServer["server-1"][0].id);
   });
 
   it("限制单服务器终端选项卡数量", () => {
@@ -42,7 +59,7 @@ describe("terminalSessionStore 终端选项卡", () => {
     expect(store.sessionsByServer["server-1"]).toHaveLength(MAX_SESSIONS_PER_SERVER);
   });
 
-  it("将旧分屏中的 Shell 叶子迁移成独立选项卡并丢弃旧 Agent 叶子", () => {
+  it("启动恢复时只保留旧布局中的活动 Shell 标签", () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
       version: 2,
       sessionsByServer: {
@@ -78,7 +95,7 @@ describe("terminalSessionStore 终端选项卡", () => {
     const store = useTerminalSessionStore();
     store.ensureWorkspace("server-1");
 
-    expect(store.sessionsByServer["server-1"].map(({ id }) => id)).toEqual(["shell-a", "shell-b"]);
+    expect(store.sessionsByServer["server-1"].map(({ id }) => id)).toEqual(["shell-b"]);
     expect(store.activeSessionByServer["server-1"]).toBe("shell-b");
     expect(store.sessionsByServer["server-1"].every(({ panes, layout }) =>
       panes.length === 1 && layout.type === "pane")).toBe(true);
@@ -121,5 +138,21 @@ describe("terminalSessionStore 终端选项卡", () => {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}");
     expect(saved.paneStatusById).toBeUndefined();
     expect(saved.agentOutputByPane).toBeUndefined();
+  });
+
+  it("将绑定 PTY 的实时输出和退出码返回执行器", async () => {
+    const store = useTerminalSessionStore();
+    store.ensureWorkspace("server-1");
+    const paneId = store.bindAgentTask("server-1", "task-1")!;
+    const chunks: string[] = [];
+    const resultPromise = store.requestAgentPtyCommand(paneId, "exec-1", "pwd", (chunk) => chunks.push(chunk));
+
+    expect(store.agentCommandByPane[paneId]).toMatchObject({ id: "exec-1", command: "pwd" });
+    store.publishAgentPtyProgress("exec-1", "/srv/app\n");
+    store.completeAgentPtyCommand(paneId, "exec-1", "/srv/app", 0);
+
+    await expect(resultPromise).resolves.toMatchObject({ output: "/srv/app", exitCode: 0, success: true });
+    expect(chunks).toEqual(["/srv/app\n"]);
+    expect(store.agentCommandByPane[paneId]).toBeUndefined();
   });
 });

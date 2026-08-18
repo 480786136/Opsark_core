@@ -41,6 +41,7 @@ export interface StartLongRunningMonitorInput {
   onEvent(role: "assistant" | "system", content: string): void;
   onAudit(audit: LongRunningReviewAudit): void;
   onError(title: string, detail: string): void;
+  cancelExecution?(): Promise<void> | void;
   scheduler?: LongRunningMonitorScheduler;
 }
 
@@ -92,9 +93,14 @@ export function startLongRunningMonitor(
     0,
     Math.floor((scheduler.now() - startedAt) / 1000),
   );
+  const cancelExecution = () => input.cancelExecution
+    ? input.cancelExecution()
+    : input.connection
+      ? backend.cancelCommand(input.connection, input.executionId)
+      : Promise.resolve();
 
   const heartbeatTimer = scheduler.setInterval(() => {
-    if (stopped) return;
+    if (stopped || input.isCancelled()) return;
     const elapsed = elapsedSeconds();
     const progressMessage = elapsed >= 10
       ? `远程命令仍在运行（${elapsed} 秒），系统会每 ${LONG_RUNNING_REVIEW_INTERVAL_MS / 1000} 秒获取状态并复核`
@@ -115,7 +121,7 @@ export function startLongRunningMonitor(
     if (!connection) return;
     if (state.decision) {
       try {
-        await backend.cancelCommand(connection, input.executionId);
+        await cancelExecution();
       } catch (error) {
         input.onError(
           `${input.step.title} · 重试停止长驻命令失败`,
@@ -184,7 +190,7 @@ export function startLongRunningMonitor(
           ? `定期校验已满足后置条件，模型建议停止持续等待并进入正式校验：${review.summary}`
           : `长任务复核建议停止当前命令并调整：${review.summary}`,
       );
-      await backend.cancelCommand(connection, input.executionId);
+      await cancelExecution();
     } catch (error) {
       if (!stopped) {
         input.onError(

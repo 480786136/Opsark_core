@@ -79,6 +79,8 @@ fn probe_live_ssh_adapter() {
     )
     .expect("SSH probe failed");
     assert!(probe.info.cores > 0);
+    assert!(probe.info.memory_gb > 0);
+    assert!(probe.info.disk_gb > 0);
     assert!(!probe.info.os.is_empty());
     let files = list_sftp_directory(
         config.host.clone(),
@@ -103,8 +105,6 @@ fn probe_live_ssh_adapter() {
         ssh_exec(&command_session, "printf OPSARK_SSH_OK").expect("SSH command failed");
     assert_eq!(command_status, 0);
     assert!(command_output.contains("OPSARK_SSH_OK"));
-    assert!(validate_step("marker".into(), command_output).passed);
-
     let pty_session = connect_ssh(&config.host, config.port, &config.user, &config.password)
         .expect("PTY SSH connection failed");
     let mut pty = pty_session.channel_session().expect("PTY channel failed");

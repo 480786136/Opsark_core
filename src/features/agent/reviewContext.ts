@@ -118,7 +118,10 @@ export function buildLongRunningReviewContext(input: {
       .filter((step) => step !== input.step && step.status !== "pending")
       .map((step) => historySnapshot(step, 1200)),
     fullPlan: input.task.plan.map(planSnapshot),
-    remainingSteps,
+    remainingSteps: remainingSteps.map((step) => ({
+      ...step,
+      note: "这些是当前命令结束后才能执行的后续步骤；不得因它们存在而把 continue 解释为进入下一步",
+    })),
   };
 }
 

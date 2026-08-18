@@ -10,7 +10,6 @@ import {
 } from "./terminalSplitTree";
 
 export type TerminalPaneStatus =
-  | "demo"
   | "connecting"
   | "connected"
   | "reconnecting"
@@ -21,6 +20,29 @@ export interface AgentTerminalOutputChunk {
   id: number;
   data: string;
 }
+
+export interface AgentPtyCommandRequest {
+  id: string;
+  paneId: string;
+  command: string;
+  displayCommand: string;
+  createdAt: string;
+}
+
+export interface AgentPtyCommandResult {
+  output: string;
+  success: boolean;
+  simulated: false;
+  exitCode: number;
+  emptyResult: boolean;
+}
+
+const agentCommandCallbacks = new Map<string, {
+  resolve: (result: AgentPtyCommandResult) => void;
+  reject: (error: Error) => void;
+  onProgress?: (data: string) => void;
+  timer: number;
+}>();
 
 export interface TerminalSessionDefinition {
   id: string;
@@ -128,7 +150,7 @@ function readPersistedWorkspace(): PersistedTerminalWorkspaceV1 {
   return JSON.parse(localStorage.getItem(LEGACY_STORAGE_KEY) ?? "{}") as PersistedTerminalWorkspaceV1;
 }
 
-/** 只恢复版本化布局元数据；所有 PTY 在组件重新挂载后建立新通道。 */
+/** PTY 是实时会话；启动时每台服务器只恢复上次活动的一个标签。 */
 export const useTerminalSessionStore = defineStore("terminalSessions", {
   state: () => ({
     hydrated: false,
@@ -138,6 +160,8 @@ export const useTerminalSessionStore = defineStore("terminalSessions", {
     // Agent 输出只在当前运行期转发给任务绑定终端的只读视图，不写入布局持久化数据。
     agentOutputByPane: {} as Record<string, AgentTerminalOutputChunk[]>,
     agentOutputSequence: 0,
+    agentCommandByPane: {} as Record<string, AgentPtyCommandRequest>,
+    agentInterruptByPane: {} as Record<string, number>,
   }),
   actions: {
     hydrate() {
@@ -152,14 +176,22 @@ export const useTerminalSessionStore = defineStore("terminalSessions", {
             .map(normalizeSession)
             .filter((session): session is TerminalSessionDefinition => Boolean(session))
             .slice(0, MAX_SESSIONS_PER_SERVER);
-          if (valid.length) this.sessionsByServer[serverId] = valid;
+          if (!valid.length) continue;
+          const persistedActiveId = parsed.activeSessionByServer?.[serverId];
+          const active = valid.find(({ id }) => id === persistedActiveId) ?? valid[0];
+          const activePane = active.panes.find(({ id }) => id === active.activePaneId) ?? active.panes[0];
+          const restored: TerminalSessionDefinition = {
+            id: activePane.id,
+            label: active.label,
+            createdAt: activePane.createdAt,
+            panes: [{ ...activePane, kind: "shell", agentTaskId: undefined }],
+            activePaneId: activePane.id,
+            layout: createTerminalPaneNode(activePane.id),
+          };
+          this.sessionsByServer[serverId] = [restored];
+          this.activeSessionByServer[serverId] = restored.id;
         }
-        for (const [serverId, sessionId] of Object.entries(parsed.activeSessionByServer ?? {})) {
-          if (typeof sessionId === "string" && this.sessionsByServer[serverId]?.some(({ id }) => id === sessionId)) {
-            this.activeSessionByServer[serverId] = sessionId;
-          }
-        }
-        if (migrateLegacy && Object.keys(this.sessionsByServer).length) this.persist();
+        if ((migrateLegacy || Object.keys(this.sessionsByServer).length) && Object.keys(this.sessionsByServer).length) this.persist();
       } catch {
         // 布局数据损坏时按服务器重建默认标签，不影响 SSH 凭据。
       }
@@ -261,6 +293,44 @@ export const useTerminalSessionStore = defineStore("terminalSessions", {
       // 组件暂未挂载时保留有限队列，防止长任务无限占用内存。
       if (queue.length > 500) queue.splice(0, queue.length - 500);
     },
+    requestAgentPtyCommand(paneId: string, executionId: string, command: string, onProgress?: (data: string) => void, displayCommand = command) {
+      if (this.agentCommandByPane[paneId]) return Promise.reject(new Error("当前终端已有智能命令在执行"));
+      const request = { id: executionId, paneId, command, displayCommand, createdAt: new Date().toISOString() };
+      this.agentCommandByPane[paneId] = request;
+      return new Promise<AgentPtyCommandResult>((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          delete this.agentCommandByPane[paneId];
+          agentCommandCallbacks.delete(executionId);
+          reject(new Error("绑定终端执行超时"));
+        }, 30 * 60 * 1000);
+        agentCommandCallbacks.set(executionId, { resolve, reject, onProgress, timer });
+      });
+    },
+    publishAgentPtyProgress(executionId: string, data: string) {
+      if (data) agentCommandCallbacks.get(executionId)?.onProgress?.(data);
+    },
+    completeAgentPtyCommand(paneId: string, executionId: string, output: string, exitCode: number) {
+      const callback = agentCommandCallbacks.get(executionId);
+      if (!callback) return;
+      window.clearTimeout(callback.timer);
+      agentCommandCallbacks.delete(executionId);
+      if (this.agentCommandByPane[paneId]?.id === executionId) delete this.agentCommandByPane[paneId];
+      const emptyResult = exitCode === 0 && !output.trim();
+      callback.resolve({ output, success: exitCode === 0, simulated: false, exitCode, emptyResult });
+    },
+    failAgentPtyCommand(paneId: string, executionId: string, reason: string) {
+      const callback = agentCommandCallbacks.get(executionId);
+      if (!callback) return;
+      window.clearTimeout(callback.timer);
+      agentCommandCallbacks.delete(executionId);
+      if (this.agentCommandByPane[paneId]?.id === executionId) delete this.agentCommandByPane[paneId];
+      callback.reject(new Error(reason));
+    },
+    interruptAgentPtyCommand(paneId: string) {
+      const request = this.agentCommandByPane[paneId];
+      this.agentInterruptByPane[paneId] = (this.agentInterruptByPane[paneId] ?? 0) + 1;
+      if (request) this.completeAgentPtyCommand(paneId, request.id, "用户已终止绑定终端命令", 130);
+    },
     consumeAgentOutput(paneId: string, throughId: number) {
       const queue = this.agentOutputByPane[paneId];
       if (!queue?.length) return;
@@ -288,10 +358,13 @@ export const useTerminalSessionStore = defineStore("terminalSessions", {
         delete this.agentOutputByPane[id];
       });
       sessions.splice(index, 1);
-      if (this.activeSessionByServer[serverId] === sessionId) {
+      if (!sessions.length) {
+        const replacement = createSession(1);
+        sessions.push(replacement);
+        this.activeSessionByServer[serverId] = replacement.id;
+      } else if (this.activeSessionByServer[serverId] === sessionId) {
         const adjacent = sessions[Math.min(index, sessions.length - 1)];
-        if (adjacent) this.activeSessionByServer[serverId] = adjacent.id;
-        else delete this.activeSessionByServer[serverId];
+        this.activeSessionByServer[serverId] = adjacent.id;
       }
       this.persist();
     },

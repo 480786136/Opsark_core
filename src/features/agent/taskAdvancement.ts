@@ -43,12 +43,10 @@ export async function runDiscoveryRefinement(
     const pending = await planner({ ...planInput, model: input.model });
     if (isCancelled()) return { kind: "cancelled" as const };
 
-    const autoApprove = ["autonomous", "managed"].includes(input.task.permission);
+    const autoApprove = input.task.permission === "managed";
     const eventMessage = input.task.permission === "managed"
       ? `已根据发现证据生成 ${pending.length} 个后续步骤，完全托管模式自动批准并继续。`
-      : input.task.permission === "autonomous"
-        ? `已根据发现证据生成 ${pending.length} 个后续步骤，自动执行继续。`
-        : `已根据发现证据生成 ${pending.length} 个后续步骤，请审批后继续。`;
+      : `已根据发现证据生成 ${pending.length} 个后续步骤，请审批后继续。`;
     return { kind: "success" as const, pending, autoApprove, eventMessage };
   } catch (error) {
     if (input.isCancelled()) return { kind: "cancelled" as const };

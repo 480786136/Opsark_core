@@ -16,7 +16,7 @@ describe("agent context", () => {
       conversationHistory: [],
       knownExecutionFacts: {},
       tools: resolveToolRegistry([{ id: "server.realtime_metrics", enabled: false }]),
-      secretMetadata: [{ key: "TOKEN", description: "部署令牌", scope: "global" }],
+      secretMetadata: [{ key: "TOKEN", description: "部署令牌", scope: "server", serverId: "server-1" }],
       serverId: "server-1",
     });
 
@@ -42,7 +42,7 @@ describe("agent context", () => {
       metrics: { cpu: 1, memory: 2, disk: 3, networkIn: 4, networkOut: 5, sampledAt: "now" },
       task,
       tools: resolveToolRegistry([]),
-      secretMetadata: [{ key: "TOKEN", description: "部署令牌", scope: "global" as const }],
+      secretMetadata: [{ key: "TOKEN", description: "部署令牌", scope: "server" as const, serverId: "server-1" }],
     };
     const adjustment = buildAdjustmentContext(input, task.plan[0]);
     const continuation = buildContinuationContext(input);

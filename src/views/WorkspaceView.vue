@@ -6,7 +6,6 @@ import { useI18n } from "vue-i18n";
 import AgentConsole from "@/components/AgentConsole.vue";
 import FileExplorer from "@/components/FileExplorer.vue";
 import MetricsBar from "@/components/MetricsBar.vue";
-import StatusDot from "@/components/StatusDot.vue";
 import TerminalWorkspace from "@/features/terminal/TerminalWorkspace.vue";
 import WorkspaceToolbar from "@/features/workspace/WorkspaceToolbar.vue";
 import {
@@ -197,8 +196,7 @@ watch(serverId, async (nextServerId) => {
           </section>
         </Transition>
       </div>
-      <StatusDot :status="server.status" />
-      <div :class="['workspace-env', { live: isLive }]"><Wifi :size="13" />{{ isLive ? t("workspace.liveSession") : t("workspace.demoSession") }}</div>
+      <div :class="['workspace-env', { live: isLive, preparing: !isLive }]"><Wifi :size="13" />{{ isLive ? t("workspace.liveSession") : t("workspace.preparingSession") }}</div>
       <WorkspaceToolbar />
       <button class="refresh-button" :disabled="store.isCollecting" @click="refreshOrConnect">
         <RefreshCw v-if="isLive" :class="{ spin: store.isCollecting }" :size="15" />

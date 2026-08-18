@@ -3,27 +3,37 @@ import { reactive } from "vue";
 import { X } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import { useOpsStore } from "@/stores/ops";
+import type { ServerProfile } from "@/types";
 
+const props = defineProps<{ server?: ServerProfile }>();
 const emit = defineEmits<{ close: [] }>();
 const store = useOpsStore();
 const { t } = useI18n();
-const form = reactive({ name: "", host: "", port: 22, username: "root", group: t("dashboard.defaultGroup"), password: "" });
+const form = reactive({
+  name: props.server?.name ?? "",
+  host: props.server?.host ?? "",
+  port: props.server?.port ?? 22,
+  username: props.server?.username ?? "root",
+  group: props.server?.group ?? t("dashboard.defaultGroup"),
+  password: "",
+});
 
 function submit() {
   if (!form.name.trim() || !form.host.trim()) return;
   const { password, ...server } = form;
-  store.addServer(server, password);
+  if (props.server) store.updateServer(props.server.id, server, password);
+  else store.addServer(server, password);
   emit("close");
 }
 </script>
 
 <template>
-  <div class="modal-backdrop" @click.self="emit('close')">
+  <div class="modal-backdrop">
     <form class="modal-card" @submit.prevent="submit">
       <div class="modal-title">
         <div>
-          <h2>{{ t("serverForm.title") }}</h2>
-          <p>{{ t("serverForm.subtitle") }}</p>
+          <h2>{{ t(props.server ? "serverForm.editTitle" : "serverForm.title") }}</h2>
+          <p>{{ t(props.server ? "serverForm.editSubtitle" : "serverForm.subtitle") }}</p>
         </div>
         <button class="icon-button" type="button" @click="emit('close')"><X :size="18" /></button>
       </div>
@@ -37,7 +47,7 @@ function submit() {
       <label>{{ t("serverForm.password") }}<input v-model="form.password" type="password" autocomplete="new-password" :placeholder="t('serverForm.passwordPlaceholder')" /></label>
       <div class="modal-actions">
         <button class="button secondary" type="button" @click="emit('close')">{{ t("common.cancel") }}</button>
-        <button class="button primary" type="submit">{{ t("serverForm.submit") }}</button>
+        <button class="button primary" type="submit">{{ t(props.server ? "serverForm.save" : "serverForm.submit") }}</button>
       </div>
     </form>
   </div>

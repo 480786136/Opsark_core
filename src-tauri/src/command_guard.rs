@@ -30,6 +30,7 @@ pub(crate) fn risk_for(command: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn requires_high_risk_approval(command: &str) -> bool {
     risk_for(command) == "high"
 }

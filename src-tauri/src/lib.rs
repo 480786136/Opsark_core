@@ -24,7 +24,7 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, State};
 
-use command_guard::{requires_high_risk_approval, risk_for};
+use command_guard::risk_for;
 use credential::{delete_credential, load_credential, save_credential};
 use file_tree::{scan_sftp, FileStructureResult};
 use json_contract::{parse_model_array_field, parse_model_json};
@@ -49,9 +49,9 @@ struct ServerInfo {
     os: String,
     kernel: String,
     cpu: String,
-    cores: u8,
-    memory_gb: u16,
-    disk_gb: u16,
+    cores: u16,
+    memory_gb: u32,
+    disk_gb: u32,
     uptime: String,
 }
 
@@ -77,12 +77,6 @@ struct CommandResult {
     simulated: bool,
     exit_code: i32,
     empty_result: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ValidationResult {
-    passed: bool,
-    detail: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -112,7 +106,7 @@ const PLAN_STEP_OUTPUT_CONTRACT: &str = r#"输出必须是 {"steps":[...]} 对�
 字段内容应清晰、直接并保持完成任务所需的完整信息。command 和 validation 可以包含换行，但必须按标准 JSON 规则转义。
 Shell 反斜杠在 JSON 字符串内必须写成双反斜杠，例如 Shell 的 \( 必须输出为 \\( 的 JSON 文本。
 输出前逐个检查六个字段，必须保证整个 JSON 对象完整闭合，不得截断任何字段。"#;
-const REQUIREMENT_CLASSIFICATION_CONTRACT: &str = r#"本阶段只做需求分类和约束提取，禁止输出 steps、command、validation 或执行计划。咨询类必须严格输出：{"intent":"answer","answer":"非空回答","constraints":null}。执行类必须严格输出：{"intent":"execute","answer":"","constraints":{"changePolicy":"unspecified|read_only|requested_changes_only|allow_necessary_changes","environmentPolicy":"unspecified|preserve|allow_isolated_changes|allow_host_changes","failurePolicy":"unspecified|strict|best_effort","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]}}。顶层只允许 intent、answer、constraints 三个字段。"#;
+const REQUIREMENT_CLASSIFICATION_CONTRACT: &str = r#"本阶段只做需求分类、终端上下文判断和约束提取，禁止输出 steps、command、validation 或执行计划。必须先判断回答或计划是否依赖用户之前的终端输入/输出：如依赖且 terminalContext.content 未提供或范围不够，返回 terminal_context，terminalContextLines 必须大于当前 includedLines，且不超过 totalLines 和 400；不依赖则不得请求终端内容。咨询类必须严格输出：{"intent":"answer","answer":"非空回答","constraints":null,"terminalContextLines":0}。执行类必须严格输出：{"intent":"execute","answer":"","constraints":{"changePolicy":"unspecified|read_only|requested_changes_only|allow_necessary_changes","environmentPolicy":"unspecified|preserve|allow_isolated_changes|allow_host_changes","failurePolicy":"unspecified|strict|best_effort","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},"terminalContextLines":0}。需要更多终端内容时必须严格输出：{"intent":"terminal_context","answer":"","constraints":null,"terminalContextLines":80}。顶层只允许 intent、answer、constraints、terminalContextLines 四个字段。"#;
 const SECRET_PLACEHOLDER_RULE: &str = "敏感变量规则：${secret.NAME} 是 Opsark 的执行时传输占位符，不是要保留在远端文件里的字面量。必须原样写成 ${secret.NAME}，绝对不得在美元符号前添加反斜杠。程序会在 SSH 执行前注入真实值，并在输出、日志和模型上下文中脱敏。模型看到的 •••••••• 只表示真实值已被脱敏：它既不是远端文件的实际内容，也不能证明具体密码正确或错误，更不能据此声称占位符未解析。选择变量时名称和说明必须与目标凭据语义一致；若现有变量无法区分目标账户或用途，应使用新的、用途明确的变量名，由界面向用户索取，不能静默借用含义模糊的旧值。写入远端配置后应使用不泄露秘密的功能性后置条件校验；校验命令中仍可使用同一占位符供程序注入。不得要求远端保留 Opsark 占位符，也不得因脱敏标记判定泄露、写入失败或密码错误。除非用户明确禁止持久化密码，不得自行增加该限制。";
 const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
 
@@ -135,7 +129,7 @@ const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
 const GENERAL_DISCOVERY_RULES: &str = "对于需要发现实际实现方式的任务，先读取目标自带的说明、声明、配置、入口和已有状态，由证据确定依赖、运行方式、构建方式、部署方式和验收标准。核心不提供任何领域工具或技术栈的默认方案；只能使用当前证据明确展示的能力。发现步骤的校验只确认证据可获得，不要把可选信息缺失判为失败。";
 const GENERAL_REQUIREMENT_SYSTEM: &str = "你是通用运维需求分类器，本阶段不生成计划。判断用户是仅需要不依赖当前环境的知识性回答，还是需要读取或改变真实目标环境。需要当前状态、真实数据或任何环境变更时必须返回 execute。结构化约束只能来自用户明确表达，不得猜测或自行增加。";
 const GENERAL_SUMMARY_SYSTEM: &str = "你是通用运维结果总结器。仅根据用户目标和脱敏的真实执行证据总结。结构化 result 和 evidence.facts 优先于预期文本和旧总结。有效的“未发现”、“非健康”或“警告”是观察结果，不等于命令执行失败。若存在关键失败且无后续证据证明目标已达成，必须明确说明任务未完成、最终阻断、已确认结果和尚未满足的目标。若目标已达成，必须直接给出用户所需的具体结果。不得把某个中间信号自动归因给目标对象，除非证据已建立关联。不得虚构、输出命令或泄露敏感信息。使用一至三段中文纯文本。";
-const GENERAL_REVIEW_SYSTEM: &str = "你是通用运维执行复核员。根据原始用户目标、executionConstraints、完整计划、已完成记录、当前步骤真实证据和剩余步骤，判断工作流应 continue、adjust 或 complete。只返回包含 decision、reason、summary 的 JSON 对象。不得把真实失败改写为成功，不得虚构证据、新命令或新的用户授权。当前异常若不阻断整体目标，或剩余计划有明确且符合约束的恢复路径，返回 continue；若已阻断目标、证据不足或剩余计划无法处理，返回 adjust；只有用户整体目标已被真实证据充分证明时才返回 complete。对只读发现，得到“不存在”或异常状态是有效结果，应根据剩余计划判断。对变更步骤，后置条件未满足时不得 complete。当 trigger 为长时间运行定期复核时，continue 表示继续等待，adjust 表示停止并调整，complete 仅在 periodicObservation.passed=true 时表示停止等待并进入正式校验。安全拦截、用户审批、真实执行结果和程序门禁不可被覆盖。";
+const GENERAL_REVIEW_SYSTEM: &str = "你是通用运维执行复核员。根据原始用户目标、executionConstraints、完整计划、已完成记录、当前步骤真实证据和剩余步骤，判断工作流应 continue、adjust 或 complete。只返回包含 decision、reason、summary 的 JSON 对象。不得把真实失败改写为成功，不得虚构证据、新命令或新的用户授权。当前异常若不阻断整体目标，或剩余计划有明确且符合约束的恢复路径，返回 continue；若已阻断目标、证据不足或剩余计划无法处理，返回 adjust；只有用户整体目标已被真实证据充分证明时才返回 complete。对只读发现，得到“不存在”或异常状态是有效结果，应根据剩余计划判断。对变更步骤，后置条件未满足时不得 complete。当 trigger 为长时间运行定期复核时，必须忽略后续步骤是否值得执行，只判断当前命令是否仍需等待：continue 只表示当前命令仍在运行且需继续等待；adjust 表示停止并调整；complete 仅在 periodicObservation.passed=true 时表示当前命令已可停止等待并进入正式校验。不得用“继续执行剩余步骤”作为 continue 的理由。安全拦截、用户审批、真实执行结果和程序门禁不可被覆盖。";
 const STRUCTURED_OUTPUT_ATTEMPTS: usize = 2;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -183,6 +177,9 @@ struct AiRequirementDecision {
     intent: String,
     answer: String,
     constraints: Value,
+    #[serde(rename = "terminalContextLines")]
+    #[serde(default)]
+    terminal_context_lines: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -203,6 +200,8 @@ struct RequirementProcessingResult {
     answer: Option<String>,
     plan: Vec<PlanStep>,
     constraints: Option<ExecutionConstraints>,
+    #[serde(rename = "terminalContextLines")]
+    terminal_context_lines: usize,
 }
 
 fn normalize_execution_constraints(
@@ -298,6 +297,12 @@ fn convert_ai_plan_steps(raw_steps: Vec<AiPlanStep>) -> Result<Vec<PlanStep>, St
             if command.is_empty() || validation.is_empty() {
                 return Err(format!(
                     "第 {} 个计划步骤缺少非空 command 或 validation",
+                    index + 1
+                ));
+            }
+            if matches!(validation.as_str(), "true" | ":" | "exit 0" | "/bin/true") {
+                return Err(format!(
+                    "第 {} 个计划步骤使用了无业务意义的 validation；必须用独立、只读且能验证 expected 的命令",
                     index + 1
                 ));
             }
@@ -438,40 +443,6 @@ fn is_valid_empty_result(command: &str, status: i32, output: &str) -> bool {
     lower.contains("grep ") || lower.contains("grep -") || lower.contains("pgrep ")
 }
 
-fn step(
-    index: usize,
-    title: &str,
-    description: &str,
-    command: &str,
-    expected: &str,
-    validation: &str,
-) -> PlanStep {
-    PlanStep {
-        id: format!("step-{}-{}", unix_seconds(), index),
-        title: title.into(),
-        description: description.into(),
-        command: command.into(),
-        risk: risk_for(command).into(),
-        expected: expected.into(),
-        validation: validation.into(),
-        status: "pending".into(),
-        output: None,
-    }
-}
-
-#[tauri::command]
-fn collect_server_info() -> ServerInfo {
-    ServerInfo {
-        os: "Ubuntu 24.04 LTS".into(),
-        kernel: "6.8.0-44-generic".into(),
-        cpu: "Intel Xeon Gold 6338N".into(),
-        cores: 8,
-        memory_gb: 16,
-        disk_gb: 160,
-        uptime: "16 天 4 小时".into(),
-    }
-}
-
 #[tauri::command(async)]
 fn probe_ssh_server(
     host: String,
@@ -482,7 +453,7 @@ fn probe_ssh_server(
     let session = connect_ssh(&host, port, &username, &password)?;
     let (raw, status) = ssh_exec(
         &session,
-        "printf '%s\\n' \"$(hostname)\" \"$(uname -srm)\" \"$(. /etc/os-release 2>/dev/null; echo ${PRETTY_NAME:-Unknown})\" \"$(nproc 2>/dev/null || echo 1)\" \"$(free -m 2>/dev/null | awk '/Mem:/{printf \\\"%.1f\\\", $2/1024}' || echo 0)\" \"$(df -BG / 2>/dev/null | awk 'NR==2{gsub(/G/,\\\"\\\",$2); print $2}' || echo 0)\" \"$(uptime -p 2>/dev/null || uptime)\"",
+        "printf '%s\\n' \"$(hostname)\" \"$(uname -srm)\" \"$(. /etc/os-release 2>/dev/null; echo ${PRETTY_NAME:-Unknown})\" \"$(nproc 2>/dev/null || echo 1)\" \"$(awk '/MemTotal:/{print $2/1048576}' /proc/meminfo 2>/dev/null || echo 0)\" \"$(df -Pk / 2>/dev/null | awk 'NR==2{print $2/1048576}' || echo 0)\" \"$(uptime -p 2>/dev/null || uptime)\"",
     )?;
     if status != 0 {
         return Err(format!("服务器信息采集失败：{raw}"));
@@ -496,8 +467,8 @@ fn probe_ssh_server(
         kernel: lines[1].to_string(),
         cpu: "远程服务器 CPU".into(),
         cores: lines[3].trim().parse().unwrap_or(1),
-        memory_gb: lines[4].trim().parse::<f32>().unwrap_or(0.0).ceil() as u16,
-        disk_gb: lines[5].trim().parse().unwrap_or(0),
+        memory_gb: lines[4].trim().parse::<f64>().unwrap_or(0.0).ceil() as u32,
+        disk_gb: lines[5].trim().parse::<f64>().unwrap_or(0.0).ceil() as u32,
         uptime: lines[6].trim_start_matches("up ").to_string(),
     };
     Ok(SshProbe {
@@ -781,7 +752,7 @@ async fn process_ai_requirement(
             }
         };
         let contract_error = match decision.intent.as_str() {
-            "answer" if !decision.answer.trim().is_empty() && decision.constraints.is_null() => {
+            "answer" if !decision.answer.trim().is_empty() && decision.constraints.is_null() && decision.terminal_context_lines == 0 => {
                 None
             }
             "answer" => Some("咨询类响应的 answer 必须是非空字符串".to_string()),
@@ -790,14 +761,18 @@ async fn process_ai_requirement(
                     && serde_json::from_value::<ExecutionConstraints>(
                         decision.constraints.clone(),
                     )
-                    .is_ok() =>
+                    .is_ok() && decision.terminal_context_lines == 0 =>
             {
                 None
             }
             "execute" => {
                 Some("执行类响应的 answer 必须为空字符串，constraints 必须包含合法字段".to_string())
             }
-            _ => Some("需求分类 intent 只能是 answer 或 execute".to_string()),
+            "terminal_context" if decision.answer.trim().is_empty()
+                && decision.constraints.is_null()
+                && (1..=400).contains(&decision.terminal_context_lines) => None,
+            "terminal_context" => Some("终端上下文请求必须给出 1 到 400 行".to_string()),
+            _ => Some("需求分类 intent 只能是 answer、execute 或 terminal_context".to_string()),
         };
         if let Some(error) = contract_error {
             last_error = error;
@@ -814,6 +789,16 @@ async fn process_ai_requirement(
             answer: Some(decision.answer.trim().to_string()),
             plan: Vec::new(),
             constraints: None,
+            terminal_context_lines: 0,
+        });
+    }
+    if decision.intent == "terminal_context" {
+        return Ok(RequirementProcessingResult {
+            intent: "terminal_context".into(),
+            answer: None,
+            plan: Vec::new(),
+            constraints: None,
+            terminal_context_lines: decision.terminal_context_lines,
         });
     }
 
@@ -836,6 +821,7 @@ async fn process_ai_requirement(
         answer: None,
         plan,
         constraints: Some(constraints),
+        terminal_context_lines: 0,
     })
 }
 
@@ -935,52 +921,6 @@ async fn review_ai_step(
     ))
 }
 
-#[tauri::command]
-fn generate_plan(requirement: String) -> Vec<PlanStep> {
-    vec![step(
-        0,
-        "采集目标相关事实",
-        &format!("仅读取执行环境基础信息，供后续理解用户需求：{requirement}"),
-        "uname -a && pwd",
-        "获得可用于后续判断的基础事实",
-        "uname -a >/dev/null && pwd >/dev/null",
-    )]
-}
-
-#[tauri::command]
-fn execute_command(command: String, approved_high_risk: bool) -> CommandResult {
-    if requires_high_risk_approval(&command) && !approved_high_risk {
-        return CommandResult {
-            output: format!("$ {command}\n[安全策略] 高危命令已拦截，未发送至服务器"),
-            success: false,
-            simulated: true,
-            exit_code: 126,
-            empty_result: false,
-        };
-    }
-
-    CommandResult {
-        output: format!("$ {command}\n[演示执行器] 命令已安全执行\n状态: success\n耗时: 0.38s"),
-        success: true,
-        simulated: true,
-        exit_code: 0,
-        empty_result: false,
-    }
-}
-
-#[tauri::command]
-fn validate_step(expected: String, output: String) -> ValidationResult {
-    let passed = output.contains("success") || output.contains("[exit: 0]");
-    ValidationResult {
-        passed,
-        detail: if passed {
-            format!("校验通过：{expected}")
-        } else {
-            "未在命令输出中找到成功标记".into()
-        },
-    }
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -988,7 +928,6 @@ pub fn run() {
         .manage(SftpTransferManager::default())
         .manage(ExecutionManager::default())
         .invoke_handler(tauri::generate_handler![
-            collect_server_info,
             get_realtime_metrics,
             probe_ssh_server,
             execute_ssh_command,
@@ -1008,14 +947,11 @@ pub fn run() {
             download_sftp_transfer,
             cancel_sftp_transfer,
             get_ssh_metrics,
-            generate_plan,
             generate_ai_plan,
             process_ai_requirement,
             check_ai_model,
             generate_ai_summary,
             review_ai_step,
-            execute_command,
-            validate_step,
             save_credential,
             load_credential,
             delete_credential

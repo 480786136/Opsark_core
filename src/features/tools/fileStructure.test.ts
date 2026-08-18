@@ -1,8 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  buildDemoFileStructure,
-  normalizeFileStructureRequest,
-} from "@/features/tools/fileStructure";
+import { normalizeFileStructureRequest } from "@/features/tools/fileStructure";
 
 describe("file structure tool", () => {
   it("merges defaults and normalizes request limits", () => {
@@ -26,17 +23,4 @@ describe("file structure tool", () => {
     expect(() => normalizeFileStructureRequest({ rootPath: "/opt/app", maxNodes: 0 })).toThrow("节点数量");
   });
 
-  it("applies hidden, exclusion, depth and node limits in demo mode", () => {
-    const result = buildDemoFileStructure(normalizeFileStructureRequest({
-      rootPath: "/opt/app",
-      maxDepth: 1,
-      maxNodes: 3,
-    }));
-
-    expect(result.nodes.some((node) => node.name === "node_modules")).toBe(false);
-    expect(result.nodes.some((node) => node.name === ".env")).toBe(false);
-    expect(result.maxDepthReached).toBe(true);
-    expect(result.truncated).toBe(true);
-    expect(result.totalNodes).toBe(3);
-  });
 });

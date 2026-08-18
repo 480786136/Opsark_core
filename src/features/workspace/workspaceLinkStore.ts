@@ -6,6 +6,12 @@ export interface WorkspacePathRequest {
   path: string;
 }
 
+export interface TerminalModelReference {
+  id: number;
+  paneId: string;
+  content: string;
+}
+
 let nextRequestId = 0;
 
 function createPathRequest(path: string): WorkspacePathRequest {
@@ -49,6 +55,7 @@ export const useWorkspaceLinkStore = defineStore("workspaceLinks", {
     terminalPathRequests: {} as Record<string, WorkspacePathRequest>,
     sftpPathRequests: {} as Record<string, WorkspacePathRequest>,
     paneDirectories: {} as Record<string, string>,
+    terminalModelReferences: {} as Record<string, TerminalModelReference>,
   }),
   actions: {
     requestTerminalPath(serverId: string, path: string) {
@@ -67,6 +74,15 @@ export const useWorkspaceLinkStore = defineStore("workspaceLinks", {
     },
     publishPaneDirectory(paneId: string, path: string) {
       this.paneDirectories[paneId] = normalizeRemotePath(path);
+    },
+    publishTerminalModelReference(serverId: string, paneId: string, content: string) {
+      const normalized = content.trim().slice(0, 24_000);
+      if (!normalized) return undefined;
+      this.terminalModelReferences[serverId] = { id: ++nextRequestId, paneId, content: normalized };
+      return this.terminalModelReferences[serverId];
+    },
+    consumeTerminalModelReference(serverId: string, requestId: number) {
+      if (this.terminalModelReferences[serverId]?.id === requestId) delete this.terminalModelReferences[serverId];
     },
     removePane(paneId: string) {
       delete this.paneDirectories[paneId];

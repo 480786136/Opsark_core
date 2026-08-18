@@ -49,7 +49,7 @@ fn plan_step_count_limit_is_only_applied_when_enabled() {
             description: "执行必要操作".into(),
             command: format!("echo {index}"),
             expected: "命令正常完成".into(),
-            validation: "true".into(),
+            validation: format!("printf '%s\\n' {index} | grep -qx {index}"),
             risk: Some("low".into()),
         })
         .collect::<Vec<_>>();
@@ -103,10 +103,4 @@ fn grep_no_match_is_a_valid_empty_query_result() {
         2,
         "No such file"
     ));
-}
-
-#[test]
-fn demo_high_risk_command_requires_explicit_approval() {
-    assert!(!execute_command("rm -rf /tmp/explicit-target".into(), false).success);
-    assert!(execute_command("rm -rf /tmp/explicit-target".into(), true).success);
 }

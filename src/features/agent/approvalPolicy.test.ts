@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { requiresStepApproval } from "@/features/agent/approvalPolicy";
+import { normalizePermissionLevel, requiresStepApproval } from "@/features/agent/approvalPolicy";
 import type { PlanStep } from "@/types";
 
 const step = (risk: PlanStep["risk"], command = "uname -a"): PlanStep => ({
@@ -18,12 +18,16 @@ describe("approval policy", () => {
     expect(requiresStepApproval("observe", step("low"))).toBe(true);
     expect(requiresStepApproval("safe", step("low"))).toBe(false);
     expect(requiresStepApproval("safe", step("medium"))).toBe(true);
-    expect(requiresStepApproval("autonomous", step("medium"))).toBe(false);
     expect(requiresStepApproval("managed", step("medium"))).toBe(false);
   });
 
   it("always requires approval for high-risk or destructive commands", () => {
-    expect(requiresStepApproval("autonomous", step("high"))).toBe(true);
+    expect(requiresStepApproval("managed", step("high"))).toBe(true);
     expect(requiresStepApproval("managed", step("low", "rm -rf /tmp/example"))).toBe(true);
+  });
+
+  it("migrates the removed automatic mode to safe mode", () => {
+    expect(normalizePermissionLevel("autonomous")).toBe("safe");
+    expect(normalizePermissionLevel("managed")).toBe("managed");
   });
 });

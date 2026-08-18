@@ -81,6 +81,7 @@ describe("TerminalPanel 多分屏隔离", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     host.remove();
   });
@@ -178,7 +179,7 @@ describe("TerminalPanel 多分屏隔离", () => {
     app.unmount();
   });
 
-  it("智能任务执行时显示实时记录并锁定发起终端输入", async () => {
+  it("智能任务执行时保持 Shell 可见、不自动打开实时记录并锁定输入", async () => {
     const pinia = createPinia();
     const ops = useOpsStore(pinia);
     ops.servers.push({
@@ -194,7 +195,7 @@ describe("TerminalPanel 多分屏隔离", () => {
       createdAt: new Date().toISOString(),
     });
     ops.connectedServerIds.push("server-a");
-    const task = ops.createTask("server-a", "autonomous", "model-deepseek");
+    const task = ops.createTask("server-a", "managed", "model-deepseek");
     task.status = "running";
     const sessions = useTerminalSessionStore(pinia);
     sessions.ensureWorkspace("server-a");
@@ -212,11 +213,53 @@ describe("TerminalPanel 多分屏隔离", () => {
     await nextTick();
     terminalBackend.inputListeners.forEach((listener) => listener("whoami\r"));
 
-    expect(host.querySelector(".terminal-agent-view")?.textContent).toContain("v16.20.2");
-    expect(host.querySelector(".terminal-agent-running")?.textContent).toContain("终端已锁定");
-    expect(host.querySelector<HTMLElement>(".terminal-host")?.style.display).toBe("none");
+    expect(host.querySelector(".terminal-agent-view")).toBeNull();
+    expect(host.querySelector<HTMLElement>(".terminal-host")?.style.display).not.toBe("none");
+    expect(host.querySelector<HTMLElement>(".terminal-host")?.classList.contains("locked")).toBe(true);
     expect(terminalBackend.writeTerminal).not.toHaveBeenCalledWith(expect.anything(), "whoami\r");
     app.unmount();
+  });
+
+  it("通过单行 PTY 协议识别实时输出和退出码", async () => {
+    vi.useFakeTimers();
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    ops.servers.push({
+      id: "server-a", name: "Test", host: "127.0.0.1", port: 22, username: "ops", group: "test",
+      status: "online", environment: [],
+      info: { os: "Linux", kernel: "6", cpu: "CPU", cores: 1, memoryGb: 1, diskGb: 1, uptime: "1h" },
+      createdAt: new Date().toISOString(),
+    });
+    ops.serverPasswords["server-a"] = "secret";
+    ops.connectedServerIds.push("server-a");
+    const sessions = useTerminalSessionStore(pinia);
+    sessions.ensureWorkspace("server-a");
+    const paneId = sessions.resolveActivePaneId("server-a")!;
+    const app = createApp(TerminalPanel, { serverId: "server-a", sessionId: paneId, active: true });
+    app.use(pinia).use(i18n).mount(host);
+    await nextTick();
+    await Promise.resolve();
+    terminalBackend.statusListeners.forEach((listener) => listener({
+      terminalId: `pty-server-a-${paneId}`, generation: 1, status: "connected", retryable: false,
+    }));
+    const chunks: string[] = [];
+    const resultPromise = sessions.requestAgentPtyCommand(paneId, "exec-1", "pwd", (chunk) => chunks.push(chunk));
+    await nextTick();
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(terminalBackend.writeTerminal).toHaveBeenCalledWith(
+      `pty-server-a-${paneId}`,
+      expect.stringMatching(/__OPSARK_BEGIN_exec-1__.*__OPSARK_END_exec-1_/),
+    );
+    terminalBackend.outputListeners.forEach((listener) => listener({
+      terminalId: `pty-server-a-${paneId}`,
+      data: "__OPSARK_BEGIN_exec-1__\r\n/root\r\n__OPSARK_END_exec-1_0__\r\n",
+      stream: "stdout",
+    }));
+    await expect(resultPromise).resolves.toMatchObject({ output: "/root", exitCode: 0, success: true });
+    expect(chunks.join("")).toContain("/root");
+    app.unmount();
+    vi.useRealTimers();
   });
 
 });

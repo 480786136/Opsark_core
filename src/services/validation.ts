@@ -52,7 +52,7 @@ interface OutputSignals {
   blocking: boolean;
 }
 
-function analyzeOutputSignals(output: string): OutputSignals {
+function analyzeOutputSignals(output: string, semantic = ""): OutputSignals {
   const lines = outputLines(output);
   const text = lines.join("\n");
   const warningLines = lines.filter((line) =>
@@ -69,6 +69,9 @@ function analyzeOutputSignals(output: string): OutputSignals {
       .test(line),
   );
   const networkFailure = networkFailureLines.length > 0;
+  const emptyRequiredFile = /(?:\.sql|backup|dump)/i.test(`${semantic}\n${text}`)
+    && /完整|备份|backup|dump/i.test(semantic)
+    && (/(?:^|\n)\s*0\s+\S+\.sql\s*$/im.test(text) || /\.sql:\s*empty\b/i.test(text));
   const warnings: string[] = [];
   if (warningLines.length) {
     warnings.push("命令成功完成，但输出中包含需要关注的警告信息。");
@@ -81,8 +84,9 @@ function analyzeOutputSignals(output: string): OutputSignals {
     );
   }
   if (networkFailure) warnings.push("下载或网络连接失败，目标文件或安装脚本未可靠获取。");
+  if (emptyRequiredFile) warnings.push("目标 SQL/备份文件为空，已经足以否定其内容完整性。");
   return {
-    status: platformIncompatible || networkFailure
+    status: platformIncompatible || networkFailure || emptyRequiredFile
       ? "unhealthy"
       : warningLines.length
         ? "warning"
@@ -97,11 +101,12 @@ function analyzeOutputSignals(output: string): OutputSignals {
       missingAbiSymbols,
       networkFailure,
       networkFailureSamples: networkFailureLines.slice(0, 5),
+      emptyRequiredFile,
       warningCount: warningLines.length,
       warningSamples: [...new Set(warningLines)].slice(0, 8),
     },
     warnings,
-    blocking: platformIncompatible || networkFailure,
+    blocking: platformIncompatible || networkFailure || emptyRequiredFile,
   };
 }
 
@@ -365,8 +370,9 @@ export function classifyStepResult(
   const step = ensureStepValidator(rawStep);
   const validator = step.validator;
   const mainParsed = parseObservation(step, execution);
-  const mainSignals = analyzeOutputSignals(mainOutput(execution.output));
-  const validationSignals = analyzeOutputSignals(validation.output ?? "");
+  const semantic = `${step.title}\n${step.description}\n${step.expected}`;
+  const mainSignals = analyzeOutputSignals(mainOutput(execution.output), semantic);
+  const validationSignals = analyzeOutputSignals(validation.output ?? "", semantic);
   const outputSignals: OutputSignals = {
     status: mainSignals.status === "unhealthy" || validationSignals.status === "unhealthy"
       ? "unhealthy"

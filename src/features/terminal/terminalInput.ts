@@ -77,6 +77,13 @@ export function appendTerminalHistory(history: string[], command: string, maximu
   return [...history, command.trim()].slice(-maximum);
 }
 
+/** Commands that repaint the primary screen and can erase the visible history. */
+export function shouldPreserveViewportBeforeCommand(command: string) {
+  const normalized = command.trim();
+  if (!/^(?:sudo\s+)?top(?:\s|$)/.test(normalized)) return false;
+  return !/(?:^|\s)-(?:[^\s]*b[^\s]*)(?:\s|$)/.test(normalized);
+}
+
 export function matchesTerminalShortcut(event: KeyboardEvent, action: TerminalShortcutAction, preset: TerminalShortcutPreset) {
   if (event.type !== "keydown") return false;
   const key = event.key.toLowerCase();

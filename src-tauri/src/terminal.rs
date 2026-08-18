@@ -153,6 +153,8 @@ fn run_terminal_session(
     port: u16,
     username: &str,
     password: &str,
+    cols: u32,
+    rows: u32,
     generation: u64,
     receiver: mpsc::Receiver<TerminalInput>,
 ) -> Result<TerminalExit, String> {
@@ -161,19 +163,13 @@ fn run_terminal_session(
         .channel_session()
         .map_err(|error| format!("无法创建终端通道：{error}"))?;
     channel
-        .request_pty("xterm-256color", None, Some((120, 32, 0, 0)))
+        .request_pty("xterm-256color", None, Some((cols.max(2), rows.max(1), 0, 0)))
         .map_err(|error| format!("无法申请远程 PTY：{error}"))?;
     channel
         .shell()
         .map_err(|error| format!("无法启动远程 Shell：{error}"))?;
     session.set_blocking(false);
     emit_terminal_status(app, terminal_id, generation, "connected", None, false);
-    emit_terminal(
-        app,
-        terminal_id,
-        format!("\r\n[Opsark] 已建立真实 SSH PTY：{username}@{host}\r\n"),
-        "system",
-    );
 
     let mut buffer = [0_u8; 8192];
     loop {
@@ -240,6 +236,8 @@ pub(crate) fn start_ssh_terminal(
     port: u16,
     username: String,
     password: String,
+    cols: u32,
+    rows: u32,
 ) -> Result<u64, String> {
     let (sender, receiver) = mpsc::channel();
     let Some(generation) = manager.register(&terminal_id, sender)? else {
@@ -259,6 +257,8 @@ pub(crate) fn start_ssh_terminal(
             port,
             &username,
             &password,
+            cols,
+            rows,
             generation,
             receiver,
         );

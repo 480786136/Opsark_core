@@ -21,7 +21,7 @@ export type StepStatus =
   | "failed"
   | "skipped";
 export type RiskLevel = "low" | "medium" | "high";
-export type PermissionLevel = "observe" | "safe" | "autonomous" | "managed";
+export type PermissionLevel = "observe" | "safe" | "managed";
 export type StepReviewDecision = "continue" | "adjust" | "complete";
 export type ExecutionStatus = "success" | "failed" | "cancelled" | "blocked";
 export type ObservationStatus =
@@ -205,10 +205,11 @@ export interface AiGenerationSettings {
 }
 
 export interface RequirementProcessingResult {
-  intent: "answer" | "execute";
+  intent: "answer" | "execute" | "terminal_context";
   answer?: string;
   plan: PlanStep[];
   constraints?: ExecutionConstraints;
+  terminalContextLines?: number;
 }
 
 export interface AuditEvent {
@@ -218,7 +219,12 @@ export interface AuditEvent {
   title: string;
   detail: string;
   serverId?: string;
+  /** Snapshot names make an audit record understandable after a server/task is renamed or deleted. */
+  serverName?: string;
   taskId?: string;
+  taskTitle?: string;
+  stepId?: string;
+  executionId?: string;
   createdAt: string;
 }
 
@@ -233,6 +239,6 @@ export interface FileEntry {
 export interface SecretMetadata {
   key: string;
   description: string;
-  scope: "global" | "server";
-  serverId?: string;
+  scope: "server";
+  serverId: string;
 }

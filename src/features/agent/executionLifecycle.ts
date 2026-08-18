@@ -43,6 +43,7 @@ export interface RunCommandLifecycleInput {
   onEvent(role: "assistant" | "system", content: string): void;
   onAudit(audit: LongRunningReviewAudit): void;
   onError(title: string, detail: string): void;
+  cancelExecution?(): Promise<void> | void;
 }
 
 export interface CommandLifecycleResult {
@@ -77,6 +78,7 @@ export async function runCommandLifecycle(
     onEvent: input.onEvent,
     onAudit: input.onAudit,
     onError: input.onError,
+    cancelExecution: input.cancelExecution,
   });
 
   let result: ExecutionCommandResult;
@@ -167,4 +169,3 @@ export async function runValidationLifecycle(
   validation = await run(input.createRetryExecutionId());
   return { validation, retried: true, firstFailedOutput };
 }
-

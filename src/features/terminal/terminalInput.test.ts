@@ -5,6 +5,7 @@ import {
   canStoreTerminalCommand,
   isRecognizedShellPrompt,
   matchesTerminalShortcut,
+  shouldPreserveViewportBeforeCommand,
   updateCommandDraft,
 } from "./terminalInput";
 
@@ -29,5 +30,13 @@ describe("terminal input", () => {
     expect(result.submitted).toBe("eco ok");
     expect(matchesTerminalShortcut(new KeyboardEvent("keydown", { key: "f", ctrlKey: true }), "find", "platform")).toBe(true);
     expect(matchesTerminalShortcut(new KeyboardEvent("keydown", { key: "f", ctrlKey: true, shiftKey: true }), "find", "vscode")).toBe(true);
+  });
+
+  it("仅为交互式 top 保留当前可视区", () => {
+    expect(shouldPreserveViewportBeforeCommand("top")).toBe(true);
+    expect(shouldPreserveViewportBeforeCommand("top -o %MEM")).toBe(true);
+    expect(shouldPreserveViewportBeforeCommand("sudo top")).toBe(true);
+    expect(shouldPreserveViewportBeforeCommand("top -b -n 1")).toBe(false);
+    expect(shouldPreserveViewportBeforeCommand("htop")).toBe(false);
   });
 });

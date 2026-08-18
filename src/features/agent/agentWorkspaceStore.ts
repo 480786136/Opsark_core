@@ -1,4 +1,5 @@
 import { defineStore } from "pinia";
+import { normalizePermissionLevel } from "@/features/agent/approvalPolicy";
 import type { PermissionLevel } from "@/types";
 
 export interface ServerAgentWorkspaceState {
@@ -32,13 +33,10 @@ function defaultWorkspace(): ServerAgentWorkspaceState {
 function normalizeWorkspace(value: unknown): ServerAgentWorkspaceState | undefined {
   if (!value || typeof value !== "object") return undefined;
   const candidate = value as Record<string, unknown>;
-  const permissions: PermissionLevel[] = ["observe", "safe", "autonomous", "managed"];
   return {
     activeTaskId: typeof candidate.activeTaskId === "string" ? candidate.activeTaskId : "",
     draft: typeof candidate.draft === "string" ? candidate.draft.slice(0, 20_000) : "",
-    permission: permissions.includes(candidate.permission as PermissionLevel)
-      ? candidate.permission as PermissionLevel
-      : "safe",
+    permission: normalizePermissionLevel(candidate.permission),
     modelId: typeof candidate.modelId === "string" ? candidate.modelId : "",
     automationEnabled: candidate.automationEnabled === true,
     showTasks: candidate.showTasks !== false,

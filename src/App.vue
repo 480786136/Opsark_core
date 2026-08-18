@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { onMounted } from "vue";
+import { onBeforeUnmount, onMounted } from "vue";
 import { RouterLink, RouterView, useRoute } from "vue-router";
-import { Boxes, LayoutDashboard, ScrollText, Settings, ShieldCheck } from "lucide-vue-next";
+import { Boxes, BrainCircuit, KeyRound, LayoutDashboard, ScrollText, Settings, ShieldCheck, Wrench } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import AppearanceControls from "@/features/preferences/AppearanceControls.vue";
 import { useOpsStore } from "@/stores/ops";
@@ -10,7 +10,18 @@ const route = useRoute();
 const store = useOpsStore();
 const { t } = useI18n();
 
-onMounted(() => void store.hydrateCredentials());
+function suppressBrowserContextMenu(event: MouseEvent) {
+  // Opsark is a desktop console. Browser actions such as Reload, Translate and
+  // Inspect Element are unrelated to the workspace; feature-owned menus (for
+  // example SFTP entries) already handle the event before it reaches here.
+  event.preventDefault();
+}
+
+onMounted(() => {
+  void store.hydrateCredentials();
+  document.addEventListener("contextmenu", suppressBrowserContextMenu);
+});
+onBeforeUnmount(() => document.removeEventListener("contextmenu", suppressBrowserContextMenu));
 </script>
 
 <template>
@@ -25,6 +36,15 @@ onMounted(() => void store.hydrateCredentials());
         </RouterLink>
         <RouterLink to="/logs" :title="t('nav.logs')">
           <ScrollText :size="20" />
+        </RouterLink>
+        <RouterLink to="/secrets" :title="t('nav.secrets')">
+          <KeyRound :size="20" />
+        </RouterLink>
+        <RouterLink to="/models" :title="t('nav.models')">
+          <BrainCircuit :size="20" />
+        </RouterLink>
+        <RouterLink to="/tools" :title="t('nav.tools')">
+          <Wrench :size="20" />
         </RouterLink>
         <RouterLink to="/settings" :title="t('nav.settings')">
           <Settings :size="20" />

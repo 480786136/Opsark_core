@@ -28,14 +28,6 @@ interface PersistedFileWorkspace {
 
 const STORAGE_KEY = "opsark.fileWorkspace.v1";
 
-export const DEMO_FILE_ENTRIES: FileEntry[] = [
-  { name: "etc", path: "/etc", kind: "directory", size: "—", modified: "今天 09:20" },
-  { name: "home", path: "/home", kind: "directory", size: "—", modified: "昨天 18:42" },
-  { name: "opt", path: "/opt", kind: "directory", size: "—", modified: "7月24日" },
-  { name: "var", path: "/var", kind: "directory", size: "—", modified: "今天 11:04" },
-  { name: "deploy.sh", path: "/deploy.sh", kind: "file", size: "2.4 KB", modified: "7月21日" },
-];
-
 function createServerWorkspace(initialFiles: FileEntry[] = []): ServerFileWorkspace {
   return {
     files: [...initialFiles],

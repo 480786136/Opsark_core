@@ -20,7 +20,7 @@ export function sanitizeTerminalOutput(value: string) {
       .replace(/\u0007/g, "")
       .replace(/\r\n/g, "\n")
       .replace(/\r/g, "\n"),
-  );
+  ).replace(/(?:^|\n)\s*1337;(?:PreExecMarker;[^\n]*|PostExecMarker;Exit=\d+;)\s*/g, "\n");
   const lines = cleaned.split("\n");
   const compacted: string[] = [];
   let pendingProgress: string | undefined;

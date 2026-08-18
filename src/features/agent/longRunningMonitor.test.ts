@@ -83,4 +83,32 @@ describe("longRunningMonitor", () => {
     controller.stop();
     expect(timers.size).toBe(0);
   });
+
+  it("任务取消后立即停止心跳消息", () => {
+    let cancelled = false;
+    let nextTimerId = 0;
+    const timers = new Map<number, () => void>();
+    const scheduler: LongRunningMonitorScheduler = {
+      now: () => Date.now(),
+      setInterval: (callback) => { timers.set(++nextTimerId, callback); return nextTimerId; },
+      clearInterval: (timerId) => void timers.delete(timerId),
+    };
+    const onHeartbeat = vi.fn();
+    const step = {
+      id: "step-1", title: "Check", description: "Check", command: "check", validation: "verify",
+      expected: "done", risk: "low", status: "running",
+    } satisfies PlanStep;
+    const task = {
+      id: "task-1", serverId: "server-1", title: "Task", status: "running", permission: "safe",
+      modelId: "model-1", messages: [], plan: [step], createdAt: "now", updatedAt: "now",
+    } satisfies OpsTask;
+    startLongRunningMonitor({
+      task, step, requirement: "Check", validation: "verify", executionId: "exec-1", secretValues: {},
+      getStreamedOutput: () => "", isCancelled: () => cancelled, onHeartbeat, onEvent: vi.fn(),
+      onAudit: vi.fn(), onError: vi.fn(), scheduler,
+    });
+    cancelled = true;
+    timers.get(1)?.();
+    expect(onHeartbeat).not.toHaveBeenCalled();
+  });
 });

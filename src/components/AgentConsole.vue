@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
   Bot,
   Check,
@@ -28,11 +28,15 @@ import { useOpsStore } from "@/stores/ops";
 import type { ObservationStatus, OpsTask, PlanStep } from "@/types";
 import ModelSettingsModal from "@/components/ModelSettingsModal.vue";
 import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
+import { useWorkspaceLinkStore } from "@/features/workspace/workspaceLinkStore";
 
 const props = defineProps<{ serverId: string }>();
 const store = useOpsStore();
 const agentWorkspaces = useAgentWorkspaceStore();
+const workspaceLinks = useWorkspaceLinkStore();
 const { t, locale } = useI18n();
+const taskMenuTrigger = ref<HTMLElement>();
+const taskMenu = ref<HTMLElement>();
 const workspaceState = agentWorkspaces.ensureServer(props.serverId);
 const persistedField = <K extends keyof typeof workspaceState>(key: K) => computed({
   get: () => workspaceState[key],
@@ -84,6 +88,9 @@ const currentRecords = computed(() => {
     .find(({ message }) => message.role === "user" && message.kind === "message")?.index ?? -1;
   return task.value.messages.slice(start + 1).filter((message) => message.kind === "event");
 });
+const activeRecordId = computed(() => isBusy.value
+  ? currentRecords.value[currentRecords.value.length - 1]?.id
+  : undefined);
 
 watch(
   () => [task.value?.messages.length, task.value?.plan.length, task.value?.status],
@@ -91,6 +98,17 @@ watch(
     await nextTick();
     timeline.value?.scrollTo({ top: timeline.value.scrollHeight, behavior: "smooth" });
   },
+);
+
+watch(
+  () => workspaceLinks.terminalModelReferences[props.serverId],
+  (reference) => {
+    if (!reference) return;
+    terminalReference.value = reference.content;
+    workspaceLinks.consumeTerminalModelReference(props.serverId, reference.id);
+    void nextTick(() => document.querySelector<HTMLTextAreaElement>(`.agent-workspace-stack textarea`)?.focus());
+  },
+  { immediate: true },
 );
 
 watch(
@@ -107,7 +125,7 @@ function toggleStep(id: string) {
 
 async function submit() {
   const value = input.value.trim();
-  if (!value || !automationEnabled.value || isBusy.value || !modelId.value) return;
+  if (!value || !automationEnabled.value || isBusy.value || !modelId.value || !store.connectedServerIds.includes(props.serverId)) return;
   showTasks.value = false;
   let selectedTask = task.value;
   if (!selectedTask) {
@@ -265,14 +283,34 @@ function startNewTask() {
   agentWorkspaces.updateServer(props.serverId, { activeTaskId: "", showTasks: false });
 }
 
-onMounted(() => void restoreAutomation());
+function closeTaskMenuOnOutsidePointer(event: PointerEvent) {
+  const target = event.target as Node;
+  if (showTasks.value && !taskMenu.value?.contains(target) && !taskMenuTrigger.value?.contains(target)) {
+    showTasks.value = false;
+  }
+}
+
+onMounted(() => {
+  document.addEventListener("pointerdown", closeTaskMenuOnOutsidePointer);
+  void restoreAutomation();
+});
+onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuOnOutsidePointer));
 </script>
 
 <template>
   <section class="work-panel agent-panel">
     <header class="agent-header">
-      <div class="agent-title"><Bot :size="18" /><strong>{{ t("agent.title") }}</strong><span class="beta">CORE</span></div>
-      <button class="text-icon-button" @click="showTasks = !showTasks"><History :size="15" />{{ t("agent.tasks") }}</button>
+      <div class="agent-title">
+        <span class="agent-title-icon"><Bot :size="17" /></span>
+        <span class="agent-title-copy"><strong>{{ t("agent.title") }}</strong><small v-if="task">{{ task.title }}</small></span>
+        <span class="beta">CORE</span>
+        <span v-if="isBusy" class="agent-activity"><i></i>{{ statusText(task?.status) }}</span>
+      </div>
+      <button ref="taskMenuTrigger" :class="['text-icon-button', 'task-menu-trigger', { active: showTasks }]" @click="showTasks = !showTasks">
+        <span class="task-menu-trigger-icon"><History :size="14" /></span>
+        <span class="task-menu-trigger-copy"><strong>{{ t("agent.tasks") }}</strong><small>{{ task ? statusText(task.status) : t("agent.noActiveTask") }}</small></span>
+        <b>{{ serverTasks.length }}</b>
+      </button>
     </header>
 
     <div v-if="!automationEnabled" class="agent-welcome">
@@ -284,17 +322,20 @@ onMounted(() => void restoreAutomation());
         <span><Check :size="14" />{{ t("agent.contextMetrics") }}</span>
         <span><Check :size="14" />{{ t("agent.contextSecurity") }}</span>
       </div>
-      <button class="button primary wide" @click="enableAutomation"><Play :size="15" />{{ t("agent.enableTitle") }}</button>
-      <small>{{ t(store.connectedServerIds.includes(serverId) ? "agent.liveHint" : "agent.demoHint") }}</small>
+      <button class="button primary wide" :disabled="!store.connectedServerIds.includes(serverId)" @click="enableAutomation"><Play :size="15" />{{ t("agent.enableTitle") }}</button>
+      <small>{{ t(store.connectedServerIds.includes(serverId) ? "agent.liveHint" : "agent.disconnectedHint") }}</small>
     </div>
 
     <template v-else>
-      <div v-if="showTasks && serverTasks.length" class="task-strip">
-        <div
-          v-for="item in serverTasks"
-          :key="item.id"
-          :class="['task-strip-item', { active: item.id === task?.id }]"
-        >
+      <Transition name="task-pop">
+      <div v-if="showTasks" ref="taskMenu" class="task-strip">
+        <header class="task-strip-head">
+          <span class="task-strip-heading"><History :size="14" /><span><strong>{{ t("agent.taskListTitle") }}</strong><small>{{ t("agent.taskListHint") }}</small></span></span>
+          <strong>{{ serverTasks.length }}</strong>
+        </header>
+        <div class="task-strip-list">
+        <TransitionGroup name="task-list">
+        <div v-for="item in serverTasks" :key="item.id" :class="['task-strip-item', item.status, { active: item.id === task?.id }]">
           <button class="task-select" @click="selectTaskItem(item.id)">
             <span :class="['task-status-mini', item.status]"></span>
             <span><strong>{{ item.title }}</strong><small>{{ t("agent.rounds", { count: (item.planHistory?.length ?? 0) + (item.messages.some((message) => message.role === 'user' && message.kind === 'message') ? 1 : 0), status: statusText(item.status) }) }}</small></span>
@@ -307,8 +348,12 @@ onMounted(() => void restoreAutomation());
             @click.stop="deleteTaskItem(item)"
           ><Trash2 :size="13" /></button>
         </div>
+        </TransitionGroup>
+        <div v-if="!serverTasks.length" class="task-strip-empty">{{ t("agent.emptyTitle") }}</div>
+        </div>
         <button class="new-task" @click="startNewTask"><MessageSquarePlus :size="14" />{{ t("agent.newTask") }}</button>
       </div>
+      </Transition>
 
       <div ref="timeline" class="agent-timeline">
         <div v-if="!task" class="empty-agent">
@@ -359,7 +404,7 @@ onMounted(() => void restoreAutomation());
                 <div class="steps">
                   <div v-for="(step, index) in round.plan" :key="step.id" :class="['plan-step', step.status]">
                     <button class="step-main" @click="toggleStep(`history-${round.id}-${step.id}`)">
-                      <span class="step-icon"><CheckCircle2 v-if="step.status === 'completed'" :size="17" /><Circle v-else :size="17" /></span>
+                      <span class="step-icon"><CheckCircle2 v-if="step.status === 'completed'" :size="17" /><LoaderCircle v-else-if="['running', 'validating'].includes(step.status)" class="spin" :size="17" /><Circle v-else :size="17" /></span>
                       <span class="step-copy"><strong>{{ index + 1 }}. {{ step.title }}</strong><small>{{ step.description }}</small></span>
                       <span v-if="step.result" :class="['observation-tag', step.result.observationStatus]">{{ stepObservationText(step) }}</span>
                       <span :class="['risk-tag', step.risk]">{{ riskText(step) }}</span>
@@ -432,22 +477,25 @@ onMounted(() => void restoreAutomation());
             </div>
           </div>
 
-          <div v-if="task.plan.length" :class="['plan-card', `task-card-${task.status}`]">
+          <div v-if="task.plan.length" :class="['plan-card', 'current-plan-card', `task-card-${task.status}`]">
             <div class="plan-card-head">
-              <span><strong>{{ t("agent.currentPlan") }}</strong><small>{{ t("agent.processed", { done: task.plan.filter((step) => ["completed", "skipped", "failed"].includes(step.status)).length, total: task.plan.length }) }}</small></span>
-              <span class="plan-head-actions">
-                <button
-                  v-if="canTerminate"
-                  class="terminate-business"
-                  type="button"
-                  :title="t('agent.terminateTitle')"
-                  @click.stop="store.terminateTask(task.id)"
-                ><Square :size="11" />{{ t("agent.terminate") }}</button>
-                <span :class="['task-state-pill', task.status]">
-                  <LoaderCircle v-if="isBusy" class="spin" :size="13" />
-                  <Clock3 v-else-if="task.status.includes('awaiting')" :size="13" />
-                  <CheckCircle2 v-else-if="task.status === 'completed'" :size="13" />
-                  {{ statusText(task.status) }}
+              <span class="plan-title-block">
+                <span class="plan-title-line">
+                  <LoaderCircle v-if="isBusy" class="spin plan-title-loading" :size="15" />
+                  <strong>{{ t("agent.currentPlan") }}</strong>
+                  <span v-if="!isBusy" :class="['task-state-pill', task.status]">
+                    <Clock3 v-if="task.status.includes('awaiting')" :size="13" />
+                    <CheckCircle2 v-else-if="task.status === 'completed'" :size="13" />
+                    {{ statusText(task.status) }}
+                  </span>
+                  <small class="plan-processed">{{ t("agent.processed", { done: task.plan.filter((step) => ["completed", "skipped", "failed"].includes(step.status)).length, total: task.plan.length }) }}</small>
+                  <button
+                    v-if="canTerminate"
+                    class="terminate-business"
+                    type="button"
+                    :title="t('agent.terminateTitle')"
+                    @click.stop="store.terminateTask(task.id)"
+                  ><Square :size="11" />{{ t("agent.terminate") }}</button>
                 </span>
               </span>
             </div>
@@ -515,13 +563,13 @@ onMounted(() => void restoreAutomation());
 
           <div v-if="currentRecords.length || task.plan.some((step) => step.output)" class="plan-card execution-record-card">
             <button class="plan-card-head archived-head" @click="toggleRecords('current')">
-              <span><ListTree :size="15" /><span><strong>{{ t("agent.executionRecord") }}</strong><small>{{ t("agent.recordsHint", { count: currentRecords.length }) }}</small></span></span>
+              <span><LoaderCircle v-if="isBusy" class="spin execution-record-running" :size="15" /><ListTree v-else :size="15" /><span><strong>{{ t("agent.executionRecord") }}</strong><small>{{ t("agent.recordsHint", { count: currentRecords.length }) }}</small></span></span>
               <span><ChevronDown v-if="expandedRecords.includes('current')" :size="15" /><ChevronRight v-else :size="15" /></span>
             </button>
             <div v-if="expandedRecords.includes('current')" class="execution-record-body">
-              <div v-for="record in currentRecords" :key="record.id" class="execution-event-row">
+              <div v-for="record in currentRecords" :key="record.id" :class="['execution-event-row', { active: record.id === activeRecordId }]">
                 <time>{{ new Date(record.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
-                <span>{{ record.content }}</span>
+                <span><i v-if="record.id === activeRecordId" class="execution-event-pulse" />{{ record.content }}</span>
               </div>
               <div v-for="step in task.plan.filter((item) => item.output)" :key="`current-output-${step.id}`" class="execution-output">
                 <strong>{{ step.title }}</strong><code>{{ step.command }}</code><pre>{{ step.output }}</pre>
@@ -571,7 +619,6 @@ onMounted(() => void restoreAutomation());
           <select v-model="permission" :title="t('agent.permission')">
             <option value="observe">{{ t("agent.permissionObserve") }}</option>
             <option value="safe">{{ t("agent.permissionSafe") }}</option>
-            <option value="autonomous">{{ t("agent.permissionAutonomous") }}</option>
             <option value="managed">{{ t("agent.permissionManaged") }}</option>
           </select>
           <button class="send-button" type="submit" :disabled="!input.trim() || Boolean(isBusy) || !modelId"><Send :size="16" /></button>

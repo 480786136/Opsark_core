@@ -13,11 +13,9 @@ import {
   FolderOpen,
   FolderInput,
   FolderPlus,
-  List,
   LoaderCircle,
   Pencil,
   RefreshCw,
-  Rows3,
   TriangleAlert,
   Trash2,
   Upload,
@@ -32,14 +30,12 @@ import {
   type FileSortKey,
   type FileSortState,
 } from "@/features/files/fileWorkspace";
-import {
-  DEMO_FILE_ENTRIES,
-  useFileWorkspaceStore,
-} from "@/features/files/fileWorkspaceStore";
+import { useFileWorkspaceStore } from "@/features/files/fileWorkspaceStore";
 import { localizeFileMutationAudit, type FileMutationResult } from "@/features/files/fileMutationResult";
 import {
   buildRemoteBreadcrumbs,
   joinRemotePath,
+  normalizeRemotePath,
   parentRemotePath,
   validateRemoteEntryName,
 } from "@/features/files/remotePath";
@@ -57,6 +53,8 @@ interface FileDialogState {
   file?: File;
 }
 
+const FILE_COLUMNS_STORAGE_KEY = "opsark.fileColumns.v2";
+
 const props = defineProps<{ serverId: string }>();
 const emit = defineEmits<{ edit: [entry: FileEntry] }>();
 const store = useOpsStore();
@@ -66,7 +64,11 @@ const workspaceLinks = useWorkspaceLinkStore();
 const { t } = useI18n();
 const fileInput = ref<HTMLInputElement>();
 const nameInput = ref<HTMLInputElement>();
+const pathInput = ref<HTMLInputElement>();
 const fileList = ref<HTMLElement>();
+const editingPath = ref(false);
+const pathDraft = ref("");
+const columnWidths = ref({ name: 160, size: 52, modified: 74 });
 const selection = ref<FileSelectionState>({ selectedPaths: [], anchorPath: "" });
 const sort = ref<FileSortState>({ key: "name", direction: "asc" });
 const contextMenu = ref<{ x: number; y: number; entry: FileEntry }>();
@@ -76,7 +78,7 @@ const operationError = ref("");
 const operationPending = ref(false);
 const transferQueueOpen = ref(false);
 fileWorkspace.hydrate();
-fileWorkspace.ensureServer(props.serverId, DEMO_FILE_ENTRIES);
+fileWorkspace.ensureServer(props.serverId);
 
 const fileState = computed(() => fileWorkspace.serverWorkspaces[props.serverId]);
 const currentPath = computed(() => fileState.value.currentPath);
@@ -90,6 +92,48 @@ const directoryErrorMessage = computed(() => fileState.value.errorCode
     path: fileState.value.lastSuccessfulPath,
   })
   : "");
+const fileTableStyle = computed(() => ({
+  "--file-name-column": `${columnWidths.value.name}px`,
+  "--file-size-column": `${columnWidths.value.size}px`,
+  "--file-modified-column": `${columnWidths.value.modified}px`,
+}));
+
+function beginPathEdit() {
+  pathDraft.value = currentPath.value;
+  editingPath.value = true;
+  void nextTick(() => pathInput.value?.select());
+}
+
+function cancelPathEdit() {
+  editingPath.value = false;
+  pathDraft.value = currentPath.value;
+}
+
+function submitPath() {
+  const target = normalizeRemotePath(pathDraft.value.trim() || "/");
+  editingPath.value = false;
+  if (target !== currentPath.value) void loadDirectory(target);
+}
+
+function startColumnResize(column: "name" | "size" | "modified", event: PointerEvent) {
+  event.preventDefault();
+  const startX = event.clientX;
+  const startWidth = columnWidths.value[column];
+  const limits = column === "name" ? [110, 520] : column === "size" ? [42, 130] : [58, 190];
+  const onMove = (moveEvent: PointerEvent) => {
+    columnWidths.value = {
+      ...columnWidths.value,
+      [column]: Math.min(limits[1], Math.max(limits[0], startWidth + moveEvent.clientX - startX)),
+    };
+  };
+  const onEnd = () => {
+    localStorage.setItem(FILE_COLUMNS_STORAGE_KEY, JSON.stringify(columnWidths.value));
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onEnd);
+  };
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onEnd);
+}
 
 async function loadDirectory(path: string) {
   const connection = store.getRuntimeConnection(props.serverId);
@@ -369,6 +413,12 @@ watch(
 );
 
 onMounted(() => {
+  try {
+    const saved = JSON.parse(localStorage.getItem(FILE_COLUMNS_STORAGE_KEY) ?? "null");
+    if (saved && [saved.name, saved.size, saved.modified].every(Number.isFinite)) {
+      columnWidths.value = saved;
+    }
+  } catch { /* 使用默认列宽。 */ }
   document.addEventListener("pointerdown", closeContextMenu);
   if (isLive.value) void loadDirectory(currentPath.value);
 });
@@ -378,15 +428,11 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeContextMe
 <template>
   <section class="work-panel file-panel">
     <header class="panel-header">
-      <div><span class="eyebrow">SFTP</span><strong>{{ t("files.title") }}</strong></div>
+      <div class="file-panel-title"><span class="eyebrow">SFTP</span><strong>{{ t("files.title") }}</strong></div>
       <div class="header-actions">
         <button type="button" :title="t('files.upload')" :disabled="!isLive" @click="fileInput?.click()"><Upload :size="15" /></button>
         <button type="button" :title="t('files.newFolder')" :disabled="!isLive" @click="openDialog('create')"><FolderPlus :size="15" /></button>
         <button type="button" :title="t('files.openInTerminal')" :disabled="!isLive" @click="openCurrentPathInTerminal"><FolderInput :size="15" /></button>
-        <div class="file-view-toggle" role="group" :aria-label="t('files.viewMode')">
-          <button type="button" :title="t('files.listView')" :class="{ active: fileWorkspace.viewMode === 'list' }" @click="fileWorkspace.setViewMode('list')"><List :size="14" /></button>
-          <button type="button" :title="t('files.compactView')" :class="{ active: fileWorkspace.viewMode === 'compact' }" @click="fileWorkspace.setViewMode('compact')"><Rows3 :size="14" /></button>
-        </div>
         <button type="button" :title="t('common.refresh')" @click="loadDirectory(currentPath)"><RefreshCw :class="{ spin: fileState.loading }" :size="15" /></button>
         <button type="button" :title="t('files.transfers')" :class="{ active: transferQueueOpen }" @click="transferQueueOpen = !transferQueueOpen">
           <ArrowUpDown :size="15" /><i v-if="serverTransferCount">{{ serverTransferCount }}</i>
@@ -396,47 +442,59 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeContextMe
     </header>
     <nav class="path-bar" :aria-label="t('files.title')">
       <button type="button" :title="t('files.goUp')" :disabled="currentPath === '/'" @click="goUp"><ChevronLeft :size="14" /></button>
-      <template v-for="(item, index) in breadcrumbs" :key="item.path">
+      <form v-if="editingPath" class="path-editor" @submit.prevent="submitPath">
+        <input ref="pathInput" v-model="pathDraft" :aria-label="t('files.path')" spellcheck="false" @keydown.esc.prevent="cancelPathEdit" @blur="submitPath" />
+      </form>
+      <template v-for="(item, index) in editingPath ? [] : breadcrumbs" :key="item.path">
         <ChevronRight v-if="index" :size="12" />
-        <button type="button" :class="{ current: index === breadcrumbs.length - 1 }" @click="openDirectory(item.path)">{{ item.label }}</button>
+        <button type="button" :class="{ current: index === breadcrumbs.length - 1 }" :title="item.path" @click="openDirectory(item.path)">{{ item.label }}</button>
       </template>
+      <button v-if="!editingPath" type="button" class="path-empty-editor" :title="t('files.editPath')" :aria-label="t('files.editPath')" @click="beginPathEdit" />
     </nav>
-    <div :class="['file-table-head', fileWorkspace.viewMode]">
+    <div class="file-table-viewport" :style="fileTableStyle">
+    <div class="file-table-head">
       <button type="button" :title="t('files.sortBy', { column: t('files.name') })" @click="toggleSort('name')">
-        {{ t("files.name") }}<component :is="sort.direction === 'asc' ? ArrowUp : ArrowDown" v-if="sort.key === 'name'" :size="10" />
+        {{ t("files.name") }}<component :is="sort.direction === 'asc' ? ArrowUp : ArrowDown" v-if="sort.key === 'name'" :size="10" /><i class="file-column-resizer" @pointerdown.stop="startColumnResize('name', $event)" />
       </button>
       <button type="button" :title="t('files.sortBy', { column: t('files.size') })" @click="toggleSort('size')">
-        {{ t("files.size") }}<component :is="sort.direction === 'asc' ? ArrowUp : ArrowDown" v-if="sort.key === 'size'" :size="10" />
+        {{ t("files.size") }}<component :is="sort.direction === 'asc' ? ArrowUp : ArrowDown" v-if="sort.key === 'size'" :size="10" /><i class="file-column-resizer" @pointerdown.stop="startColumnResize('size', $event)" />
       </button>
       <button type="button" :title="t('files.sortBy', { column: t('files.modified') })" @click="toggleSort('modified')">
-        {{ t("files.modified") }}<component :is="sort.direction === 'asc' ? ArrowUp : ArrowDown" v-if="sort.key === 'modified'" :size="10" />
+        {{ t("files.modified") }}<component :is="sort.direction === 'asc' ? ArrowUp : ArrowDown" v-if="sort.key === 'modified'" :size="10" /><i class="file-column-resizer" @pointerdown.stop="startColumnResize('modified', $event)" />
       </button><i />
     </div>
-    <div ref="fileList" :class="['file-list', fileWorkspace.viewMode]" tabindex="0" role="listbox" :aria-multiselectable="true" @keydown="handleListKeydown">
+    <div ref="fileList" class="file-list" tabindex="0" role="listbox" :aria-multiselectable="true" @keydown="handleListKeydown">
       <div v-if="fileState.loading" class="file-loading"><LoaderCircle class="spin" :size="17" />{{ t("files.loading") }}</div>
-      <div v-else-if="!fileState.files.length" class="file-empty"><Folder :size="22" /><span>{{ t("files.empty") }}</span></div>
-      <div
-        v-for="(file, index) in sortedFiles"
-        v-else
-        :key="file.path"
-        :data-file-index="index"
-        :class="['file-row-wrap', { selected: selectedSet.has(file.path) }]"
-        role="option"
-        :aria-selected="selectedSet.has(file.path)"
-        @click="selectEntry(file, $event)"
-        @dblclick="openEntry(file)"
-        @contextmenu.prevent="openContextMenu(file, $event)"
-      >
-        <button class="file-row" type="button">
-          <span class="file-primary"><component :is="file.kind === 'directory' ? Folder : FileCode2" :size="16" /><span class="file-name">{{ file.name }}</span></span>
-          <small>{{ file.size }}</small><small>{{ file.modified }}</small>
+      <template v-else>
+        <button v-if="currentPath !== '/'" class="file-row file-parent-row" type="button" :title="t('files.goUp')" @dblclick="goUp">
+          <span class="file-primary"><Folder :size="16" /><span class="file-name">..</span></span>
+          <small>—</small><small>—</small>
         </button>
-        <div v-if="isLive" class="file-actions">
-          <button v-if="file.kind === 'file'" type="button" :title="t('files.download')" @click.stop="download(file)"><Download :size="12" /></button>
-          <button type="button" :title="t('files.rename')" @click.stop="openDialog('rename', file)"><Pencil :size="12" /></button>
-          <button type="button" :title="t('files.remove')" @click.stop="openDialog('delete', file)"><Trash2 :size="12" /></button>
+        <div v-if="!fileState.files.length" class="file-empty"><Folder :size="22" /><span>{{ t("files.empty") }}</span></div>
+        <div
+          v-for="(file, index) in sortedFiles"
+          v-else
+          :key="file.path"
+          :data-file-index="index"
+          :class="['file-row-wrap', { selected: selectedSet.has(file.path) }]"
+          role="option"
+          :aria-selected="selectedSet.has(file.path)"
+          @click="selectEntry(file, $event)"
+          @dblclick="openEntry(file)"
+          @contextmenu.prevent="openContextMenu(file, $event)"
+        >
+          <button class="file-row" type="button">
+            <span class="file-primary"><component :is="file.kind === 'directory' ? Folder : FileCode2" :size="16" /><span class="file-name">{{ file.name }}</span></span>
+            <small>{{ file.size }}</small><small>{{ file.modified }}</small>
+          </button>
+          <div v-if="isLive" class="file-actions">
+            <button v-if="file.kind === 'file'" type="button" :title="t('files.download')" @click.stop="download(file)"><Download :size="12" /></button>
+            <button type="button" :title="t('files.rename')" @click.stop="openDialog('rename', file)"><Pencil :size="12" /></button>
+            <button type="button" :title="t('files.remove')" @click.stop="openDialog('delete', file)"><Trash2 :size="12" /></button>
+          </div>
         </div>
-      </div>
+      </template>
+    </div>
     </div>
     <div v-if="fileState.errorCode" class="file-directory-state" role="alert">
       <TriangleAlert :size="14" />
@@ -446,7 +504,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeContextMe
     <p v-if="operationError" class="file-operation-error">{{ operationError }}</p>
     <TransferQueuePanel v-if="transferQueueOpen" :server-id="serverId" @close="transferQueueOpen = false" />
     <div class="panel-footnote">
-      <span>{{ t("files.items", { count: fileState.files.length }) }} · {{ isLive ? t("files.live") : t("files.demo") }}</span>
+      <span>{{ t("files.items", { count: fileState.files.length }) }}<template v-if="!isLive"> · {{ t("files.preparing") }}</template></span>
       <strong v-if="selection.selectedPaths.length">{{ t("files.selected", { count: selection.selectedPaths.length }) }}</strong>
     </div>
 

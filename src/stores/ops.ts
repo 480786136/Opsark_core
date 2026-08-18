@@ -24,7 +24,7 @@ import {
   extractKnownExecutionFacts,
   trimEvidence,
 } from "@/features/agent/agentContext";
-import { requiresStepApproval } from "@/features/agent/approvalPolicy";
+import { normalizePermissionLevel, requiresStepApproval } from "@/features/agent/approvalPolicy";
 import { transitionTask } from "@/features/agent/taskMachine";
 import { transitionStep } from "@/features/agent/stepMachine";
 import {
@@ -69,6 +69,8 @@ import {
   runValidationLifecycle,
 } from "@/features/agent/executionLifecycle";
 import { prepareStepExecution } from "@/features/agent/executionPreparation";
+import { executeStepCommand } from "@/features/agent/executionRunner";
+import { redactExecutionOutput } from "@/features/agent/secretTool";
 import {
   buildCommandResultAudit,
   buildValidationResultAudit,
@@ -111,6 +113,17 @@ const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 let persistTimer: number | undefined;
 let credentialHydration: Promise<void> | undefined;
 
+const secretValueId = (serverId: string, key: string) => `${serverId}::${key}`;
+
+function serverSecretValues(values: Record<string, string>, serverId: string) {
+  const prefix = `${serverId}::`;
+  return Object.fromEntries(
+    Object.entries(values)
+      .filter(([id]) => id.startsWith(prefix))
+      .map(([id, value]) => [id.slice(prefix.length), value]),
+  );
+}
+
 const emptyServerInfo = {
   os: "等待采集…",
   kernel: "—",
@@ -121,17 +134,7 @@ const emptyServerInfo = {
   uptime: "—",
 };
 
-const defaultModels: ModelProfile[] = [
-  {
-    id: "model-deepseek",
-    name: "DeepSeek V4 Flash",
-    provider: "DeepSeek",
-    model: "deepseek-v4-flash",
-    endpoint: "https://api.deepseek.com",
-    enabled: true,
-    hasApiKey: false,
-  },
-];
+const defaultModels: ModelProfile[] = [];
 
 const defaultAiGenerationSettings: AiGenerationSettings = {
   limitOutput: false,
@@ -175,17 +178,39 @@ function readSaved<T>(key: string, fallback: T): T {
 }
 
 function initialServers() {
-  return readSaved<ServerProfile[]>("opsark.servers", []);
+  return readSaved<ServerProfile[]>("opsark.servers", []).map((server) => ({
+    ...server,
+    info: {
+      ...emptyServerInfo,
+      ...(server.info ?? {}),
+      cores: Number.isFinite(Number(server.info?.cores)) ? Number(server.info.cores) : 0,
+      memoryGb: Number.isFinite(Number(server.info?.memoryGb)) ? Number(server.info.memoryGb) : 0,
+      diskGb: Number.isFinite(Number(server.info?.diskGb)) ? Number(server.info.diskGb) : 0,
+    },
+  }));
 }
 
 function initialModels() {
   const saved = readSaved<ModelProfile[]>("opsark.models", defaultModels)
-    .filter((model) => model.provider !== "Built-in" && model.id !== "model-local");
+    .filter((model) => model.provider !== "Built-in" && model.id !== "model-local")
+    .filter((model) => !(
+      model.id === "model-deepseek"
+      && model.name === "DeepSeek V4 Flash"
+      && model.model === "deepseek-v4-flash"
+      && model.hasApiKey !== true
+    ));
   return saved.length ? saved : defaultModels.map((model) => ({ ...model }));
+}
+
+function initialSecretMetadata() {
+  const serverIds = new Set(initialServers().map(({ id }) => id));
+  return readSaved<SecretMetadata[]>("opsark.secretMetadata", [])
+    .filter((secret) => secret.scope !== "server" || Boolean(secret.serverId && serverIds.has(secret.serverId)));
 }
 
 function initialTasks() {
   return readSaved<OpsTask[]>("opsark.tasks", []).map((task) => {
+    task.permission = normalizePermissionLevel(task.permission);
     task.confirmedSecretKeys = [];
     task.plan = task.plan.map(ensureStepValidator);
     task.planHistory?.forEach((round) => {
@@ -212,6 +237,16 @@ function initialTasks() {
   });
 }
 
+function initialLogs() {
+  return readSaved<AuditEvent[]>("opsark.logs", []).map((event) => ({
+    ...event,
+    // Older records may not have been written with snapshots. Keep them
+    // readable after a server/task is renamed or removed.
+    title: event.title || "未命名事件",
+    detail: event.detail || "",
+  }));
+}
+
 export const useOpsStore = defineStore("ops", {
   state: () => ({
     servers: initialServers(),
@@ -221,29 +256,23 @@ export const useOpsStore = defineStore("ops", {
     tools: initialTools(),
     toolSaveError: "",
     modelAvailability: {} as Record<string, ModelAvailability>,
-    logs: readSaved<AuditEvent[]>("opsark.logs", []),
+    logs: initialLogs(),
     metrics: {
-      cpu: 32,
-      memory: 56,
-      disk: 68,
-      networkIn: 5.2,
-      networkOut: 1.8,
-      sampledAt: now(),
+      cpu: 0,
+      memory: 0,
+      disk: 0,
+      networkIn: 0,
+      networkOut: 0,
+      sampledAt: "",
     } as Metrics,
     activeTaskId: null as string | null,
     serverPasswords: {} as Record<string, string>,
     modelApiKeys: {} as Record<string, string>,
     connectedServerIds: [] as string[],
-    secretMetadata: readSaved<SecretMetadata[]>("opsark.secretMetadata", [
-      { key: "DB_PASSWORD", description: "数据库密码", scope: "server", serverId: "srv-tencent-test" },
-      { key: "GIT_TOKEN", description: "代码仓库访问令牌", scope: "global" },
-    ]),
+    secretMetadata: initialSecretMetadata(),
     secretValues: {} as Record<string, string>,
     pendingSecret: null as { taskId: string; stepId: string; key: string } | null,
-    terminalLines: [
-      "Opsark Secure Terminal",
-      "连接服务器后可直接使用交互式 PTY；智能任务命令也会在此显示。",
-    ],
+    terminalLines: [] as string[],
     isCollecting: false,
     metricsLoading: false,
     credentialsHydrated: false,
@@ -324,12 +353,19 @@ export const useOpsStore = defineStore("ops", {
               value: await backend.loadCredential("model", model.id),
             })),
         );
-        const secretCredentials = await Promise.allSettled(
-          this.secretMetadata.map(async (secret) => ({
-            id: secret.key,
-            value: await backend.loadCredential("secret", secret.key),
-          })),
-        );
+        const scopedSecrets = this.secretMetadata.filter((secret) => secret.serverId);
+        const secretCredentials = await Promise.allSettled(scopedSecrets.map(async (secret) => {
+          const id = secretValueId(secret.serverId!, secret.key);
+          let value = await backend.loadCredential("secret", id);
+          if (!value) {
+            value = await backend.loadCredential("secret", secret.key);
+            if (value) {
+              await backend.saveCredential("secret", id, value);
+              await backend.deleteCredential("secret", secret.key);
+            }
+          }
+          return { id, legacyKey: secret.key, value };
+        }));
         for (const result of serverCredentials) {
           if (result.status === "fulfilled" && result.value.value) {
             this.serverPasswords[result.value.id] = result.value.value;
@@ -345,6 +381,8 @@ export const useOpsStore = defineStore("ops", {
         for (const result of secretCredentials) {
           if (result.status === "fulfilled" && result.value.value) {
             this.secretValues[result.value.id] = result.value.value;
+            // Compatibility mirror only. Runtime execution never reads unscoped keys.
+            this.secretValues[result.value.legacyKey] = result.value.value;
           }
         }
         const rejected = [...serverCredentials, ...modelCredentials, ...secretCredentials]
@@ -368,9 +406,27 @@ export const useOpsStore = defineStore("ops", {
     },
 
     addLog(event: Omit<AuditEvent, "id" | "createdAt">) {
+      const task = event.taskId
+        ? this.tasks.find((item) => item.id === event.taskId)
+        : undefined;
+      // A task is always owned by one server. Deriving the server here keeps
+      // every task event in the correct server bucket even when a caller only
+      // knows the task ID.
+      const serverId = event.serverId ?? task?.serverId;
+      const server = serverId
+        ? this.servers.find((item) => item.id === serverId)
+        : undefined;
       this.logs = prependAuditEvent(
         this.logs,
-        createAuditEvent(event, uid("log"), now()),
+        createAuditEvent({
+          ...event,
+          serverId,
+          // Keep a human-readable snapshot alongside IDs. This is important for
+          // audit history: deleting or renaming a task must not make old records
+          // impossible to identify.
+          serverName: event.serverName ?? server?.name,
+          taskTitle: event.taskTitle ?? task?.title,
+        }, uid("log"), now()),
       );
       this.persist();
     },
@@ -399,8 +455,7 @@ export const useOpsStore = defineStore("ops", {
             this.refreshMetrics(serverId),
           ]);
         } else {
-          server.info = await backend.collectServerInfo();
-          server.status = "online";
+          throw new Error("未找到该服务器的 SSH 凭据，请重新连接");
         }
         this.addLog({
           category: "system",
@@ -527,13 +582,39 @@ export const useOpsStore = defineStore("ops", {
       return server;
     },
 
+    updateServer(
+      serverId: string,
+      input: Pick<ServerProfile, "name" | "host" | "port" | "username" | "group">,
+      password = "",
+    ) {
+      const server = this.servers.find((item) => item.id === serverId);
+      if (!server) return;
+      const connectionChanged = server.host !== input.host
+        || server.port !== input.port
+        || server.username !== input.username;
+      Object.assign(server, input);
+      this.persist(true);
+      const credential = password || this.serverPasswords[serverId];
+      if (connectionChanged) {
+        this.connectedServerIds = this.connectedServerIds.filter((id) => id !== serverId);
+        server.status = credential ? "testing" : "offline";
+      }
+      if (credential && (password || connectionChanged)) void this.connectServer(serverId, credential, Boolean(password));
+    },
+
     removeServer(serverId: string) {
+      const removedSecrets = this.secretMetadata.filter((secret) => secret.serverId === serverId);
       this.servers = this.servers.filter((server) => server.id !== serverId);
+      this.secretMetadata = this.secretMetadata.filter((secret) => secret.serverId !== serverId);
+      for (const secret of removedSecrets) delete this.secretValues[secretValueId(serverId, secret.key)];
       delete this.serverPasswords[serverId];
       this.connectedServerIds = this.connectedServerIds.filter((id) => id !== serverId);
       useFileWorkspaceStore().removeServer(serverId);
       useAgentWorkspaceStore().removeServer(serverId);
       void backend.deleteCredential("server", serverId);
+      void Promise.allSettled(removedSecrets.map((secret) => (
+        backend.deleteCredential("secret", secretValueId(serverId, secret.key))
+      )));
       this.persist(true);
     },
 
@@ -766,28 +847,60 @@ export const useOpsStore = defineStore("ops", {
           throw new Error(`“${model.name}”的 API Key 未恢复，请前往“模型与设置”重新保存一次。${keychainDetail}`);
         }
         const server = this.servers.find((item) => item.id === serverId);
-        const context = JSON.stringify(buildAgentContext({
-          server,
-          metrics: this.metrics,
-          permission,
-          terminalReference: terminalReference || undefined,
-          conversationHistory: priorConversation,
-          previousExecution,
-          knownExecutionFacts: extractKnownExecutionFacts(task),
-          tools: this.tools,
-          secretMetadata: this.secretMetadata,
-          serverId,
-        }));
-        const processed = await backend.processRequirement(
-          content,
-          {
+        const contextSecrets = serverSecretValues(this.secretValues, serverId);
+        const availableTerminalLines = this.terminalLines.slice(-400)
+          .map((line) => redactExecutionOutput(line, contextSecrets));
+        const selectedLines = terminalReference
+          ? terminalReference.split("\n").map((line) => redactExecutionOutput(line, contextSecrets))
+          : [];
+        let requestedTerminalLines = selectedLines.length;
+        let context = "";
+        let processed;
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          const includedLines = selectedLines.length
+            ? selectedLines
+            : requestedTerminalLines > 0
+              ? availableTerminalLines.slice(-requestedTerminalLines)
+              : [];
+          context = JSON.stringify(buildAgentContext({
+            server,
+            metrics: this.metrics,
+            permission,
+            terminalReference: selectedLines.length ? terminalReference : undefined,
+            terminalContext: {
+              source: selectedLines.length ? "selection" : "automatic",
+              totalLines: selectedLines.length || availableTerminalLines.length,
+              includedLines: includedLines.length,
+              hasMore: !selectedLines.length && includedLines.length < availableTerminalLines.length,
+              content: includedLines.length ? includedLines.join("\n") : undefined,
+            },
+            conversationHistory: priorConversation,
+            previousExecution,
+            knownExecutionFacts: extractKnownExecutionFacts(task),
+            tools: this.tools,
+            secretMetadata: this.secretMetadata,
+            serverId,
+          }));
+          processed = await backend.processRequirement(content, {
             apiKey: apiKey ?? "",
             endpoint: model.endpoint,
             model: model.model,
             context,
             generationSettings: this.aiGenerationSettings,
-          },
-        );
+          });
+          if (processed.intent !== "terminal_context") break;
+          if (selectedLines.length) throw new Error("模型已获得用户标注的终端内容，仍无法判断需求");
+          const nextRange = Math.min(
+            availableTerminalLines.length,
+            Math.max(requestedTerminalLines + 40, processed.terminalContextLines ?? 80),
+          );
+          if (nextRange <= requestedTerminalLines) throw new Error("可用终端历史不足以支持当前需求");
+          requestedTerminalLines = nextRange;
+          understandingMessage.content = `模型需要查看终端历史，已扩展至最近 ${requestedTerminalLines} 行…`;
+        }
+        if (!processed || processed.intent === "terminal_context") {
+          throw new Error("已达终端上下文读取上限，模型仍无法完成需求判断");
+        }
         if (processed.intent === "answer") {
           task.plan = [];
           transitionTask(task, "completed");
@@ -838,8 +951,6 @@ export const useOpsStore = defineStore("ops", {
           kind: "message",
           content: permission === "managed"
             ? `已生成 ${task.plan.length} 个执行步骤，完全托管模式已自动批准计划并开始运行。`
-            : permission === "autonomous"
-              ? `已生成 ${task.plan.length} 个执行步骤，自动执行模式已开始运行。`
             : `已生成 ${task.plan.length} 个执行步骤。请检查风险、命令和预期结果后确认计划。`,
         });
         this.persist();
@@ -847,7 +958,7 @@ export const useOpsStore = defineStore("ops", {
           transitionTask(task, "cancelled");
           return;
         }
-        if (["autonomous", "managed"].includes(permission)) {
+        if (permission === "managed") {
           await this.approvePlan(task.id, true);
         }
       } catch (error) {
@@ -970,9 +1081,7 @@ export const useOpsStore = defineStore("ops", {
         role: automatic ? "system" : "user",
         kind: "event",
         content: automatic
-          ? task.permission === "managed"
-            ? "完全托管模式已自动批准计划，开始执行。"
-            : "自动执行模式已批准计划，开始执行。"
+          ? "完全托管模式已自动批准计划，开始执行。"
           : "计划已批准，开始执行。",
       });
       this.addLog({
@@ -1008,6 +1117,11 @@ export const useOpsStore = defineStore("ops", {
       task.cancelRequested = true;
       this.pushMessage(task, { role: "user", kind: "event", content: "正在终止本次业务及其当前远程进程…" });
       const executionId = task.currentExecutionId;
+      const terminalSessions = useTerminalSessionStore();
+      const boundPaneId = terminalSessions.resolveTaskPaneId(task.serverId, task.id);
+      if (executionId && boundPaneId && terminalSessions.agentCommandByPane[boundPaneId]?.id === executionId) {
+        terminalSessions.interruptAgentPtyCommand(boundPaneId);
+      }
       const server = this.servers.find((item) => item.id === task.serverId);
       const password = this.serverPasswords[task.serverId];
       if (executionId && server && password) {
@@ -1269,12 +1383,13 @@ export const useOpsStore = defineStore("ops", {
           serverPassword: password,
           model: runtimeModel,
           modelApiKey: runtimeApiKey,
-          secretValues: this.secretValues,
+          secretValues: serverSecretValues(this.secretValues, task.serverId),
         });
         step.command = prepared.commandTemplate;
         step.validation = prepared.validationTemplate;
         const executionId = uid("exec");
         const requirement = latestTaskRequirement(task);
+        const scopedSecrets = serverSecretValues(this.secretValues, task.serverId);
         const commandLifecycle = await runCommandLifecycle({
           task,
           step,
@@ -1284,7 +1399,7 @@ export const useOpsStore = defineStore("ops", {
           executionId,
           connection: prepared.connection,
           runtimeModel: prepared.runtimeModel,
-          secretValues: this.secretValues,
+          secretValues: scopedSecrets,
           isCancelled: () => task.cancelRequested === true,
           onExecutionChange: (activeExecutionId) => {
             task.currentExecutionId = activeExecutionId;
@@ -1323,6 +1438,28 @@ export const useOpsStore = defineStore("ops", {
               taskId,
             });
           },
+          cancelExecution: async () => {
+            if (targetPaneId && terminalSessions.agentCommandByPane[targetPaneId]?.id === executionId) {
+              terminalSessions.interruptAgentPtyCommand(targetPaneId);
+              return;
+            }
+            if (prepared.connection) await backend.cancelCommand(prepared.connection, executionId);
+          },
+        }, async (input) => {
+          if (!targetPaneId || terminalSessions.paneStatusById[targetPaneId] !== "connected") {
+            return executeStepCommand(input);
+          }
+          const result = await terminalSessions.requestAgentPtyCommand(
+            targetPaneId,
+            input.executionId,
+            input.command,
+            (chunk) => {
+              const safeChunk = redactExecutionOutput(chunk, scopedSecrets);
+              if (safeChunk) input.onProgress?.(safeChunk, { executionId: input.executionId, data: safeChunk, stream: "stdout" });
+            },
+            step.command,
+          );
+          return { ...result, output: redactExecutionOutput(result.output, scopedSecrets) };
         });
         const result = commandLifecycle.result;
         const streamedOutput = commandLifecycle.streamedOutput;
@@ -1422,7 +1559,7 @@ export const useOpsStore = defineStore("ops", {
           initialExecutionId: uid("validation"),
           createRetryExecutionId: () => uid("validation-retry"),
           connection: prepared.connection,
-          secretValues: this.secretValues,
+          secretValues: serverSecretValues(this.secretValues, task.serverId),
           isCancelled: () => task.cancelRequested === true,
           onExecutionChange: (activeExecutionId) => {
             task.currentExecutionId = activeExecutionId;
@@ -1530,14 +1667,16 @@ export const useOpsStore = defineStore("ops", {
     async provideSecret(value: string) {
       const request = this.pendingSecret;
       if (!request || !value) return;
-      this.secretValues[request.key] = value;
-      if (!this.secretMetadata.some((item) => item.key === request.key)) {
-        this.secretMetadata.push({ key: request.key, description: "任务执行时请求的敏感变量", scope: "global" });
-      }
-      this.pendingSecret = null;
       const task = this.tasks.find((item) => item.id === request.taskId);
       const step = task?.plan.find((item) => item.id === request.stepId);
       if (!task || !step) return;
+      const valueId = secretValueId(task.serverId, request.key);
+      this.secretValues[valueId] = value;
+      if (!this.secretMetadata.some((item) => item.key === request.key && item.serverId === task.serverId)) {
+        this.secretMetadata.push({ key: request.key, description: "任务执行时请求的敏感变量", scope: "server", serverId: task.serverId });
+      }
+      await backend.saveCredential("secret", valueId, value);
+      this.pendingSecret = null;
       task.confirmedSecretKeys ??= [];
       if (!task.confirmedSecretKeys.includes(request.key)) task.confirmedSecretKeys.push(request.key);
       resumeStepAfterSecret(step);
@@ -1547,45 +1686,57 @@ export const useOpsStore = defineStore("ops", {
       await this.runStep(request.taskId, request.stepId);
     },
 
-    addSecretMetadata(key: string, description: string, value = "") {
+    addSecretMetadata(key: string, description: string, value: string, serverId: string) {
       const normalized = key.trim().toUpperCase().replace(/[^A-Z0-9_]/g, "_");
-      if (!normalized || this.secretMetadata.some((item) => item.key === normalized)) return;
-      this.secretMetadata.push({ key: normalized, description: description.trim() || "敏感变量", scope: "global" });
-      if (value) this.secretValues[normalized] = value;
+      if (!normalized || !serverId || this.secretMetadata.some((item) => item.key === normalized && item.serverId === serverId)) return;
+      this.secretMetadata.push({ key: normalized, description: description.trim() || "敏感变量", scope: "server", serverId });
+      if (value) this.secretValues[secretValueId(serverId, normalized)] = value;
       this.persist();
     },
 
-    async renameSecretMetadata(oldKey: string, nextKey: string) {
+    async renameSecretMetadata(oldKey: string, nextKey: string, serverId: string) {
       const normalized = nextKey.trim().toUpperCase().replace(/[^A-Z0-9_]/g, "_");
       if (!normalized || normalized === oldKey) return normalized === oldKey;
-      if (this.secretMetadata.some((item) => item.key === normalized)) return false;
-      const secret = this.secretMetadata.find((item) => item.key === oldKey);
+      if (this.secretMetadata.some((item) => item.key === normalized && item.serverId === serverId)) return false;
+      const secret = this.secretMetadata.find((item) => item.key === oldKey && item.serverId === serverId);
       if (!secret) return false;
-      const value = this.secretValues[oldKey] ?? "";
-      if (value) await backend.saveCredential("secret", normalized, value);
-      await backend.deleteCredential("secret", oldKey);
+      const oldId = secretValueId(serverId, oldKey);
+      const nextId = secretValueId(serverId, normalized);
+      const value = this.secretValues[oldId] ?? "";
+      if (value) await backend.saveCredential("secret", nextId, value);
+      await backend.deleteCredential("secret", oldId);
       secret.key = normalized;
-      if (value) this.secretValues[normalized] = value;
-      delete this.secretValues[oldKey];
+      if (value) this.secretValues[nextId] = value;
+      delete this.secretValues[oldId];
       this.persist(true);
       return true;
     },
 
-    async removeSecretMetadata(key: string) {
-      await backend.deleteCredential("secret", key);
-      this.secretMetadata = this.secretMetadata.filter((item) => item.key !== key);
-      delete this.secretValues[key];
+    async removeSecretMetadata(key: string, serverId: string) {
+      const id = secretValueId(serverId, key);
+      await backend.deleteCredential("secret", id);
+      this.secretMetadata = this.secretMetadata.filter((item) => !(item.key === key && item.serverId === serverId));
+      delete this.secretValues[id];
       this.persist(true);
     },
 
     async saveSecretSettings() {
       await Promise.all(this.secretMetadata.map((secret) => {
-        const value = this.secretValues[secret.key] ?? "";
+        const id = secretValueId(secret.serverId, secret.key);
+        const value = this.secretValues[id] ?? "";
         return value
-          ? backend.saveCredential("secret", secret.key, value)
-          : backend.deleteCredential("secret", secret.key);
+          ? backend.saveCredential("secret", id, value)
+          : backend.deleteCredential("secret", id);
       }));
       this.persist(true);
+    },
+
+    getServerSecretValues(serverId: string) {
+      return serverSecretValues(this.secretValues, serverId);
+    },
+
+    setServerSecretValue(serverId: string, key: string, value: string) {
+      this.secretValues[secretValueId(serverId, key)] = value;
     },
 
     addModel() {
@@ -1634,6 +1785,7 @@ export const useOpsStore = defineStore("ops", {
         level: result.success ? "success" : "error",
         title: "手动终端命令",
         detail: `${command}\n${result.output}`,
+        serverId,
       });
     },
 

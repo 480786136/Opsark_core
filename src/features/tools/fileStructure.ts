@@ -1,8 +1,4 @@
-import type {
-  FileStructureNode,
-  FileStructureRequest,
-  FileStructureResult,
-} from "@/features/tools/types";
+import type { FileStructureRequest } from "@/features/tools/types";
 
 export const DEFAULT_FILE_STRUCTURE_EXCLUDES = [
   ".git",
@@ -55,71 +51,5 @@ export function normalizeFileStructureRequest(
     maxDepth,
     maxNodes,
     includeHidden: request.includeHidden ?? false,
-  };
-}
-
-const demoNodes: FileStructureNode[] = [
-  {
-    name: "src",
-    relativePath: "src",
-    kind: "directory",
-    children: [
-      { name: "components", relativePath: "src/components", kind: "directory", children: [] },
-      { name: "services", relativePath: "src/services", kind: "directory", children: [] },
-      { name: "main.ts", relativePath: "src/main.ts", kind: "file", size: 640 },
-    ],
-  },
-  { name: "docs", relativePath: "docs", kind: "directory", children: [] },
-  { name: "node_modules", relativePath: "node_modules", kind: "directory", children: [] },
-  { name: ".env", relativePath: ".env", kind: "file", size: 120 },
-  { name: "package.json", relativePath: "package.json", kind: "file", size: 860 },
-  { name: "README.md", relativePath: "README.md", kind: "file", size: 2200 },
-];
-
-function isExcluded(node: FileStructureNode, excludes: string[]) {
-  return excludes.some((exclude) => exclude.includes("/")
-    ? node.relativePath === exclude || node.relativePath.startsWith(`${exclude}/`)
-    : node.name === exclude);
-}
-
-export function buildDemoFileStructure(
-  request: NormalizedFileStructureRequest,
-): FileStructureResult {
-  let totalNodes = 0;
-  let truncated = false;
-  let maxDepthReached = false;
-
-  const visit = (nodes: FileStructureNode[], depth: number): FileStructureNode[] => {
-    const result: FileStructureNode[] = [];
-    for (const node of nodes) {
-      if (totalNodes >= request.maxNodes) {
-        truncated = true;
-        break;
-      }
-      if (isExcluded(node, request.excludeDirectories)) continue;
-      if (!request.includeHidden && node.name.startsWith(".")) continue;
-      totalNodes += 1;
-      const copy = { ...node };
-      if (node.kind === "directory") {
-        if (depth >= request.maxDepth) {
-          maxDepthReached = true;
-          copy.children = [];
-        } else {
-          copy.children = visit(node.children ?? [], depth + 1);
-        }
-      }
-      result.push(copy);
-    }
-    return result;
-  };
-
-  return {
-    rootPath: request.rootPath,
-    nodes: visit(demoNodes, 1),
-    excludedDirectories: request.excludeDirectories,
-    totalNodes,
-    maxDepthReached,
-    truncated,
-    warnings: [],
   };
 }

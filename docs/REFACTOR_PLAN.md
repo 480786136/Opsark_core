@@ -548,9 +548,9 @@ validating -> running | needs_adjustment | completed | failed
 
 - `observe`：所有步骤确认。
 - `safe`：低风险自动，中高风险确认。
-- `autonomous`：低中风险自动，高风险确认。
 - `managed`：计划自动批准，低中风险自动，高风险确认。
 - 高危破坏性操作始终需要步骤级确认。
+- 历史 `autonomous` 配置加载时迁移为 `safe`。
 
 ### `executionRunner.ts`
 

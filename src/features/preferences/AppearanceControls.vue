@@ -1,22 +1,24 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import { Keyboard, Languages, Monitor, Palette, TerminalSquare, Type, X } from "lucide-vue-next";
+import { onBeforeUnmount, onMounted, ref } from "vue";
+import { Check, CircleHelp, Keyboard, Languages, Palette, Type, X } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
-import { accentThemes, usePreferenceStore, type SurfaceTheme, type TerminalColorTheme } from "./preferenceStore";
+import { systemThemes, usePreferenceStore } from "./preferenceStore";
 
 const open = ref(false);
+const root = ref<HTMLElement>();
 const preferences = usePreferenceStore();
 const { t } = useI18n();
-const surfaceThemes: SurfaceTheme[] = ["carbon", "ink", "graphite", "porcelain", "mist"];
-const terminalThemes: Array<{ id: TerminalColorTheme; colors: [string, string] }> = [
-  { id: "opsark", colors: ["#0b0e11", "#d8ff5f"] },
-  { id: "aurora", colors: ["#0a1016", "#65d9e8"] },
-  { id: "paper", colors: ["#f4f1e8", "#315a68"] },
-];
+
+function closeOnOutsidePointer(event: PointerEvent) {
+  if (open.value && !root.value?.contains(event.target as Node)) open.value = false;
+}
+
+onMounted(() => document.addEventListener("pointerdown", closeOnOutsidePointer));
+onBeforeUnmount(() => document.removeEventListener("pointerdown", closeOnOutsidePointer));
 </script>
 
 <template>
-  <div class="appearance-control">
+  <div ref="root" class="appearance-control">
     <button class="rail-action" type="button" :title="t('nav.appearance')" @click="open = !open">
       <Palette :size="18" />
     </button>
@@ -31,39 +33,24 @@ const terminalThemes: Array<{ id: TerminalColorTheme; colors: [string, string] }
           <button :class="{ active: preferences.locale === 'zh-CN' }" @click="preferences.setLocale('zh-CN')">{{ t("appearance.zh") }}</button>
           <button :class="{ active: preferences.locale === 'en-US' }" @click="preferences.setLocale('en-US')">{{ t("appearance.en") }}</button>
         </div>
-        <label><Monitor :size="14" />{{ t("appearance.surface") }}</label>
-        <div class="theme-segments">
-          <button
-            v-for="theme in surfaceThemes"
-            :key="theme"
-            type="button"
-            :class="['surface-option', theme, { active: preferences.surfaceTheme === theme }]"
-            @click="preferences.setSurfaceTheme(theme)"
-          ><i></i><span>{{ t(`appearance.${theme}`) }}</span></button>
+        <div class="appearance-section-heading">
+          <label><Palette :size="14" />{{ t("appearance.systemTheme") }}</label>
+          <small>{{ t("appearance.systemThemeHint") }}</small>
         </div>
-        <label><Palette :size="14" />{{ t("appearance.color") }}</label>
-        <div class="color-swatches">
+        <div class="system-theme-grid">
           <button
-            v-for="theme in accentThemes"
-            :key="theme.id"
-            :class="{ active: preferences.accentTheme === theme.id }"
-            :style="{ '--swatch': theme.color }"
-            :title="t(theme.labelKey)"
-            @click="preferences.setAccentTheme(theme.id)"
-          ><i></i></button>
-        </div>
-        <label><TerminalSquare :size="14" />{{ t("appearance.terminalColor") }}</label>
-        <div class="terminal-theme-options">
-          <button
-            v-for="theme in terminalThemes"
+            v-for="theme in systemThemes"
             :key="theme.id"
             type="button"
-            :class="{ active: preferences.terminalColorTheme === theme.id }"
-            :title="t(`appearance.${theme.id}`)"
-            @click="preferences.setTerminalColorTheme(theme.id)"
+            :class="{ active: preferences.systemTheme === theme.id }"
+            :aria-pressed="preferences.systemTheme === theme.id"
+            @click="preferences.setSystemTheme(theme.id)"
           >
-            <i :style="{ '--terminal-surface': theme.colors[0], '--terminal-ink': theme.colors[1] }"></i>
-            <span>{{ t(`appearance.${theme.id}`) }}</span>
+            <span class="theme-preview" :style="{ '--preview-bg': theme.preview[0], '--preview-panel': theme.preview[1], '--preview-accent': theme.preview[2], '--preview-terminal': theme.preview[3] }">
+              <i></i><i></i><i></i>
+            </span>
+            <span class="theme-copy"><strong>{{ t(theme.labelKey) }}</strong><small>{{ t(theme.descriptionKey) }}</small></span>
+            <Check v-if="preferences.systemTheme === theme.id" :size="13" />
           </button>
         </div>
         <label><Type :size="14" />{{ t("appearance.terminalTypography") }}</label>
@@ -89,7 +76,19 @@ const terminalThemes: Array<{ id: TerminalColorTheme; colors: [string, string] }
             @input="preferences.setTerminalTypography(preferences.terminalFontSize, Number(($event.target as HTMLInputElement).value))"
           />
         </div>
-        <label><Keyboard :size="14" />{{ t("appearance.shortcuts") }}</label>
+        <label class="shortcut-label">
+          <Keyboard :size="14" />{{ t("appearance.shortcuts") }}
+          <button class="shortcut-help" type="button" :aria-label="t('appearance.shortcutsHelp')">
+            <CircleHelp :size="13" />
+            <span class="shortcut-tooltip" role="tooltip">
+              <strong>{{ t(preferences.terminalShortcutPreset === 'vscode' ? 'appearance.vscodeShortcuts' : 'appearance.platformShortcuts') }}</strong>
+              <span><kbd>{{ preferences.terminalShortcutPreset === 'vscode' ? 'Ctrl+Shift+F' : '⌘/Ctrl+F' }}</kbd>{{ t("appearance.shortcutFind") }}</span>
+              <span><kbd>{{ preferences.terminalShortcutPreset === 'vscode' ? 'Ctrl+Shift+C' : '⌘/Ctrl+Shift+C' }}</kbd>{{ t("appearance.shortcutCopy") }}</span>
+              <span><kbd>{{ preferences.terminalShortcutPreset === 'vscode' ? 'Ctrl+Shift+K' : '⌘/Ctrl+K' }}</kbd>{{ t("appearance.shortcutClear") }}</span>
+              <span><kbd>Ctrl+R</kbd>{{ t("appearance.shortcutHistory") }}</span>
+            </span>
+          </button>
+        </label>
         <div class="segmented-control">
           <button type="button" :class="{ active: preferences.terminalShortcutPreset === 'platform' }" @click="preferences.setTerminalShortcutPreset('platform')">{{ t("appearance.platformShortcuts") }}</button>
           <button type="button" :class="{ active: preferences.terminalShortcutPreset === 'vscode' }" @click="preferences.setTerminalShortcutPreset('vscode')">{{ t("appearance.vscodeShortcuts") }}</button>

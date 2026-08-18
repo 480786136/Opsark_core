@@ -8,6 +8,7 @@ import {
   History,
   Ellipsis,
   Maximize2,
+  Quote,
   RefreshCw,
   Search,
   TerminalSquare,
@@ -26,6 +27,7 @@ import {
   appendTerminalHistory,
   isRecognizedShellPrompt,
   matchesTerminalShortcut,
+  shouldPreserveViewportBeforeCommand,
   updateCommandDraft,
   type TerminalCommandDraft,
   type TerminalPasteAnalysis,
@@ -38,6 +40,7 @@ import {
 import { backend, type TerminalStatusEvent } from "@/services/backend";
 import { usePreferenceStore } from "@/features/preferences/preferenceStore";
 import { useOpsStore } from "@/stores/ops";
+import { redactExecutionOutput } from "@/features/agent/secretTool";
 import type { TerminalPaneStatus } from "@/features/terminal/terminalSessionStore";
 import { useTerminalSessionStore } from "@/features/terminal/terminalSessionStore";
 import { sanitizeTerminalOutput } from "@/utils/terminal";
@@ -74,17 +77,14 @@ const agentOutputHost = ref<HTMLElement>();
 const historyQuery = ref("");
 const commandHistory = ref<string[]>([]);
 const pendingPaste = ref<{ data: string; analysis: TerminalPasteAnalysis }>();
+const selectedTerminalText = ref("");
 const statusMessage = ref("");
 const pendingSftpSync = ref(false);
-const connectionState = ref<"demo" | "connecting" | "connected" | "disconnected" | "error" | "reconnecting">(
-  store.connectedServerIds.includes(props.serverId) ? "connecting" : "demo",
+const connectionState = ref<"connecting" | "connected" | "disconnected" | "error" | "reconnecting">(
+  store.connectedServerIds.includes(props.serverId) ? "connecting" : "disconnected",
 );
 const terminalId = `pty-${props.serverId}-${props.sessionId}`;
 const isLive = computed(() => store.connectedServerIds.includes(props.serverId));
-const server = computed(() => store.servers.find((item) => item.id === props.serverId));
-const terminalLabel = computed(() =>
-  server.value ? `${server.value.username}@${server.value.host}` : "SSH",
-);
 const agentTask = computed(() => store.tasks.find(({ id }) => id === props.agentTaskId));
 const agentBusy = computed(() => Boolean(
   agentTask.value && ["planning", "running", "validating"].includes(agentTask.value.status),
@@ -104,8 +104,8 @@ let statusUnlisten: (() => void) | undefined;
 let resizeObserver: ResizeObserver | undefined;
 let themeObserver: MutationObserver | undefined;
 let inputDisposable: IDisposable | undefined;
+let selectionDisposable: IDisposable | undefined;
 let transcript: TerminalTranscriptState = { lines: [], remainder: "" };
-let demoCommand = "";
 let resizeTimer: number | undefined;
 let reconnectTimer: number | undefined;
 let activeGeneration: number | undefined;
@@ -113,6 +113,14 @@ let reconnectAttempts = 0;
 let pendingStatusEvent: TerminalStatusEvent | undefined;
 let commandDraft: TerminalCommandDraft = { value: "", recordable: false };
 let osc7Buffer = "";
+let activeAgentCapture: {
+  id: string;
+  begin: string;
+  endPrefix: string;
+  started: boolean;
+  buffer: string;
+  output: string;
+} | undefined;
 
 function readTerminalTheme(): ITheme {
   const styles = getComputedStyle(document.documentElement);
@@ -142,6 +150,11 @@ function readTerminalTheme(): ITheme {
   };
 }
 
+function readTerminalFontFamily() {
+  return getComputedStyle(document.documentElement).getPropertyValue("--font-mono").trim()
+    || 'ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace';
+}
+
 function currentTerminalLine() {
   if (!terminal) return "";
   const buffer = terminal.buffer.active;
@@ -150,7 +163,7 @@ function currentTerminalLine() {
 
 function trackCommandInput(data: string) {
   if (!commandDraft.value && !commandDraft.recordable) {
-    commandDraft.recordable = connectionState.value === "demo" || isRecognizedShellPrompt(currentTerminalLine());
+    commandDraft.recordable = isRecognizedShellPrompt(currentTerminalLine());
   }
   const result = updateCommandDraft(commandDraft, data);
   commandDraft = result.state;
@@ -158,6 +171,7 @@ function trackCommandInput(data: string) {
     if (commandDraft.recordable) commandHistory.value = appendTerminalHistory(commandHistory.value, result.submitted);
     commandDraft = { value: "", recordable: false };
   }
+  return result.submitted;
 }
 
 /** 所有终端输入统一经过此边界，确认前不会写入远端 PTY。 */
@@ -168,9 +182,13 @@ function writeTerminalInput(data: string, confirmed = false) {
     pendingPaste.value = { data, analysis };
     return;
   }
-  trackCommandInput(data);
+  const submitted = trackCommandInput(data);
+  if (submitted && shouldPreserveViewportBeforeCommand(submitted) && terminal) {
+    // GNU top may repaint the primary buffer instead of entering the alternate
+    // screen. Move the current viewport into scrollback before its first clear.
+    terminal.write("\r\n".repeat(Math.max(1, terminal.rows)));
+  }
   if (connectionState.value === "connected") void backend.writeTerminal(terminalId, data);
-  else if (connectionState.value === "demo") handleDemoInput(data);
 }
 
 function confirmPaste() {
@@ -202,6 +220,89 @@ function updateTranscript(chunk: string) {
   if (props.active) syncActiveTranscript();
 }
 
+function handleAgentPtyData(data: string) {
+  const capture = activeAgentCapture;
+  if (!capture) return data;
+  capture.buffer += data;
+  if (!capture.started) {
+    const beginIndex = capture.buffer.indexOf(capture.begin);
+    if (beginIndex < 0) {
+      const safeLength = Math.max(0, capture.buffer.length - capture.begin.length);
+      const visible = capture.buffer.slice(0, safeLength);
+      capture.buffer = capture.buffer.slice(safeLength);
+      return visible;
+    }
+    const visible = capture.buffer.slice(0, beginIndex);
+    capture.buffer = capture.buffer.slice(beginIndex + capture.begin.length).replace(/^\r?\n/, "");
+    capture.started = true;
+    if (visible) terminal?.write(visible);
+  }
+
+  const endIndex = capture.buffer.indexOf(capture.endPrefix);
+  if (endIndex >= 0) {
+    const output = capture.buffer.slice(0, endIndex).replace(/\r?\n$/, "");
+    const afterPrefix = capture.buffer.slice(endIndex + capture.endPrefix.length);
+    const endMatch = afterPrefix.match(/^(\d+)__\r?\n?/);
+    if (!endMatch) return "";
+    const visibleOutput = redactExecutionOutput(output, store.getServerSecretValues(props.serverId));
+    if (visibleOutput) {
+      capture.output += visibleOutput;
+      terminalSessions.publishAgentPtyProgress(capture.id, visibleOutput);
+    }
+    const remainder = afterPrefix.slice(endMatch[0].length);
+    terminalSessions.completeAgentPtyCommand(props.sessionId, capture.id, capture.output, Number(endMatch[1]));
+    activeAgentCapture = undefined;
+    return `${visibleOutput}${remainder}`;
+  }
+
+  const longestSecret = Math.max(0, ...Object.values(store.getServerSecretValues(props.serverId)).map((value) => value.length));
+  const safeLength = Math.max(0, capture.buffer.length - Math.max(96, longestSecret));
+  const rawVisible = capture.buffer.slice(0, safeLength);
+  capture.buffer = capture.buffer.slice(safeLength);
+  const visible = redactExecutionOutput(rawVisible, store.getServerSecretValues(props.serverId));
+  if (visible) {
+    capture.output += visible;
+    terminalSessions.publishAgentPtyProgress(capture.id, visible);
+  }
+  return visible;
+}
+
+function executeBoundAgentCommand(request: { id: string; command: string; displayCommand: string }) {
+  if (connectionState.value !== "connected") {
+    terminalSessions.failAgentPtyCommand(props.sessionId, request.id, "绑定终端尚未连接");
+    return;
+  }
+  const markerId = request.id.replace(/[^A-Za-z0-9_-]/g, "_");
+  const beginMarker = `__OPSARK_BEGIN_${markerId}__`;
+  const endMarkerPrefix = `__OPSARK_END_${markerId}_`;
+  activeAgentCapture = {
+    id: request.id,
+    begin: beginMarker,
+    endPrefix: endMarkerPrefix,
+    started: false,
+    buffer: "",
+    output: "",
+  };
+  const safeDisplayCommand = redactExecutionOutput(request.displayCommand, store.getServerSecretValues(props.serverId));
+  // The user may have an unsubmitted draft at the prompt. Clear the remote
+  // canonical input line before taking control, otherwise commands concatenate
+  // (for example `ll` + `export` => `llexport`) and the marker protocol hangs.
+  commandDraft = { value: "", recordable: false };
+  const bytes = new TextEncoder().encode(request.command);
+  let binary = "";
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+  const encodedCommand = btoa(binary);
+  // First disable echo/history, then submit one CR-terminated line. A single line avoids PTY paste/newline ambiguity.
+  void backend.writeTerminal(terminalId, "\u0015 stty -echo; export HISTCONTROL=ignorespace\r");
+  window.setTimeout(() => {
+    if (activeAgentCapture?.id !== request.id) return;
+    terminal?.write(`\r\n\u001b[36m[Agent]\u001b[0m $ ${safeDisplayCommand}\r\n`);
+    updateTranscript(`[Agent] $ ${safeDisplayCommand}\n`);
+    const script = ` __opsark_payload='${encodedCommand}'; printf '${beginMarker}\\n'; ( eval \"$(printf '%s' \"$__opsark_payload\" | base64 -d)\" ); __opsark_status=$?; printf '\\n${endMarkerPrefix}%s__\\n' \"$__opsark_status\"; unset __opsark_payload; stty echo\r`;
+    void backend.writeTerminal(terminalId, script);
+  }, 80);
+}
+
 function trackTerminalDirectory(chunk: string) {
   osc7Buffer = `${osc7Buffer}${chunk}`.slice(-4_096);
   const directories = extractOsc7Directories(osc7Buffer);
@@ -226,6 +327,15 @@ function syncSftpDirectory() {
   writeTerminalInput(buildTerminalDirectoryProbeCommand(), true);
 }
 
+function referenceSelectionToModel() {
+  if (!selectedTerminalText.value) return;
+  workspaceLinks.publishTerminalModelReference(props.serverId, props.sessionId, selectedTerminalText.value);
+  terminal?.clearSelection();
+  selectedTerminalText.value = "";
+  statusMessage.value = t("terminal.selectionAttached");
+  window.setTimeout(() => { if (statusMessage.value === t("terminal.selectionAttached")) statusMessage.value = ""; }, 1800);
+}
+
 /** 模型只读取当前聚焦分屏的脱敏转录，后台分屏输出不会覆盖上下文。 */
 function syncActiveTranscript() {
   store.terminalLines = transcript.remainder
@@ -240,7 +350,13 @@ async function startLiveTerminal() {
   connectionState.value = "connecting";
   activeGeneration = undefined;
   try {
-    activeGeneration = await backend.startTerminal(terminalId, connection);
+    // Full-screen programs such as top rely on the PTY size from their first
+    // frame. Fit before opening SSH so the remote session never starts at a
+    // placeholder size and leaves stale rows in xterm's scrollback.
+    if (terminalHost.value?.clientWidth) fitAddon?.fit();
+    const cols = Math.max(2, terminal?.cols ?? 120);
+    const rows = remoteTerminalRows();
+    activeGeneration = await backend.startTerminal(terminalId, connection, cols, rows);
     if (pendingStatusEvent && shouldHandleTerminalGeneration(activeGeneration, pendingStatusEvent.generation)) {
       handleTerminalStatus(pendingStatusEvent);
     }
@@ -300,9 +416,15 @@ function scheduleFit() {
     if (!terminal || !fitAddon || !terminalHost.value?.clientWidth) return;
     fitAddon.fit();
     if (connectionState.value === "connected" && terminal.cols > 0 && terminal.rows > 0) {
-      void backend.resizeTerminal(terminalId, terminal.cols, terminal.rows);
+      void backend.resizeTerminal(terminalId, terminal.cols, remoteTerminalRows());
     }
   }, 60);
+}
+
+function remoteTerminalRows() {
+  // Keep the final PTY row clear of xterm's viewport rounding and scrollbar.
+  // Full-screen programs otherwise render their last row beneath the panel edge.
+  return Math.max(1, (terminal?.rows ?? 32) - 1);
 }
 
 async function reconnect() {
@@ -314,42 +436,6 @@ async function reconnect() {
   terminal?.clear();
   await startLiveTerminal();
   terminal?.focus();
-}
-
-function writeDemoPrompt() {
-  terminal?.write(`\r\n\u001b[36m${terminalLabel.value}:~$\u001b[0m `);
-}
-
-async function runDemoCommand(command: string) {
-  const before = store.terminalLines.length;
-  await store.runTerminalCommand(command, props.serverId);
-  const appended = store.terminalLines.slice(before);
-  const output = appended[0]?.includes(command) ? appended.slice(1) : appended;
-  output.forEach((line) => terminal?.writeln(line.replace(/\r?\n/g, "")));
-  transcript = { lines: [...store.terminalLines], remainder: "" };
-}
-
-function handleDemoInput(data: string) {
-  for (const character of data) {
-    if (character === "\r") {
-      const command = demoCommand.trimEnd();
-      demoCommand = "";
-      terminal?.write("\r\n");
-      if (command) void runDemoCommand(command).finally(writeDemoPrompt);
-      else writeDemoPrompt();
-    } else if (character === "\u007f") {
-      if (!demoCommand) continue;
-      demoCommand = demoCommand.slice(0, -1);
-      terminal?.write("\b \b");
-    } else if (character === "\u0003") {
-      demoCommand = "";
-      terminal?.write("^C");
-      writeDemoPrompt();
-    } else if (character >= " " && character !== "\u007f") {
-      demoCommand += character;
-      terminal?.write(character);
-    }
-  }
 }
 
 function toggleSearch() {
@@ -379,7 +465,6 @@ async function copySelection() {
 function interrupt() {
   commandDraft = { value: "", recordable: false };
   if (connectionState.value === "connected") void backend.writeTerminal(terminalId, "\u0003");
-  else if (connectionState.value === "demo") handleDemoInput("\u0003");
   terminal?.focus();
 }
 
@@ -421,8 +506,7 @@ function flushAgentOutput() {
   agentOutput.value = `${agentOutput.value}${sanitizeTerminalOutput(queue.map(({ data }) => data).join(""))}`
     .slice(-120_000);
   terminalSessions.consumeAgentOutput(props.sessionId, queue[queue.length - 1].id);
-  showAgentOutput.value = true;
-  void nextTick(() => agentOutputHost.value?.scrollTo({ top: agentOutputHost.value.scrollHeight }));
+  if (showAgentOutput.value) void nextTick(() => agentOutputHost.value?.scrollTo({ top: agentOutputHost.value.scrollHeight }));
 }
 
 function toggleAgentOutput() {
@@ -438,7 +522,7 @@ onMounted(async () => {
     convertEol: false,
     cursorBlink: true,
     cursorStyle: "block",
-    fontFamily: '"SFMono-Regular", Menlo, Monaco, Consolas, monospace',
+    fontFamily: readTerminalFontFamily(),
     fontSize: preferences.terminalFontSize,
     lineHeight: preferences.terminalLineHeight,
     scrollback: 10_000,
@@ -452,7 +536,7 @@ onMounted(async () => {
   terminal.open(terminalHost.value!);
   if (props.agentTaskId) {
     agentOutput.value = formatTaskHistory();
-    showAgentOutput.value = agentBusy.value || Boolean(agentOutput.value);
+    showAgentOutput.value = false;
   }
   flushAgentOutput();
   terminal.attachCustomKeyEventHandler((event) => {
@@ -476,11 +560,17 @@ onMounted(async () => {
     return true;
   });
   inputDisposable = terminal.onData((data) => writeTerminalInput(data));
+  const selectionSource = terminal as Terminal & { onSelectionChange?: (listener: () => void) => IDisposable };
+  selectionDisposable = selectionSource.onSelectionChange?.(() => {
+    selectedTerminalText.value = terminal?.getSelection().trim() ?? "";
+  });
   outputUnlisten = await backend.onTerminalOutput((event) => {
     if (event.terminalId !== terminalId) return;
-    terminal?.write(event.data);
-    trackTerminalDirectory(event.data);
-    updateTranscript(event.data);
+    const visibleData = handleAgentPtyData(event.data);
+    if (!visibleData) return;
+    terminal?.write(visibleData);
+    trackTerminalDirectory(visibleData);
+    updateTranscript(visibleData);
   });
   statusUnlisten = await backend.onTerminalStatus((event) => {
     if (event.terminalId !== terminalId) return;
@@ -494,15 +584,13 @@ onMounted(async () => {
   resizeObserver = new ResizeObserver(scheduleFit);
   resizeObserver.observe(terminalHost.value!);
   themeObserver = new MutationObserver(() => {
-    if (terminal) terminal.options.theme = readTerminalTheme();
+    if (!terminal) return;
+    terminal.options.theme = readTerminalTheme();
+    terminal.options.fontFamily = readTerminalFontFamily();
   });
-  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-accent", "data-terminal-theme"] });
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 
   if (isLive.value) await startLiveTerminal();
-  else {
-    terminal.writeln(`\u001b[1m${t("terminal.demoWelcome")}\u001b[0m`);
-    terminal.write(`\u001b[36m${terminalLabel.value}:~$\u001b[0m `);
-  }
   scheduleFit();
   if (props.active) {
     syncActiveTranscript();
@@ -515,7 +603,7 @@ watch(isLive, async (live) => {
   else {
     clearReconnectTimer();
     activeGeneration = undefined;
-    connectionState.value = "demo";
+    connectionState.value = "disconnected";
     await backend.closeTerminal(terminalId);
   }
 });
@@ -532,17 +620,31 @@ watch(
   flushAgentOutput,
 );
 
-watch(agentBusy, (busy) => {
-  if (busy) showAgentOutput.value = true;
-});
+watch(agentBusy, (busy) => { if (busy) showAgentOutput.value = false; });
 
 watch(() => props.agentTaskId, () => {
   agentOutput.value = formatTaskHistory();
-  showAgentOutput.value = Boolean(props.agentTaskId);
+  showAgentOutput.value = false;
   flushAgentOutput();
 });
 
 watch(connectionState, (status) => emit("statusChange", status), { immediate: true });
+
+watch(
+  () => terminalSessions.agentCommandByPane[props.sessionId],
+  (request) => { if (request && request.id !== activeAgentCapture?.id) executeBoundAgentCommand(request); },
+  { immediate: true },
+);
+
+watch(
+  () => terminalSessions.agentInterruptByPane[props.sessionId],
+  (version, previous) => {
+    if (!version || version === previous || !activeAgentCapture) return;
+    void backend.writeTerminal(terminalId, "\u0003");
+    window.setTimeout(() => void backend.writeTerminal(terminalId, "stty echo\r"), 50);
+    activeAgentCapture = undefined;
+  },
+);
 
 watch(
   [
@@ -573,9 +675,11 @@ onBeforeUnmount(() => {
   if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
   clearReconnectTimer();
   activeGeneration = undefined;
+  if (activeAgentCapture) terminalSessions.failAgentPtyCommand(props.sessionId, activeAgentCapture.id, "终端已关闭");
   resizeObserver?.disconnect();
   themeObserver?.disconnect();
   inputDisposable?.dispose();
+  selectionDisposable?.dispose();
   outputUnlisten?.();
   statusUnlisten?.();
   terminal?.dispose();
@@ -628,6 +732,9 @@ onBeforeUnmount(() => {
       </section>
     </Transition>
     <div v-show="!showAgentOutput" ref="terminalHost" :class="['terminal-host', { locked: agentBusy }]" />
+    <Transition name="status-fade">
+      <button v-if="selectedTerminalText && !showAgentOutput" class="terminal-selection-action" type="button" @click="referenceSelectionToModel"><Quote :size="13" /><span>{{ t("terminal.askWithSelection", { count: selectedTerminalText.split('\n').length }) }}</span></button>
+    </Transition>
     <section v-if="showAgentOutput" class="terminal-agent-view">
       <header><Bot :size="14" /><strong>{{ t("terminal.agentOutput") }}</strong><span v-if="agentBusy" class="terminal-agent-running">{{ t("terminal.agentRunning") }}</span></header>
       <pre ref="agentOutputHost">{{ agentOutput }}</pre>

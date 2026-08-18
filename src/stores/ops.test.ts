@@ -75,6 +75,20 @@ describe("智能任务状态机", () => {
         createdAt: "2026-01-01T00:00:00.000Z",
       },
     ]));
+    localStorage.setItem("opsark.models", JSON.stringify([
+      {
+        id: "model-deepseek",
+        name: "测试模型",
+        provider: "Test",
+        model: "test-model",
+        endpoint: "https://model.example.invalid",
+        enabled: true,
+        hasApiKey: true,
+      },
+    ]));
+    localStorage.setItem("opsark.secretMetadata", JSON.stringify([
+      { key: "DB_PASSWORD", description: "测试数据库密码", scope: "server", serverId: "srv-tencent-test" },
+    ]));
     setActivePinia(createPinia());
     vi.spyOn(backend, "generatePlan").mockResolvedValue(structuredClone(plan));
     vi.spyOn(backend, "processRequirement").mockResolvedValue({
@@ -115,6 +129,27 @@ describe("智能任务状态机", () => {
     useOpsStore().modelApiKeys["model-deepseek"] = "test-model-api-key";
   });
 
+  it("将审计事件归档到任务所属服务器并保留名称快照", () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    task.title = "检查 Web 服务";
+
+    store.addLog({
+      category: "task",
+      level: "info",
+      title: "任务事件",
+      detail: "任务已创建",
+      taskId: task.id,
+    });
+
+    expect(store.logs[0]).toMatchObject({
+      serverId: "srv-production-01",
+      serverName: "测试服务器",
+      taskId: task.id,
+      taskTitle: "检查 Web 服务",
+    });
+  });
+
   it("安全模式自动执行低风险步骤，并在中风险步骤前暂停确认", async () => {
     const store = useOpsStore();
     await store.submitRequirement("srv-production-01", "检查并重新加载 Nginx", "safe", "model-deepseek");
@@ -152,18 +187,18 @@ describe("智能任务状态机", () => {
     expect(context.tools[0]).not.toHaveProperty("implementation");
   });
 
-  it("自动执行模式会自动批准计划并连续执行低中风险步骤", async () => {
+  it("完全托管模式会自动批准计划并连续执行低中风险步骤", async () => {
     const store = useOpsStore();
     const terminalSessions = useTerminalSessionStore();
     terminalSessions.ensureWorkspace("srv-production-01");
     const firstTerminalId = terminalSessions.sessionsByServer["srv-production-01"][0].id;
     const initiatingTerminal = terminalSessions.addSession("srv-production-01")!;
 
-    await store.submitRequirement("srv-production-01", "自动检查并重新加载 Nginx", "autonomous", "model-deepseek");
+    await store.submitRequirement("srv-production-01", "自动检查并重新加载 Nginx", "managed", "model-deepseek");
 
     expect(store.activeTask?.status).toBe("completed");
     expect(store.activeTask?.plan.every((step) => step.status === "completed")).toBe(true);
-    expect(store.activeTask?.messages.some((message) => message.content.includes("自动执行模式已批准计划"))).toBe(true);
+    expect(store.activeTask?.messages.some((message) => message.content.includes("完全托管模式已自动批准计划"))).toBe(true);
     const agentPaneId = terminalSessions.resolveTaskPaneId("srv-production-01", store.activeTask!.id)!;
     expect(agentPaneId).toBe(initiatingTerminal.activePaneId);
     expect(terminalSessions.sessionsByServer["srv-production-01"]
@@ -245,7 +280,7 @@ describe("智能任务状态机", () => {
       options?.onProgress?.({ executionId: options.executionId, data: "download complete\n", stream: "stdout" });
       return { output: "$ download\ndownload 42%\n[exit: 0]", success: true, simulated: false, exitCode: 0 };
     });
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [{ ...structuredClone(plan[0]), id: "stream-step" }];
 
@@ -262,7 +297,7 @@ describe("智能任务状态机", () => {
 
   it("模型工具命令由工具执行器处理，不发送到远端 shell", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     store.serverPasswords[task.serverId] = "test-password";
     task.status = "running";
     task.plan = [{
@@ -325,7 +360,7 @@ describe("智能任务状态机", () => {
     vi.useFakeTimers();
     try {
       const store = useOpsStore();
-      const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+      const task = store.createTask("srv-production-01", "managed", "model-deepseek");
       store.serverPasswords[task.serverId] = "test-password";
       store.pushMessage(task, {
         role: "user",
@@ -399,7 +434,7 @@ describe("智能任务状态机", () => {
 
   it("终止业务会取消当前执行并跳过活动步骤", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.currentExecutionId = "exec-running";
     task.plan = [{ ...structuredClone(plan[0]), status: "running" }];
@@ -418,7 +453,7 @@ describe("智能任务状态机", () => {
 
   it("远程执行抛出异常时会清理执行 ID 并写入失败结果", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [{ ...structuredClone(plan[0]), id: "execution-error" }];
     vi.mocked(backend.executeCommand).mockRejectedValueOnce(new Error("connection closed"));
@@ -528,7 +563,7 @@ describe("智能任务状态机", () => {
 
   it("正在规划或执行的任务必须先终止，不能直接删除", () => {
     const store = useOpsStore();
-    const running = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const running = store.createTask("srv-production-01", "managed", "model-deepseek");
     running.status = "running";
     running.currentExecutionId = "exec-live";
 
@@ -543,7 +578,7 @@ describe("智能任务状态机", () => {
 
     expect(store.needsApproval("observe", highRisk)).toBe(true);
     expect(store.needsApproval("safe", highRisk)).toBe(true);
-    expect(store.needsApproval("autonomous", highRisk)).toBe(true);
+    expect(store.needsApproval("managed", highRisk)).toBe(true);
     expect(store.needsApproval("managed", highRisk)).toBe(true);
   });
 
@@ -558,14 +593,14 @@ describe("智能任务状态机", () => {
     })).toBe(true);
   });
 
-  it("自动执行模式对所有高风险步骤要求确认", () => {
+  it("完全托管模式对所有高风险步骤要求确认", () => {
     const store = useOpsStore();
-    expect(store.needsApproval("autonomous", {
+    expect(store.needsApproval("managed", {
       ...plan[0],
       risk: "high",
       command: "cd /opt/O2OA && mvn clean install -DskipTests",
     })).toBe(true);
-    expect(store.needsApproval("autonomous", {
+    expect(store.needsApproval("managed", {
       ...plan[0],
       risk: "high",
       command: "DROP DATABASE ffp",
@@ -574,7 +609,7 @@ describe("智能任务状态机", () => {
 
   it("高风险步骤只有单独批准后才携带后端放行标记", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "awaiting_plan_approval";
     task.plan = [{ ...structuredClone(plan[0]), risk: "high", command: "rm -rf /tmp/explicit-target" }];
 
@@ -596,7 +631,7 @@ describe("智能任务状态机", () => {
 
   it("高风险步骤批准后可以等待敏感输入并恢复执行", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "awaiting_plan_approval";
     task.plan = [{
       ...structuredClone(plan[0]),
@@ -626,7 +661,7 @@ describe("智能任务状态机", () => {
 
   it("工具命令解析失败时写入稳定失败结果", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [{
       ...structuredClone(plan[0]),
@@ -647,7 +682,7 @@ describe("智能任务状态机", () => {
 
   it("敏感变量缺失时暂停输入，合并执行后对终端和日志脱敏", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [{
       ...plan[0],
@@ -673,7 +708,7 @@ describe("智能任务状态机", () => {
 
   it("新一轮任务不会静默复用上一轮敏感变量", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [{
       ...structuredClone(plan[0]),
@@ -728,7 +763,11 @@ describe("智能任务状态机", () => {
     expect(store.models.find((model) => model.id === "model-deepseek")?.hasApiKey).toBe(true);
     expect(await store.ensureServerConnected("srv-tencent-test")).toBe(true);
     expect(store.connectedServerIds).toContain("srv-tencent-test");
-    expect(backend.saveCredential).not.toHaveBeenCalled();
+    expect(backend.saveCredential).toHaveBeenCalledWith(
+      "secret",
+      "srv-tencent-test::DB_PASSWORD",
+      "remembered-db-password",
+    );
   });
 
   it("保存模型设置时把 API Key 写入系统凭据存储", async () => {
@@ -779,22 +818,31 @@ describe("智能任务状态机", () => {
 
   it("敏感信息支持保存、重命名和直接删除", async () => {
     const store = useOpsStore();
-    store.secretValues.DB_PASSWORD = "current-real-value";
+    store.setServerSecretValue("srv-tencent-test", "DB_PASSWORD", "current-real-value");
 
     await store.saveSecretSettings();
-    expect(backend.saveCredential).toHaveBeenCalledWith("secret", "DB_PASSWORD", "current-real-value");
+    expect(backend.saveCredential).toHaveBeenCalledWith("secret", "srv-tencent-test::DB_PASSWORD", "current-real-value");
 
-    expect(await store.renameSecretMetadata("DB_PASSWORD", "MYSQL_ROOT_PASSWORD")).toBe(true);
+    expect(await store.renameSecretMetadata("DB_PASSWORD", "MYSQL_ROOT_PASSWORD", "srv-tencent-test")).toBe(true);
     expect(store.secretMetadata.some((item) => item.key === "MYSQL_ROOT_PASSWORD")).toBe(true);
-    expect(store.secretValues.MYSQL_ROOT_PASSWORD).toBe("current-real-value");
-    expect(store.secretValues.DB_PASSWORD).toBeUndefined();
-    expect(backend.saveCredential).toHaveBeenCalledWith("secret", "MYSQL_ROOT_PASSWORD", "current-real-value");
-    expect(backend.deleteCredential).toHaveBeenCalledWith("secret", "DB_PASSWORD");
+    expect(store.getServerSecretValues("srv-tencent-test").MYSQL_ROOT_PASSWORD).toBe("current-real-value");
+    expect(store.getServerSecretValues("srv-tencent-test").DB_PASSWORD).toBeUndefined();
+    expect(backend.saveCredential).toHaveBeenCalledWith("secret", "srv-tencent-test::MYSQL_ROOT_PASSWORD", "current-real-value");
+    expect(backend.deleteCredential).toHaveBeenCalledWith("secret", "srv-tencent-test::DB_PASSWORD");
 
-    await store.removeSecretMetadata("MYSQL_ROOT_PASSWORD");
+    await store.removeSecretMetadata("MYSQL_ROOT_PASSWORD", "srv-tencent-test");
     expect(store.secretMetadata.some((item) => item.key === "MYSQL_ROOT_PASSWORD")).toBe(false);
-    expect(store.secretValues.MYSQL_ROOT_PASSWORD).toBeUndefined();
-    expect(backend.deleteCredential).toHaveBeenCalledWith("secret", "MYSQL_ROOT_PASSWORD");
+    expect(store.getServerSecretValues("srv-tencent-test").MYSQL_ROOT_PASSWORD).toBeUndefined();
+    expect(backend.deleteCredential).toHaveBeenCalledWith("secret", "srv-tencent-test::MYSQL_ROOT_PASSWORD");
+  });
+
+  it("同名敏感变量按服务器隔离", () => {
+    const store = useOpsStore();
+    store.addSecretMetadata("DEPLOY_TOKEN", "测试环境令牌", "test-token", "srv-tencent-test");
+    store.addSecretMetadata("DEPLOY_TOKEN", "生产环境令牌", "prod-token", "srv-production-01");
+
+    expect(store.getServerSecretValues("srv-tencent-test").DEPLOY_TOKEN).toBe("test-token");
+    expect(store.getServerSecretValues("srv-production-01").DEPLOY_TOKEN).toBe("prod-token");
   });
 
   it("选中已有任务后可继续多轮需求，不会强制创建新任务", async () => {
@@ -889,7 +937,7 @@ describe("智能任务状态机", () => {
 
   it("校验命令会合并敏感变量，保存的输出仍保持脱敏", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [{
       ...structuredClone(plan[0]),
@@ -897,7 +945,7 @@ describe("智能任务状态机", () => {
       command: "mysql -p'${secret.DB_PASSWORD}' -e 'SELECT 1'",
       validation: "mysql -p'${secret.DB_PASSWORD}' -e 'SELECT 1' | grep -q 1",
     }];
-    store.secretValues.DB_PASSWORD = "private-validation-value";
+    store.setServerSecretValue("srv-production-01", "DB_PASSWORD", "private-validation-value");
     task.confirmedSecretKeys = ["DB_PASSWORD"];
     vi.mocked(backend.validateStep).mockImplementation(async (step) => ({
       passed: true,
@@ -1032,7 +1080,7 @@ describe("智能任务状态机", () => {
     await store.refreshModelAvailability();
 
     expect(backend.checkModel).toHaveBeenCalledWith(expect.objectContaining({
-      model: "deepseek-v4-flash",
+      model: "test-model",
     }));
     expect(store.modelAvailability["model-deepseek"]?.status).toBe("available");
     expect(store.availableModels.map((model) => model.id)).toEqual(["model-deepseek"]);
@@ -1161,7 +1209,7 @@ describe("智能任务状态机", () => {
 
   it("正常程序证据一致时跳过逐步骤模型复核", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [structuredClone(plan[0])];
 
@@ -1178,7 +1226,7 @@ describe("智能任务状态机", () => {
 
   it("只读诊断发现异常线索时继续下一项诊断，不立即重拟计划", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [
       {
@@ -1240,7 +1288,7 @@ describe("智能任务状态机", () => {
 
   it("模型确认整体目标已达成时跳过剩余步骤并完成任务", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [
       ensureStepValidator({
@@ -1269,7 +1317,7 @@ describe("智能任务状态机", () => {
 
   it("证据无法解析时才调用模型并允许暂停调整", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [
       ensureStepValidator({
@@ -1297,7 +1345,7 @@ describe("智能任务状态机", () => {
 
   it("主命令成功但程序校验失败时会调用一次模型复核", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [structuredClone(plan[0])];
     vi.mocked(backend.validateStep).mockResolvedValueOnce({
@@ -1318,7 +1366,7 @@ describe("智能任务状态机", () => {
 
   it("后置校验失败且模型不可用时不会按兜底规则继续", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [structuredClone(plan[0])];
     vi.mocked(backend.validateStep).mockResolvedValueOnce({
@@ -1343,7 +1391,7 @@ describe("智能任务状态机", () => {
 
   it("变更步骤后置校验失败时仅在剩余计划可修复的情况下允许继续", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [
       {
@@ -1383,7 +1431,7 @@ describe("智能任务状态机", () => {
 
   it("模型不能覆盖后置校验中的确定性平台阻断", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [{
       ...structuredClone(plan[1]),
@@ -1420,7 +1468,7 @@ describe("智能任务状态机", () => {
 
   it("只读 HTTP 主结果明确时独立校验冲突会重试并进入复核而不直接失败", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [ensureStepValidator({
       ...structuredClone(plan[0]),
@@ -1539,6 +1587,27 @@ describe("智能任务状态机", () => {
     );
     expect(port.result.facts.ports).toEqual([8080]);
     expect(port.result.facts.ownershipConfirmed).toBe(true);
+  });
+
+  it("将空 SQL 备份识别为决定性不完整证据", () => {
+    const step = ensureStepValidator({
+      ...structuredClone(plan[0]),
+      title: "检查 SQL 备份是否完整",
+      description: "读取备份文件大小和内容状态",
+      expected: "备份文件包含有效 SQL 内容",
+      command: "wc -l ffp_backup.sql && file ffp_backup.sql",
+      validation: "test -s ffp_backup.sql",
+    });
+    const classified = classifyStepResult(
+      step,
+      { success: true, exitCode: 0, output: "0 ffp_backup.sql\nffp_backup.sql: empty" },
+      { passed: false, exitCode: 1, detail: "文件为空", output: "" },
+    );
+
+    expect(classified.result.observationStatus).toBe("unhealthy");
+    expect(classified.result.facts.emptyRequiredFile).toBe(true);
+    expect(classified.result.facts.blockingSignal).toBe(true);
+    expect(classified.needsModelReview).toBe(true);
   });
 
   it("通用核心不解释领域工具的私有错误标记", () => {
@@ -1727,7 +1796,7 @@ describe("智能任务状态机", () => {
 
   it("通用阻断证据未被剩余计划处理时停止后续变更", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [
       ensureStepValidator({
@@ -1772,7 +1841,7 @@ describe("智能任务状态机", () => {
 
   it("只读发现可继续但进入依赖安装前会拦截尚未解决的运行时阻断", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [
       ensureStepValidator({
@@ -1824,7 +1893,7 @@ describe("智能任务状态机", () => {
 
   it("用户明确要求使用当前版本尝试时由模型复核后继续执行", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     store.pushMessage(task, {
       role: "user",
       kind: "message",
@@ -1941,7 +2010,7 @@ describe("智能任务状态机", () => {
 
   it("单步构建失败只显示暂停原因，不提前生成本轮总结", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [{
       ...structuredClone(plan[0]),
@@ -1976,7 +2045,7 @@ describe("智能任务状态机", () => {
 
   it("主命令失败后模型会结合用户约束和剩余恢复步骤决定继续", async () => {
     const store = useOpsStore();
-    const task = store.createTask("srv-production-01", "autonomous", "model-deepseek");
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     store.pushMessage(task, {
       role: "user",
       kind: "message",
