@@ -38,4 +38,5 @@ describe("serverWorkspaceTabsStore", () => {
     expect(store.close("b")).toBe("a");
     expect(store.close("a")).toBe("");
   });
+
 });

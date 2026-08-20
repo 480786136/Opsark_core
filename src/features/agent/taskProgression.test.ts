@@ -6,6 +6,7 @@ import {
   selectContinuationSteps,
 } from "@/features/agent/taskProgression";
 import type { OpsTask, PlanStep } from "@/types";
+import type { ToolDefinition } from "@/features/tools/types";
 
 const step = (overrides: Partial<PlanStep> = {}): PlanStep => ({
   id: overrides.id ?? "step-1",
@@ -59,6 +60,43 @@ describe("taskProgression", () => {
     expect(resolveTaskProgression(current)).toEqual({ kind: "refine-discovery" });
     current.discoveryRefined = true;
     expect(resolveTaskProgression(current)).toEqual({ kind: "complete" });
+  });
+
+  it("treats a completed user-input tool as discovery evidence", () => {
+    const current = task([step({
+      title: "Need parameters",
+      command: 'opsark-tool user.request_input {"title":"Deploy","fields":[]}',
+    })]);
+    expect(resolveTaskProgression(current)).toEqual({ kind: "refine-discovery" });
+  });
+
+  it("refines after a terminal tool when its catalog metadata requires follow-up", () => {
+    const current = task([step({
+      title: "连接并切换服务器",
+      command: 'opsark-tool server.connect {"host":"192.168.1.237"}',
+    })], {
+      activeSkillIds: ["ssh-terminal-jump"],
+      executionConstraints: {
+        changePolicy: "requested_changes_only",
+        environmentPolicy: "preserve",
+        failurePolicy: "strict",
+        prohibitedActions: [],
+        requiredConditions: [],
+        userDirectives: [],
+      },
+    });
+
+    expect(resolveTaskProgression(current)).toEqual({ kind: "refine-discovery" });
+  });
+
+  it("uses generic completion metadata for newly registered tools", () => {
+    const tools: ToolDefinition[] = [{
+      id: "custom.discovery", implementation: "custom", name: "Custom", description: "Custom",
+      usageInstructions: "Custom", inputSchema: {}, outputDescription: "Custom",
+      completionMode: "refine", enabled: true, builtIn: false, version: 1, updatedAt: "now",
+    }];
+    const current = task([step({ command: 'opsark-tool custom.discovery {"scope":"all"}' })]);
+    expect(resolveTaskProgression(current, tools)).toEqual({ kind: "refine-discovery" });
   });
 
   it("selects the first pending step and removes duplicate continuation commands", () => {

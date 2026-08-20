@@ -18,7 +18,10 @@ import {
   resolveToolRegistry,
 } from "@/features/tools/toolRegistry";
 import { normalizeToolDefinition, validateToolDefinition } from "@/features/tools/toolValidation";
-import { executeToolCall as executeRegisteredToolCall } from "@/features/tools/toolExecutor";
+import {
+  executeToolCall as executeRegisteredToolCall,
+  parseUserInputArguments,
+} from "@/features/tools/toolExecutor";
 import {
   buildAgentContext,
   extractKnownExecutionFacts,
@@ -29,6 +32,7 @@ import { transitionTask } from "@/features/agent/taskMachine";
 import { transitionStep } from "@/features/agent/stepMachine";
 import {
   cancelStep,
+  failToolCommandParsing,
   resumeStepAfterSecret,
 } from "@/features/agent/stepInterruption";
 import {
@@ -101,17 +105,35 @@ import type {
 import type {
   FileStructureRequest,
   FileStructureResult,
+  ServerFileTransferRequest,
+  ServerConnectionLookupRequest,
+  ServerConnectionLookupResult,
+  ServerConnectRequest,
+  ServerConnectResult,
   ToolCall,
+  PendingUserInput,
 } from "@/features/tools/types";
 import { useFileWorkspaceStore } from "@/features/files/fileWorkspaceStore";
 import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
 import { useTerminalSessionStore } from "@/features/terminal/terminalSessionStore";
+import {
+  createCustomSkill,
+  createSkillConfiguration,
+  buildSkillContext,
+  normalizeSkillRegistry,
+  parseSkillConfiguration,
+  resetSkillDefinition,
+  resolveSkillRegistry,
+  resolveTaskSkills,
+} from "@/features/skills/skillRegistry";
+import { validateSkillDefinition } from "@/features/skills/skillValidation";
 
 const now = () => new Date().toISOString();
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 let persistTimer: number | undefined;
 let credentialHydration: Promise<void> | undefined;
+const adjustingTaskIds = new Set<string>();
 
 const secretValueId = (serverId: string, key: string) => `${serverId}::${key}`;
 
@@ -122,6 +144,32 @@ function serverSecretValues(values: Record<string, string>, serverId: string) {
       .filter(([id]) => id.startsWith(prefix))
       .map(([id, value]) => [id.slice(prefix.length), value]),
   );
+}
+
+async function waitForBoundTerminal(
+  terminalSessions: ReturnType<typeof useTerminalSessionStore>,
+  serverId: string,
+  paneId: string,
+  isCancelled: () => boolean,
+) {
+  terminalSessions.activatePane(serverId, paneId);
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    if (isCancelled()) throw new Error("智能任务已终止");
+    if (terminalSessions.paneStatusById[paneId] === "connected") return;
+    await wait(100);
+  }
+  throw new Error("任务绑定终端未就绪，已取消后台降级执行，请重连终端后重试");
+}
+
+function masksExecutionFailure(script: string) {
+  const normalized = script.trim().toLocaleLowerCase();
+  const tail = normalized.replace(/[;\s]+$/g, "");
+  if (/\|\|\s*(?:true|\/bin\/true|:)$/.test(tail) || /(?:;|\n)\s*true$/.test(tail)) return true;
+  if (/\bset\s+\+e\b/.test(normalized) && /(?:^|;|\n)\s*exit\s+0$/.test(tail)) return true;
+  if (/\b(?:ssh|scp|rsync)\b[^\n]*(?:\|\|)\s*echo\b/.test(normalized)) return true;
+  const branches = normalized.split("||");
+  const failureBranch = branches[branches.length - 1];
+  return normalized.includes("||") && Boolean(failureBranch?.includes("exit 0"));
 }
 
 const emptyServerInfo = {
@@ -166,6 +214,10 @@ function initialAiGenerationSettings() {
 
 function initialTools() {
   return resolveToolRegistry(parseToolOverrides(readSaved<unknown>("opsark.toolOverrides", [])));
+}
+
+function initialSkills() {
+  return resolveSkillRegistry(parseSkillConfiguration(readSaved<unknown>("opsark.skillConfiguration", {})));
 }
 
 function readSaved<T>(key: string, fallback: T): T {
@@ -247,6 +299,39 @@ function initialLogs() {
   }));
 }
 
+function truncatePersistedText(value: string | undefined, limit: number) {
+  if (!value || value.length <= limit) return value;
+  return `${value.slice(0, limit)}\n…[持久化时已截断，完整实时输出不受影响]`;
+}
+
+function compactPersistedStep(step: PlanStep, aggressive: boolean): PlanStep {
+  const outputLimit = aggressive ? 8_000 : 40_000;
+  return {
+    ...step,
+    output: truncatePersistedText(step.output, outputLimit),
+    evidence: step.evidence?.slice(-(aggressive ? 4 : 12)).map((evidence) => ({
+      ...evidence,
+      rawOutput: truncatePersistedText(evidence.rawOutput, aggressive ? 4_000 : 20_000) ?? "",
+    })),
+  };
+}
+
+function compactPersistedTasks(tasks: OpsTask[], aggressive = false): OpsTask[] {
+  return tasks.slice(0, aggressive ? 20 : 50).map((task) => ({
+    ...task,
+    messages: task.messages.slice(-(aggressive ? 80 : 240)).map((message) => ({
+      ...message,
+      content: truncatePersistedText(message.content, aggressive ? 4_000 : 16_000) ?? "",
+    })),
+    plan: task.plan.map((step) => compactPersistedStep(step, aggressive)),
+    planHistory: task.planHistory?.slice(-(aggressive ? 2 : 8)).map((round) => ({
+      ...round,
+      plan: round.plan.map((step) => compactPersistedStep(step, aggressive)),
+      records: round.records?.slice(-(aggressive ? 40 : 120)),
+    })),
+  }));
+}
+
 export const useOpsStore = defineStore("ops", {
   state: () => ({
     servers: initialServers(),
@@ -255,6 +340,8 @@ export const useOpsStore = defineStore("ops", {
     aiGenerationSettings: initialAiGenerationSettings(),
     tools: initialTools(),
     toolSaveError: "",
+    skills: initialSkills(),
+    skillSaveError: "",
     modelAvailability: {} as Record<string, ModelAvailability>,
     logs: initialLogs(),
     metrics: {
@@ -272,12 +359,14 @@ export const useOpsStore = defineStore("ops", {
     secretMetadata: initialSecretMetadata(),
     secretValues: {} as Record<string, string>,
     pendingSecret: null as { taskId: string; stepId: string; key: string } | null,
+    pendingUserInputs: [] as PendingUserInput[],
     terminalLines: [] as string[],
     isCollecting: false,
     metricsLoading: false,
     credentialsHydrated: false,
     credentialsLoading: false,
     credentialError: "",
+    persistenceWarning: "",
   }),
 
   getters: {
@@ -295,6 +384,9 @@ export const useOpsStore = defineStore("ops", {
     enabledTools(state) {
       return state.tools.filter((tool) => tool.enabled);
     },
+    enabledSkills(state) {
+      return state.skills.filter((skill) => skill.enabled);
+    },
   },
 
   actions: {
@@ -302,13 +394,26 @@ export const useOpsStore = defineStore("ops", {
       if (persistTimer !== undefined) window.clearTimeout(persistTimer);
       const store = this;
       const write = () => {
-        localStorage.setItem("opsark.servers", JSON.stringify(store.servers));
-        localStorage.setItem("opsark.tasks", JSON.stringify(store.tasks));
-        localStorage.setItem("opsark.models", JSON.stringify(store.models));
-        localStorage.setItem("opsark.aiGenerationSettings", JSON.stringify(store.aiGenerationSettings));
-        localStorage.setItem("opsark.toolOverrides", JSON.stringify(createToolOverrides(store.tools)));
-        localStorage.setItem("opsark.logs", JSON.stringify(store.logs.slice(0, 500)));
-        localStorage.setItem("opsark.secretMetadata", JSON.stringify(store.secretMetadata));
+        try {
+          localStorage.setItem("opsark.tasks", JSON.stringify(compactPersistedTasks(store.tasks)));
+          localStorage.setItem("opsark.logs", JSON.stringify(store.logs.slice(0, 300)));
+          localStorage.setItem("opsark.servers", JSON.stringify(store.servers));
+          localStorage.setItem("opsark.models", JSON.stringify(store.models));
+          localStorage.setItem("opsark.aiGenerationSettings", JSON.stringify(store.aiGenerationSettings));
+          localStorage.setItem("opsark.toolOverrides", JSON.stringify(createToolOverrides(store.tools)));
+          localStorage.setItem("opsark.skillConfiguration", JSON.stringify(createSkillConfiguration(store.skills)));
+          localStorage.setItem("opsark.secretMetadata", JSON.stringify(store.secretMetadata));
+          store.persistenceWarning = "";
+        } catch (error) {
+          // 本地记录空间不足不能改变远程命令结果；降级保存精简快照并继续任务。
+          store.persistenceWarning = `任务记录空间不足，已自动压缩历史：${String(error)}`;
+          try {
+            localStorage.setItem("opsark.tasks", JSON.stringify(compactPersistedTasks(store.tasks, true)));
+            localStorage.setItem("opsark.logs", JSON.stringify(store.logs.slice(0, 80)));
+          } catch {
+            // 极端情况下保留内存态，禁止把持久化失败误报为执行失败。
+          }
+        }
         persistTimer = undefined;
       };
       if (immediate) write();
@@ -330,6 +435,46 @@ export const useOpsStore = defineStore("ops", {
     resetTool(toolId: string) {
       this.tools = resetToolDefinition(toolId, this.tools);
       this.toolSaveError = "";
+      this.persist(true);
+    },
+
+    addSkill() {
+      const skill = createCustomSkill(uid("skill"));
+      this.skills.push(skill);
+      this.skillSaveError = "";
+      return skill;
+    },
+
+    removeSkill(skillId: string) {
+      const skill = this.skills.find((item) => item.id === skillId);
+      if (!skill || skill.builtIn) return false;
+      this.skills = this.skills.filter((item) => item.id !== skillId);
+      this.skillSaveError = "";
+      this.persist(true);
+      return true;
+    },
+
+    saveSkills() {
+      this.skillSaveError = "";
+      const normalized = normalizeSkillRegistry(this.skills);
+      const duplicateId = normalized.find((skill, index) =>
+        normalized.findIndex((candidate) => candidate.id === skill.id) !== index,
+      );
+      const invalid = normalized.find((skill) => validateSkillDefinition(skill).length > 0);
+      if (duplicateId || invalid) {
+        const target = duplicateId ?? invalid!;
+        this.skillSaveError = duplicateId
+          ? `Skill ID“${target.id}”重复`
+          : `Skill“${target.name || target.id}”的配置不完整`;
+        throw new Error(this.skillSaveError);
+      }
+      this.skills = normalized;
+      this.persist(true);
+    },
+
+    resetSkill(skillId: string) {
+      this.skills = resetSkillDefinition(skillId, this.skills);
+      this.skillSaveError = "";
       this.persist(true);
     },
 
@@ -518,17 +663,105 @@ export const useOpsStore = defineStore("ops", {
       }
     },
 
-    async executeToolCall(serverId: string, call: ToolCall) {
+    async executeToolCall(serverId: string, call: ToolCall, onProgress?: (message: string) => void, paneId?: string) {
       const connection = this.getRuntimeConnection(serverId);
       if (!connection) throw new Error("请先连接真实服务器");
       const startedAt = performance.now();
       const result = await executeRegisteredToolCall(call, this.tools, {
+        resolveServerConnection: async (
+          request: ServerConnectionLookupRequest,
+        ): Promise<ServerConnectionLookupResult> => {
+          const port = request.port ?? 22;
+          const target = this.servers.find((server) => server.host === request.host && server.port === port);
+          const credentialAvailable = Boolean(target && this.serverPasswords[target.id]);
+          return {
+            found: Boolean(target),
+            serverId: target?.id,
+            host: request.host,
+            port,
+            username: target?.username,
+            credentialAvailable,
+            credentialRef: credentialAvailable && target ? `managed-server:${target.id}` : undefined,
+          };
+        },
+        connectServer: async (request: ServerConnectRequest): Promise<ServerConnectResult> => {
+          const port = request.port ?? 22;
+          let username = request.username;
+          let password: string | undefined;
+          if (request.credentialRef?.startsWith("managed-server:")) {
+            const targetId = request.credentialRef.slice("managed-server:".length);
+            const managedTarget = this.servers.find((server) => server.id === targetId);
+            if (!managedTarget || managedTarget.host !== request.host || managedTarget.port !== port) {
+              throw new Error("credentialRef 与目标服务器不匹配，请重新查询连接资料");
+            }
+            username = managedTarget.username;
+            password = this.serverPasswords[managedTarget.id];
+          } else if (request.passwordSecretKey) {
+            password = serverSecretValues(this.secretValues, serverId)[request.passwordSecretKey];
+          }
+          if (!username) throw new Error("缺少目标服务器 SSH 用户名，请先查询连接资料或向用户收集");
+          if (!password) throw new Error("缺少目标服务器 SSH 密码，请先查询连接资料或通过用户输入工具安全收集");
+          if (!paneId) throw new Error("未找到任务绑定终端，无法在当前终端执行 SSH 跳转");
+          await useTerminalSessionStore().requestAgentPtySshJump(paneId, call.id, {
+            host: request.host,
+            port,
+            username,
+          }, password);
+          let target = this.servers.find((server) => server.host === request.host && server.port === port);
+          if (target) {
+            target.username = username;
+            if (request.name) target.name = request.name;
+            if (request.group) target.group = request.group;
+          } else {
+            target = this.addServer({
+              name: request.name ?? request.host,
+              host: request.host,
+              port,
+              username,
+              group: request.group ?? "智能连接",
+            });
+          }
+          this.serverPasswords[target.id] = password;
+          try {
+            await backend.saveCredential("server", target.id, password);
+          } catch (error) {
+            this.credentialError = String(error);
+          }
+          this.persist(true);
+          return {
+            serverId: target.id,
+            name: target.name,
+            host: target.host,
+            port: target.port,
+            username: target.username,
+            connected: true,
+            info: { terminalJump: true },
+          };
+        },
         getRemoteFileStructure: (request) => backend.getRemoteFileStructure(connection, request),
+        transferFileBetweenServers: async (request: ServerFileTransferRequest) => {
+          const target = this.servers.find((server) => [server.id, server.name, server.host].includes(request.targetServer));
+          if (!target) throw new Error(`目标服务器“${request.targetServer}”尚未加入服务器管理`);
+          if (target.id === serverId) throw new Error("源服务器和目标服务器不能相同");
+          const targetConnection = this.getRuntimeConnection(target.id);
+          if (!targetConnection) throw new Error(`目标服务器“${target.name}”缺少已保存的连接凭据，请先在服务器管理中连接该服务器`);
+          const transfer = await backend.transferSftpBetweenServers(
+            connection, targetConnection, call.id, request.sourcePath, request.targetPath,
+            request.overwrite === true,
+            (event) => {
+              const percent = event.totalBytes > 0
+                ? Math.min(100, Math.round((event.transferredBytes / event.totalBytes) * 100))
+                : 0;
+              onProgress?.(`正在传输到 ${target.host}：${percent}%`);
+            },
+          );
+          return { ...transfer, targetServerId: target.id };
+        },
       });
       const fileResult = result.data as FileStructureResult | undefined;
       this.addLog({
         category: "tool",
-        level: result.success ? (fileResult?.warnings.length ? "warning" : "success") : "error",
+        level: result.success ? (fileResult?.warnings?.length ? "warning" : "success") : "error",
         title: result.success ? "工具调用完成" : "工具调用失败",
         detail: JSON.stringify({
           toolId: call.toolId,
@@ -656,6 +889,7 @@ export const useOpsStore = defineStore("ops", {
       const wasActive = this.activeTaskId === taskId;
       this.tasks = this.tasks.filter((item) => item.id !== taskId);
       if (this.pendingSecret?.taskId === taskId) this.pendingSecret = null;
+      this.pendingUserInputs = this.pendingUserInputs.filter((item) => item.taskId !== taskId);
       if (wasActive) {
         this.activeTaskId = this.tasks.find((item) => item.serverId === task.serverId)?.id ?? null;
       }
@@ -737,9 +971,8 @@ export const useOpsStore = defineStore("ops", {
         task = this.createTask(serverId, permission, modelId);
       }
       const terminalSessions = useTerminalSessionStore();
-      if (!terminalSessions.resolveTaskPaneId(serverId, task.id)) {
-        terminalSessions.bindAgentTask(serverId, task.id);
-      }
+      const taskPaneId = terminalSessions.resolveTaskPaneId(serverId, task.id)
+        ?? terminalSessions.bindAgentTask(serverId, task.id);
       const requestsCurrentRoundAdjustment =
         task.status === "needs_adjustment"
         && /^(?:请)?(?:进行|生成|重新)?(?:一次|一下)?(?:调整|调整计划|重试)(?:吧|。)?$/i.test(content);
@@ -819,6 +1052,8 @@ export const useOpsStore = defineStore("ops", {
       task.confirmedSecretKeys = [];
       task.adjustmentCount = 0;
       task.discoveryRefined = false;
+      task.refinementCount = 0;
+      const continuesExistingWorkflow = /^(?:请)?(?:继续|继续执行|重试|再试一次)(?:吧|。)?$/i.test(content.trim());
       task.cancelRequested = false;
       task.currentExecutionId = undefined;
       this.activeTaskId = task.id;
@@ -846,7 +1081,15 @@ export const useOpsStore = defineStore("ops", {
           const keychainDetail = this.credentialError ? ` 系统凭据读取错误：${this.credentialError}` : "";
           throw new Error(`“${model.name}”的 API Key 未恢复，请前往“模型与设置”重新保存一次。${keychainDetail}`);
         }
-        const server = this.servers.find((item) => item.id === serverId);
+        const terminalTarget = taskPaneId
+          ? terminalSessions.effectiveSshTargetByPane[taskPaneId]
+          : undefined;
+        const server = terminalTarget
+          ? this.servers.find((item) => item.host === terminalTarget.host && item.port === terminalTarget.port)
+          : this.servers.find((item) => item.id === serverId);
+        const contextMetrics = terminalTarget
+          ? { cpu: 0, memory: 0, disk: 0, networkIn: 0, networkOut: 0, sampledAt: "" }
+          : this.metrics;
         const contextSecrets = serverSecretValues(this.secretValues, serverId);
         const availableTerminalLines = this.terminalLines.slice(-400)
           .map((line) => redactExecutionOutput(line, contextSecrets));
@@ -864,7 +1107,7 @@ export const useOpsStore = defineStore("ops", {
               : [];
           context = JSON.stringify(buildAgentContext({
             server,
-            metrics: this.metrics,
+            metrics: contextMetrics,
             permission,
             terminalReference: selectedLines.length ? terminalReference : undefined,
             terminalContext: {
@@ -876,8 +1119,10 @@ export const useOpsStore = defineStore("ops", {
             },
             conversationHistory: priorConversation,
             previousExecution,
-            knownExecutionFacts: extractKnownExecutionFacts(task),
+            knownExecutionFacts: extractKnownExecutionFacts(task, resolveTaskSkills(task, this.skills)),
             tools: this.tools,
+            skills: resolveTaskSkills(task, this.skills),
+            skillDirectory: this.enabledSkills,
             secretMetadata: this.secretMetadata,
             serverId,
           }));
@@ -887,7 +1132,7 @@ export const useOpsStore = defineStore("ops", {
             model: model.model,
             context,
             generationSettings: this.aiGenerationSettings,
-          });
+          }, buildSkillContext(this.enabledSkills));
           if (processed.intent !== "terminal_context") break;
           if (selectedLines.length) throw new Error("模型已获得用户标注的终端内容，仍无法判断需求");
           const nextRange = Math.min(
@@ -900,6 +1145,37 @@ export const useOpsStore = defineStore("ops", {
         }
         if (!processed || processed.intent === "terminal_context") {
           throw new Error("已达终端上下文读取上限，模型仍无法完成需求判断");
+        }
+        const selectedSkillIds = processed.selectedSkillIds ?? [];
+        if (selectedSkillIds.length > 0 || !continuesExistingWorkflow) {
+          task.activeSkillIds = selectedSkillIds;
+        }
+        if (processed.planError) {
+          const selectedSkillNames = resolveTaskSkills(task, this.skills).map((skill) => skill.name);
+          const selectionSummary = selectedSkillNames.length
+            ? `已选择 Skill：${selectedSkillNames.join("、")}。`
+            : "本轮未选择领域 Skill，使用通用运维规则。";
+          const failureSummary = processed.planError.includes("要求模型针对性修复一次")
+            ? "计划经针对性修复后仍未通过安全校验。"
+            : "计划生成未完成，已保留 Skill 选择结果。";
+          this.pushMessage(task, {
+            role: "system",
+            kind: "event",
+            content: `${selectionSummary}${failureSummary}`,
+          });
+          this.addLog({
+            category: "model",
+            level: "error",
+            title: "Skill 选择已保留，计划生成失败",
+            detail: JSON.stringify({
+              requirement: content,
+              selectedSkillIds: task.activeSkillIds ?? [],
+              error: processed.planError,
+            }, null, 2),
+            serverId,
+            taskId: task.id,
+          });
+          throw processed.planError;
         }
         if (processed.intent === "answer") {
           task.plan = [];
@@ -940,6 +1216,7 @@ export const useOpsStore = defineStore("ops", {
           detail: JSON.stringify({
             requirement: content,
             constraints: task.executionConstraints,
+            selectedSkillIds: task.activeSkillIds ?? [],
             context: JSON.parse(context),
             plan: task.plan,
           }, null, 2),
@@ -971,9 +1248,12 @@ export const useOpsStore = defineStore("ops", {
     },
 
     async adjustTask(taskId: string) {
-      await this.hydrateCredentials();
-      const task = this.tasks.find((item) => item.id === taskId);
-      if (!task || !["needs_adjustment", "failed"].includes(task.status)) return;
+      if (adjustingTaskIds.has(taskId)) return;
+      adjustingTaskIds.add(taskId);
+      try {
+        await this.hydrateCredentials();
+        const task = this.tasks.find((item) => item.id === taskId);
+        if (!task || !["needs_adjustment", "failed"].includes(task.status)) return;
       task.adjustmentCount ??= 0;
       if (task.adjustmentCount >= 1) {
         await this.finalizeFailedTask(
@@ -1013,15 +1293,14 @@ export const useOpsStore = defineStore("ops", {
           model,
           apiKey,
           generationSettings: this.aiGenerationSettings,
+          skills: resolveTaskSkills(task, this.skills),
         });
         task.plan = adjustment.plan;
         transitionTask(task, "awaiting_plan_approval");
         this.pushMessage(task, {
           role: "assistant",
           kind: "message",
-          content: task.permission === "managed"
-            ? `已根据失败结果生成 ${adjustment.replacement.length} 个调整步骤，完全托管模式将自动批准并继续。`
-            : `已根据失败结果生成 ${adjustment.replacement.length} 个调整步骤，请重新审查并批准。`,
+          content: `已根据失败结果生成 ${adjustment.replacement.length} 个调整步骤，请重新审查并批准。`,
         });
         this.addLog({
           category: "model",
@@ -1049,15 +1328,22 @@ export const useOpsStore = defineStore("ops", {
           taskId,
         });
       }
-      this.persist();
-      if (task.status === "awaiting_plan_approval" && task.permission === "managed") {
-        await this.approvePlan(task.id, true);
+        this.persist();
+      } finally {
+        adjustingTaskIds.delete(taskId);
       }
     },
 
     async requestAdjustment(taskId: string) {
+      if (adjustingTaskIds.has(taskId)) return;
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || !["needs_adjustment", "failed"].includes(task.status)) return;
+      const blocker = task.pauseReason?.replace(/\d+/g, "#").slice(0, 500);
+      if (blocker && task.lastAdjustmentBlocker === blocker && (task.adjustmentCount ?? 0) >= 1) {
+        await this.finalizeFailedTask(task.id, "相同阻塞原因再次出现，系统已停止重复生成计划。请先解决凭据、网络或输入条件后重新发起任务。");
+        return;
+      }
+      if (blocker) task.lastAdjustmentBlocker = blocker;
       if ((task.adjustmentCount ?? 0) >= 1) {
         task.adjustmentCount = 0;
         transitionTask(task, "needs_adjustment");
@@ -1074,7 +1360,7 @@ export const useOpsStore = defineStore("ops", {
     async approvePlan(taskId: string, automatic = false) {
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || task.status !== "awaiting_plan_approval") return;
-      task.plan = normalizePlanPreconditions(task.plan);
+      task.plan = normalizePlanPreconditions(task.plan, latestTaskRequirement(task), this.tools);
       transitionTask(task, "running");
       task.pauseReason = undefined;
       this.pushMessage(task, {
@@ -1107,6 +1393,7 @@ export const useOpsStore = defineStore("ops", {
         ? `本次任务已由用户结束。结束前的暂停原因：${task.pauseReason}`
         : "本次任务已由用户取消，未再执行后续步骤。";
       task.pauseReason = undefined;
+      this.pendingUserInputs = this.pendingUserInputs.filter((item) => item.taskId !== taskId);
       this.pushMessage(task, { role: "assistant", kind: "summary", content: task.summary });
       this.persist();
     },
@@ -1124,6 +1411,9 @@ export const useOpsStore = defineStore("ops", {
       }
       const server = this.servers.find((item) => item.id === task.serverId);
       const password = this.serverPasswords[task.serverId];
+      if (executionId) {
+        try { await backend.cancelSftpTransfer(executionId); } catch { /* 当前执行并非文件传输。 */ }
+      }
       if (executionId && server && password) {
         try {
           await backend.cancelCommand(
@@ -1135,6 +1425,7 @@ export const useOpsStore = defineStore("ops", {
         }
       }
       transitionTask(task, "cancelled");
+      this.pendingUserInputs = this.pendingUserInputs.filter((item) => item.taskId !== taskId);
       const active = task.plan.find((step) => ["running", "validating", "awaiting_approval", "awaiting_input"].includes(step.status));
       if (active) {
         cancelStep(active, "用户终止");
@@ -1153,10 +1444,11 @@ export const useOpsStore = defineStore("ops", {
     async advanceTask(taskId: string) {
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || !["running", "awaiting_step_approval"].includes(task.status)) return;
-      const progression = resolveTaskProgression(task);
+      const progression = resolveTaskProgression(task, this.tools);
       if (progression.kind !== "execute-step") {
         if (progression.kind === "refine-discovery") {
           task.discoveryRefined = true;
+          task.refinementCount = (task.refinementCount ?? 0) + 1;
           transitionTask(task, "planning");
           const requirement = latestTaskRequirement(task);
           const model = this.models.find((item) => item.id === task.modelId);
@@ -1172,6 +1464,7 @@ export const useOpsStore = defineStore("ops", {
             model,
             apiKey,
             generationSettings: this.aiGenerationSettings,
+            skills: resolveTaskSkills(task, this.skills),
             isCancelled: () => task.cancelRequested === true,
             onStart: () => {
               this.pushMessage(task, {
@@ -1296,10 +1589,56 @@ export const useOpsStore = defineStore("ops", {
       const task = this.tasks.find((item) => item.id === taskId);
       const step = task?.plan.find((item) => item.id === stepId);
       if (!task || !step) return;
+      const toolDefinition = this.tools.find((tool) => tool.id === call.toolId);
+      if (toolDefinition?.executionMode === "user-input") {
+        try {
+          const request = parseUserInputArguments(call.arguments);
+          transitionStep(step, "awaiting_input");
+          transitionTask(task, "awaiting_input");
+          step.startedAt = now();
+          step.progressMessage = "等待用户补充参数";
+          this.pendingUserInputs = this.pendingUserInputs
+            .filter((item) => item.taskId !== taskId)
+            .concat({ taskId, stepId, callId: call.id, ...request });
+          this.pushMessage(task, {
+            role: "assistant",
+            kind: "event",
+            content: `需要用户补充 ${request.fields.length} 个参数后才能继续；每个参数的用途已在输入区说明。`,
+          });
+          this.persist();
+        } catch (error) {
+          const failure = failToolCommandParsing(step, error);
+          transitionTask(task, "needs_adjustment");
+          task.pauseReason = failure.pauseReason;
+          this.pushMessage(task, { role: "assistant", kind: "event", content: failure.eventMessage });
+          this.persist();
+        }
+        return;
+      }
+      const terminalSessions = useTerminalSessionStore();
+      const targetPaneId = terminalSessions.resolveTaskPaneId(task.serverId, task.id)
+        ?? terminalSessions.bindAgentTask(task.serverId, task.id);
+      task.currentExecutionId = call.id;
       const lifecycle = await runToolStepLifecycle({
         step,
         call,
-        execute: () => this.executeToolCall(task.serverId, call),
+        execute: async () => {
+          if (toolDefinition?.executionMode === "terminal") {
+            if (!targetPaneId) throw new Error("当前任务没有可用终端");
+            await waitForBoundTerminal(
+              terminalSessions,
+              task.serverId,
+              targetPaneId,
+              () => task.cancelRequested === true,
+            );
+          }
+          return this.executeToolCall(
+            task.serverId,
+            call,
+            (message) => { step.progressMessage = message; },
+            targetPaneId,
+          );
+        },
         createEvidenceId: () => uid("evidence-tool"),
         now,
         isCancelled: () => task.cancelRequested === true,
@@ -1309,6 +1648,7 @@ export const useOpsStore = defineStore("ops", {
           this.persist();
         },
       });
+      task.currentExecutionId = undefined;
       if (lifecycle.cancelled || task.cancelRequested) return;
       transitionTask(task, lifecycle.taskStatus);
       task.pauseReason = lifecycle.pauseReason;
@@ -1385,6 +1725,9 @@ export const useOpsStore = defineStore("ops", {
           modelApiKey: runtimeApiKey,
           secretValues: serverSecretValues(this.secretValues, task.serverId),
         });
+        if (masksExecutionFailure(prepared.resolvedCommand) || masksExecutionFailure(prepared.resolvedValidation)) {
+          throw new Error("计划命令或后置校验掩盖了失败退出码，已拒绝执行并要求重新调整计划");
+        }
         step.command = prepared.commandTemplate;
         step.validation = prepared.validationTemplate;
         const executionId = uid("exec");
@@ -1446,9 +1789,17 @@ export const useOpsStore = defineStore("ops", {
             if (prepared.connection) await backend.cancelCommand(prepared.connection, executionId);
           },
         }, async (input) => {
-          if (!targetPaneId || terminalSessions.paneStatusById[targetPaneId] !== "connected") {
+          // 非实时会话（例如单元测试或未进入工作台）仍使用标准执行器。
+          // 真实 SSH 会话已建立时则必须等待绑定终端，不允许静默降级到后台 SSH。
+          if (!targetPaneId || !this.connectedServerIds.includes(task.serverId)) {
             return executeStepCommand(input);
           }
+          await waitForBoundTerminal(
+            terminalSessions,
+            task.serverId,
+            targetPaneId,
+            () => task.cancelRequested === true,
+          );
           const result = await terminalSessions.requestAgentPtyCommand(
             targetPaneId,
             input.executionId,
@@ -1569,16 +1920,43 @@ export const useOpsStore = defineStore("ops", {
             appendTerminalStream(this.terminalLines, safeChunk);
             publishAgentOutput(safeChunk);
           },
-          onRetry: (firstValidationOutput) => {
+          onRetry: (firstValidationOutput, maxRetries) => {
             step.output = appendFirstValidationFailureOutput(step.output, firstValidationOutput);
             this.pushMessage(task, {
               role: "system",
               kind: "event",
-              content: `${step.title}的独立网络校验与主结果不一致，正在自动重试一次…`,
+              content: `${step.title}的后置状态尚未稳定，将在有界窗口内自动复核最多 ${maxRetries} 次…`,
             });
-            publishAgentOutput("\n\u001b[33m[Agent 验证重试]\u001b[0m\n");
+            publishAgentOutput("\n\u001b[33m[Agent 状态稳定复核]\u001b[0m\n");
           },
-        });
+        }, this.connectedServerIds.includes(task.serverId) && targetPaneId
+          ? async (input) => {
+            await waitForBoundTerminal(
+              terminalSessions,
+              task.serverId,
+              targetPaneId,
+              () => task.cancelRequested === true,
+            );
+            const result = await terminalSessions.requestAgentPtyCommand(
+              targetPaneId,
+              input.executionId,
+              input.step.validation,
+              (chunk) => input.onProgress?.(chunk, {
+                executionId: input.executionId,
+                data: chunk,
+                stream: "stdout",
+              }),
+              input.step.validation,
+            );
+            return {
+              passed: result.success,
+              detail: result.success ? "后置校验通过" : `后置校验退出码 ${result.exitCode}`,
+              output: result.output,
+              exitCode: result.exitCode,
+              emptyResult: result.emptyResult,
+            };
+          }
+          : undefined);
         if (task.cancelRequested) return;
         const validation = validationLifecycle.validation;
         const assembledValidation = assembleFinalValidationOutput(step.output, validation.output);
@@ -1662,6 +2040,78 @@ export const useOpsStore = defineStore("ops", {
         });
         this.persist();
       }
+    },
+
+    async provideUserInput(taskId: string, rawValues: Record<string, string>) {
+      const request = this.pendingUserInputs.find((item) => item.taskId === taskId);
+      const task = this.tasks.find((item) => item.id === taskId);
+      const step = task?.plan.find((item) => item.id === request?.stepId);
+      if (!request || !task || !step) return false;
+
+      const missing = request.fields.find((field) => field.required && !String(rawValues[field.key] ?? "").trim());
+      if (missing) {
+        request.error = `请填写必填参数“${missing.label}”`;
+        return false;
+      }
+      const invalidNumber = request.fields.find((field) => field.type === "number" && String(rawValues[field.key] ?? "").trim()
+        && !Number.isFinite(Number(rawValues[field.key])));
+      if (invalidNumber) {
+        request.error = `参数“${invalidNumber.label}”必须是有效数字`;
+        return false;
+      }
+
+      const values: Record<string, string | number> = {};
+      try {
+        for (const field of request.fields) {
+          const raw = String(rawValues[field.key] ?? "").trim();
+          if (!raw) continue;
+          if (field.type === "password") {
+            const secretKey = field.key.toUpperCase();
+            const valueId = secretValueId(task.serverId, secretKey);
+            this.secretValues[valueId] = raw;
+            if (!this.secretMetadata.some((item) => item.key === secretKey && item.serverId === task.serverId)) {
+              this.secretMetadata.push({ key: secretKey, description: field.description, scope: "server", serverId: task.serverId });
+            }
+            await backend.saveCredential("secret", valueId, raw);
+            task.confirmedSecretKeys ??= [];
+            if (!task.confirmedSecretKeys.includes(secretKey)) task.confirmedSecretKeys.push(secretKey);
+            values[field.key] = `已安全保存为 \${secret.${secretKey}}`;
+          } else {
+            values[field.key] = field.type === "number" ? Number(raw) : raw;
+          }
+        }
+      } catch (error) {
+        request.error = `保存输入失败：${String(error)}`;
+        return false;
+      }
+
+      request.error = undefined;
+      this.pendingUserInputs = this.pendingUserInputs.filter((item) => item !== request);
+      transitionStep(step, "pending");
+      const call: ToolCall = { id: request.callId, toolId: "user.request_input", arguments: {} };
+      const lifecycle = await runToolStepLifecycle({
+        step,
+        call,
+        execute: async () => ({ callId: call.id, toolId: call.toolId, success: true, data: { title: request.title, values } }),
+        createEvidenceId: () => uid("evidence-user-input"),
+        now,
+        isCancelled: () => task.cancelRequested === true,
+        onStart: () => {
+          transitionTask(task, "running");
+          this.pushMessage(task, {
+            role: "user",
+            kind: "event",
+            content: `已提交参数：${request.fields.filter((field) => field.key in values).map((field) => field.label).join("、")}。`,
+          });
+        },
+      });
+      if (lifecycle.cancelled || task.cancelRequested) return false;
+      transitionTask(task, lifecycle.taskStatus);
+      task.pauseReason = lifecycle.pauseReason;
+      this.pushMessage(task, { role: "assistant", kind: "event", content: "用户输入已安全确认，正在基于这些参数继续任务。" });
+      this.persist();
+      if (lifecycle.shouldAdvance) await this.advanceTask(taskId);
+      return true;
     },
 
     async provideSecret(value: string) {

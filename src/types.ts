@@ -172,7 +172,10 @@ export interface OpsTask {
   pauseReason?: string;
   executionConstraints?: ExecutionConstraints;
   adjustmentCount?: number;
+  lastAdjustmentBlocker?: string;
   discoveryRefined?: boolean;
+  refinementCount?: number;
+  activeSkillIds?: string[];
   currentExecutionId?: string;
   cancelRequested?: boolean;
   confirmedSecretKeys?: string[];
@@ -210,6 +213,8 @@ export interface RequirementProcessingResult {
   plan: PlanStep[];
   constraints?: ExecutionConstraints;
   terminalContextLines?: number;
+  selectedSkillIds?: string[];
+  planError?: string;
 }
 
 export interface AuditEvent {

@@ -44,6 +44,9 @@ export function buildToolStepOutcome(input: BuildToolStepOutcomeInput): ToolStep
   const truncated = result.truncated === true;
   const output = JSON.stringify(result.data, null, 2);
   const facts = { toolId: call.toolId, truncated };
+  const successSummary = truncated
+    ? "工具已返回部分结构化证据。"
+    : "工具已返回结构化证据。";
   return {
     status: "completed",
     output,
@@ -66,11 +69,11 @@ export function buildToolStepOutcome(input: BuildToolStepOutcomeInput): ToolStep
     review: {
       decision: "continue",
       reason: "工具调用成功并返回结构化证据",
-      summary: truncated ? "已获得部分目录结构。" : "已获得目录结构。",
+      summary: successSummary,
       source: "rules",
     },
     eventMessage: truncated
-      ? `工具 ${call.toolId} 已返回部分结果，达到遍历限制。`
+      ? `工具 ${call.toolId} 已返回部分结果，达到处理限制。`
       : `工具 ${call.toolId} 已返回完整结果。`,
   };
 }
@@ -83,4 +86,3 @@ export function applyToolStepOutcome(step: PlanStep, outcome: ToolStepOutcome): 
   step.evidence = outcome.evidence;
   step.review = outcome.review;
 }
-

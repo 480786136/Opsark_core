@@ -78,7 +78,8 @@ describe("longRunningMonitor", () => {
 
     currentTime += 11_000;
     timers.get(1)?.();
-    expect(onHeartbeat).toHaveBeenCalledWith(11, expect.stringContaining("30 秒"));
+    expect(onHeartbeat).toHaveBeenCalledWith(11, expect.stringContaining("完成后才会进行后置校验"));
+    expect(onHeartbeat).toHaveBeenCalledWith(11, expect.stringContaining("暂未收到实时输出"));
 
     controller.stop();
     expect(timers.size).toBe(0);

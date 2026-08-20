@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import {
   buildTerminalChangeDirectoryCommand,
+  buildTerminalDirectoryProbeCommand,
   extractOsc7Directories,
   quoteShellPath,
   useWorkspaceLinkStore,
@@ -16,6 +17,7 @@ describe("workspaceLinkStore", () => {
     expect(quoteShellPath("/srv/app's release")).toBe("'/srv/app'\"'\"'s release'");
     expect(buildTerminalChangeDirectoryCommand("/srv/app's release"))
       .toContain("cd -- '/srv/app'\"'\"'s release' && printf");
+    expect(buildTerminalDirectoryProbeCommand()).toContain("history -d $((HISTCMD-1))");
   });
 
   it("只从完整 OSC 7 标记提取规范化工作目录", () => {

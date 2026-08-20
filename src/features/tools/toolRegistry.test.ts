@@ -23,7 +23,7 @@ describe("tool registry", () => {
     expect(tool.name).toBe("项目结构读取");
     expect(tool.enabled).toBe(false);
     expect(tool.implementation).toBe("getRemoteFileStructure");
-    expect(tool.inputSchema).toEqual(defaultToolCatalog[defaultToolCatalog.length - 1].inputSchema);
+    expect(tool.inputSchema).toEqual(defaultToolCatalog.find((item) => item.id === "files.get_structure")?.inputSchema);
   });
 
   it("persists only fields that differ from the catalog", () => {

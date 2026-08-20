@@ -158,6 +158,7 @@ watch(serverId, async (nextServerId) => {
   connecting.value = !connected;
   void store.refreshMetrics(nextServerId);
 }, { immediate: true });
+
 </script>
 
 <template>

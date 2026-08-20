@@ -18,8 +18,7 @@ import type {
   LongRunningReviewAudit,
   StartLongRunningMonitorInput,
 } from "@/features/agent/longRunningMonitor";
-import { ensureStepValidator, isReadOnlyStep } from "@/features/agent/evidenceReview";
-import { sanitizeTerminalOutput } from "@/utils/terminal";
+import { appendTerminalOutput } from "@/utils/terminal";
 import type { OpsTask, PlanStep } from "@/types";
 
 type CommandExecutor = (input: ExecuteStepCommandInput) => Promise<ExecutionCommandResult>;
@@ -90,7 +89,7 @@ export async function runCommandLifecycle(
       executionId: input.executionId,
       secretValues: input.secretValues,
       onProgress: (safeChunk) => {
-        streamedOutput = sanitizeTerminalOutput(streamedOutput + safeChunk);
+        streamedOutput = appendTerminalOutput(streamedOutput, safeChunk);
         input.onProgress(safeChunk, streamedOutput);
       },
     });
@@ -126,16 +125,32 @@ export interface RunValidationLifecycleInput {
   isCancelled(): boolean;
   onExecutionChange(executionId?: string): void;
   onProgress(safeChunk: string): void;
-  onRetry(firstOutput: string): void;
+  onRetry(firstOutput: string, maxRetries: number): void;
+  waitBeforeRetry?(delayMs: number): Promise<void>;
 }
 
 export interface ValidationLifecycleResult {
   validation: StepValidationResult;
   retried: boolean;
   firstFailedOutput: string;
+  attemptCount: number;
 }
 
-/** Runs validation with one read-only HTTP retry and clears every execution ID in finally. */
+export const VALIDATION_STABILIZATION_DELAYS_MS = [500, 1_500, 3_000] as const;
+
+function validationMayStillStabilize(validation: StepValidationResult) {
+  return !validation.passed && ![2, 126, 127].includes(validation.exitCode ?? 1);
+}
+
+const defaultValidationWait = (delayMs: number) => new Promise<void>((resolve) => {
+  globalThis.setTimeout(resolve, delayMs);
+});
+
+/**
+ * Runs every postcondition through one bounded stabilization window. This covers
+ * service readiness, filesystem propagation and other eventual state without
+ * treating syntax errors or missing validators as transient races.
+ */
 export async function runValidationLifecycle(
   input: RunValidationLifecycleInput,
   executeValidation: ValidationExecutor = executeStepValidation,
@@ -156,16 +171,20 @@ export async function runValidationLifecycle(
   };
 
   let validation = await run(input.initialExecutionId);
-  const shouldRetry = !input.isCancelled()
-    && !validation.passed
-    && isReadOnlyStep(input.step)
-    && ensureStepValidator({ ...input.step, validation: input.validation }).validator.type === "http";
-  if (!shouldRetry) {
-    return { validation, retried: false, firstFailedOutput: "" };
+  let attemptCount = 1;
+  if (input.isCancelled() || !validationMayStillStabilize(validation)) {
+    return { validation, retried: false, firstFailedOutput: "", attemptCount };
   }
 
   const firstFailedOutput = validation.output ?? "";
-  input.onRetry(firstFailedOutput);
-  validation = await run(input.createRetryExecutionId());
-  return { validation, retried: true, firstFailedOutput };
+  input.onRetry(firstFailedOutput, VALIDATION_STABILIZATION_DELAYS_MS.length);
+  const waitBeforeRetry = input.waitBeforeRetry ?? defaultValidationWait;
+  for (const delayMs of VALIDATION_STABILIZATION_DELAYS_MS) {
+    await waitBeforeRetry(delayMs);
+    if (input.isCancelled()) break;
+    validation = await run(input.createRetryExecutionId());
+    attemptCount += 1;
+    if (validation.passed || !validationMayStillStabilize(validation)) break;
+  }
+  return { validation, retried: attemptCount > 1, firstFailedOutput, attemptCount };
 }

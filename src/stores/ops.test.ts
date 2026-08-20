@@ -1,6 +1,11 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import { backend, buildExecutionSummary, normalizePlanPreconditions } from "@/services/backend";
+import {
+  backend,
+  buildExecutionSummary,
+  normalizeLongRunningCommandOutput,
+  normalizePlanPreconditions,
+} from "@/services/backend";
 import { useOpsStore } from "@/stores/ops";
 import type { PlanStep } from "@/types";
 import { sanitizeTerminalOutput } from "@/utils/terminal";
@@ -46,6 +51,8 @@ const plan: PlanStep[] = [
 ];
 
 describe("智能任务状态机", () => {
+  afterEach(() => vi.useRealTimers());
+
   beforeEach(() => {
     vi.restoreAllMocks();
     localStorage.clear();
@@ -295,6 +302,56 @@ describe("智能任务状态机", () => {
     expect(terminalSessions.agentOutputByPane[secondSession.activePaneId]).toBeUndefined();
   });
 
+  it("真实 SSH 会话的主命令和正式校验都通过绑定终端执行", async () => {
+    const store = useOpsStore();
+    const terminalSessions = useTerminalSessionStore();
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
+    task.status = "running";
+    task.plan = [{
+      ...structuredClone(plan[0]),
+      id: "pty-step",
+      command: "echo running",
+      validation: "test -n running",
+    }];
+    store.serverPasswords[task.serverId] = "test-password";
+    store.connectedServerIds.push(task.serverId);
+    terminalSessions.ensureWorkspace(task.serverId);
+    const paneId = terminalSessions.bindAgentTask(task.serverId, task.id)!;
+    terminalSessions.setPaneStatus(paneId, "connected");
+    const executeInPty = vi.spyOn(terminalSessions, "requestAgentPtyCommand")
+      .mockImplementation(async (_paneId, _executionId, command, onProgress) => {
+        onProgress?.(`${command}: ok\n`);
+        return { output: `${command}: ok`, success: true, simulated: false, exitCode: 0, emptyResult: false };
+      });
+
+    await store.runStep(task.id, "pty-step");
+
+    expect(executeInPty.mock.calls.map(([, , command]) => command))
+      .toEqual(["echo running", "test -n running"]);
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.validateStep).not.toHaveBeenCalled();
+    expect(task.plan[0].status).toBe("completed");
+  });
+
+  it("执行前拦截旧计划中掩盖真实失败的命令与校验", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
+    task.status = "running";
+    task.plan = [{
+      ...structuredClone(plan[0]),
+      id: "masked-step",
+      command: "timeout 900 make download-toolchain || { echo failed; exit 0; }",
+      validation: "find toolchain -name rustc | head -n 1; true",
+    }];
+
+    await store.runStep(task.id, "masked-step");
+
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.validateStep).not.toHaveBeenCalled();
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.pauseReason).toContain("掩盖了失败退出码");
+  });
+
   it("模型工具命令由工具执行器处理，不发送到远端 shell", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
@@ -318,6 +375,114 @@ describe("智能任务状态机", () => {
     expect(task.plan[0].status).toBe("completed");
     expect(task.plan[0].evidence?.[0].facts.toolId).toBe("files.get_structure");
     expect(task.status).toBe("completed");
+  });
+
+  it("用户输入工具展示参数用途，并在提交后以脱敏证据继续规划", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    store.pushMessage(task, { role: "user", kind: "message", content: "部署应用" });
+    task.status = "running";
+    task.executionConstraints = {
+      changePolicy: "requested_changes_only",
+      environmentPolicy: "preserve",
+      failurePolicy: "strict",
+      prohibitedActions: [],
+      requiredConditions: [],
+      userDirectives: [],
+    };
+    task.plan = [{
+      ...structuredClone(plan[0]),
+      id: "user-input-step",
+      title: "获取部署参数",
+      command: 'opsark-tool user.request_input {"title":"补充部署信息","description":"用于生成安全的部署计划","fields":[{"key":"port","label":"服务端口","description":"应用对外监听的 TCP 端口","type":"number","required":true},{"key":"deploy_token","label":"部署令牌","description":"访问私有制品库的鉴权令牌","type":"password","required":true}]}',
+      validation: "true",
+    }];
+
+    await store.runStep(task.id, "user-input-step");
+    expect(task.status).toBe("awaiting_input");
+    expect(store.pendingUserInputs[0].fields[0].description).toContain("TCP 端口");
+
+    await store.provideUserInput(task.id, { port: "8080", deploy_token: "private-token" });
+
+    expect(backend.saveCredential).toHaveBeenCalledWith("secret", `${task.serverId}::DEPLOY_TOKEN`, "private-token");
+    expect(task.plan[0].output).toContain("8080");
+    expect(task.plan[0].output).not.toContain("private-token");
+    expect(JSON.stringify(store.logs)).not.toContain("private-token");
+    expect(task.discoveryRefined).toBe(true);
+  });
+
+  it("通过当前可见终端执行 SSH 跳转，不创建后台连接", async () => {
+    const store = useOpsStore();
+    store.serverPasswords["srv-production-01"] = "source-password";
+    store.setServerSecretValue("srv-production-01", "SSH_PASSWORD", "target-password");
+    const terminalSessions = useTerminalSessionStore();
+    const jump = vi.spyOn(terminalSessions, "requestAgentPtySshJump").mockResolvedValue({
+      output: "SSH 登录成功",
+      success: true,
+      simulated: false,
+      exitCode: 0,
+      emptyResult: false,
+    });
+
+    const result = await store.executeToolCall("srv-production-01", {
+      id: "native-connect",
+      toolId: "server.connect",
+      arguments: {
+        host: "192.168.1.23",
+        port: 22,
+        username: "root",
+        passwordSecretKey: "SSH_PASSWORD",
+      },
+    }, undefined, "pane-current");
+
+    expect(result.success).toBe(true);
+    const target = store.servers.find((server) => server.host === "192.168.1.23")!;
+    expect(jump).toHaveBeenCalledWith("pane-current", "native-connect", {
+      host: "192.168.1.23", port: 22, username: "root",
+    }, "target-password");
+    expect(store.connectedServerIds).not.toContain(target.id);
+    expect(backend.executeCommand).not.toHaveBeenCalledWith(expect.stringContaining("sshpass"), expect.anything(), expect.anything());
+    expect(JSON.stringify(result.data)).not.toContain("target-password");
+    expect(JSON.stringify(store.logs)).not.toContain("target-password");
+  });
+
+  it("按目标服务器作用域解析钥匙串凭据并通过引用完成终端跳转", async () => {
+    const store = useOpsStore();
+    store.serverPasswords["srv-production-01"] = "source-password";
+    const target = store.addServer({
+      name: "目标服务器",
+      host: "10.0.0.23",
+      port: 2222,
+      username: "target-user",
+      group: "测试",
+    });
+    store.serverPasswords[target.id] = "target-password";
+    const terminalSessions = useTerminalSessionStore();
+    const jump = vi.spyOn(terminalSessions, "requestAgentPtySshJump").mockResolvedValue({
+      output: "SSH 登录成功", success: true, simulated: false, exitCode: 0, emptyResult: false,
+    });
+
+    const lookup = await store.executeToolCall("srv-production-01", {
+      id: "lookup-target",
+      toolId: "server.resolve_connection",
+      arguments: { host: "10.0.0.23", port: 2222 },
+    });
+    expect(lookup.data).toMatchObject({
+      username: "target-user",
+      credentialAvailable: true,
+      credentialRef: `managed-server:${target.id}`,
+    });
+
+    const connected = await store.executeToolCall("srv-production-01", {
+      id: "connect-target-ref",
+      toolId: "server.connect",
+      arguments: { host: "10.0.0.23", port: 2222, credentialRef: `managed-server:${target.id}` },
+    }, undefined, "pane-current");
+    expect(connected.success).toBe(true);
+    expect(jump).toHaveBeenCalledWith("pane-current", "connect-target-ref", {
+      host: "10.0.0.23", port: 2222, username: "target-user",
+    }, "target-password");
+    expect(JSON.stringify({ lookup, connected })).not.toContain("target-password");
   });
 
   it("文件结构工具结果会作为真实证据生成后续部署计划", async () => {
@@ -356,7 +521,7 @@ describe("智能任务状态机", () => {
     expect(task.plan.length).toBeGreaterThan(1);
   });
 
-  it("远程命令长时间未返回时定期获取状态并交给模型复核", async () => {
+  it("远程命令长时间未返回时只报告心跳，真实退出后才校验", async () => {
     vi.useFakeTimers();
     try {
       const store = useOpsStore();
@@ -397,33 +562,27 @@ describe("智能任务状态机", () => {
         detail: "容器已运行",
         output: "$ docker ps\napp Up 30 seconds\n[exit: 0]",
       });
-      vi.mocked(backend.reviewStep).mockResolvedValueOnce({
-        decision: "complete",
-        reason: "独立校验已证明服务运行，无需继续等待前台进程",
-        summary: "停止等待并进入正式校验。",
-        source: "model",
-      });
-      vi.spyOn(backend, "cancelCommand").mockImplementationOnce(async () => {
-        finishExecution({
-          output: "$ docker run\nservice ready\n[exit: 130]",
-          success: false,
-          simulated: false,
-          exitCode: 130,
-        });
-      });
+      const cancelCommand = vi.spyOn(backend, "cancelCommand");
 
       const running = store.runStep(task.id, "long-running-service");
       await vi.advanceTimersByTimeAsync(30_000);
+      expect(backend.validateStep).not.toHaveBeenCalled();
+      expect(backend.reviewStep).not.toHaveBeenCalled();
+      expect(cancelCommand).not.toHaveBeenCalled();
+      expect(task.plan[0].progressMessage).toContain("完成后才会进行后置校验");
+
+      finishExecution({
+        output: "$ docker run\nservice ready\n[exit: 0]",
+        success: true,
+        simulated: false,
+        exitCode: 0,
+      });
       await vi.advanceTimersByTimeAsync(500);
       await running;
 
-      expect(backend.validateStep).toHaveBeenCalledTimes(2);
-      expect(backend.reviewStep).toHaveBeenCalledTimes(1);
-      const reviewContext = JSON.parse(vi.mocked(backend.reviewStep).mock.calls[0][1]);
-      expect(reviewContext.reviewPolicy.periodicLongRunningReview).toBe(true);
-      expect(reviewContext.periodicObservation.passed).toBe(true);
-      expect(reviewContext.fullPlan).toHaveLength(1);
-      expect(backend.cancelCommand).toHaveBeenCalledTimes(1);
+      expect(backend.validateStep).toHaveBeenCalledTimes(1);
+      expect(backend.reviewStep).not.toHaveBeenCalled();
+      expect(cancelCommand).not.toHaveBeenCalled();
       expect(task.plan[0].status).toBe("completed");
       expect(task.status).toBe("completed");
       expect(task.currentExecutionId).toBeUndefined();
@@ -878,8 +1037,84 @@ describe("智能任务状态机", () => {
     expect(runtimeContext.previousExecution.requirement).toBe("第一轮需求");
     expect(runtimeContext.previousExecution.summary).toContain("PID 5149");
     expect(runtimeContext.previousExecution.steps[0].output).toContain("/opt/O2OA");
-    expect(runtimeContext.knownExecutionFacts.workingDirectories).toContain("/opt/O2OA/o2server/start.sh");
+    expect(runtimeContext.knownExecutionFacts.completedSteps[0].result).toEqual(task.planHistory?.[0].plan[0].result);
     expect(runtimeContext.knownExecutionFacts.instruction).toContain("必须优先复用");
+  });
+
+  it("用户配置的 Skill 会持久化并进入模型可选目录", async () => {
+    const store = useOpsStore();
+    const skill = store.addSkill();
+    skill.name = "内存专项分析";
+    skill.description = "分析指定服务器的内存压力。";
+    skill.matchRules = ["内存专项"];
+    skill.instructions = "先采样内存指标，再定位进程，最后只输出基于证据的建议。";
+    store.saveSkills();
+
+    const persisted = JSON.parse(localStorage.getItem("opsark.skillConfiguration") ?? "{}");
+    expect(persisted.customSkills).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: skill.id, name: "内存专项分析" }),
+    ]));
+
+    await store.submitRequirement("srv-production-01", "执行内存专项检查", "safe", "model-deepseek");
+    const runtimeContext = JSON.parse(vi.mocked(backend.processRequirement).mock.calls[0][1].context);
+    expect(runtimeContext.skillDirectory).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: skill.id, description: "分析指定服务器的内存压力。" }),
+    ]));
+    expect(runtimeContext.activeSkills).toEqual([]);
+    expect(vi.mocked(backend.processRequirement).mock.calls[0][2]).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: skill.id, instructions: expect.stringContaining("先采样内存指标") }),
+    ]));
+  });
+
+  it("接受模型选择的多个 Skill 并联合激活", async () => {
+    const store = useOpsStore();
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({
+      intent: "execute",
+      plan: structuredClone(plan),
+      selectedSkillIds: ["project-source-acquisition", "project-build"],
+    });
+
+    await store.submitRequirement(
+      "srv-production-01",
+      "获取项目后进行构建",
+      "safe",
+      "model-deepseek",
+    );
+
+    expect(store.activeTask?.activeSkillIds).toEqual([
+      "project-source-acquisition",
+      "project-build",
+    ]);
+  });
+
+  it("计划生成失败时保留模型已选 Skill 并记录具体错误", async () => {
+    const store = useOpsStore();
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({
+      intent: "execute",
+      plan: [],
+      selectedSkillIds: ["ssh-terminal-jump"],
+      planError: "第 1 个计划步骤使用了无业务意义的 validation",
+    });
+
+    await store.submitRequirement(
+      "srv-production-01",
+      "ssh跳转到69.33.213.101",
+      "safe",
+      "model-deepseek",
+    );
+
+    expect(store.activeTask?.activeSkillIds).toEqual(["ssh-terminal-jump"]);
+    expect(store.activeTask?.status).toBe("failed");
+    expect(store.activeTask?.summary).toContain("无业务意义的 validation");
+    expect(store.activeTask?.messages).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: "event",
+        content: expect.stringContaining("已选择 Skill：终端 SSH 跳转"),
+      }),
+    ]));
+    expect(store.logs).toEqual(expect.arrayContaining([
+      expect.objectContaining({ title: "Skill 选择已保留，计划生成失败" }),
+    ]));
   });
 
   it("暂停后输入进行调整会直接触发本轮调整而不是交给模型当咨询", async () => {
@@ -1132,6 +1367,55 @@ describe("智能任务状态机", () => {
     expect(normalized.map((step) => step.command)).toEqual(steps.map((step) => step.command));
   });
 
+  it("按工具 planMode 元数据保留独占步骤", () => {
+    const connect = {
+      ...structuredClone(plan[0]),
+      id: "connect-target",
+      command: 'opsark-tool server.connect {"host":"192.168.1.237","port":22,"username":"root","passwordSecretKey":"PASSWORD"}',
+      validation: "true",
+    };
+    const sourceValidation = {
+      ...structuredClone(plan[1]),
+      id: "source-validation",
+      command: "hostname && id && uptime",
+      validation: "hostname",
+    };
+
+    expect(normalizePlanPreconditions([connect, sourceValidation])).toEqual([
+      expect.objectContaining({ id: "connect-target" }),
+    ]);
+  });
+
+  it("多阶段 Skill 续跑时保留已完成证据，只裁剪本轮待执行步骤", () => {
+    const completedLookup = {
+      ...structuredClone(plan[0]),
+      id: "lookup-completed",
+      status: "completed" as const,
+      command: 'opsark-tool server.resolve_connection {"host":"192.168.1.237"}',
+      validation: "true",
+    };
+    const connect = {
+      ...structuredClone(plan[1]),
+      id: "connect-pending",
+      status: "pending" as const,
+      command: 'opsark-tool server.connect {"host":"192.168.1.237","credentialRef":"managed-server:target"}',
+      validation: "true",
+    };
+    const prematureValidation = { ...structuredClone(plan[2]), id: "validation-pending" };
+
+    expect(normalizePlanPreconditions([completedLookup, connect, prematureValidation]).map((step) => step.id))
+      .toEqual(["lookup-completed", "connect-pending"]);
+  });
+
+  it("包管理器命令保留实时输出和真实退出码", () => {
+    expect(normalizeLongRunningCommandOutput("dnf install -y git 2>&1 | tail -20"))
+      .toBe("dnf install -y git 2>&1");
+    expect(normalizeLongRunningCommandOutput("sudo apt-get install -y git | tail -n 20"))
+      .toBe("sudo apt-get install -y git");
+    expect(normalizeLongRunningCommandOutput("journalctl -u app | tail -20"))
+      .toBe("journalctl -u app | tail -20");
+  });
+
   it("部署计划会移除用户未要求且没有证据支撑的破坏性残留清理", () => {
     const cleanup = {
       ...structuredClone(plan[0]),
@@ -1344,24 +1628,29 @@ describe("智能任务状态机", () => {
   });
 
   it("主命令成功但程序校验失败时会调用一次模型复核", async () => {
+    vi.useFakeTimers();
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
     task.plan = [structuredClone(plan[0])];
-    vi.mocked(backend.validateStep).mockResolvedValueOnce({
+    vi.mocked(backend.validateStep).mockResolvedValue({
       passed: false,
+      exitCode: 1,
       detail: "独立校验未达到预期",
     });
 
-    await store.runStep(task.id, task.plan[0].id);
+    const running = store.runStep(task.id, task.plan[0].id);
+    await vi.runAllTimersAsync();
+    await running;
 
     expect(backend.reviewStep).toHaveBeenCalledTimes(1);
     expect(task.plan[0].status).toBe("completed");
     expect(task.status).toBe("completed");
     expect(task.messages.some((message) =>
-      message.content.includes("后置校验未通过")
-      && message.content.includes("异常模型复核"),
+      message.content.includes("后置状态尚未稳定")
+      && message.content.includes("有界窗口"),
     )).toBe(true);
+    vi.useRealTimers();
   });
 
   it("后置校验失败且模型不可用时不会按兜底规则继续", async () => {
@@ -1390,6 +1679,7 @@ describe("智能任务状态机", () => {
   });
 
   it("变更步骤后置校验失败时仅在剩余计划可修复的情况下允许继续", async () => {
+    vi.useFakeTimers();
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
@@ -1415,18 +1705,24 @@ describe("智能任务状态机", () => {
         exitCode: 1,
         detail: "当前 shell 尚未加载 nvm",
       })
+      .mockResolvedValueOnce({ passed: false, exitCode: 1, detail: "nvm 状态尚未稳定" })
+      .mockResolvedValueOnce({ passed: false, exitCode: 1, detail: "nvm 状态尚未稳定" })
+      .mockResolvedValueOnce({ passed: false, exitCode: 1, detail: "nvm 状态尚未稳定" })
       .mockResolvedValueOnce({
         passed: true,
         exitCode: 0,
         detail: "nvm 已加载",
       });
 
-    await store.runStep(task.id, "install-nvm");
+    const running = store.runStep(task.id, "install-nvm");
+    await vi.runAllTimersAsync();
+    await running;
 
     expect(backend.reviewStep).toHaveBeenCalledTimes(1);
     expect(task.plan[0].status).toBe("completed");
     expect(task.plan[1].status).toBe("completed");
     expect(task.status).toBe("completed");
+    vi.useRealTimers();
   });
 
   it("模型不能覆盖后置校验中的确定性平台阻断", async () => {
@@ -1467,6 +1763,7 @@ describe("智能任务状态机", () => {
   });
 
   it("只读 HTTP 主结果明确时独立校验冲突会重试并进入复核而不直接失败", async () => {
+    vi.useFakeTimers();
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
@@ -1483,19 +1780,12 @@ describe("智能任务状态机", () => {
       simulated: false,
       exitCode: 0,
     });
-    vi.mocked(backend.validateStep)
-      .mockResolvedValueOnce({
-        passed: false,
-        exitCode: 1,
-        detail: "首次校验未达到预期",
-        output: "$ test\n[exit: 1]",
-      })
-      .mockResolvedValueOnce({
-        passed: false,
-        exitCode: 1,
-        detail: "重试校验未达到预期",
-        output: "$ test\n[exit: 1]",
-      });
+    vi.mocked(backend.validateStep).mockResolvedValue({
+      passed: false,
+      exitCode: 1,
+      detail: "重试校验未达到预期",
+      output: "$ test\n[exit: 1]",
+    });
     vi.mocked(backend.reviewStep).mockResolvedValueOnce({
       decision: "complete",
       reason: "主命令已获得明确 HTTP 200，重复请求存在瞬时差异",
@@ -1503,9 +1793,11 @@ describe("智能任务状态机", () => {
       source: "model",
     });
 
-    await store.runStep(task.id, "network-probe");
+    const running = store.runStep(task.id, "network-probe");
+    await vi.runAllTimersAsync();
+    await running;
 
-    expect(backend.validateStep).toHaveBeenCalledTimes(2);
+    expect(backend.validateStep).toHaveBeenCalledTimes(4);
     expect(backend.reviewStep).toHaveBeenCalledTimes(1);
     expect(task.plan[0].status).toBe("completed");
     expect(task.plan[0].result?.executionStatus).toBe("success");
@@ -1513,6 +1805,7 @@ describe("智能任务状态机", () => {
     expect(task.status).toBe("completed");
     expect(task.plan[0].output).toContain("首次未通过");
     expect(task.currentExecutionId).toBeUndefined();
+    vi.useRealTimers();
   });
 
   it("结构化校验器区分 SQL 不存在、HTTP 异常和进程无匹配", () => {

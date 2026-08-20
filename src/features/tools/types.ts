@@ -6,6 +6,14 @@ export interface ToolDefinition {
   usageInstructions: string;
   inputSchema: Record<string, unknown>;
   outputDescription: string;
+  /** Controls whether this atomic tool must be the only step in a generated plan. */
+  planMode?: "regular" | "standalone";
+  /** Tells the generic orchestrator what to do after a successful tool call. */
+  completionMode?: "continue" | "refine" | "complete";
+  /** Limits automatic refinement to workflows that deliberately activated a Skill. */
+  refinementScope?: "always" | "active-skill";
+  /** Selects the execution adapter without branching on a concrete tool id. */
+  executionMode?: "local" | "terminal" | "user-input";
   enabled: boolean;
   builtIn: boolean;
   version: number;
@@ -42,6 +50,70 @@ export interface ToolResult<T = unknown> {
   truncated?: boolean;
 }
 
+export type UserInputFieldType = "text" | "password" | "number";
+
+export interface UserInputField {
+  key: string;
+  label: string;
+  description: string;
+  type: UserInputFieldType;
+  placeholder?: string;
+  required: boolean;
+}
+
+export interface UserInputRequest {
+  title: string;
+  description?: string;
+  fields: UserInputField[];
+}
+
+export interface UserInputResult {
+  title: string;
+  values: Record<string, string | number>;
+}
+
+export interface PendingUserInput extends UserInputRequest {
+  taskId: string;
+  stepId: string;
+  callId: string;
+  error?: string;
+}
+
+export interface ServerConnectRequest {
+  host: string;
+  port?: number;
+  username?: string;
+  passwordSecretKey?: string;
+  credentialRef?: string;
+  name?: string;
+  group?: string;
+}
+
+export interface ServerConnectionLookupRequest {
+  host: string;
+  port?: number;
+}
+
+export interface ServerConnectionLookupResult {
+  found: boolean;
+  serverId?: string;
+  host: string;
+  port: number;
+  username?: string;
+  credentialAvailable: boolean;
+  credentialRef?: string;
+}
+
+export interface ServerConnectResult {
+  serverId: string;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  connected: boolean;
+  info: Record<string, unknown>;
+}
+
 export interface FileStructureRequest {
   rootPath: string;
   excludeDirectories?: string[];
@@ -66,4 +138,19 @@ export interface FileStructureResult {
   maxDepthReached: boolean;
   truncated: boolean;
   warnings: string[];
+}
+
+export interface ServerFileTransferRequest {
+  sourcePath: string;
+  targetServer: string;
+  targetPath: string;
+  overwrite?: boolean;
+}
+
+export interface ServerFileTransferResult {
+  sourcePath: string;
+  targetPath: string;
+  transferredBytes: number;
+  sha256: string;
+  targetServerId: string;
 }

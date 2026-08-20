@@ -25,7 +25,8 @@ export function quoteShellPath(path: string) {
 }
 
 export function buildTerminalDirectoryProbeCommand() {
-  return "printf '\\033]7;file://%s%s\\007' \"$HOSTNAME\" \"$PWD\"\r";
+  // 该命令是工作台内部探针，执行后从 Bash 历史中精确删除自身。
+  return "printf '\\033]7;file://%s%s\\007' \"$HOSTNAME\" \"$PWD\"; if [ -n \"${BASH_VERSION:-}\" ]; then case $- in *h*) __opsark_history_tail=$(history 1); case \"$__opsark_history_tail\" in *file://%s%s*) history -d $((HISTCMD-1)) 2>/dev/null;; esac; unset __opsark_history_tail;; esac; fi\r";
 }
 
 export function buildTerminalChangeDirectoryCommand(path: string) {

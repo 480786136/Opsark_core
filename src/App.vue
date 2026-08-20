@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted } from "vue";
 import { RouterLink, RouterView, useRoute } from "vue-router";
-import { Boxes, BrainCircuit, KeyRound, LayoutDashboard, ScrollText, Settings, ShieldCheck, Wrench } from "lucide-vue-next";
+import { Boxes, BrainCircuit, KeyRound, LayoutDashboard, ScrollText, Settings, ShieldCheck, Sparkles, Wrench } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import AppearanceControls from "@/features/preferences/AppearanceControls.vue";
 import { useOpsStore } from "@/stores/ops";
@@ -45,6 +45,9 @@ onBeforeUnmount(() => document.removeEventListener("contextmenu", suppressBrowse
         </RouterLink>
         <RouterLink to="/tools" :title="t('nav.tools')">
           <Wrench :size="20" />
+        </RouterLink>
+        <RouterLink to="/skills" :title="t('nav.skills')">
+          <Sparkles :size="20" />
         </RouterLink>
         <RouterLink to="/settings" :title="t('nav.settings')">
           <Settings :size="20" />

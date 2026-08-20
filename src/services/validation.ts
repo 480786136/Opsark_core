@@ -6,6 +6,15 @@ import type {
   StepValidator,
   ValidatorType,
 } from "@/types";
+import {
+  expectedSkillDiagnosticExit,
+  analyzeSkillCommandFailure,
+  analyzeSkillOutputSignals,
+  inferSkillValidator,
+  parseSkillObservation,
+  validStatesForSkillValidator,
+  type SkillOutputSignals,
+} from "@/features/skills/validationAdapters";
 
 export type NormalizedPlanStep = PlanStep & { validator: StepValidator };
 
@@ -45,106 +54,8 @@ function mainOutput(output: string) {
   return output.split("\n--- 独立校验 ---")[0];
 }
 
-interface OutputSignals {
-  status?: "warning" | "unhealthy";
-  facts: Record<string, unknown>;
-  warnings: string[];
-  blocking: boolean;
-}
-
-function analyzeOutputSignals(output: string, semantic = ""): OutputSignals {
-  const lines = outputLines(output);
-  const text = lines.join("\n");
-  const warningLines = lines.filter((line) =>
-    /\bWARN(?:ING)?\b|\bdeprecated\b|\bdeprecation\b/i.test(line),
-  );
-  const missingAbiSymbols = [...new Set(
-    [...text.matchAll(/(?:version\s+[`']?)((?:GLIBCXX|GLIBC|CXXABI)_[0-9.]+)(?:['`]?\s+not found)/gi)]
-      .map((match) => match[1]),
-  )];
-  const platformIncompatible = missingAbiSymbols.length > 0
-    || /(?:wrong ELF class|Exec format error|cannot execute binary file)/i.test(text);
-  const networkFailureLines = lines.filter((line) =>
-    /curl:\s*\(\d+\)|connection reset|could not resolve host|connection timed out|network is unreachable|TLS handshake timeout/i
-      .test(line),
-  );
-  const networkFailure = networkFailureLines.length > 0;
-  const emptyRequiredFile = /(?:\.sql|backup|dump)/i.test(`${semantic}\n${text}`)
-    && /完整|备份|backup|dump/i.test(semantic)
-    && (/(?:^|\n)\s*0\s+\S+\.sql\s*$/im.test(text) || /\.sql:\s*empty\b/i.test(text));
-  const warnings: string[] = [];
-  if (warningLines.length) {
-    warnings.push("命令成功完成，但输出中包含需要关注的警告信息。");
-  }
-  if (platformIncompatible) {
-    warnings.push(
-      missingAbiSymbols.length
-        ? `目标程序无法在当前平台运行，缺少 ABI 符号：${missingAbiSymbols.join("、")}。`
-        : "目标程序与当前操作系统或处理器架构不兼容。",
-    );
-  }
-  if (networkFailure) warnings.push("下载或网络连接失败，目标文件或安装脚本未可靠获取。");
-  if (emptyRequiredFile) warnings.push("目标 SQL/备份文件为空，已经足以否定其内容完整性。");
-  return {
-    status: platformIncompatible || networkFailure || emptyRequiredFile
-      ? "unhealthy"
-      : warningLines.length
-        ? "warning"
-        : undefined,
-    facts: {
-      category: platformIncompatible
-        ? "platform_incompatible"
-        : networkFailure
-          ? "network_failure"
-          : undefined,
-      platformIncompatible,
-      missingAbiSymbols,
-      networkFailure,
-      networkFailureSamples: networkFailureLines.slice(0, 5),
-      emptyRequiredFile,
-      warningCount: warningLines.length,
-      warningSamples: [...new Set(warningLines)].slice(0, 8),
-    },
-    warnings,
-    blocking: platformIncompatible || networkFailure || emptyRequiredFile,
-  };
-}
-
 export function analyzeCommandFailure(output: string) {
-  const text = mainOutput(output);
-  const missingAbiSymbols = [...new Set(
-    [...text.matchAll(/(?:version\s+[`']?)((?:GLIBCXX|GLIBC|CXXABI)_[0-9.]+)(?:['`]?\s+not found)/gi)]
-      .map((match) => match[1]),
-  )];
-  if (missingAbiSymbols.length || /wrong ELF class|Exec format error|cannot execute binary file/i.test(text)) {
-    return {
-      reason: missingAbiSymbols.length
-        ? `目标程序与当前系统 ABI 不兼容，缺少 ${missingAbiSymbols.join("、")}`
-        : "目标程序与当前操作系统或处理器架构不兼容",
-      facts: {
-        category: "platform_incompatible",
-        platformIncompatible: true,
-        missingAbiSymbols,
-      },
-    };
-  }
-  if (/ENOSPC|no space left on device/i.test(text)) {
-    return { reason: "服务器磁盘空间不足", facts: { category: "disk_full" } };
-  }
-  if (/permission denied|EACCES/i.test(text)) {
-    return { reason: "当前用户没有完成该操作所需的权限", facts: { category: "permission_denied" } };
-  }
-  if (/command not found|not recognized as an internal/i.test(text)) {
-    return { reason: "命令或必要工具未安装", facts: { category: "command_not_found" } };
-  }
-  const unavailableResource = text.match(/(?:404|not found)[^\n]*(https?:\/\/\S+)/i);
-  if (unavailableResource) {
-    return {
-      reason: "请求的远程资源不存在或地址无效",
-      facts: { category: "resource_not_found", url: unavailableResource[1] },
-    };
-  }
-  return { reason: "命令执行未成功", facts: { category: "command_failed" } };
+  return analyzeSkillCommandFailure(mainOutput(output));
 }
 
 export function isMutatingStepCommand(command: string) {
@@ -157,33 +68,11 @@ export function isReadOnlyStep(step: PlanStep) {
 }
 
 export function inferValidatorType(step: Pick<PlanStep, "title" | "description" | "command" | "validation">): ValidatorType {
-  const semantic = `${step.title}\n${step.description}`.toLowerCase();
-  const validation = step.validation.toLowerCase();
-  const text = `${semantic}\n${step.command}\n${validation}`.toLowerCase();
-  if (/平台兼容|系统兼容|操作系统.*架构|abi 兼容/.test(text)) return "platform";
-  if (
-    /运行时|runtime|版本兼容|可执行文件版本/.test(semantic)
-    || /(?:^|[;&|]\s*)\S+\s+(?:--version|-version|-V)(?:\s|$)/.test(validation)
-  ) return "runtime";
-  if (/\bmysql\b|\bpsql\b|\bsqlite3\b|show\s+(databases|tables)|information_schema/.test(text)) return "sql-query";
-  if (
-    /http状态|页面响应|首页|网页|接口响应/.test(semantic)
-    || /\bcurl\b[^\n]*(?:https?:\/\/|%{http_code}|-i\b|-I\b|-f\b)/.test(validation)
-    || /\bwget\b[^\n]*--spider/.test(validation)
-  ) return "http";
-  if (/\bss\s|\bnetstat\b|\blsof\b.*-i|监听端口|端口归属/.test(text)) return "port-owner";
-  if (/\bsystemctl\b|\bservice\b|服务状态/.test(text)) return "service";
-  if (/\bdocker\b|\bpodman\b|容器/.test(text)) return "docker";
-  if (/\bjournalctl\b|\.log\b|日志|tail\s/.test(text)) return "log";
-  if (/\bps\s|\bpgrep\b|\bpidof\b|进程/.test(text)) return "process";
-  if (/\btest\s+-[efdLrwx]\b|\bstat\b|\bfind\b|\bls\s|文件|目录/.test(text)) return "file";
-  return "command";
+  return inferSkillValidator(step).type;
 }
 
 function defaultValidStates(type: ValidatorType): ObservationStatus[] {
-  if (["http", "service", "runtime", "platform"].includes(type)) return ["healthy", "unhealthy", "warning", "unknown"];
-  if (type === "log") return ["matched", "not_found", "warning", "unknown"];
-  return ["matched", "not_found", "unknown"];
+  return validStatesForSkillValidator(type);
 }
 
 export function ensureStepValidator(step: PlanStep): NormalizedPlanStep {
@@ -207,126 +96,6 @@ export function ensureStepValidator(step: PlanStep): NormalizedPlanStep {
   };
 }
 
-function parseHttpFacts(lines: string[]) {
-  const statuses = lines
-    .flatMap((line) => [...line.matchAll(/HTTP\/\S+\s+(\d{3})/gi)].map((match) => Number(match[1])));
-  if (!statuses.length) {
-    const standalone = lines.find((line) => /^\d{3}$/.test(line));
-    if (standalone) statuses.push(Number(standalone));
-  }
-  const status = statuses[statuses.length - 1];
-  return {
-    facts: {
-      httpStatus: status,
-      redirectCount: Math.max(0, statuses.length - 1),
-      responseReceived: lines.length > 0,
-    },
-    status: status === undefined
-      ? ("unknown" as const)
-      : status >= 200 && status < 400
-        ? ("healthy" as const)
-        : ("unhealthy" as const),
-  };
-}
-
-function parseProcessFacts(lines: string[], emptyResult: boolean) {
-  const pids = new Set<number>();
-  lines.forEach((line) => {
-    const psMatch = line.match(/^\S+\s+(\d+)\s+/);
-    const pgrepMatch = line.match(/^(\d+)(?:\s|$)/);
-    const value = psMatch?.[1] ?? pgrepMatch?.[1];
-    if (value) pids.add(Number(value));
-  });
-  const found = !emptyResult && lines.length > 0;
-  return {
-    facts: { processFound: found, processCount: found ? Math.max(pids.size, 1) : 0, pids: [...pids] },
-    status: found ? ("matched" as const) : ("not_found" as const),
-  };
-}
-
-function parsePortFacts(lines: string[], emptyResult: boolean) {
-  const ports = new Set<number>();
-  const pids = new Set<number>();
-  lines.forEach((line) => {
-    [...line.matchAll(/(?:\[[0-9a-f:]+\]|(?:\d{1,3}\.){3}\d{1,3}|\*|[0-9a-f:]+):(\d+)\b/gi)]
-      .forEach((match) => ports.add(Number(match[1])));
-    [...line.matchAll(/pid[=/](\d+)/gi)].forEach((match) => pids.add(Number(match[1])));
-  });
-  const found = !emptyResult && lines.length > 0;
-  return {
-    facts: {
-      listenerFound: found,
-      ports: [...ports],
-      ownerPids: [...pids],
-      ownershipConfirmed: pids.size > 0,
-    },
-    status: found ? ("matched" as const) : ("not_found" as const),
-  };
-}
-
-function parseSqlFacts(lines: string[], command: string, emptyResult: boolean) {
-  const values = lines.filter((line) => !/^mysql: \[warning\]/i.test(line));
-  const isCount = /count\s*\(\s*\*\s*\)/i.test(command);
-  if (isCount) {
-    const countLine = [...values].reverse().find((line) => /^\d+$/.test(line));
-    const count = countLine === undefined ? undefined : Number(countLine);
-    return {
-      facts: { count, exists: count === undefined ? undefined : count > 0, rows: values },
-      status: count === undefined ? ("unknown" as const) : count > 0 ? ("matched" as const) : ("not_found" as const),
-    };
-  }
-  const rows = values.filter((line) =>
-    !/^(database|tables_in_.+|count\(\*\)|count)$/i.test(line),
-  );
-  const found = !emptyResult && rows.length > 0;
-  return {
-    facts: { rowCount: rows.length, rows },
-    status: found ? ("matched" as const) : ("not_found" as const),
-  };
-}
-
-function parseServiceFacts(lines: string[], emptyResult: boolean) {
-  const text = lines.join("\n").toLowerCase();
-  const active = /(^|\s)active(?:\s|$)|active:\s+active/.test(text);
-  const unhealthy = /inactive|failed|dead|not-found|could not be found/.test(text);
-  return {
-    facts: { active, stateText: lines.slice(0, 6) },
-    status: active
-      ? ("healthy" as const)
-      : unhealthy || emptyResult
-        ? ("unhealthy" as const)
-        : ("unknown" as const),
-  };
-}
-
-function parseLogFacts(lines: string[], emptyResult: boolean) {
-  const errorLines = lines.filter((line) => /\b(error|fatal|panic|exception|connection refused)\b/i.test(line));
-  return {
-    facts: { lineCount: lines.length, errorCount: errorLines.length, errorSamples: errorLines.slice(0, 5) },
-    status: errorLines.length
-      ? ("warning" as const)
-      : emptyResult || !lines.length
-        ? ("not_found" as const)
-        : ("matched" as const),
-  };
-}
-
-function parseGenericFacts(lines: string[], emptyResult: boolean) {
-  const found = !emptyResult && lines.length > 0;
-  return {
-    facts: { lineCount: lines.length, outputPresent: found },
-    status: emptyResult ? ("not_found" as const) : ("matched" as const),
-  };
-}
-
-function parsePresenceFacts(lines: string[], emptyResult: boolean) {
-  const found = !emptyResult && lines.length > 0;
-  return {
-    facts: { found, lineCount: lines.length },
-    status: found ? ("matched" as const) : ("not_found" as const),
-  };
-}
-
 function parseObservation(
   step: PlanStep,
   execution: CommandSnapshot,
@@ -335,31 +104,11 @@ function parseObservation(
   const output = mainOutput(execution.output);
   const lines = outputLines(output);
   const emptyResult = Boolean(execution.emptyResult || output.includes("未发现匹配项"));
-  switch (validator.type) {
-    case "http": return parseHttpFacts(lines);
-    case "process": return parseProcessFacts(lines, emptyResult);
-    case "port-owner": return parsePortFacts(lines, emptyResult);
-    case "sql-query": return parseSqlFacts(lines, step.command, emptyResult);
-    case "service": return parseServiceFacts(lines, emptyResult);
-    case "log": return parseLogFacts(lines, emptyResult);
-    case "file":
-    case "docker":
-      return parsePresenceFacts(lines, emptyResult);
-    case "runtime":
-    case "platform":
-    case "command":
-    default:
-      return parseGenericFacts(lines, emptyResult);
-  }
+  return parseSkillObservation(validator.type, lines, emptyResult, step);
 }
 
 function expectedDiagnosticExit(type: ValidatorType, exitCode?: number) {
-  if (exitCode === undefined) return false;
-  if (exitCode === 0) return true;
-  if (["process", "port-owner", "sql-query", "file", "log", "docker", "runtime"].includes(type)) return exitCode === 1;
-  if (type === "service") return [1, 3, 4].includes(exitCode);
-  if (type === "http") return [1, 22, 28].includes(exitCode);
-  return false;
+  return expectedSkillDiagnosticExit(type, exitCode);
 }
 
 export function classifyStepResult(
@@ -371,9 +120,9 @@ export function classifyStepResult(
   const validator = step.validator;
   const mainParsed = parseObservation(step, execution);
   const semantic = `${step.title}\n${step.description}\n${step.expected}`;
-  const mainSignals = analyzeOutputSignals(mainOutput(execution.output), semantic);
-  const validationSignals = analyzeOutputSignals(validation.output ?? "", semantic);
-  const outputSignals: OutputSignals = {
+  const mainSignals = analyzeSkillOutputSignals(outputLines(mainOutput(execution.output)), semantic);
+  const validationSignals = analyzeSkillOutputSignals(outputLines(validation.output ?? ""), semantic);
+  const outputSignals: SkillOutputSignals = {
     status: mainSignals.status === "unhealthy" || validationSignals.status === "unhealthy"
       ? "unhealthy"
       : mainSignals.status ?? validationSignals.status,

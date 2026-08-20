@@ -1,4 +1,11 @@
 import { buildToolContext } from "@/features/tools/toolContext";
+import {
+  buildSkillDirectory,
+  buildSkillContext,
+  collectSkillFacts,
+  resolveTaskSkills,
+} from "@/features/skills/skillRegistry";
+import type { SkillDefinition } from "@/features/skills/types";
 import type { ToolDefinition } from "@/features/tools/types";
 import type {
   Metrics,
@@ -14,38 +21,19 @@ export function trimEvidence(value: string | undefined, limit = 3200) {
   return value.length > limit ? `${value.slice(0, limit)}\n…（输出已截断）` : value;
 }
 
-export function extractKnownExecutionFacts(task: OpsTask) {
+export function extractKnownExecutionFacts(task: OpsTask, skills = resolveTaskSkills(task)) {
   const steps = [
     ...(task.planHistory ?? []).flatMap((round) => round.plan),
     ...task.plan,
   ].filter((step) => step.status === "completed");
-  const repositoryUrls = new Set<string>();
-  const workingDirectories = new Set<string>();
-
-  for (const step of steps) {
-    const text = `${step.command}\n${step.output ?? ""}`;
-    for (const match of text.matchAll(/https?:\/\/[^\s'"<>]+?\.git\b/gi)) repositoryUrls.add(match[0]);
-    for (const match of step.command.matchAll(/\bgit\s+clone\b[^;&\n]*?\s+(\/[^\s;&'"\n]+)/gi)) {
-      workingDirectories.add(match[1].replace(/[),]+$/, ""));
-    }
-    for (const match of step.command.matchAll(/(?:^|[;&]\s*)cd\s+(?:'([^']+)'|"([^"]+)"|(\/[^\s;&]+))/gi)) {
-      const directory = match[1] ?? match[2] ?? match[3];
-      if (directory?.startsWith("/")) workingDirectories.add(directory.replace(/[),]+$/, ""));
-    }
-    for (const match of text.matchAll(/\/(?:tmp|opt|home|srv|var\/www)\/[A-Za-z0-9._@%+~/-]+/g)) {
-      workingDirectories.add(match[0].replace(/[),.]+$/, ""));
-    }
-  }
-
   return {
-    repositoryUrls: [...repositoryUrls].slice(0, 8),
-    workingDirectories: [...workingDirectories].slice(0, 16),
+    skillFacts: collectSkillFacts(task, skills),
     completedSteps: steps.slice(-12).map((step) => ({
       title: step.title,
       command: step.command,
       result: step.result,
     })),
-    instruction: "这些路径和仓库来自同一任务的已完成执行证据。后续需求必须优先复用，不得在无新证据时改猜其他目录。",
+    instruction: "这些事实来自同一任务的已完成执行证据。后续步骤必须优先复用，不得在无新证据时猜测或重复已完成工作。",
   };
 }
 
@@ -80,6 +68,8 @@ export interface AgentContextInput {
   previousExecution?: unknown;
   knownExecutionFacts: unknown;
   tools: ToolDefinition[];
+  skills?: SkillDefinition[];
+  skillDirectory?: SkillDefinition[];
   secretMetadata: SecretMetadata[];
   serverId: string;
 }
@@ -95,6 +85,13 @@ export function buildAgentContext(input: AgentContextInput) {
     previousExecution: input.previousExecution,
     knownExecutionFacts: input.knownExecutionFacts,
     tools: buildToolContext(input.tools),
+    skillSelection: {
+      mode: "model",
+      multiple: true,
+      currentActiveSkillIds: (input.skills ?? []).map((skill) => skill.id),
+    },
+    skillDirectory: buildSkillDirectory(input.skillDirectory ?? []),
+    activeSkills: [],
     secretVariables: secretVariableContext(input.secretMetadata, input.serverId),
   };
 }
@@ -105,25 +102,29 @@ interface WorkflowContextInput {
   task: OpsTask;
   tools: ToolDefinition[];
   secretMetadata: SecretMetadata[];
+  skills?: SkillDefinition[];
 }
 
 export function buildAdjustmentContext(input: WorkflowContextInput, failedStep?: PlanStep) {
+  const activeSkills = input.skills ?? resolveTaskSkills(input.task);
   return {
     workflowPhase: "adjust_after_failure",
     server: serverSnapshot(input.server),
     metrics: input.metrics,
     permission: input.task.permission,
     executionConstraints: input.task.executionConstraints,
-    knownExecutionFacts: extractKnownExecutionFacts(input.task),
+    knownExecutionFacts: extractKnownExecutionFacts(input.task, activeSkills),
     tools: buildToolContext(input.tools),
+    activeSkills: buildSkillContext(activeSkills),
     previousPlan: input.task.plan,
     failedStep,
-    instruction: "仅根据已有证据和未完成目标生成最少必要的替代步骤。先确定上一步是执行失败、观察到有效异常，还是主命令与后置校验冲突。目标已被真实证据证明时不得再变更；未达成时必须更换有实质区别的方法，不得对已失败命令仅做表面改写后重复执行。发现步骤只验证证据可获得；可选信息缺失或目标不存在是有效观察。每步是独立非交互 Shell，必须在当步建立所需目录和环境。不得预设技术栈、工具、路径、端口或服务名，不得重复已完成步骤，并以对用户目标的独立验收结束。",
+    instruction: "仅根据已有证据和未完成目标生成最少必要的替代步骤。先确定上一步是执行失败、观察到有效异常，还是主命令与后置校验冲突。目标已被真实证据证明时不得再变更；未达成时必须更换有实质区别的方法，不得对已失败命令仅做表面改写后重复执行。发现步骤只验证证据可获得；可选信息缺失或目标不存在是有效观察。每步是独立非交互 Shell，必须在当步建立所需目录和环境。用户给出的命令、地址、标识符和协议必须保持语义不变。所有进程必须被执行器跟踪，不得脱离生命周期；不得重复输入、发现、变更或验收。不得预设技术栈、工具、路径、端口或服务名；存在 activeSkills 时继续遵循对应 Skill，并以其要求的独立验收结束。",
     secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),
   };
 }
 
 export function buildContinuationContext(input: WorkflowContextInput) {
+  const activeSkills = input.skills ?? resolveTaskSkills(input.task);
   return {
     workflowPhase: "continue_after_discovery",
     server: serverSnapshot(input.server),
@@ -143,8 +144,9 @@ export function buildContinuationContext(input: WorkflowContextInput) {
       })),
       output: trimEvidence(output),
     })),
-    knownExecutionFacts: extractKnownExecutionFacts(input.task),
+    knownExecutionFacts: extractKnownExecutionFacts(input.task, activeSkills),
     tools: buildToolContext(input.tools),
+    activeSkills: buildSkillContext(activeSkills),
     instruction: "只使用本轮已完成发现的真实证据，生成完成用户剩余目标所需的最少变更和最终验收。不得重复发现步骤或猜测路径、工具、端口和服务名。",
     secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),
   };

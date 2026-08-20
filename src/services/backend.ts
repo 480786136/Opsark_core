@@ -1,7 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { AiGenerationSettings, FileEntry, Metrics, PlanStep, RequirementProcessingResult, ServerInfo, StepReview } from "@/types";
+import type { ModelSkillDefinition } from "@/features/skills/types";
 import {
+  normalizeLongRunningCommandOutput,
   normalizePlanPreconditions,
   normalizeSecretPlaceholders,
 } from "@/features/agent/planNormalizer";
@@ -50,10 +52,17 @@ export interface TerminalStatusEvent {
 
 export interface SftpTransferProgressEvent {
   transferId: string;
-  direction: "upload" | "download";
+  direction: "upload" | "download" | "server";
   transferredBytes: number;
   totalBytes: number;
   status: "running" | "completed";
+}
+
+export interface ServerTransferResult {
+  sourcePath: string;
+  targetPath: string;
+  transferredBytes: number;
+  sha256: string;
 }
 
 export interface CommandOutputEvent {
@@ -64,7 +73,12 @@ export interface CommandOutputEvent {
 
 export type CredentialKind = "server" | "model" | "secret";
 
-export { buildExecutionSummary, normalizePlanPreconditions, normalizeSecretPlaceholders };
+export {
+  buildExecutionSummary,
+  normalizeLongRunningCommandOutput,
+  normalizePlanPreconditions,
+  normalizeSecretPlaceholders,
+};
 
 function requireDesktopRuntime(operation: string): never {
   throw new Error(`${operation} 仅支持 Opsark 桌面端真实连接`);
@@ -251,6 +265,41 @@ export const backend = {
     }
   },
 
+  async transferSftpBetweenServers(
+    source: RuntimeConnection,
+    target: RuntimeConnection,
+    transferId: string,
+    sourcePath: string,
+    targetPath: string,
+    overwrite: boolean,
+    onProgress?: (event: SftpTransferProgressEvent) => void,
+  ) {
+    if (!isTauri()) return requireDesktopRuntime("跨服务器文件传输");
+    const unlisten = onProgress
+      ? await listen<SftpTransferProgressEvent>("sftp-transfer-progress", (event) => {
+          if (event.payload.transferId === transferId) onProgress(event.payload);
+        })
+      : undefined;
+    try {
+      return await invoke<ServerTransferResult>("transfer_sftp_between_servers", {
+        transferId,
+        sourceHost: source.host,
+        sourcePort: source.port,
+        sourceUsername: source.username,
+        sourcePassword: source.password,
+        sourcePath,
+        targetHost: target.host,
+        targetPort: target.port,
+        targetUsername: target.username,
+        targetPassword: target.password,
+        targetPath,
+        overwrite,
+      });
+    } finally {
+      unlisten?.();
+    }
+  },
+
   async cancelSftpTransfer(transferId: string) {
     if (!isTauri()) {
       return requireDesktopRuntime("SFTP 传输取消");
@@ -277,6 +326,7 @@ export const backend = {
   async processRequirement(
     requirement: string,
     runtimeModel: RuntimeModel,
+    skillDefinitions: ModelSkillDefinition[] = [],
   ): Promise<RequirementProcessingResult> {
     if (isTauri()) {
       const result = await invoke<RequirementProcessingResult>("process_ai_requirement", {
@@ -285,6 +335,7 @@ export const backend = {
         model: runtimeModel.model,
         requirement,
         context: runtimeModel.context,
+        skillDefinitions,
         generationSettings: runtimeModel.generationSettings,
       });
       return { ...result, plan: normalizePlanPreconditions(result.plan, requirement) };

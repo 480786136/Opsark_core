@@ -16,6 +16,15 @@ const terminalBackend = vi.hoisted(() => ({
   outputListeners: [] as Array<(event: { terminalId: string; data: string; stream: "stdout" }) => void>,
   statusListeners: [] as Array<(event: { terminalId: string; generation: number; status: "connected"; retryable: boolean }) => void>,
   inputListeners: [] as Array<(data: string) => void>,
+  scrollListeners: [] as Array<(position: number) => void>,
+  scrollToBottomCalls: 0,
+  displayWrites: [] as string[],
+  activeBuffer: {
+    cursorY: 0,
+    viewportY: 0,
+    baseY: 0,
+    getLine: () => ({ translateToString: () => "$ " }),
+  },
 }));
 
 vi.mock("@/services/backend", () => ({
@@ -40,7 +49,7 @@ vi.mock("@xterm/xterm", () => ({
     options: Record<string, unknown>;
     cols = 80;
     rows = 24;
-    buffer = { active: { cursorY: 0, getLine: () => ({ translateToString: () => "$ " }) } };
+    buffer = { active: terminalBackend.activeBuffer };
     constructor(options: Record<string, unknown>) { this.options = options; }
     loadAddon() {}
     open() {}
@@ -49,8 +58,16 @@ vi.mock("@xterm/xterm", () => ({
       terminalBackend.inputListeners.push(listener);
       return { dispose() {} };
     }
-    write() {}
+    onScroll(listener: (position: number) => void) {
+      terminalBackend.scrollListeners.push(listener);
+      return { dispose() {} };
+    }
+    write(data: string, callback?: () => void) { terminalBackend.displayWrites.push(data); callback?.(); }
     writeln() {}
+    scrollToBottom() {
+      terminalBackend.activeBuffer.viewportY = terminalBackend.activeBuffer.baseY;
+      terminalBackend.scrollToBottomCalls += 1;
+    }
     focus() {}
     clear() {}
     dispose() {}
@@ -75,6 +92,12 @@ describe("TerminalPanel 多分屏隔离", () => {
     terminalBackend.outputListeners.length = 0;
     terminalBackend.statusListeners.length = 0;
     terminalBackend.inputListeners.length = 0;
+    terminalBackend.scrollListeners.length = 0;
+    terminalBackend.scrollToBottomCalls = 0;
+    terminalBackend.displayWrites.length = 0;
+    terminalBackend.activeBuffer.cursorY = 0;
+    terminalBackend.activeBuffer.viewportY = 0;
+    terminalBackend.activeBuffer.baseY = 0;
     vi.stubGlobal("ResizeObserver", class { observe() {}; disconnect() {} });
     host = document.createElement("div");
     document.body.append(host);
@@ -245,21 +268,90 @@ describe("TerminalPanel 多分屏隔离", () => {
     const chunks: string[] = [];
     const resultPromise = sessions.requestAgentPtyCommand(paneId, "exec-1", "pwd", (chunk) => chunks.push(chunk));
     await nextTick();
+    expect(terminalBackend.scrollToBottomCalls).toBeGreaterThan(0);
     await vi.advanceTimersByTimeAsync(100);
 
     expect(terminalBackend.writeTerminal).toHaveBeenCalledWith(
       `pty-server-a-${paneId}`,
+      expect.stringContaining("set +o history"),
+    );
+    expect(terminalBackend.writeTerminal).toHaveBeenCalledWith(
+      `pty-server-a-${paneId}`,
       expect.stringMatching(/__OPSARK_BEGIN_exec-1__.*__OPSARK_END_exec-1_/),
     );
+    const protocolCommand = terminalBackend.writeTerminal.mock.calls
+      .map(([, data]) => data)
+      .find((data) => data.includes("__OPSARK_BEGIN_exec-1__"));
+    expect(protocolCommand).toContain("set -o history");
+    expect(protocolCommand).toContain("history -d");
+    terminalBackend.activeBuffer.baseY = 20;
+    terminalBackend.activeBuffer.viewportY = 4;
+    terminalBackend.scrollListeners.forEach((listener) => listener(4));
+    const scrollCallsBeforeHistoricalViewOutput = terminalBackend.scrollToBottomCalls;
     terminalBackend.outputListeners.forEach((listener) => listener({
       terminalId: `pty-server-a-${paneId}`,
       data: "__OPSARK_BEGIN_exec-1__\r\n/root\r\n__OPSARK_END_exec-1_0__\r\n",
       stream: "stdout",
     }));
+    await vi.advanceTimersByTimeAsync(60);
     await expect(resultPromise).resolves.toMatchObject({ output: "/root", exitCode: 0, success: true });
     expect(chunks.join("")).toContain("/root");
+    expect(terminalBackend.scrollToBottomCalls).toBe(scrollCallsBeforeHistoricalViewOutput);
     app.unmount();
     vi.useRealTimers();
+  });
+
+  it("在当前可见 PTY 中执行 SSH 并安全响应密码提示", async () => {
+    vi.useFakeTimers();
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    ops.servers.push({
+      id: "server-a", name: "Source", host: "192.168.1.236", port: 22, username: "root", group: "test",
+      status: "online", environment: [],
+      info: { os: "Linux", kernel: "6", cpu: "CPU", cores: 1, memoryGb: 1, diskGb: 1, uptime: "1h" },
+      createdAt: new Date().toISOString(),
+    });
+    ops.serverPasswords["server-a"] = "source-secret";
+    ops.connectedServerIds.push("server-a");
+    const sessions = useTerminalSessionStore(pinia);
+    sessions.ensureWorkspace("server-a");
+    const paneId = sessions.resolveActivePaneId("server-a")!;
+    const app = createApp(TerminalPanel, { serverId: "server-a", sessionId: paneId, active: true });
+    app.use(pinia).use(i18n).mount(host);
+    await nextTick();
+    await Promise.resolve();
+    await Promise.resolve();
+    terminalBackend.statusListeners.forEach((listener) => listener({
+      terminalId: `pty-server-a-${paneId}`, generation: 1, status: "connected", retryable: false,
+    }));
+    await nextTick();
+
+    const resultPromise = sessions.requestAgentPtySshJump(
+      paneId,
+      "ssh-jump-1",
+      { host: "192.168.1.237", port: 22, username: "root" },
+      "target-secret",
+    ).catch((error) => { throw error; });
+    await nextTick();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(terminalBackend.displayWrites.join("")).toContain("[Agent]");
+    expect(terminalBackend.displayWrites.join("")).toContain("ssh -p 22 root@192.168.1.237");
+    expect(terminalBackend.writeTerminal.mock.calls.flat().join("\n")).not.toContain("target-secret");
+
+    terminalBackend.outputListeners.forEach((listener) => listener({
+      terminalId: `pty-server-a-${paneId}`, data: "root@192.168.1.237's password: ", stream: "stdout",
+    }));
+    await vi.advanceTimersByTimeAsync(60);
+    expect(terminalBackend.writeTerminal).toHaveBeenCalledWith(`pty-server-a-${paneId}`, "target-secret\r");
+
+    terminalBackend.outputListeners.forEach((listener) => listener({
+      terminalId: `pty-server-a-${paneId}`,
+      data: "\r\n__OPSARK_SSH_CONNECTED_ssh-jump-1__\r\n[root@target ~]# ",
+      stream: "stdout",
+    }));
+    await vi.advanceTimersByTimeAsync(60);
+    await expect(resultPromise).resolves.toMatchObject({ success: true, exitCode: 0 });
+    app.unmount();
   });
 
 });

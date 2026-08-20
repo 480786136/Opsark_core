@@ -47,6 +47,10 @@ export function resolveToolRegistry(
       id: definition.id,
       implementation: definition.implementation,
       inputSchema: structuredClone(definition.inputSchema),
+      planMode: definition.planMode,
+      completionMode: definition.completionMode,
+      refinementScope: definition.refinementScope,
+      executionMode: definition.executionMode,
       builtIn: definition.builtIn,
       version: definition.version,
     });

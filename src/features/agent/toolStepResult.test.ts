@@ -41,6 +41,23 @@ describe("tool step result", () => {
     expect(outcome.eventMessage).toContain("部分结果");
   });
 
+  it("keeps tool result copy generic instead of embedding a domain workflow", () => {
+    const connectCall: ToolCall = {
+      id: "connect-1",
+      toolId: "server.connect",
+      arguments: { host: "192.168.1.237" },
+    };
+    const outcome = buildToolStepOutcome({
+      call: connectCall,
+      result: { callId: connectCall.id, toolId: connectCall.toolId, success: true, data: { connected: true } },
+      completedAt: "2026-08-14T01:00:00.000Z",
+      evidenceId: "connect-evidence",
+    });
+
+    expect(outcome.review?.summary).toBe("工具已返回结构化证据。");
+    expect(outcome.eventMessage).toContain("完整结果");
+  });
+
   it("builds a deterministic failure without evidence", () => {
     const outcome = buildToolStepOutcome({
       call,
@@ -64,4 +81,3 @@ describe("tool step result", () => {
     expect(outcome.pauseReason).toContain("工具未启用");
   });
 });
-

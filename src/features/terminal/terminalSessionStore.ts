@@ -37,10 +37,34 @@ export interface AgentPtyCommandResult {
   emptyResult: boolean;
 }
 
+export interface AgentPtySshJumpRequest {
+  id: string;
+  paneId: string;
+  host: string;
+  port: number;
+  username: string;
+  createdAt: string;
+}
+
+export interface AgentPtySshJumpResult {
+  output: string;
+  success: true;
+  simulated: false;
+  exitCode: 0;
+  emptyResult: false;
+}
+
 const agentCommandCallbacks = new Map<string, {
   resolve: (result: AgentPtyCommandResult) => void;
   reject: (error: Error) => void;
   onProgress?: (data: string) => void;
+  timer: number;
+}>();
+
+const agentSshJumpCallbacks = new Map<string, {
+  resolve: (result: AgentPtySshJumpResult) => void;
+  reject: (error: Error) => void;
+  password: string;
   timer: number;
 }>();
 
@@ -161,6 +185,8 @@ export const useTerminalSessionStore = defineStore("terminalSessions", {
     agentOutputByPane: {} as Record<string, AgentTerminalOutputChunk[]>,
     agentOutputSequence: 0,
     agentCommandByPane: {} as Record<string, AgentPtyCommandRequest>,
+    agentSshJumpByPane: {} as Record<string, AgentPtySshJumpRequest>,
+    effectiveSshTargetByPane: {} as Record<string, { host: string; port: number; username: string }>,
     agentInterruptByPane: {} as Record<string, number>,
   }),
   actions: {
@@ -257,6 +283,16 @@ export const useTerminalSessionStore = defineStore("terminalSessions", {
       this.activeSessionByServer[serverId] = sessionId;
       this.persist();
     },
+    activatePane(serverId: string, paneId: string) {
+      const session = this.sessionsByServer[serverId]?.find(({ panes }) =>
+        panes.some(({ id }) => id === paneId)
+      );
+      if (!session) return false;
+      session.activePaneId = paneId;
+      this.activeSessionByServer[serverId] = session.id;
+      this.persist();
+      return true;
+    },
     resolveActivePaneId(serverId: string) {
       const activeSessionId = this.activeSessionByServer[serverId];
       return this.sessionsByServer[serverId]?.find(({ id }) => id === activeSessionId)?.activePaneId;
@@ -294,7 +330,7 @@ export const useTerminalSessionStore = defineStore("terminalSessions", {
       if (queue.length > 500) queue.splice(0, queue.length - 500);
     },
     requestAgentPtyCommand(paneId: string, executionId: string, command: string, onProgress?: (data: string) => void, displayCommand = command) {
-      if (this.agentCommandByPane[paneId]) return Promise.reject(new Error("当前终端已有智能命令在执行"));
+      if (this.agentCommandByPane[paneId] || this.agentSshJumpByPane[paneId]) return Promise.reject(new Error("当前终端已有智能命令在执行"));
       const request = { id: executionId, paneId, command, displayCommand, createdAt: new Date().toISOString() };
       this.agentCommandByPane[paneId] = request;
       return new Promise<AgentPtyCommandResult>((resolve, reject) => {
@@ -305,6 +341,60 @@ export const useTerminalSessionStore = defineStore("terminalSessions", {
         }, 30 * 60 * 1000);
         agentCommandCallbacks.set(executionId, { resolve, reject, onProgress, timer });
       });
+    },
+    requestAgentPtySshJump(
+      paneId: string,
+      executionId: string,
+      target: { host: string; port: number; username: string },
+      password: string,
+    ) {
+      if (this.agentCommandByPane[paneId] || this.agentSshJumpByPane[paneId]) {
+        return Promise.reject(new Error("当前终端已有智能命令在执行"));
+      }
+      this.agentSshJumpByPane[paneId] = {
+        id: executionId,
+        paneId,
+        ...target,
+        createdAt: new Date().toISOString(),
+      };
+      return new Promise<AgentPtySshJumpResult>((resolve, reject) => {
+        const timer = window.setTimeout(() => {
+          delete this.agentSshJumpByPane[paneId];
+          agentSshJumpCallbacks.delete(executionId);
+          reject(new Error("终端内 SSH 登录超时"));
+        }, 60_000);
+        agentSshJumpCallbacks.set(executionId, { resolve, reject, password, timer });
+      });
+    },
+    readAgentSshPassword(executionId: string) {
+      return agentSshJumpCallbacks.get(executionId)?.password;
+    },
+    completeAgentPtySshJump(paneId: string, executionId: string, output: string) {
+      const callback = agentSshJumpCallbacks.get(executionId);
+      if (!callback) return;
+      const request = this.agentSshJumpByPane[paneId];
+      if (request?.id === executionId) {
+        this.effectiveSshTargetByPane[paneId] = {
+          host: request.host,
+          port: request.port,
+          username: request.username,
+        };
+      }
+      window.clearTimeout(callback.timer);
+      agentSshJumpCallbacks.delete(executionId);
+      if (this.agentSshJumpByPane[paneId]?.id === executionId) delete this.agentSshJumpByPane[paneId];
+      callback.resolve({ output, success: true, simulated: false, exitCode: 0, emptyResult: false });
+    },
+    failAgentPtySshJump(paneId: string, executionId: string, reason: string) {
+      const callback = agentSshJumpCallbacks.get(executionId);
+      if (!callback) return;
+      window.clearTimeout(callback.timer);
+      agentSshJumpCallbacks.delete(executionId);
+      if (this.agentSshJumpByPane[paneId]?.id === executionId) delete this.agentSshJumpByPane[paneId];
+      callback.reject(new Error(reason));
+    },
+    clearAgentPtySshTarget(paneId: string) {
+      delete this.effectiveSshTargetByPane[paneId];
     },
     publishAgentPtyProgress(executionId: string, data: string) {
       if (data) agentCommandCallbacks.get(executionId)?.onProgress?.(data);
@@ -327,9 +417,7 @@ export const useTerminalSessionStore = defineStore("terminalSessions", {
       callback.reject(new Error(reason));
     },
     interruptAgentPtyCommand(paneId: string) {
-      const request = this.agentCommandByPane[paneId];
       this.agentInterruptByPane[paneId] = (this.agentInterruptByPane[paneId] ?? 0) + 1;
-      if (request) this.completeAgentPtyCommand(paneId, request.id, "用户已终止绑定终端命令", 130);
     },
     consumeAgentOutput(paneId: string, throughId: number) {
       const queue = this.agentOutputByPane[paneId];

@@ -54,6 +54,7 @@ const expandedRounds = ref<string[]>([]);
 const expandedRecords = ref<string[]>([]);
 const terminalReference = ref("");
 const secretInput = ref("");
+const userInputValues = ref<Record<string, string>>({});
 const timeline = ref<HTMLElement>();
 
 const serverTasks = computed(() => store.tasks.filter((task) => task.serverId === props.serverId));
@@ -68,10 +69,26 @@ const adjustmentLabel = computed(() =>
 const pendingSecretRequest = computed(() =>
   store.pendingSecret?.taskId === task.value?.id ? store.pendingSecret : undefined,
 );
+const pendingUserInputRequest = computed(() =>
+  store.pendingUserInputs.find((request) => request.taskId === task.value?.id),
+);
 const isBusy = computed(() => task.value && ["planning", "running", "validating"].includes(task.value.status));
 const canTerminate = computed(() =>
-  Boolean(task.value && !["draft", "completed", "failed", "cancelled"].includes(task.value.status)),
+  Boolean(task.value && (
+    task.value.currentExecutionId
+    || ["planning", "running", "validating", "awaiting_input"].includes(task.value.status)
+  )),
 );
+
+watch(() => pendingUserInputRequest.value?.callId, () => {
+  userInputValues.value = {};
+});
+
+async function submitUserInput() {
+  if (!task.value || !pendingUserInputRequest.value) return;
+  const submitted = await store.provideUserInput(task.value.id, userInputValues.value);
+  if (submitted) userInputValues.value = {};
+}
 const currentConversationMessages = computed(() => {
   if (!task.value) return [];
   const start = task.value.messages
@@ -367,7 +384,6 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
           <h3>{{ t("agent.emptyTitle") }}</h3>
           <p>{{ t("agent.emptyHint") }}</p>
           <button @click="input = t('agent.requestSystem')">{{ t("agent.suggestSystem") }}</button>
-          <button @click="input = t('agent.requestNginx')">{{ t("agent.suggestNginx") }}</button>
           <button @click="input = t('agent.requestDisk')">{{ t("agent.suggestDisk") }}</button>
         </div>
 
@@ -550,6 +566,36 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
               <button class="button secondary" @click="store.rejectTask(task.id)">{{ t("agent.stop") }}</button>
               <button class="button primary" @click="store.approveStep(task.id, pendingApproval.id)">{{ t("agent.executeStep") }}</button>
             </div>
+            <form v-else-if="pendingUserInputRequest" class="user-input-card" @submit.prevent="submitUserInput">
+              <div class="user-input-head">
+                <span><MessageSquarePlus :size="16" /></span>
+                <div>
+                  <strong>{{ pendingUserInputRequest.title }}</strong>
+                  <small>{{ pendingUserInputRequest.description || t('agent.userInputDefaultDescription') }}</small>
+                </div>
+              </div>
+              <div class="user-input-fields">
+                <label v-for="field in pendingUserInputRequest.fields" :key="field.key">
+                  <span class="user-input-label">
+                    <strong>{{ field.label }}</strong>
+                    <i>{{ field.required ? t('agent.requiredParameter') : t('agent.optionalParameter') }}</i>
+                  </span>
+                  <small>{{ field.description }}</small>
+                  <input
+                    v-model="userInputValues[field.key]"
+                    :type="field.type === 'password' ? 'password' : field.type === 'number' ? 'number' : 'text'"
+                    :autocomplete="field.type === 'password' ? 'new-password' : 'off'"
+                    :placeholder="field.placeholder || t('agent.parameterPlaceholder', { label: field.label })"
+                  />
+                  <em v-if="field.type === 'password'"><KeyRound :size="11" />{{ t('agent.passwordParameterHint') }}</em>
+                </label>
+              </div>
+              <p v-if="pendingUserInputRequest.error" class="user-input-error">{{ pendingUserInputRequest.error }}</p>
+              <div class="user-input-actions">
+                <span>{{ t('agent.userInputSecurityHint') }}</span>
+                <button class="button primary" type="submit">{{ t('agent.confirmParameters') }}</button>
+              </div>
+            </form>
             <form v-else-if="pendingSecretRequest" class="secret-input-bar" @submit.prevent="store.provideSecret(secretInput); secretInput = ''">
               <span><KeyRound :size="14" />{{ pendingSecretRequest.key }}</span>
               <input v-model="secretInput" type="password" autocomplete="off" :placeholder="t('agent.secretPlaceholder')" autofocus />

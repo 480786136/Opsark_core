@@ -1,7 +1,27 @@
 use reqwest::StatusCode;
 use serde_json::Value;
+use std::time::Duration;
 
 const MODEL_RESPONSE_ATTEMPTS: usize = 3;
+
+fn build_model_client(timeout_seconds: u64, force_http1: bool) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(timeout_seconds))
+        .pool_max_idle_per_host(0);
+    if force_http1 {
+        builder = builder.http1_only();
+    }
+    builder.build().map_err(|error| error.to_string())
+}
+
+async fn wait_before_model_retry(attempt: usize) {
+    let delay_ms = match attempt {
+        1 => 350,
+        _ => 900,
+    };
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+}
 
 pub(crate) struct ModelAvailability {
     pub available: bool,
@@ -16,24 +36,31 @@ pub(crate) async fn post_model_request(
     request_name: &str,
     timeout_seconds: u64,
 ) -> Result<Value, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_seconds))
-        .build()
-        .map_err(|error| format!("{request_name}客户端初始化失败：{error}"))?;
     let mut last_retryable_error = String::new();
 
     for attempt in 1..=MODEL_RESPONSE_ATTEMPTS {
-        let response = match client
+        // 每轮使用新连接，避免重用被上游代理截断的 HTTP 连接。
+        // 最后一轮回退到 HTTP/1.1 + identity，兼容有问题的 HTTP/2/压缩网关。
+        let force_http1 = attempt == MODEL_RESPONSE_ATTEMPTS;
+        let client = build_model_client(timeout_seconds, force_http1)
+            .map_err(|error| format!("{request_name}客户端初始化失败：{error}"))?;
+        let mut request = client
             .post(url)
             .bearer_auth(api_key)
-            .json(body)
-            .send()
-            .await
-        {
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(body);
+        if attempt > 1 {
+            request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
+        }
+        if force_http1 {
+            request = request.header(reqwest::header::CONNECTION, "close");
+        }
+        let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
                 last_retryable_error = format!("{request_name}请求失败：{error}");
                 if attempt < MODEL_RESPONSE_ATTEMPTS {
+                    wait_before_model_retry(attempt).await;
                     continue;
                 }
                 break;
@@ -46,11 +73,22 @@ pub(crate) async fn post_model_request(
             .and_then(|value| value.to_str().ok())
             .unwrap_or("未提供")
             .to_string();
+        let content_encoding = response
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("无")
+            .to_string();
+        let content_length = response.content_length();
         let response_bytes = match response.bytes().await {
             Ok(bytes) => bytes,
             Err(error) => {
-                last_retryable_error = format!("{request_name}接口响应读取不完整：{error}");
+                last_retryable_error = format!(
+                    "{request_name}接口响应读取不完整（状态 {status}，Content-Encoding {content_encoding}，Content-Length {}）：{error}",
+                    content_length.map_or_else(|| "未提供".to_string(), |value| value.to_string())
+                );
                 if attempt < MODEL_RESPONSE_ATTEMPTS {
+                    wait_before_model_retry(attempt).await;
                     continue;
                 }
                 break;
@@ -64,6 +102,7 @@ pub(crate) async fn post_model_request(
                     response_bytes.len()
                 );
                 if attempt < MODEL_RESPONSE_ATTEMPTS {
+                    wait_before_model_retry(attempt).await;
                     continue;
                 }
                 break;
@@ -81,6 +120,7 @@ pub(crate) async fn post_model_request(
         if (status.as_u16() == 429 || status.is_server_error()) && attempt < MODEL_RESPONSE_ATTEMPTS
         {
             last_retryable_error = error;
+            wait_before_model_retry(attempt).await;
             continue;
         }
         return Err(error);
@@ -151,29 +191,50 @@ pub(crate) async fn check_model_availability(
         });
     }
     let url = format!("{}/models", endpoint.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
     let mut decoded = None;
     let mut last_error = String::new();
     for attempt in 1..=MODEL_RESPONSE_ATTEMPTS {
-        let response = match client.get(&url).bearer_auth(api_key).send().await {
+        let force_http1 = attempt == MODEL_RESPONSE_ATTEMPTS;
+        let client = build_model_client(15, force_http1)
+            .map_err(|error| format!("模型列表客户端初始化失败：{error}"))?;
+        let mut request = client
+            .get(&url)
+            .bearer_auth(api_key)
+            .header(reqwest::header::ACCEPT, "application/json");
+        if attempt > 1 {
+            request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
+        }
+        if force_http1 {
+            request = request.header(reqwest::header::CONNECTION, "close");
+        }
+        let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
                 last_error = format!("无法连接模型服务：{error}");
                 if attempt < MODEL_RESPONSE_ATTEMPTS {
+                    wait_before_model_retry(attempt).await;
                     continue;
                 }
                 break;
             }
         };
         let status = response.status();
+        let content_encoding = response
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("无")
+            .to_string();
+        let content_length = response.content_length();
         let bytes = match response.bytes().await {
             Ok(bytes) => bytes,
             Err(error) => {
-                last_error = format!("模型列表接口响应读取不完整：{error}");
+                last_error = format!(
+                    "模型列表接口响应读取不完整（状态 {status}，Content-Encoding {content_encoding}，Content-Length {}）：{error}",
+                    content_length.map_or_else(|| "未提供".to_string(), |value| value.to_string())
+                );
                 if attempt < MODEL_RESPONSE_ATTEMPTS {
+                    wait_before_model_retry(attempt).await;
                     continue;
                 }
                 break;
@@ -181,6 +242,17 @@ pub(crate) async fn check_model_availability(
         };
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(payload) => {
+                if (status.as_u16() == 429 || status.is_server_error())
+                    && attempt < MODEL_RESPONSE_ATTEMPTS
+                {
+                    let message = payload
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("未知接口错误");
+                    last_error = format!("模型列表接口返回 {status}：{message}");
+                    wait_before_model_retry(attempt).await;
+                    continue;
+                }
                 decoded = Some((status, payload));
                 break;
             }
@@ -190,6 +262,7 @@ pub(crate) async fn check_model_availability(
                     bytes.len()
                 );
                 if attempt < MODEL_RESPONSE_ATTEMPTS {
+                    wait_before_model_retry(attempt).await;
                     continue;
                 }
             }
@@ -234,5 +307,11 @@ mod tests {
         let result = evaluate_model_list(StatusCode::UNAUTHORIZED, &payload, "model-a");
         assert!(!result.available);
         assert!(result.reason.contains("invalid key"));
+    }
+
+    #[test]
+    fn builds_standard_and_http1_fallback_clients() {
+        assert!(build_model_client(30, false).is_ok());
+        assert!(build_model_client(30, true).is_ok());
     }
 }

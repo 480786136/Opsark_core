@@ -9,6 +9,7 @@ export default createRouter({
     { path: "/models", component: () => import("@/views/ModelManagementView.vue") },
     { path: "/secrets", component: () => import("@/views/SecretManagementView.vue") },
     { path: "/tools", component: () => import("@/views/ToolManagementView.vue") },
+    { path: "/skills", component: () => import("@/views/SkillManagementView.vue") },
     { path: "/settings", component: () => import("@/views/SettingsView.vue") },
   ],
 });

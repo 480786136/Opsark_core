@@ -43,7 +43,7 @@ import { useOpsStore } from "@/stores/ops";
 import { redactExecutionOutput } from "@/features/agent/secretTool";
 import type { TerminalPaneStatus } from "@/features/terminal/terminalSessionStore";
 import { useTerminalSessionStore } from "@/features/terminal/terminalSessionStore";
-import { sanitizeTerminalOutput } from "@/utils/terminal";
+import { appendTerminalOutput, sanitizeTerminalOutput } from "@/utils/terminal";
 import {
   buildTerminalChangeDirectoryCommand,
   buildTerminalDirectoryProbeCommand,
@@ -105,9 +105,12 @@ let resizeObserver: ResizeObserver | undefined;
 let themeObserver: MutationObserver | undefined;
 let inputDisposable: IDisposable | undefined;
 let selectionDisposable: IDisposable | undefined;
+let scrollDisposable: IDisposable | undefined;
 let transcript: TerminalTranscriptState = { lines: [], remainder: "" };
 let resizeTimer: number | undefined;
 let reconnectTimer: number | undefined;
+let agentOutputFlushTimer: number | undefined;
+let pendingAgentPtyData = "";
 let activeGeneration: number | undefined;
 let reconnectAttempts = 0;
 let pendingStatusEvent: TerminalStatusEvent | undefined;
@@ -121,6 +124,35 @@ let activeAgentCapture: {
   buffer: string;
   output: string;
 } | undefined;
+let activeSshJump: {
+  id: string;
+  marker: string;
+  output: string;
+  passwordSent: boolean;
+  hostConfirmed: boolean;
+} | undefined;
+let followAgentOutput = true;
+
+function isTerminalViewportAtBottom(position?: number) {
+  if (!terminal) return true;
+  const buffer = terminal.buffer.active;
+  return (position ?? buffer.viewportY) >= buffer.baseY;
+}
+
+function followLatestAgentOutput() {
+  followAgentOutput = true;
+  terminal?.scrollToBottom();
+}
+
+/**
+ * Agent 命令与用户共用一个交互式 Shell。执行前暂停 Bash 历史，
+ * 避免内部标记、Base64 载荷和终端探针被 ↑ 重新调出。
+ */
+const pauseAgentShellHistoryCommand = "\u0015__opsark_history_enabled=0; if [ -n \"${BASH_VERSION:-}\" ]; then case $- in *h*) __opsark_history_enabled=1; __opsark_history_tail=$(history 1); case \"$__opsark_history_tail\" in *__opsark_history_enabled=0*) history -d $((HISTCMD-1)) 2>/dev/null;; esac; unset __opsark_history_tail; set +o history;; esac; fi; stty -echo\r";
+
+const purgeLegacyOpsarkHistoryCommand = "if [ -n \"${BASH_VERSION:-}\" ]; then for __opsark_history_id in $(history | command awk 'index($0, \"__OPSARK_\") || index($0, \"file://%s%s\") { print $1 }' | command sort -rn); do history -d \"$__opsark_history_id\" 2>/dev/null; done; fi;";
+
+const restoreAgentShellCommand = "stty echo; if [ \"${__opsark_history_enabled:-0}\" = 1 ]; then set -o history; fi; unset __opsark_history_enabled __opsark_history_id";
 
 function readTerminalTheme(): ITheme {
   const styles = getComputedStyle(document.documentElement);
@@ -227,15 +259,12 @@ function handleAgentPtyData(data: string) {
   if (!capture.started) {
     const beginIndex = capture.buffer.indexOf(capture.begin);
     if (beginIndex < 0) {
-      const safeLength = Math.max(0, capture.buffer.length - capture.begin.length);
-      const visible = capture.buffer.slice(0, safeLength);
-      capture.buffer = capture.buffer.slice(safeLength);
-      return visible;
+      // 开始标记之前只会有内部控制行的 PTY 回显，不应展示或写入转录。
+      capture.buffer = capture.buffer.slice(-capture.begin.length);
+      return "";
     }
-    const visible = capture.buffer.slice(0, beginIndex);
     capture.buffer = capture.buffer.slice(beginIndex + capture.begin.length).replace(/^\r?\n/, "");
     capture.started = true;
-    if (visible) terminal?.write(visible);
   }
 
   const endIndex = capture.buffer.indexOf(capture.endPrefix);
@@ -246,7 +275,7 @@ function handleAgentPtyData(data: string) {
     if (!endMatch) return "";
     const visibleOutput = redactExecutionOutput(output, store.getServerSecretValues(props.serverId));
     if (visibleOutput) {
-      capture.output += visibleOutput;
+      capture.output = appendTerminalOutput(capture.output, visibleOutput);
       terminalSessions.publishAgentPtyProgress(capture.id, visibleOutput);
     }
     const remainder = afterPrefix.slice(endMatch[0].length);
@@ -261,10 +290,48 @@ function handleAgentPtyData(data: string) {
   capture.buffer = capture.buffer.slice(safeLength);
   const visible = redactExecutionOutput(rawVisible, store.getServerSecretValues(props.serverId));
   if (visible) {
-    capture.output += visible;
+    capture.output = appendTerminalOutput(capture.output, visible);
     terminalSessions.publishAgentPtyProgress(capture.id, visible);
   }
   return visible;
+}
+
+function handleAgentSshJumpData(data: string) {
+  const jump = activeSshJump;
+  if (!jump) return data;
+  const safeData = redactExecutionOutput(data, store.getServerSecretValues(props.serverId));
+  jump.output = appendTerminalOutput(jump.output, safeData);
+  const plainOutput = sanitizeTerminalOutput(jump.output);
+  if (!jump.hostConfirmed && /are you sure you want to continue connecting/i.test(plainOutput)) {
+    jump.hostConfirmed = true;
+    void backend.writeTerminal(terminalId, "yes\r");
+  }
+  const passwordPrompts = plainOutput.match(/password\s*:/gi)?.length ?? 0;
+  if (passwordPrompts > 0 && !jump.passwordSent) {
+    const password = terminalSessions.readAgentSshPassword(jump.id);
+    if (!password) {
+      terminalSessions.failAgentPtySshJump(props.sessionId, jump.id, "SSH 密码不可用");
+      activeSshJump = undefined;
+      return safeData;
+    }
+    jump.passwordSent = true;
+    void backend.writeTerminal(terminalId, `${password}\r`);
+  } else if (passwordPrompts > 1 && jump.passwordSent) {
+    terminalSessions.failAgentPtySshJump(props.sessionId, jump.id, "SSH 用户名或密码错误");
+    activeSshJump = undefined;
+    return safeData;
+  }
+  if (plainOutput.includes(jump.marker)) {
+    const output = plainOutput.replace(jump.marker, "").trim();
+    terminalSessions.completeAgentPtySshJump(props.sessionId, jump.id, output || "SSH 登录成功");
+    activeSshJump = undefined;
+    return safeData.replace(jump.marker, "");
+  }
+  if (/permission denied|connection refused|no route to host|could not resolve hostname|connection timed out|connection closed by/i.test(plainOutput)) {
+    terminalSessions.failAgentPtySshJump(props.sessionId, jump.id, "终端内 SSH 登录失败，请检查凭据、端口和网络");
+    activeSshJump = undefined;
+  }
+  return safeData;
 }
 
 function executeBoundAgentCommand(request: { id: string; command: string; displayCommand: string }) {
@@ -283,6 +350,9 @@ function executeBoundAgentCommand(request: { id: string; command: string; displa
     buffer: "",
     output: "",
   };
+  // Agent 执行期间的终端是实时观测面。无论用户之前停在哪一段历史，
+  // 新的智能命令开始时都先回到最新一行，后续输出也会持续跟随。
+  followLatestAgentOutput();
   const safeDisplayCommand = redactExecutionOutput(request.displayCommand, store.getServerSecretValues(props.serverId));
   // The user may have an unsubmitted draft at the prompt. Clear the remote
   // canonical input line before taking control, otherwise commands concatenate
@@ -293,12 +363,44 @@ function executeBoundAgentCommand(request: { id: string; command: string; displa
   bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
   const encodedCommand = btoa(binary);
   // First disable echo/history, then submit one CR-terminated line. A single line avoids PTY paste/newline ambiguity.
-  void backend.writeTerminal(terminalId, "\u0015 stty -echo; export HISTCONTROL=ignorespace\r");
+  void backend.writeTerminal(terminalId, pauseAgentShellHistoryCommand);
   window.setTimeout(() => {
     if (activeAgentCapture?.id !== request.id) return;
-    terminal?.write(`\r\n\u001b[36m[Agent]\u001b[0m $ ${safeDisplayCommand}\r\n`);
+    terminal?.write(
+      `\r\n\u001b[36m[Agent]\u001b[0m $ ${safeDisplayCommand}\r\n`,
+      () => {
+        if (followAgentOutput) terminal?.scrollToBottom();
+      },
+    );
     updateTranscript(`[Agent] $ ${safeDisplayCommand}\n`);
-    const script = ` __opsark_payload='${encodedCommand}'; printf '${beginMarker}\\n'; ( eval \"$(printf '%s' \"$__opsark_payload\" | base64 -d)\" ); __opsark_status=$?; printf '\\n${endMarkerPrefix}%s__\\n' \"$__opsark_status\"; unset __opsark_payload; stty echo\r`;
+    const script = ` ${purgeLegacyOpsarkHistoryCommand} __opsark_payload='${encodedCommand}'; printf '${beginMarker}\\n'; ( eval \"$(printf '%s' \"$__opsark_payload\" | base64 -d)\" ); __opsark_status=$?; unset __opsark_payload; ${restoreAgentShellCommand}; printf '\\n${endMarkerPrefix}%s__\\n' \"$__opsark_status\"; unset __opsark_status\r`;
+    void backend.writeTerminal(terminalId, script);
+  }, 80);
+}
+
+function executeBoundSshJump(request: { id: string; host: string; port: number; username: string }) {
+  if (connectionState.value !== "connected") {
+    terminalSessions.failAgentPtySshJump(props.sessionId, request.id, "绑定终端尚未连接");
+    return;
+  }
+  const markerId = request.id.replace(/[^A-Za-z0-9_-]/g, "_");
+  const marker = `__OPSARK_SSH_CONNECTED_${markerId}__`;
+  activeSshJump = { id: request.id, marker, output: "", passwordSent: false, hostConfirmed: false };
+  followLatestAgentOutput();
+  commandDraft = { value: "", recordable: false };
+  const displayCommand = `ssh -p ${request.port} ${request.username}@${request.host}`;
+  const remoteCommand = `printf \"\\n${marker}\\n\"; exec \"\${SHELL:-/bin/sh}\" -l`;
+  const sshCommand = `ssh -tt -p ${request.port} -- ${request.username}@${request.host} '${remoteCommand}'`;
+  const bytes = new TextEncoder().encode(sshCommand);
+  let binary = "";
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+  const encodedCommand = btoa(binary);
+  void backend.writeTerminal(terminalId, pauseAgentShellHistoryCommand);
+  window.setTimeout(() => {
+    if (activeSshJump?.id !== request.id) return;
+    terminal?.write(`\r\n\u001b[36m[Agent]\u001b[0m $ ${displayCommand}\r\n`, () => terminal?.scrollToBottom());
+    updateTranscript(`[Agent] $ ${displayCommand}\n`);
+    const script = ` ${purgeLegacyOpsarkHistoryCommand} __opsark_payload='${encodedCommand}'; stty echo; eval \"$(printf '%s' \"$__opsark_payload\" | base64 -d)\"; __opsark_status=$?; unset __opsark_payload; ${restoreAgentShellCommand}; unset __opsark_status\r`;
     void backend.writeTerminal(terminalId, script);
   }, 80);
 }
@@ -382,6 +484,11 @@ function handleTerminalStatus(event: TerminalStatusEvent) {
     return;
   }
   connectionState.value = event.status;
+  terminalSessions.clearAgentPtySshTarget(props.sessionId);
+  if (activeSshJump) {
+    terminalSessions.failAgentPtySshJump(props.sessionId, activeSshJump.id, event.reason ?? "终端连接已断开");
+    activeSshJump = undefined;
+  }
   statusMessage.value = event.reason ?? t("terminal.disconnected");
   if (event.retryable && isLive.value) scheduleReconnect();
 }
@@ -421,6 +528,43 @@ function scheduleFit() {
   }, 60);
 }
 
+function renderTerminalOutput(data: string) {
+  if (!activeSshJump
+    && terminalSessions.effectiveSshTargetByPane[props.sessionId]
+    && /connection to .+ closed\.?/i.test(sanitizeTerminalOutput(data))) {
+    terminalSessions.clearAgentPtySshTarget(props.sessionId);
+  }
+  const shouldFollowAgentExecution = Boolean(activeAgentCapture || activeSshJump) && followAgentOutput;
+  const visibleData = handleAgentSshJumpData(handleAgentPtyData(data));
+  if (!visibleData) return;
+  terminal?.write(visibleData, () => {
+    if (shouldFollowAgentExecution) terminal?.scrollToBottom();
+  });
+  trackTerminalDirectory(visibleData);
+  updateTranscript(visibleData);
+}
+
+function flushAgentPtyOutput() {
+  if (agentOutputFlushTimer !== undefined) window.clearTimeout(agentOutputFlushTimer);
+  agentOutputFlushTimer = undefined;
+  if (!pendingAgentPtyData) return;
+  const data = pendingAgentPtyData;
+  pendingAgentPtyData = "";
+  renderTerminalOutput(data);
+}
+
+function queueAgentPtyOutput(data: string) {
+  pendingAgentPtyData += data;
+  // 20 FPS 足够平滑展示下载进度，并显著减少 xterm 与 Vue 的重复渲染。
+  if (pendingAgentPtyData.length >= 64 * 1024) {
+    flushAgentPtyOutput();
+    return;
+  }
+  if (agentOutputFlushTimer === undefined) {
+    agentOutputFlushTimer = window.setTimeout(flushAgentPtyOutput, 50);
+  }
+}
+
 function remoteTerminalRows() {
   // Keep the final PTY row clear of xterm's viewport rounding and scrollbar.
   // Full-screen programs otherwise render their last row beneath the panel edge.
@@ -432,6 +576,7 @@ async function reconnect() {
   clearReconnectTimer();
   reconnectAttempts = 0;
   activeGeneration = undefined;
+  terminalSessions.clearAgentPtySshTarget(props.sessionId);
   await backend.closeTerminal(terminalId);
   terminal?.clear();
   await startLiveTerminal();
@@ -560,17 +705,19 @@ onMounted(async () => {
     return true;
   });
   inputDisposable = terminal.onData((data) => writeTerminalInput(data));
+  scrollDisposable = terminal.onScroll((position) => {
+    if (!activeAgentCapture && !activeSshJump) return;
+    // 用户向上查看历史时暂停自动跟随；手动滚回底部后继续跟随实时输出。
+    followAgentOutput = isTerminalViewportAtBottom(position);
+  });
   const selectionSource = terminal as Terminal & { onSelectionChange?: (listener: () => void) => IDisposable };
   selectionDisposable = selectionSource.onSelectionChange?.(() => {
     selectedTerminalText.value = terminal?.getSelection().trim() ?? "";
   });
   outputUnlisten = await backend.onTerminalOutput((event) => {
     if (event.terminalId !== terminalId) return;
-    const visibleData = handleAgentPtyData(event.data);
-    if (!visibleData) return;
-    terminal?.write(visibleData);
-    trackTerminalDirectory(visibleData);
-    updateTranscript(visibleData);
+    if (activeAgentCapture || activeSshJump || pendingAgentPtyData) queueAgentPtyOutput(event.data);
+    else renderTerminalOutput(event.data);
   });
   statusUnlisten = await backend.onTerminalStatus((event) => {
     if (event.terminalId !== terminalId) return;
@@ -637,12 +784,22 @@ watch(
 );
 
 watch(
+  () => terminalSessions.agentSshJumpByPane[props.sessionId],
+  (request) => { if (request && request.id !== activeSshJump?.id) executeBoundSshJump(request); },
+  { immediate: true },
+);
+
+watch(
   () => terminalSessions.agentInterruptByPane[props.sessionId],
   (version, previous) => {
-    if (!version || version === previous || !activeAgentCapture) return;
+    if (!version || version === previous || (!activeAgentCapture && !activeSshJump)) return;
+    // 只向远程前台进程组发送中断。不在这里提前完成 Promise：
+    // 必须等 Shell 继续执行收尾脚本并返回 OPSARK_END 及真实退出码。
     void backend.writeTerminal(terminalId, "\u0003");
-    window.setTimeout(() => void backend.writeTerminal(terminalId, "stty echo\r"), 50);
-    activeAgentCapture = undefined;
+    if (activeSshJump) {
+      terminalSessions.failAgentPtySshJump(props.sessionId, activeSshJump.id, "终端内 SSH 登录已终止");
+      activeSshJump = undefined;
+    }
   },
 );
 
@@ -673,13 +830,17 @@ watch(
 
 onBeforeUnmount(() => {
   if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
+  if (agentOutputFlushTimer !== undefined) window.clearTimeout(agentOutputFlushTimer);
   clearReconnectTimer();
   activeGeneration = undefined;
   if (activeAgentCapture) terminalSessions.failAgentPtyCommand(props.sessionId, activeAgentCapture.id, "终端已关闭");
+  if (activeSshJump) terminalSessions.failAgentPtySshJump(props.sessionId, activeSshJump.id, "终端已关闭");
+  terminalSessions.clearAgentPtySshTarget(props.sessionId);
   resizeObserver?.disconnect();
   themeObserver?.disconnect();
   inputDisposable?.dispose();
   selectionDisposable?.dispose();
+  scrollDisposable?.dispose();
   outputUnlisten?.();
   statusUnlisten?.();
   terminal?.dispose();

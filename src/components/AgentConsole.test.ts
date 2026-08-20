@@ -63,4 +63,35 @@ describe("AgentConsole 服务器工作区隔离", () => {
     expect(panels[1].querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("继续检查 Beta");
     app.unmount();
   });
+
+  it("任务已暂停调整时不再显示终止业务", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    const paused = ops.createTask("server-a", "safe", "model-deepseek");
+    paused.status = "needs_adjustment";
+    paused.pauseReason = "独立校验未通过";
+    paused.plan = [{
+      id: "step-1",
+      title: "验收仓库",
+      description: "验收仓库",
+      command: "git -C /root/app rev-parse HEAD",
+      expected: "返回提交哈希",
+      validation: "git -C /root/app rev-parse --verify HEAD",
+      risk: "low",
+      status: "failed",
+    }];
+    useAgentWorkspaceStore(pinia).updateServer("server-a", {
+      activeTaskId: paused.id,
+      automationEnabled: true,
+    });
+
+    const app = createApp(AgentConsole, { serverId: "server-a" }).use(pinia).use(i18n);
+    app.mount(host);
+    await nextTick();
+
+    expect(host.querySelector(".terminate-business")).toBeNull();
+    expect(host.textContent).toContain("生成一次精简调整计划");
+    app.unmount();
+  });
 });

@@ -104,7 +104,7 @@ describe("execution lifecycle", () => {
     expect(executionChanges).toEqual(["exec-2", undefined]);
   });
 
-  it("retries a failed read-only HTTP validation once", async () => {
+  it("对所有可收敛的后置校验进行有界重试", async () => {
     const step = createStep({ status: "validating" });
     const executionChanges: Array<string | undefined> = [];
     const onRetry = vi.fn();
@@ -122,16 +122,75 @@ describe("execution lifecycle", () => {
       onExecutionChange: (id) => executionChanges.push(id),
       onProgress: noop,
       onRetry,
+      waitBeforeRetry: async () => undefined,
     }, execute);
 
-    expect(result).toMatchObject({ retried: true, firstFailedOutput: "timeout" });
+    expect(result).toMatchObject({ retried: true, firstFailedOutput: "timeout", attemptCount: 2 });
     expect(result.validation.passed).toBe(true);
     expect(execute).toHaveBeenCalledTimes(2);
-    expect(onRetry).toHaveBeenCalledWith("timeout");
+    expect(onRetry).toHaveBeenCalledWith("timeout", 3);
     expect(executionChanges).toEqual([
       "validation-1", undefined,
       "validation-2", undefined,
     ]);
+  });
+
+  it("持续未收敛时最多执行四次而不无限等待", async () => {
+    const step = createStep({
+      command: "systemctl restart app",
+      validation: "systemctl is-active --quiet app",
+      status: "validating",
+    });
+    const execute = vi.fn().mockResolvedValue({
+      passed: false,
+      detail: "activating",
+      output: "activating",
+      exitCode: 1,
+    });
+    const waits: number[] = [];
+
+    const result = await runValidationLifecycle({
+      step,
+      validation: step.validation,
+      initialExecutionId: "validation-1",
+      createRetryExecutionId: () => `validation-${execute.mock.calls.length + 1}`,
+      secretValues: {},
+      isCancelled: () => false,
+      onExecutionChange: noop,
+      onProgress: noop,
+      onRetry: noop,
+      waitBeforeRetry: async (delayMs) => { waits.push(delayMs); },
+    }, execute);
+
+    expect(result).toMatchObject({ retried: true, attemptCount: 4 });
+    expect(execute).toHaveBeenCalledTimes(4);
+    expect(waits).toEqual([500, 1_500, 3_000]);
+  });
+
+  it("校验命令不可执行时不将确定性失败当成竞态", async () => {
+    const step = createStep({ status: "validating" });
+    const execute = vi.fn().mockResolvedValue({
+      passed: false,
+      detail: "command not found",
+      output: "command not found",
+      exitCode: 127,
+    });
+
+    const result = await runValidationLifecycle({
+      step,
+      validation: step.validation,
+      initialExecutionId: "validation-1",
+      createRetryExecutionId: () => "unused",
+      secretValues: {},
+      isCancelled: () => false,
+      onExecutionChange: noop,
+      onProgress: noop,
+      onRetry: noop,
+      waitBeforeRetry: async () => undefined,
+    }, execute);
+
+    expect(result).toMatchObject({ retried: false, attemptCount: 1 });
+    expect(execute).toHaveBeenCalledOnce();
   });
 
   it("clears validation execution state when validation throws", async () => {
@@ -154,4 +213,3 @@ describe("execution lifecycle", () => {
     expect(executionChanges).toEqual(["validation-error", undefined]);
   });
 });
-

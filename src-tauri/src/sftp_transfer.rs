@@ -1,5 +1,7 @@
 use crate::ssh::connect_ssh;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use ssh2::RenameFlags;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -24,6 +26,15 @@ struct SftpTransferEvent {
     transferred_bytes: u64,
     total_bytes: u64,
     status: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ServerTransferResult {
+    source_path: String,
+    target_path: String,
+    transferred_bytes: u64,
+    sha256: String,
 }
 
 impl SftpTransferManager {
@@ -256,6 +267,173 @@ pub(crate) async fn download_sftp_transfer(
     })
     .await
     .map_err(|error| format!("SFTP 下载任务异常：{error}"))?;
+    transfer_manager.finish(&task_id);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn relay_between_servers(
+    app: &AppHandle,
+    transfer_id: &str,
+    source_host: &str,
+    source_port: u16,
+    source_username: &str,
+    source_password: &str,
+    source_path: &str,
+    target_host: &str,
+    target_port: u16,
+    target_username: &str,
+    target_password: &str,
+    target_path: &str,
+    overwrite: bool,
+    cancelled: &AtomicBool,
+) -> Result<ServerTransferResult, String> {
+    let source_sftp = connect_ssh(source_host, source_port, source_username, source_password)?
+        .sftp()
+        .map_err(|error| format!("源服务器 SFTP 会话创建失败：{error}"))?;
+    let target_sftp = connect_ssh(target_host, target_port, target_username, target_password)?
+        .sftp()
+        .map_err(|error| format!("目标服务器 SFTP 会话创建失败：{error}"))?;
+    let mut source = source_sftp
+        .open(Path::new(source_path))
+        .map_err(|error| format!("打开源文件失败：{error}"))?;
+    let total = source
+        .stat()
+        .map_err(|error| format!("读取源文件信息失败：{error}"))?
+        .size
+        .unwrap_or(0);
+    if target_sftp.stat(Path::new(target_path)).is_ok() && !overwrite {
+        return Err(format!("目标文件已存在，未授权覆盖：{target_path}"));
+    }
+    let safe_id: String = transfer_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+    let temporary_path = format!(
+        "{target_path}.opsark-part-{}",
+        &safe_id[..safe_id.len().min(24)]
+    );
+    let mut target = target_sftp
+        .create(Path::new(&temporary_path))
+        .map_err(|error| format!("创建目标临时文件失败：{error}"))?;
+    let result = (|| {
+        let mut source_hash = Sha256::new();
+        let mut transferred = 0_u64;
+        let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(CANCELLED_ERROR.into());
+            }
+            let size = source
+                .read(&mut buffer)
+                .map_err(|error| format!("读取源文件失败：{error}"))?;
+            if size == 0 {
+                break;
+            }
+            target
+                .write_all(&buffer[..size])
+                .map_err(|error| format!("写入目标文件失败：{error}"))?;
+            source_hash.update(&buffer[..size]);
+            transferred += size as u64;
+            emit_progress(app, transfer_id, "server", transferred, total, "running");
+        }
+        target
+            .flush()
+            .map_err(|error| format!("刷新目标文件失败：{error}"))?;
+        drop(target);
+
+        let mut verify = target_sftp
+            .open(Path::new(&temporary_path))
+            .map_err(|error| format!("重新打开目标文件校验失败：{error}"))?;
+        let mut target_hash = Sha256::new();
+        loop {
+            let size = verify
+                .read(&mut buffer)
+                .map_err(|error| format!("读取目标文件校验失败：{error}"))?;
+            if size == 0 {
+                break;
+            }
+            target_hash.update(&buffer[..size]);
+        }
+        let source_digest = source_hash.finalize();
+        let target_digest = target_hash.finalize();
+        if source_digest.as_slice() != target_digest.as_slice() {
+            return Err("跨服务器传输 SHA-256 校验失败".into());
+        }
+        if overwrite && target_sftp.stat(Path::new(target_path)).is_ok() {
+            target_sftp
+                .unlink(Path::new(target_path))
+                .map_err(|error| format!("移除目标旧文件失败：{error}"))?;
+        }
+        target_sftp
+            .rename(
+                Path::new(&temporary_path),
+                Path::new(target_path),
+                Some(RenameFlags::OVERWRITE | RenameFlags::ATOMIC),
+            )
+            .or_else(|_| {
+                target_sftp.rename(Path::new(&temporary_path), Path::new(target_path), None)
+            })
+            .map_err(|error| format!("提交目标文件失败：{error}"))?;
+        let sha256 = source_digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        emit_progress(app, transfer_id, "server", transferred, total, "completed");
+        Ok(ServerTransferResult {
+            source_path: source_path.into(),
+            target_path: target_path.into(),
+            transferred_bytes: transferred,
+            sha256,
+        })
+    })();
+    if result.is_err() {
+        let _ = target_sftp.unlink(Path::new(&temporary_path));
+    }
+    result
+}
+
+#[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn transfer_sftp_between_servers(
+    app: AppHandle,
+    manager: State<'_, SftpTransferManager>,
+    transfer_id: String,
+    source_host: String,
+    source_port: u16,
+    source_username: String,
+    source_password: String,
+    source_path: String,
+    target_host: String,
+    target_port: u16,
+    target_username: String,
+    target_password: String,
+    target_path: String,
+    overwrite: bool,
+) -> Result<ServerTransferResult, String> {
+    let cancelled = manager.start(&transfer_id)?;
+    let transfer_manager = manager.inner().clone();
+    let task_id = transfer_id.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        relay_between_servers(
+            &app,
+            &transfer_id,
+            &source_host,
+            source_port,
+            &source_username,
+            &source_password,
+            &source_path,
+            &target_host,
+            target_port,
+            &target_username,
+            &target_password,
+            &target_path,
+            overwrite,
+            &cancelled,
+        )
+    })
+    .await
+    .map_err(|error| format!("跨服务器传输任务异常：{error}"))?;
     transfer_manager.finish(&task_id);
     result
 }

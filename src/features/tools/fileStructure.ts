@@ -1,21 +1,6 @@
 import type { FileStructureRequest } from "@/features/tools/types";
 
-export const DEFAULT_FILE_STRUCTURE_EXCLUDES = [
-  ".git",
-  "node_modules",
-  "vendor",
-  "dist",
-  "build",
-  "target",
-  "coverage",
-  ".cache",
-  ".next",
-  ".nuxt",
-  ".venv",
-  "venv",
-  "__pycache__",
-  "logs",
-];
+export const DEFAULT_FILE_STRUCTURE_EXCLUDES: string[] = [];
 
 export interface NormalizedFileStructureRequest {
   rootPath: string;

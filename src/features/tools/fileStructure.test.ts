@@ -2,14 +2,14 @@ import { describe, expect, it } from "vitest";
 import { normalizeFileStructureRequest } from "@/features/tools/fileStructure";
 
 describe("file structure tool", () => {
-  it("merges defaults and normalizes request limits", () => {
+  it("normalizes only caller-provided exclusions and request limits", () => {
     const request = normalizeFileStructureRequest({
       rootPath: "/opt/app/",
       excludeDirectories: ["uploads", "storage/cache", "uploads"],
     });
 
     expect(request.rootPath).toBe("/opt/app");
-    expect(request.excludeDirectories).toEqual(expect.arrayContaining(["node_modules", "uploads", "storage/cache"]));
+    expect(request.excludeDirectories).toEqual(["uploads", "storage/cache"]);
     expect(request.excludeDirectories.filter((item) => item === "uploads")).toHaveLength(1);
     expect(request.maxDepth).toBe(6);
     expect(request.maxNodes).toBe(2000);

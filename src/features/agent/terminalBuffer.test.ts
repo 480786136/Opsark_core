@@ -5,8 +5,17 @@ import {
   appendTerminalStream,
   isTerminalProgressFrame,
 } from "@/features/agent/terminalBuffer";
+import { appendTerminalOutput } from "@/utils/terminal";
 
 describe("terminal buffer", () => {
+  it("replaces carriage-return download frames and bounds retained output", () => {
+    let output = appendTerminalOutput("downloading\n10%", "\r20%");
+    output = appendTerminalOutput(output, "\r30%\nready\n");
+    expect(output).toBe("downloading\n30%\nready\n");
+
+    expect(appendTerminalOutput("old-line\n", "new-line-that-is-long", 12)).toBe("that-is-long");
+  });
+
   it("recognizes and replaces adjacent percentage progress frames", () => {
     const lines = ["downloading", "10%"];
     appendTerminalStream(lines, "20%\nfile ready\n");
@@ -36,4 +45,3 @@ describe("terminal buffer", () => {
     expect(lines).toEqual(["validation", "line-1", "line-2"]);
   });
 });
-

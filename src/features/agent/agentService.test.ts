@@ -94,7 +94,7 @@ describe("agentService", () => {
     );
   });
 
-  it("generates an adjustment plan while retaining only recent completed evidence", async () => {
+  it("generates an adjustment plan without re-queueing completed evidence", async () => {
     const currentTask = task();
     currentTask.plan = [
       step("old-1", "echo 1"),
@@ -116,7 +116,7 @@ describe("agentService", () => {
       generationSettings,
     }, vi.fn().mockResolvedValue([replacement]));
 
-    expect(result.plan.map((item) => item.id)).toEqual(["old-2", "old-3", "old-4", "old-5", "repair"]);
+    expect(result.plan.map((item) => item.id)).toEqual(["repair"]);
     expect(result.context).toMatchObject({ workflowPhase: "adjust_after_failure" });
   });
 

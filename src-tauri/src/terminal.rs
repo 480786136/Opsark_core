@@ -163,7 +163,11 @@ fn run_terminal_session(
         .channel_session()
         .map_err(|error| format!("无法创建终端通道：{error}"))?;
     channel
-        .request_pty("xterm-256color", None, Some((cols.max(2), rows.max(1), 0, 0)))
+        .request_pty(
+            "xterm-256color",
+            None,
+            Some((cols.max(2), rows.max(1), 0, 0)),
+        )
         .map_err(|error| format!("无法申请远程 PTY：{error}"))?;
     channel
         .shell()

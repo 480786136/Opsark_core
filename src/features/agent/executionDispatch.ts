@@ -1,4 +1,4 @@
-import { findSecretKeys } from "@/features/agent/secretTool";
+import { findInvalidSecretPlaceholders, findSecretKeys } from "@/features/agent/secretTool";
 import { parseToolCommand } from "@/features/tools/toolExecutor";
 import type { ToolCall } from "@/features/tools/types";
 import type { PlanStep } from "@/types";
@@ -18,6 +18,10 @@ export function resolveStepDispatch(
   confirmedSecretKeys: string[],
   toolCallId: string,
 ): StepDispatchDecision {
+  const invalidPlaceholders = findInvalidSecretPlaceholders(step.command);
+  if (invalidPlaceholders.length) {
+    return { kind: "invalid", error: `敏感变量占位符格式不合法：${invalidPlaceholders.join("、")}；仅支持 \${secret.NAME}` };
+  }
   try {
     const call = parseToolCommand(step.command, toolCallId);
     if (call) return { kind: "tool", call };
@@ -29,4 +33,3 @@ export function resolveStepDispatch(
     .find((candidate) => !confirmedSecretKeys.includes(candidate));
   return key ? { kind: "await-secret", key } : { kind: "command" };
 }
-

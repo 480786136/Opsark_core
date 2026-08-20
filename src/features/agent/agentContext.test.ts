@@ -7,6 +7,7 @@ import {
 } from "@/features/agent/agentContext";
 import type { OpsTask, ServerProfile } from "@/types";
 import { resolveToolRegistry } from "@/features/tools/toolRegistry";
+import { resolveSkillRegistry } from "@/features/skills/skillRegistry";
 
 describe("agent context", () => {
   it("contains enabled tools and secret metadata without values", () => {
@@ -25,14 +26,46 @@ describe("agent context", () => {
     expect(JSON.stringify(context)).not.toContain("secretValues");
   });
 
-  it("extracts reusable paths and repository URLs from completed evidence", () => {
+  it("provides a selectable Skill directory without loading workflow instructions", () => {
+    const skills = resolveSkillRegistry({ overrides: [], customSkills: [] });
+    const context = buildAgentContext({
+      metrics: { cpu: 1, memory: 2, disk: 3, networkIn: 4, networkOut: 5, sampledAt: "now" },
+      permission: "safe",
+      conversationHistory: [],
+      knownExecutionFacts: {},
+      tools: resolveToolRegistry([]),
+      skills: [skills[0]],
+      skillDirectory: skills,
+      secretMetadata: [],
+      serverId: "server-1",
+    });
+
+    expect(context.skillSelection).toEqual({
+      mode: "model",
+      multiple: true,
+      currentActiveSkillIds: ["ssh-terminal-jump"],
+    });
+    expect(context.skillDirectory.map((skill) => skill.id)).toEqual([
+      "ssh-terminal-jump",
+      "project-source-acquisition",
+      "project-build",
+      "file-transfer-integrity",
+    ]);
+    expect(context.activeSkills).toEqual([]);
+    expect(JSON.stringify(context.skillDirectory)).not.toContain("server.resolve_connection");
+  });
+
+  it("extracts domain facts through the active project skill", () => {
     const task = createTask();
+    task.activeSkillIds = ["project-build"];
     task.plan[0].command = "git clone https://example.com/team/app.git /opt/app && cd /opt/app";
     task.plan[0].output = "deployed at /var/www/app";
     const facts = extractKnownExecutionFacts(task);
 
-    expect(facts.repositoryUrls).toEqual(["https://example.com/team/app.git"]);
-    expect(facts.workingDirectories).toEqual(expect.arrayContaining(["/opt/app", "/var/www/app"]));
+    expect(facts.skillFacts["project-build"]).toMatchObject({
+      repositoryUrls: ["https://example.com/team/app.git"],
+      workingDirectories: expect.arrayContaining(["/opt/app"]),
+    });
   });
 
   it("builds consistent adjustment and continuation contexts", () => {

@@ -34,6 +34,15 @@ describe("execution dispatch", () => {
     expect(decision).toEqual({ kind: "await-secret", key: "TOKEN" });
   });
 
+  it("rejects shell modifiers inside secret placeholders before execution", () => {
+    const decision = resolveStepDispatch({
+      command: "ssh -i ${secret.SSH_PRIVATE_KEY:-} host",
+    }, [], "call-invalid-secret");
+
+    expect(decision).toMatchObject({ kind: "invalid" });
+    if (decision.kind === "invalid") expect(decision.error).toContain("仅支持 ${secret.NAME}");
+  });
+
   it("routes an executable command when all secrets are confirmed", () => {
     const decision = resolveStepDispatch({
       command: "deploy --token ${secret.TOKEN}",
@@ -42,4 +51,3 @@ describe("execution dispatch", () => {
     expect(decision).toEqual({ kind: "command" });
   });
 });
-

@@ -41,8 +41,9 @@ async function removeModel(modelId: string) {
 </script>
 
 <template>
-  <div v-if="open" class="modal-backdrop" @click.self="emit('close')">
-    <div class="modal-card model-settings-modal">
+  <Teleport to="body">
+    <div v-if="open" class="modal-backdrop" @click.self="emit('close')">
+      <div class="modal-card model-settings-modal">
       <div class="modal-title">
         <div><h2>{{ t("settings.modalTitle") }}</h2><p>{{ t("settings.modalSubtitle") }}</p></div>
         <button class="icon-button" type="button" @click="emit('close')"><X :size="18" /></button>
@@ -104,6 +105,7 @@ async function removeModel(modelId: string) {
           <Save :size="14" />{{ saveState === "saving" ? t("settings.savingAndChecking") : saveState === "saved" ? t("settings.savedShort") : t("settings.saveConfig") }}
         </button>
       </div>
+      </div>
     </div>
-  </div>
+  </Teleport>
 </template>

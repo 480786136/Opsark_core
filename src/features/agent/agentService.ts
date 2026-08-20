@@ -7,6 +7,7 @@ import {
 } from "@/features/agent/agentContext";
 import { latestTaskRequirement, selectContinuationSteps } from "@/features/agent/taskProgression";
 import type { ToolDefinition } from "@/features/tools/types";
+import type { SkillDefinition } from "@/features/skills/types";
 import type {
   AiGenerationSettings,
   Metrics,
@@ -34,6 +35,7 @@ export interface PlanDiscoveryContinuationInput {
   model: ModelProfile;
   apiKey?: string;
   generationSettings: AiGenerationSettings;
+  skills?: SkillDefinition[];
 }
 
 export interface PlanTaskAdjustmentInput {
@@ -46,6 +48,7 @@ export interface PlanTaskAdjustmentInput {
   model: ModelProfile;
   apiKey?: string;
   generationSettings: AiGenerationSettings;
+  skills?: SkillDefinition[];
 }
 
 export interface CompletionSummaryRequest {
@@ -68,8 +71,8 @@ export interface SummarizeFailedTaskInput {
 }
 
 /**
- * Generates the one allowed continuation after read-only discovery. Existing and
- * duplicate commands are removed so evidence collection is not repeated.
+ * Generates the next bounded continuation after a discovery or standalone Skill stage.
+ * Existing and duplicate commands are removed so evidence collection is not repeated.
  */
 export async function planDiscoveryContinuation(
   input: PlanDiscoveryContinuationInput,
@@ -81,6 +84,7 @@ export async function planDiscoveryContinuation(
     task: input.task,
     tools: input.tools,
     secretMetadata: input.secretMetadata,
+    skills: input.skills,
   }));
   const candidates = await generatePlan(
     `${input.requirement}\n\n发现阶段已完成，请仅规划尚未完成的变更与最终验收。`,
@@ -94,8 +98,9 @@ export async function planDiscoveryContinuation(
 }
 
 /**
- * Generates a replacement plan from preserved failure evidence. Only the latest
- * completed steps are retained to keep context without re-queuing old work.
+ * Generates a replacement plan from preserved failure evidence. Previous steps
+ * stay in the adjustment context and audit log; they are not re-queued in the
+ * active plan or counted as newly processed work.
  */
 export async function planTaskAdjustment(
   input: PlanTaskAdjustmentInput,
@@ -108,6 +113,7 @@ export async function planTaskAdjustment(
     task: input.task,
     tools: input.tools,
     secretMetadata: input.secretMetadata,
+    skills: input.skills,
   }, input.failedStep);
   const replacement = await generatePlan(
     `${requirement}\n\n上次执行未达到预期，请生成安全的调整计划。`,
@@ -115,13 +121,14 @@ export async function planTaskAdjustment(
       ? undefined
       : createRuntimeModel(input.model, input.apiKey, JSON.stringify(context), input.generationSettings),
   );
-  if (!replacement.length) throw new Error("模型未返回可执行的调整步骤");
-  const completed = input.task.plan.filter((step) => step.status === "completed").slice(-4);
+  const completed = input.task.plan.filter((step) => step.status === "completed");
+  const selected = selectContinuationSteps(completed, replacement);
+  if (!selected.length) throw new Error("模型未返回新的可执行调整步骤");
   return {
     requirement,
     context,
-    replacement,
-    plan: [...completed, ...replacement],
+    replacement: selected,
+    plan: selected,
   };
 }
 

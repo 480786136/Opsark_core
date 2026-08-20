@@ -16,7 +16,7 @@ mod tests;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -35,7 +35,8 @@ use sftp::{
     rename_sftp_entry, write_sftp_file,
 };
 use sftp_transfer::{
-    cancel_sftp_transfer, download_sftp_transfer, upload_sftp_transfer, SftpTransferManager,
+    cancel_sftp_transfer, download_sftp_transfer, transfer_sftp_between_servers,
+    upload_sftp_transfer, SftpTransferManager,
 };
 use ssh::{connect_ssh, execution_pid_file, shell_quote, ssh_exec, ssh_exec_streaming};
 use terminal::{
@@ -104,9 +105,10 @@ const STRICT_JSON_OUTPUT_RULE: &str = "输出格式是强制协议：必须只�
 const PLAN_STEP_OUTPUT_CONTRACT: &str = r#"输出必须是 {"steps":[...]} 对象，steps 必须至少有 1 个元素。
 每个元素必须严格包含且只包含：{"title":"非空字符串","description":"非空字符串","command":"非空字符串","expected":"非空字符串","validation":"非空字符串","risk":"low|medium|high"}。
 字段内容应清晰、直接并保持完成任务所需的完整信息。command 和 validation 可以包含换行，但必须按标准 JSON 规则转义。
+模型工具例外：当 command 以 opsark-tool 开头时，validation 固定为 true；该值是工具协议占位，不会被当作远端校验命令执行。工具上下文中 planMode=standalone 的工具必须是 steps 中唯一的步骤，完成后系统会依据 completionMode 继续编排。
 Shell 反斜杠在 JSON 字符串内必须写成双反斜杠，例如 Shell 的 \( 必须输出为 \\( 的 JSON 文本。
 输出前逐个检查六个字段，必须保证整个 JSON 对象完整闭合，不得截断任何字段。"#;
-const REQUIREMENT_CLASSIFICATION_CONTRACT: &str = r#"本阶段只做需求分类、终端上下文判断和约束提取，禁止输出 steps、command、validation 或执行计划。必须先判断回答或计划是否依赖用户之前的终端输入/输出：如依赖且 terminalContext.content 未提供或范围不够，返回 terminal_context，terminalContextLines 必须大于当前 includedLines，且不超过 totalLines 和 400；不依赖则不得请求终端内容。咨询类必须严格输出：{"intent":"answer","answer":"非空回答","constraints":null,"terminalContextLines":0}。执行类必须严格输出：{"intent":"execute","answer":"","constraints":{"changePolicy":"unspecified|read_only|requested_changes_only|allow_necessary_changes","environmentPolicy":"unspecified|preserve|allow_isolated_changes|allow_host_changes","failurePolicy":"unspecified|strict|best_effort","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},"terminalContextLines":0}。需要更多终端内容时必须严格输出：{"intent":"terminal_context","answer":"","constraints":null,"terminalContextLines":80}。顶层只允许 intent、answer、constraints、terminalContextLines 四个字段。"#;
+const REQUIREMENT_CLASSIFICATION_CONTRACT: &str = r#"本阶段只做需求分类、终端上下文判断、约束提取和 Skill 选择，禁止输出 steps、command、validation 或执行计划。必须先判断回答或计划是否依赖用户之前的终端输入/输出：如依赖且 terminalContext.content 未提供或范围不够，返回 terminal_context，terminalContextLines 必须大于当前 includedLines，且不超过 totalLines 和 400；不依赖则不得请求终端内容。context.skillDirectory 是已启用 Skill 目录；对执行类需求，必须按整体目标的语义选择零个、一个或多个可联合使用的 Skill，selectedSkillIds 只能包含目录中的 id，不得因为多 Skill 存在交叉就只选一个。selectionHints 仅是选择提示，不是硬编码触发器；以 name、description 和用户整体目标为准。纯续接需求可复用 context.skillSelection.currentActiveSkillIds；新目标必须重新选择。咨询类必须严格输出：{"intent":"answer","answer":"非空回答","constraints":null,"terminalContextLines":0,"selectedSkillIds":[]}。执行类必须严格输出：{"intent":"execute","answer":"","constraints":{"changePolicy":"unspecified|read_only|requested_changes_only|allow_necessary_changes","environmentPolicy":"unspecified|preserve|allow_isolated_changes|allow_host_changes","failurePolicy":"unspecified|strict|best_effort","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},"terminalContextLines":0,"selectedSkillIds":["skill-id-1","skill-id-2"]}。需要更多终端内容时必须严格输出：{"intent":"terminal_context","answer":"","constraints":null,"terminalContextLines":80,"selectedSkillIds":[]}。顶层只允许 intent、answer、constraints、terminalContextLines、selectedSkillIds 五个字段。"#;
 const SECRET_PLACEHOLDER_RULE: &str = "敏感变量规则：${secret.NAME} 是 Opsark 的执行时传输占位符，不是要保留在远端文件里的字面量。必须原样写成 ${secret.NAME}，绝对不得在美元符号前添加反斜杠。程序会在 SSH 执行前注入真实值，并在输出、日志和模型上下文中脱敏。模型看到的 •••••••• 只表示真实值已被脱敏：它既不是远端文件的实际内容，也不能证明具体密码正确或错误，更不能据此声称占位符未解析。选择变量时名称和说明必须与目标凭据语义一致；若现有变量无法区分目标账户或用途，应使用新的、用途明确的变量名，由界面向用户索取，不能静默借用含义模糊的旧值。写入远端配置后应使用不泄露秘密的功能性后置条件校验；校验命令中仍可使用同一占位符供程序注入。不得要求远端保留 Opsark 占位符，也不得因脱敏标记判定泄露、写入失败或密码错误。除非用户明确禁止持久化密码，不得自行增加该限制。";
 const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
 
@@ -119,6 +121,10 @@ const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
 4. 证据充足时，按“必要确认→变更→最终验收”生成最少必要的计划。
 5. 每步在独立非交互 Shell 中运行，所需目录和环境必须在当步建立。
 6. 用户只要求修改已有资源的部分字段时，必须保留无关内容并做可恢复备份；不得用新模板覆盖整个结构化配置，除非用户明确要求整体替换或证据证明这是完整目标内容。
+7. 下载、安装、构建等可能长时间运行的命令必须保留实时标准输出和真实退出码；不得将整个主命令直接管道给非跟随模式的 tail/head 以截断输出。如需限制展示，应在主命令完成并保存真实退出状态后处理日志。
+8. 用户给出的明确命令、地址、标识符或协议必须保持语义不变，除非真实证据证明不可用并明确说明替代原因。
+9. 所有远程命令步骤都必须由执行器跟踪到真实退出；不得使用未受管的单独 &、disown、setsid -f 或伪造轮询让进程脱离执行生命周期，也不得用 || true、末尾 ; true 或失败分支 exit 0 掩盖主命令和校验的真实失败。有限操作必须前台执行；长驻进程应使用环境已有的受管机制，并通过独立只读证据校验状态。不得重复已完成的输入、发现、变更或验收步骤。
+10. context.activeSkills 是需求理解阶段从已启用目录中选出的领域工作流。存在多个 Skill 时，必须同时遵循全部 Skill 的阶段、工具选择和验收要求，将相容阶段合并且不得静默丢弃任一 Skill；如指令冲突，必须优先满足用户明确约束和核心安全规则，并仅规划可安全确定的阶段。没有激活 Skill 时仅使用通用最小证据流程。工具只能按 context.tools 中的输入协议、planMode 和 completionMode 调用，不得猜测工具能力。需要敏感变量时使用语义明确的 ${secret.NAME} 占位符，禁止把真实值写入计划。
 
 校验规则：
 - validation 必须独立、只读且可执行，退出码 0 表示已获得足够判断 expected 的证据。
@@ -127,12 +133,12 @@ const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
 
 输出：只返回符合计划输出契约的 JSON 对象。"#;
 const GENERAL_DISCOVERY_RULES: &str = "对于需要发现实际实现方式的任务，先读取目标自带的说明、声明、配置、入口和已有状态，由证据确定依赖、运行方式、构建方式、部署方式和验收标准。核心不提供任何领域工具或技术栈的默认方案；只能使用当前证据明确展示的能力。发现步骤的校验只确认证据可获得，不要把可选信息缺失判为失败。";
-const GENERAL_REQUIREMENT_SYSTEM: &str = "你是通用运维需求分类器，本阶段不生成计划。判断用户是仅需要不依赖当前环境的知识性回答，还是需要读取或改变真实目标环境。需要当前状态、真实数据或任何环境变更时必须返回 execute。结构化约束只能来自用户明确表达，不得猜测或自行增加。";
-const GENERAL_SUMMARY_SYSTEM: &str = "你是通用运维结果总结器。仅根据用户目标和脱敏的真实执行证据总结。结构化 result 和 evidence.facts 优先于预期文本和旧总结。有效的“未发现”、“非健康”或“警告”是观察结果，不等于命令执行失败。若存在关键失败且无后续证据证明目标已达成，必须明确说明任务未完成、最终阻断、已确认结果和尚未满足的目标。若目标已达成，必须直接给出用户所需的具体结果。不得把某个中间信号自动归因给目标对象，除非证据已建立关联。不得虚构、输出命令或泄露敏感信息。使用一至三段中文纯文本。";
+const GENERAL_REQUIREMENT_SYSTEM: &str = "你是通用运维需求分类与 Skill 编排器，本阶段不生成计划。判断用户是仅需要不依赖当前环境的知识性回答，还是需要读取或改变真实目标环境。需要当前状态、真实数据或任何环境变更时必须返回 execute。结构化约束只能来自用户明确表达，不得猜测或自行增加。对执行类需求，从系统提供的 Skill 目录自主选择所有必要 Skill，允许多个 Skill 联合完成同一目标；不得编造目录外 Skill。";
+const GENERAL_SUMMARY_SYSTEM: &str = "你是通用运维结果总结器。仅根据用户目标和脱敏的真实执行证据总结。结构化 result 和 evidence.facts 优先于预期文本和旧总结。有效的“未发现”、“非健康”或“警告”是观察结果，不等于命令执行失败。若存在关键失败且无后续证据证明目标已达成，必须明确说明任务未完成、最终阻断、已确认结果和尚未满足的目标。若目标已达成，必须直接给出用户所需的具体结果。启动信号或中间对象存在不等于业务目标完成，必须以真实退出状态和 Skill 要求的最终验收为准。不得把某个中间信号自动归因给目标对象，除非证据已建立关联。不得虚构、输出命令或泄露敏感信息。使用一至三段中文纯文本。";
 const GENERAL_REVIEW_SYSTEM: &str = "你是通用运维执行复核员。根据原始用户目标、executionConstraints、完整计划、已完成记录、当前步骤真实证据和剩余步骤，判断工作流应 continue、adjust 或 complete。只返回包含 decision、reason、summary 的 JSON 对象。不得把真实失败改写为成功，不得虚构证据、新命令或新的用户授权。当前异常若不阻断整体目标，或剩余计划有明确且符合约束的恢复路径，返回 continue；若已阻断目标、证据不足或剩余计划无法处理，返回 adjust；只有用户整体目标已被真实证据充分证明时才返回 complete。对只读发现，得到“不存在”或异常状态是有效结果，应根据剩余计划判断。对变更步骤，后置条件未满足时不得 complete。当 trigger 为长时间运行定期复核时，必须忽略后续步骤是否值得执行，只判断当前命令是否仍需等待：continue 只表示当前命令仍在运行且需继续等待；adjust 表示停止并调整；complete 仅在 periodicObservation.passed=true 时表示当前命令已可停止等待并进入正式校验。不得用“继续执行剩余步骤”作为 continue 的理由。安全拦截、用户审批、真实执行结果和程序门禁不可被覆盖。";
 const STRUCTURED_OUTPUT_ATTEMPTS: usize = 2;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AiPlanStep {
     #[serde(default)]
@@ -180,6 +186,19 @@ struct AiRequirementDecision {
     #[serde(rename = "terminalContextLines")]
     #[serde(default)]
     terminal_context_lines: usize,
+    #[serde(rename = "selectedSkillIds")]
+    selected_skill_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+struct ModelSkillDefinition {
+    id: String,
+    name: String,
+    description: String,
+    version: usize,
+    instructions: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -202,6 +221,50 @@ struct RequirementProcessingResult {
     constraints: Option<ExecutionConstraints>,
     #[serde(rename = "terminalContextLines")]
     terminal_context_lines: usize,
+    #[serde(rename = "selectedSkillIds")]
+    selected_skill_ids: Vec<String>,
+    #[serde(rename = "planError", skip_serializing_if = "Option::is_none")]
+    plan_error: Option<String>,
+}
+
+fn context_with_selected_skills(
+    context: &str,
+    skill_definitions: &[ModelSkillDefinition],
+    selected_skill_ids: &[String],
+) -> Result<String, String> {
+    let mut value: Value =
+        serde_json::from_str(context).map_err(|error| format!("Skill 选择上下文无效：{error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "Skill 选择上下文必须是 JSON 对象".to_string())?;
+    let definition_by_id: HashMap<&str, &ModelSkillDefinition> = skill_definitions
+        .iter()
+        .map(|skill| (skill.id.as_str(), skill))
+        .collect();
+    let selected = selected_skill_ids
+        .iter()
+        .map(|id| {
+            definition_by_id
+                .get(id.as_str())
+                .copied()
+                .ok_or_else(|| format!("模型选择了不在已启用目录中的 Skill：{id}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    object.remove("skillDirectory");
+    object.insert(
+        "skillSelection".to_string(),
+        json!({
+            "mode": "model",
+            "multiple": true,
+            "selectedSkillIds": selected_skill_ids,
+        }),
+    );
+    object.insert(
+        "activeSkills".to_string(),
+        serde_json::to_value(selected)
+            .map_err(|error| format!("Skill 上下文序列化失败：{error}"))?,
+    );
+    serde_json::to_string(&value).map_err(|error| format!("Skill 上下文序列化失败：{error}"))
 }
 
 fn normalize_execution_constraints(
@@ -284,6 +347,10 @@ fn unix_seconds() -> u64 {
         .as_secs()
 }
 
+fn is_model_tool_command(command: &str) -> bool {
+    command.split_whitespace().next() == Some("opsark-tool")
+}
+
 fn convert_ai_plan_steps(raw_steps: Vec<AiPlanStep>) -> Result<Vec<PlanStep>, String> {
     if raw_steps.is_empty() {
         return Err("模型计划至少需要一个步骤".into());
@@ -300,7 +367,9 @@ fn convert_ai_plan_steps(raw_steps: Vec<AiPlanStep>) -> Result<Vec<PlanStep>, St
                     index + 1
                 ));
             }
-            if matches!(validation.as_str(), "true" | ":" | "exit 0" | "/bin/true") {
+            if matches!(validation.as_str(), "true" | ":" | "exit 0" | "/bin/true")
+                && !is_model_tool_command(&command)
+            {
                 return Err(format!(
                     "第 {} 个计划步骤使用了无业务意义的 validation；必须用独立、只读且能验证 expected 的命令",
                     index + 1
@@ -376,6 +445,7 @@ fn validate_ai_plan_contract(
             settings.max_plan_steps.max(1)
         ));
     }
+    let mut commands = HashSet::new();
     for (index, item) in raw_steps.iter().enumerate() {
         let mut missing = Vec::new();
         if item.title.trim().is_empty() {
@@ -398,6 +468,34 @@ fn validate_ai_plan_contract(
                 "第 {} 个计划步骤缺少非空字段：{}",
                 index + 1,
                 missing.join("、")
+            ));
+        }
+        let command = item.command.trim();
+        if is_model_tool_command(command) && item.validation.trim() != "true" {
+            return Err(format!(
+                "第 {} 个模型工具步骤的 validation 必须固定为 true",
+                index + 1
+            ));
+        }
+        if !commands.insert(command) {
+            return Err(format!(
+                "第 {} 个计划步骤与前面步骤重复；请只保留一次必要操作",
+                index + 1
+            ));
+        }
+        if detaches_untracked_process(command) {
+            return Err(format!("第 {} 个计划步骤将进程脱离执行器跟踪；必须使用可跟踪的前台命令或受管服务，并获取真实退出状态", index + 1));
+        }
+        if masks_failure_status(command) || masks_failure_status(item.validation.trim()) {
+            return Err(format!(
+                "第 {} 个计划步骤掩盖了命令或校验的失败退出码；必须保留真实结果",
+                index + 1
+            ));
+        }
+        if detaches_untracked_process(item.validation.trim()) {
+            return Err(format!(
+                "第 {} 个计划步骤的 validation 脱离了执行器跟踪",
+                index + 1
             ));
         }
         if settings.limit_output
@@ -433,6 +531,111 @@ fn validate_ai_plan_contract(
         }
     }
     Ok(())
+}
+
+fn plan_repair_instruction(error: &str, previous_steps: Option<&[AiPlanStep]>) -> String {
+    let targeted = if error.contains("无业务意义的 validation") {
+        "上次计划把普通 Shell 步骤的 validation 写成了 true、:、exit 0 或 /bin/true。只有 command 以 opsark-tool 开头的模型工具步骤才允许 validation 为 true。请保留语义正确的 command，仅为每个普通 Shell 步骤生成独立、只读、能验证 expected 的 validation；不得用空操作代替校验。"
+    } else if error.contains("模型工具步骤的 validation 必须固定为 true") {
+        "上次计划中 command 以 opsark-tool 开头的步骤属于结构化工具调用。请保留其 command，将该步骤 validation 精确设为 true；普通 Shell 步骤仍必须使用独立只读校验。"
+    } else if error.contains("掩盖了命令或校验的失败退出码") {
+        "上次计划掩盖了真实失败退出码。请仅修复对应 command 或 validation，移除 || true、末尾 true、失败分支 exit 0 等掩盖逻辑，保留主命令的真实退出状态。"
+    } else if error.contains("将进程脱离执行器跟踪") {
+        "上次计划使用了未受管的后台运行方式。请仅修复对应步骤，改为执行器可跟踪到真实退出的前台命令，或使用环境已有的受管服务机制并独立验收。"
+    } else if error.contains("缺少非空字段") || error.contains("缺少非空 command 或 validation")
+    {
+        "上次计划存在必填字段缺失。请保留已经完整且正确的步骤和字段，只补齐错误所指的内容。"
+    } else if previous_steps.is_some() {
+        "请保留上次计划中已经符合用户目标和安全约束的步骤，仅修复错误指向的步骤或字段。"
+    } else {
+        "上次响应未产生可复用的完整步骤。请根据具体错误重新返回完整、必要且未截断的计划对象。"
+    };
+    let previous = previous_steps
+        .and_then(|steps| serde_json::to_string(&json!({ "steps": steps })).ok())
+        .map(|steps| format!("\n上次完整计划：\n{steps}"))
+        .unwrap_or_default();
+    format!(
+        "\n\n上次输出未通过计划校验：{error}。{targeted}\n修复后仍必须返回完整的 {{\"steps\":[...]}} JSON 对象，不得只返回差异或单个字段。{previous}"
+    )
+}
+
+fn detaches_untracked_process(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let has_disown = lower
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .any(|part| part == "disown");
+    if has_disown || lower.contains("setsid -f") || lower.contains("setsid --fork") {
+        return true;
+    }
+
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    let characters = lower.chars().collect::<Vec<_>>();
+    for (index, character) in characters.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if *character == '\\' && !single_quoted {
+            escaped = true;
+            continue;
+        }
+        if *character == '\'' && !double_quoted {
+            single_quoted = !single_quoted;
+            continue;
+        }
+        if *character == '"' && !single_quoted {
+            double_quoted = !double_quoted;
+            continue;
+        }
+        if *character != '&' || single_quoted || double_quoted {
+            continue;
+        }
+        let previous = index
+            .checked_sub(1)
+            .and_then(|offset| characters.get(offset))
+            .copied();
+        let next = characters.get(index + 1).copied();
+        if previous != Some('>')
+            && previous != Some('&')
+            && previous != Some('|')
+            && next != Some('&')
+            && next != Some('>')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn masks_failure_status(script: &str) -> bool {
+    let lower = script.trim().to_ascii_lowercase();
+    let without_trailing_separator = lower.trim_end_matches([';', '\n', '\r', ' ', '\t']);
+    if without_trailing_separator.ends_with("|| true")
+        || without_trailing_separator.ends_with("|| /bin/true")
+        || without_trailing_separator.ends_with("|| :")
+        || without_trailing_separator.ends_with("; true")
+        || without_trailing_separator.ends_with("\ntrue")
+    {
+        return true;
+    }
+    if lower.contains("set +e")
+        && (without_trailing_separator.ends_with("; exit 0")
+            || without_trailing_separator.ends_with("\nexit 0"))
+    {
+        return true;
+    }
+    if ["ssh ", "scp ", "rsync "]
+        .iter()
+        .any(|command| lower.contains(command))
+        && lower.contains("|| echo")
+    {
+        return true;
+    }
+    lower
+        .rsplit_once("||")
+        .is_some_and(|(_, failure_branch)| failure_branch.contains("exit 0"))
 }
 
 fn is_valid_empty_result(command: &str, status: i32, output: &str) -> bool {
@@ -630,9 +833,7 @@ async fn generate_ai_plan(
         let correction = if attempt == 0 {
             String::new()
         } else {
-            format!(
-                "\n\n上次输出未通过结构校验：{last_error}。请丢弃上次输出并重新返回完整对象，保持内容必要且完整，不得截断 JSON，逐步补齐所有必填字段。"
-            )
+            plan_repair_instruction(&last_error, last_repairable_steps.as_deref())
         };
         let mut body = json!({
             "model": model,
@@ -679,6 +880,7 @@ async fn generate_ai_plan(
         }
     }
     if let Some(raw_steps) = last_repairable_steps {
+        let mut fallback_commands = HashSet::new();
         let only_presentational_fields_missing = raw_steps.iter().all(|item| {
             !item.command.trim().is_empty()
                 && !item.validation.trim().is_empty()
@@ -686,6 +888,13 @@ async fn generate_ai_plan(
                     .risk
                     .as_deref()
                     .is_some_and(|value| matches!(value, "low" | "medium" | "high"))
+        });
+        let execution_fields_safe = raw_steps.iter().all(|item| {
+            fallback_commands.insert(item.command.trim())
+                && !detaches_untracked_process(item.command.trim())
+                && !detaches_untracked_process(item.validation.trim())
+                && !masks_failure_status(item.command.trim())
+                && !masks_failure_status(item.validation.trim())
         });
         let within_enabled_limits = !generation_settings.limit_output
             || (raw_steps.len() <= generation_settings.max_plan_steps.max(1)
@@ -700,12 +909,12 @@ async fn generate_ai_plan(
                         && item.validation.chars().count()
                             <= generation_settings.max_command_chars.max(1)
                 }));
-        if only_presentational_fields_missing && within_enabled_limits {
+        if only_presentational_fields_missing && execution_fields_safe && within_enabled_limits {
             return convert_ai_plan_steps(raw_steps);
         }
     }
     Err(format!(
-        "{last_error}（已要求模型按严格 JSON 格式重试一次）"
+        "{last_error}（已携带上一版计划和具体错误要求模型针对性修复一次）"
     ))
 }
 
@@ -716,6 +925,7 @@ async fn process_ai_requirement(
     model: String,
     requirement: String,
     context: String,
+    skill_definitions: Vec<ModelSkillDefinition>,
     generation_settings: Option<AiGenerationSettings>,
 ) -> Result<RequirementProcessingResult, String> {
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
@@ -738,7 +948,7 @@ async fn process_ai_requirement(
             ],
             "thinking": {"type": "disabled"},
             "response_format": {"type": "json_object"},
-            "max_tokens": 700
+            "max_tokens": 1200
         });
         let payload = post_model_request(&url, &api_key, &body, "需求理解", 45).await?;
         let parsed = message_content(&payload, "模型响应缺少需求理解结果").and_then(|content| {
@@ -751,26 +961,60 @@ async fn process_ai_requirement(
                 continue;
             }
         };
+        let available_skill_ids: HashSet<&str> = skill_definitions
+            .iter()
+            .map(|skill| skill.id.as_str())
+            .collect();
+        let unique_skill_ids: HashSet<&str> = decision
+            .selected_skill_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let skill_selection_error = if unique_skill_ids.len() != decision.selected_skill_ids.len() {
+            Some("selectedSkillIds 不得包含重复 ID".to_string())
+        } else if let Some(id) = decision
+            .selected_skill_ids
+            .iter()
+            .find(|id| !available_skill_ids.contains(id.as_str()))
+        {
+            Some(format!("selectedSkillIds 包含未启用或不存在的 Skill：{id}"))
+        } else {
+            None
+        };
         let contract_error = match decision.intent.as_str() {
-            "answer" if !decision.answer.trim().is_empty() && decision.constraints.is_null() && decision.terminal_context_lines == 0 => {
+            "answer"
+                if !decision.answer.trim().is_empty()
+                    && decision.constraints.is_null()
+                    && decision.terminal_context_lines == 0
+                    && decision.selected_skill_ids.is_empty() =>
+            {
                 None
             }
-            "answer" => Some("咨询类响应的 answer 必须是非空字符串".to_string()),
+            "answer" => {
+                Some("咨询类响应的 answer 必须是非空字符串且 selectedSkillIds 必须为空".to_string())
+            }
             "execute"
                 if decision.answer.trim().is_empty()
                     && serde_json::from_value::<ExecutionConstraints>(
                         decision.constraints.clone(),
                     )
-                    .is_ok() && decision.terminal_context_lines == 0 =>
+                    .is_ok()
+                    && decision.terminal_context_lines == 0
+                    && skill_selection_error.is_none() =>
             {
                 None
             }
-            "execute" => {
-                Some("执行类响应的 answer 必须为空字符串，constraints 必须包含合法字段".to_string())
+            "execute" => Some(skill_selection_error.unwrap_or_else(|| {
+                "执行类响应的 answer 必须为空字符串，constraints 必须包含合法字段".to_string()
+            })),
+            "terminal_context"
+                if decision.answer.trim().is_empty()
+                    && decision.constraints.is_null()
+                    && decision.selected_skill_ids.is_empty()
+                    && (1..=400).contains(&decision.terminal_context_lines) =>
+            {
+                None
             }
-            "terminal_context" if decision.answer.trim().is_empty()
-                && decision.constraints.is_null()
-                && (1..=400).contains(&decision.terminal_context_lines) => None,
             "terminal_context" => Some("终端上下文请求必须给出 1 到 400 行".to_string()),
             _ => Some("需求分类 intent 只能是 answer、execute 或 terminal_context".to_string()),
         };
@@ -790,6 +1034,8 @@ async fn process_ai_requirement(
             plan: Vec::new(),
             constraints: None,
             terminal_context_lines: 0,
+            selected_skill_ids: Vec::new(),
+            plan_error: None,
         });
     }
     if decision.intent == "terminal_context" {
@@ -799,29 +1045,42 @@ async fn process_ai_requirement(
             plan: Vec::new(),
             constraints: None,
             terminal_context_lines: decision.terminal_context_lines,
+            selected_skill_ids: Vec::new(),
+            plan_error: None,
         });
     }
 
+    let selected_skill_ids = decision.selected_skill_ids;
     let constraints = serde_json::from_value::<ExecutionConstraints>(decision.constraints)
         .map(Some)
         .map(normalize_execution_constraints)
         .map_err(|error| format!("需求分类 constraints 结构无效：{error}"))?;
-    let plan = generate_ai_plan(
+    let plan_context =
+        context_with_selected_skills(&context, &skill_definitions, &selected_skill_ids)?;
+    let plan_result = generate_ai_plan(
         api_key,
         endpoint,
         model,
         requirement,
-        context,
+        plan_context,
         generation_settings,
     )
-    .await
-    .map_err(|error| format!("需求已判定为执行类，但计划生成失败：{error}"))?;
+    .await;
+    let (plan, plan_error) = match plan_result {
+        Ok(plan) => (plan, None),
+        Err(error) => (
+            Vec::new(),
+            Some(format!("需求已判定为执行类，但计划生成失败：{error}")),
+        ),
+    };
     Ok(RequirementProcessingResult {
         intent: "execute".into(),
         answer: None,
         plan,
         constraints: Some(constraints),
         terminal_context_lines: 0,
+        selected_skill_ids,
+        plan_error,
     })
 }
 
@@ -945,6 +1204,7 @@ pub fn run() {
             write_sftp_file,
             upload_sftp_transfer,
             download_sftp_transfer,
+            transfer_sftp_between_servers,
             cancel_sftp_transfer,
             get_ssh_metrics,
             generate_ai_plan,

@@ -3,22 +3,7 @@ use ssh2::{FileStat, Sftp};
 use std::collections::HashSet;
 use std::path::{Component, Path};
 
-const DEFAULT_EXCLUDES: &[&str] = &[
-    ".git",
-    "node_modules",
-    "vendor",
-    "dist",
-    "build",
-    "target",
-    "coverage",
-    ".cache",
-    ".next",
-    ".nuxt",
-    ".venv",
-    "venv",
-    "__pycache__",
-    "logs",
-];
+const DEFAULT_EXCLUDES: &[&str] = &[];
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -282,7 +267,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validates_and_merges_excludes() {
+    fn validates_and_deduplicates_caller_excludes() {
         let options = validate_options(
             "/opt/app/".into(),
             vec!["uploads".into(), "storage/cache".into(), "uploads".into()],
@@ -293,7 +278,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(options.root_path, "/opt/app");
-        assert!(options.excludes.contains(&"node_modules".to_string()));
+        assert!(!options.excludes.contains(&"node_modules".to_string()));
         assert_eq!(
             options
                 .excludes

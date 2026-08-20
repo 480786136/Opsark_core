@@ -3,6 +3,9 @@ import {
   isReadOnlyDiagnosticStep,
   isReadOnlyStep,
 } from "@/features/agent/evidenceReview";
+import { defaultToolCatalog } from "@/features/tools/toolCatalog";
+import { parseToolCommand } from "@/features/tools/toolExecutor";
+import type { ToolDefinition } from "@/features/tools/types";
 import type { OpsTask, PlanStep } from "@/types";
 
 export type TaskProgression =
@@ -19,12 +22,31 @@ export function latestTaskRequirement(task: OpsTask) {
 }
 
 /**
- * Determines the next orchestration branch without mutating task state. A completed
- * read-only discovery round is refined once when the user still expects changes.
+ * Determines the next orchestration branch without mutating task state. Tool metadata
+ * and the active Skill decide whether another bounded evidence-driven stage is needed.
  */
-export function resolveTaskProgression(task: OpsTask): TaskProgression {
+export function resolveTaskProgression(
+  task: OpsTask,
+  tools: ToolDefinition[] = defaultToolCatalog,
+): TaskProgression {
   const pendingStep = task.plan.find((step) => step.status === "pending");
   if (pendingStep) return { kind: "execute-step", step: pendingStep };
+
+  const latestCompletedStep = [...task.plan].reverse().find((step) => step.status === "completed");
+  if (latestCompletedStep) {
+    try {
+      const call = parseToolCommand(latestCompletedStep.command, `progress-${latestCompletedStep.id}`);
+      const definition = call ? tools.find((tool) => tool.id === call.toolId) : undefined;
+      if (definition?.completionMode === "complete") return { kind: "complete" };
+      const refinementEnabled = definition?.refinementScope !== "active-skill"
+        || Boolean(task.activeSkillIds?.length);
+      if (definition?.completionMode === "refine" && refinementEnabled && (task.refinementCount ?? 0) < 8) {
+        return { kind: "refine-discovery" };
+      }
+    } catch {
+      // Invalid tool syntax is handled by step dispatch; progression remains generic.
+    }
+  }
 
   const discoveryOnly = task.plan.length > 0
     && task.plan.every((step) => step.status === "completed" && isReadOnlyDiagnosticStep(step));
