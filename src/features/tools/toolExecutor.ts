@@ -66,14 +66,73 @@ function parseServerConnectArguments(value: Record<string, unknown>): ServerConn
 export function parseToolCommand(command: string, callId: string): ToolCall | undefined {
   const match = command.trim().match(/^opsark-tool\s+([a-z0-9_.-]+)\s+([\s\S]+)$/i);
   if (!match) return undefined;
-  let jsonText = match[2].trim();
-  if ((jsonText.startsWith("'") && jsonText.endsWith("'"))
-    || (jsonText.startsWith('"') && jsonText.endsWith('"'))) {
-    jsonText = jsonText.slice(1, -1);
+  const argumentText = match[2].trim();
+  let parsed: unknown;
+  if (argumentText.startsWith("{") || argumentText.startsWith("[")
+    || ((argumentText.startsWith("'") && argumentText.endsWith("'"))
+      || (argumentText.startsWith('"') && argumentText.endsWith('"')))) {
+    let jsonText = argumentText;
+    if ((jsonText.startsWith("'") && jsonText.endsWith("'"))
+      || (jsonText.startsWith('"') && jsonText.endsWith('"'))) {
+      jsonText = jsonText.slice(1, -1);
+    }
+    parsed = JSON.parse(jsonText) as unknown;
+  } else {
+    parsed = parseCliToolArguments(argumentText);
   }
-  const parsed = JSON.parse(jsonText) as unknown;
   if (!isRecord(parsed)) throw new Error("工具命令参数必须是 JSON 对象");
   return { id: callId, toolId: match[1], arguments: parsed };
+}
+
+function parseCliToolArguments(text: string): Record<string, unknown> {
+  const tokens: string[] = [];
+  let token = "";
+  let quote = "";
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (quote) {
+      if (character === quote) quote = "";
+      else if (character === "\\" && quote === '"' && index + 1 < text.length) token += text[++index];
+      else token += character;
+    } else if (character === "'" || character === '"') {
+      quote = character;
+    } else if (/\s/.test(character)) {
+      if (token) tokens.push(token);
+      token = "";
+    } else {
+      token += character;
+    }
+  }
+  if (quote) throw new Error("工具命令参数包含未闭合的引号");
+  if (token) tokens.push(token);
+
+  const result: Record<string, unknown> = {};
+  for (let index = 0; index < tokens.length; index += 1) {
+    const option = tokens[index];
+    if (!option.startsWith("--") || option.length === 2) {
+      throw new Error(`工具命令参数必须使用 --key value 格式：${option}`);
+    }
+    const equalsIndex = option.indexOf("=");
+    const rawKey = option.slice(2, equalsIndex < 0 ? undefined : equalsIndex);
+    const key = rawKey.replace(/-([a-z])/g, (_, letter: string) => letter.toUpperCase());
+    if (!/^[A-Za-z][A-Za-z0-9]*$/.test(key)) throw new Error(`工具命令参数名无效：${rawKey}`);
+    if (Object.prototype.hasOwnProperty.call(result, key)) throw new Error(`工具命令参数重复：${rawKey}`);
+    let rawValue: string | undefined = equalsIndex < 0 ? undefined : option.slice(equalsIndex + 1);
+    if (rawValue === undefined && tokens[index + 1] && !tokens[index + 1].startsWith("--")) {
+      rawValue = tokens[++index];
+    }
+    result[key] = rawValue === undefined ? true : coerceCliToolValue(rawValue);
+  }
+  return result;
+}
+
+function coerceCliToolValue(value: string): unknown {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  if (value === "null") return null;
+  if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(value)) return Number(value);
+  if (value.startsWith("{") || value.startsWith("[")) return JSON.parse(value) as unknown;
+  return value;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

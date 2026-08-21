@@ -16,6 +16,25 @@ describe("tool executor", () => {
     expect(() => parseToolCommand("opsark-tool files.get_structure []", "call-3")).toThrow("JSON 对象");
   });
 
+  it("parses CLI-style tool arguments emitted by the planner", () => {
+    expect(parseToolCommand(
+      'opsark-tool server.resolve_connection --host "10.213.81.54" --port 22',
+      "call-cli-1",
+    )).toEqual({
+      id: "call-cli-1",
+      toolId: "server.resolve_connection",
+      arguments: { host: "10.213.81.54", port: 22 },
+    });
+    expect(parseToolCommand(
+      "opsark-tool files.get_structure --root-path=/opt/app --include-hidden false --max-depth 4",
+      "call-cli-2",
+    )?.arguments).toEqual({ rootPath: "/opt/app", includeHidden: false, maxDepth: 4 });
+    expect(() => parseToolCommand(
+      "opsark-tool server.resolve_connection --host one --host two",
+      "call-cli-3",
+    )).toThrow("参数重复");
+  });
+
   it("routes a validated file structure call", async () => {
     const getRemoteFileStructure = vi.fn().mockResolvedValue({
       rootPath: "/opt/app",

@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted } from "vue";
 import { RouterLink, RouterView, useRoute } from "vue-router";
-import { Boxes, BrainCircuit, KeyRound, LayoutDashboard, ScrollText, Settings, ShieldCheck, Sparkles, Wrench } from "lucide-vue-next";
+import { Boxes, BrainCircuit, KeyRound, LayoutDashboard, ScrollText, Settings, Sparkles, Wrench } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
+import opsarkLogo from "@/assets/opsark-logo.png";
 import AppearanceControls from "@/features/preferences/AppearanceControls.vue";
 import { useOpsStore } from "@/stores/ops";
 
@@ -28,7 +29,7 @@ onBeforeUnmount(() => document.removeEventListener("contextmenu", suppressBrowse
   <div class="app-shell">
     <aside class="app-rail">
       <RouterLink class="brand" to="/" title="Opsark">
-        <ShieldCheck :size="23" />
+        <img :src="opsarkLogo" alt="Opsark" />
       </RouterLink>
       <nav>
         <RouterLink to="/" :title="t('nav.servers')">

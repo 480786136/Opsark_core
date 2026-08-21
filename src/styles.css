@@ -88,6 +88,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .app-shell { display: flex; width: 100%; height: 100%; background: var(--bg); }
 .app-rail { width: 54px; flex: 0 0 54px; display: flex; flex-direction: column; align-items: center; border-right: 1px solid var(--border); background: var(--chrome); }
 .brand { width: 100%; height: 56px; display: grid; place-items: center; color: var(--accent); border-bottom: 1px solid var(--border); }
+.brand img { width: 30px; height: 30px; display: block; }
 .app-rail nav { display: flex; flex-direction: column; width: 100%; padding-top: 10px; gap: 4px; }
 .app-rail nav a { height: 42px; display: grid; place-items: center; color: var(--dim); border-left: 2px solid transparent; }
 .app-rail nav a:hover { color: var(--text); background: var(--panel-2); }
@@ -652,6 +653,9 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 
 /* SFTP 文件工作区 */
 .file-panel { position: relative; }
+.file-upload-dropzone { position: absolute; z-index: 12; inset: 43px 8px 31px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; pointer-events: none; border: 1px dashed var(--accent); border-radius: 7px; color: var(--accent); background: color-mix(in srgb, var(--terminal-bg) 88%, transparent); box-shadow: inset 0 0 36px var(--accent-soft); backdrop-filter: blur(3px); }
+.file-upload-dropzone strong { font-size: 11px; }
+.file-upload-dropzone small { max-width: calc(100% - 24px); overflow: hidden; color: var(--muted); font: 8px var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
 .path-bar { min-height: 34px; height: 34px; flex: 0 0 34px; padding: 0 8px; gap: 2px; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
 .path-bar button { min-width: 20px; width: auto; height: 23px; padding: 0 4px; border-radius: 3px; white-space: nowrap; }
 .path-bar button:hover { color: var(--text); background: #20252c; }
@@ -660,8 +664,9 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .file-table-viewport::-webkit-scrollbar { height: 7px; }
 .file-table-viewport::-webkit-scrollbar-thumb { border: 2px solid transparent; border-radius: 7px; background: var(--border); background-clip: padding-box; }
 .file-table-head, .file-list { width: max(100%, calc(var(--file-name-column) + var(--file-size-column) + var(--file-modified-column) + 62px)); }
-.file-table-head { min-height: 27px; padding: 0 7px 0 11px; flex: 0 0 27px; display: grid; grid-template-columns: minmax(var(--file-name-column), 1fr) var(--file-size-column) var(--file-modified-column) 53px; align-items: center; border-bottom: 1px solid var(--border-soft); color: #555e69; font-size: 7.5px; text-transform: uppercase; }
-.file-table-head button { position: relative; min-width: 0; height: 26px; padding: 0; display: flex; align-items: center; gap: 3px; border: 0; color: inherit; background: transparent; font-size: inherit; text-transform: inherit; cursor: pointer; }
+.file-table-head { min-height: 27px; padding: 0 7px 0 11px; flex: 0 0 27px; display: grid; grid-template-columns: minmax(var(--file-name-column), 1fr) var(--file-size-column) var(--file-modified-column) 25px; align-items: center; border-bottom: 1px solid var(--border-soft); color: #555e69; font-size: 7.5px; text-transform: uppercase; }
+.file-table-head button { position: relative; min-width: 0; height: 27px; padding: 0 7px; display: flex; align-items: center; justify-content: flex-start; gap: 3px; border: 1px solid var(--border-soft); border-bottom: 0; color: inherit; background: transparent; font-size: inherit; text-align: left; text-transform: inherit; cursor: pointer; }
+.file-table-head button + button { border-left: 0; }
 .file-column-resizer { position: absolute; z-index: 2; top: 4px; right: -3px; width: 7px; height: 18px; border-right: 1px solid transparent; cursor: col-resize; }
 .file-column-resizer:hover { border-right-color: var(--accent); }
 .file-table-head button:hover { color: #aeb5be; }
@@ -670,7 +675,8 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .file-view-toggle button + button { border-left: 1px solid var(--border); }
 .file-list:focus-visible { outline: 1px solid var(--accent-border); outline-offset: -1px; }
 .file-row-wrap { border-left: 2px solid transparent; }
-.file-row { height: 31px; padding: 0 60px 0 9px; display: grid; grid-template-columns: minmax(var(--file-name-column), 1fr) var(--file-size-column) var(--file-modified-column); align-items: center; gap: 0; }
+.file-row { height: 31px; padding: 0 32px 0 9px; display: grid; grid-template-columns: minmax(var(--file-name-column), 1fr) var(--file-size-column) var(--file-modified-column); align-items: center; gap: 0; text-align: left; }
+.file-row small { text-align: left; }
 .file-parent-row { width: 100%; flex: 0 0 31px; color: var(--muted); }
 .file-parent-row:hover { color: var(--text); background: var(--hover); cursor: default; }
 .file-parent-row .file-primary svg { color: var(--accent); }
@@ -780,10 +786,10 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .terminal-agent-mark.running { animation: pulse 1s infinite; filter: drop-shadow(0 0 4px var(--accent)); }
 .terminal-session-panel { position: relative; width: 100%; height: 100%; min-width: 0; min-height: 0; max-width: 100%; max-height: 100%; display: grid; grid-template-rows: minmax(0, 1fr); overflow: hidden; background: var(--terminal-bg); }
 .terminal-session-panel.active { box-shadow: inset 0 0 0 1px var(--accent-border); }
-.terminal-host { width: 100%; height: 100%; min-width: 0; min-height: 0; max-width: 100%; max-height: 100%; padding: 10px 8px 6px 12px; overflow: hidden; contain: size layout paint; background: var(--terminal-bg); }
-.terminal-host .xterm, .terminal-host .xterm-screen { max-width: 100%; max-height: 100%; }
-.terminal-host .xterm { width: 100%; height: 100%; overflow: hidden; }
-.terminal-host .xterm-viewport { width: 100% !important; height: 100% !important; max-width: 100%; max-height: 100%; overflow-y: auto !important; scrollbar-gutter: stable; }
+.terminal-host { width: 100%; height: 100%; min-width: 0; min-height: 0; max-width: 100%; max-height: 100%; padding: 0; overflow: hidden; contain: size layout paint; background: var(--terminal-bg); }
+.terminal-host .xterm, .terminal-host .xterm-screen { max-width: 100%; max-height: 100%; background: var(--terminal-bg); }
+.terminal-host .xterm { width: 100%; height: 100%; padding: 10px 8px 6px 12px; overflow: hidden; background: var(--terminal-bg); }
+.terminal-host .xterm-viewport { width: 100% !important; height: 100% !important; max-width: 100%; max-height: 100%; overflow-y: auto !important; scrollbar-gutter: stable; background: var(--terminal-bg) !important; }
 .terminal-pane-tools { position: absolute; z-index: 8; top: 8px; right: 12px; }
 .terminal-pane-tools-trigger { width: 29px; height: 27px; padding: 0; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 4px; color: var(--muted); background: color-mix(in srgb, var(--chrome) 90%, transparent); box-shadow: 0 5px 16px rgba(0, 0, 0, .24); cursor: pointer; backdrop-filter: blur(5px); }
 .terminal-pane-tools-trigger:hover, .terminal-pane-tools-trigger.active { color: var(--accent); border-color: var(--accent-border); background: var(--raised); }

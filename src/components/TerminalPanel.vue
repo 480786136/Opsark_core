@@ -566,9 +566,10 @@ function queueAgentPtyOutput(data: string) {
 }
 
 function remoteTerminalRows() {
-  // Keep the final PTY row clear of xterm's viewport rounding and scrollbar.
-  // Full-screen programs otherwise render their last row beneath the panel edge.
-  return Math.max(1, (terminal?.rows ?? 32) - 1);
+  // The remote PTY must use exactly the rows calculated by FitAddon. Sending
+  // one row less leaves xterm's final visible row outside the remote screen,
+  // which shifts the shell prompt and full-screen program footer upward.
+  return Math.max(1, terminal?.rows ?? 32);
 }
 
 async function reconnect() {

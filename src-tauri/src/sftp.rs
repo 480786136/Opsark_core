@@ -44,14 +44,17 @@ fn map_directory_entry(
     size: u64,
     modified: Option<u64>,
 ) -> Option<RemoteFileEntry> {
-    let name = entry_path.file_name()?.to_string_lossy().to_string();
+    // SFTP paths are always POSIX paths. `PathBuf` renders separators using the
+    // host OS, which previously leaked `\\` into remote paths on Windows.
+    let path = entry_path.to_string_lossy().replace('\\', "/");
+    let name = path.rsplit('/').find(|part| !part.is_empty())?.to_string();
     if matches!(name.as_str(), "." | "..") {
         return None;
     }
     let directory = is_directory(permission);
     Some(RemoteFileEntry {
         name,
-        path: entry_path.to_string_lossy().to_string(),
+        path,
         kind: if directory { "directory" } else { "file" }.into(),
         size: if directory {
             "—".into()
@@ -93,6 +96,17 @@ fn validate_upload_size(size: usize) -> Result<(), String> {
         return Err("首版上传限制为 20 MB".into());
     }
     Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn read_local_file_for_upload(path: String) -> Result<Vec<u8>, String> {
+    let metadata =
+        std::fs::metadata(&path).map_err(|error| format!("无法读取本地文件信息：{error}"))?;
+    if !metadata.is_file() {
+        return Err("只能拖放普通文件，暂不支持文件夹".into());
+    }
+    validate_upload_size(metadata.len() as usize)?;
+    std::fs::read(&path).map_err(|error| format!("无法读取本地文件：{error}"))
 }
 
 #[tauri::command(async)]
@@ -235,6 +249,15 @@ mod tests {
         assert_eq!(entries[0].size, "—");
         assert_eq!(entries[1].size, "5 B");
         assert_eq!(entries[1].modified, "12");
+    }
+
+    #[test]
+    fn serializes_remote_paths_with_posix_separators() {
+        let entry =
+            map_directory_entry(PathBuf::from(r"/boot/loader\entries"), 0o040755, 0, None).unwrap();
+
+        assert_eq!(entry.name, "entries");
+        assert_eq!(entry.path, "/boot/loader/entries");
     }
 
     #[test]

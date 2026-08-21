@@ -38,8 +38,11 @@ describe("skill registry", () => {
     expect(skill.id).toBe("file-transfer-integrity");
     expect(context[0].instructions).toContain("files.transfer_between_servers");
     expect(context[0].instructions).toContain("server.resolve_connection");
+    expect(context[0].instructions).toContain("优先在源服务器以前台 scp 直接传输");
+    expect(context[0].instructions).toContain("只有源服务器到目标服务器的网络确实不通");
+    expect(context[0].instructions).toContain("Opsark 已有证据证明能分别 SSH 连接源、目标两台服务器");
     expect(context[0].instructions).toContain("overwrite 默认为 false");
-    expect(context[0].instructions).toContain("复读 SHA-256 校验");
+    expect(context[0].instructions).toContain("在目标服务器独立读取最终文件的字节数和 SHA-256");
     expect(context[0].instructions).not.toContain("${secret.");
   });
 

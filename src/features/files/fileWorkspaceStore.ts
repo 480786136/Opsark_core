@@ -2,6 +2,7 @@ import { defineStore } from "pinia";
 import { backend, type RuntimeConnection } from "@/services/backend";
 import type { FileEntry } from "@/types";
 import { createFileMutationResult } from "./fileMutationResult";
+import { normalizeRemotePath } from "./remotePath";
 
 export type FileViewMode = "list" | "compact";
 export type DirectoryLoadErrorCode = "permission" | "disconnected" | "notFound" | "unknown";
@@ -64,7 +65,9 @@ export const useFileWorkspaceStore = defineStore("fileWorkspace", {
         const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}") as Partial<PersistedFileWorkspace>;
         if (parsed.viewMode === "list" || parsed.viewMode === "compact") this.viewMode = parsed.viewMode;
         for (const [serverId, path] of Object.entries(parsed.pathsByServer ?? {})) {
-          if (typeof path === "string" && path.startsWith("/")) this.restoredPathsByServer[serverId] = path;
+          if (typeof path === "string" && path.startsWith("/")) {
+            this.restoredPathsByServer[serverId] = normalizeRemotePath(path);
+          }
         }
       } catch {
         // 偏好损坏时使用列表视图，不影响远程文件数据。
@@ -103,24 +106,25 @@ export const useFileWorkspaceStore = defineStore("fileWorkspace", {
       connection: RuntimeConnection,
       path = "/",
     ): Promise<DirectoryLoadResult> {
+      const normalizedPath = normalizeRemotePath(path);
       const workspace = this.ensureServer(serverId);
       const requestVersion = workspace.requestVersion + 1;
       workspace.requestVersion = requestVersion;
       workspace.loading = true;
       try {
-        const files = await backend.listSftp(connection, path);
+        const files = await backend.listSftp(connection, normalizedPath);
         if (workspace.requestVersion !== requestVersion) return { ok: false, stale: true };
-        workspace.files = files;
-        workspace.currentPath = path;
-        workspace.lastSuccessfulPath = path;
+        workspace.files = files.map((file) => ({ ...file, path: normalizeRemotePath(file.path) }));
+        workspace.currentPath = normalizedPath;
+        workspace.lastSuccessfulPath = normalizedPath;
         workspace.failedPath = "";
         workspace.errorCode = undefined;
-        this.restoredPathsByServer[serverId] = path;
+        this.restoredPathsByServer[serverId] = normalizedPath;
         this.persistPreferences();
-        return { ok: true, path };
+        return { ok: true, path: normalizedPath };
       } catch (error) {
         if (workspace.requestVersion !== requestVersion) return { ok: false, stale: true };
-        workspace.failedPath = path;
+        workspace.failedPath = normalizedPath;
         workspace.errorCode = classifyDirectoryLoadError(error, true);
         return { ok: false, stale: false, error };
       } finally {

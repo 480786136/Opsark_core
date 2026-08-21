@@ -8,6 +8,8 @@
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "build:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows.ps1",
+    "build:macos": "bash scripts/build-macos.sh",
     "check": "vue-tsc --noEmit",
     "test": "vitest run"
   },

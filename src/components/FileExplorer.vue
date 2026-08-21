@@ -22,6 +22,8 @@ import {
   X,
 } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
+import { getCurrentWebview, type DragDropEvent } from "@tauri-apps/api/webview";
+import type { Event as TauriEvent, UnlistenFn } from "@tauri-apps/api/event";
 import {
   moveFileSelection,
   sortRemoteFiles,
@@ -42,6 +44,7 @@ import {
 import TransferQueuePanel from "@/features/files/TransferQueuePanel.vue";
 import { useTransferQueueStore } from "@/features/files/transferQueueStore";
 import { useOpsStore } from "@/stores/ops";
+import { backend, isTauri } from "@/services/backend";
 import type { FileEntry } from "@/types";
 import { useWorkspaceLinkStore } from "@/features/workspace/workspaceLinkStore";
 
@@ -66,6 +69,7 @@ const fileInput = ref<HTMLInputElement>();
 const nameInput = ref<HTMLInputElement>();
 const pathInput = ref<HTMLInputElement>();
 const fileList = ref<HTMLElement>();
+const filePanel = ref<HTMLElement>();
 const editingPath = ref(false);
 const pathDraft = ref("");
 const columnWidths = ref({ name: 160, size: 52, modified: 74 });
@@ -77,6 +81,8 @@ const dialogError = ref("");
 const operationError = ref("");
 const operationPending = ref(false);
 const transferQueueOpen = ref(false);
+const uploadDragDepth = ref(0);
+let nativeDropUnlisten: UnlistenFn | undefined;
 fileWorkspace.hydrate();
 fileWorkspace.ensureServer(props.serverId);
 
@@ -84,6 +90,7 @@ const fileState = computed(() => fileWorkspace.serverWorkspaces[props.serverId])
 const currentPath = computed(() => fileState.value.currentPath);
 const breadcrumbs = computed(() => buildRemoteBreadcrumbs(currentPath.value));
 const isLive = computed(() => store.connectedServerIds.includes(props.serverId));
+const draggingUpload = computed(() => isLive.value && uploadDragDepth.value > 0);
 const sortedFiles = computed(() => sortRemoteFiles(fileState.value.files, sort.value));
 const selectedSet = computed(() => new Set(selection.value.selectedPaths));
 const serverTransferCount = computed(() => transferQueue.tasks.filter(({ serverId }) => serverId === props.serverId).length);
@@ -323,23 +330,103 @@ function recordFileMutation(result: FileMutationResult) {
 
 async function handleUpload(event: Event) {
   const input = event.target as HTMLInputElement;
-  const file = input.files?.[0];
+  const files = [...(input.files ?? [])];
   input.value = "";
-  if (!file) return;
+  await uploadFiles(files);
+}
+
+async function uploadFiles(files: File[]) {
+  if (!isLive.value || !files.length) return;
   operationError.value = "";
-  if (file.size > 20 * 1024 * 1024) {
-    operationError.value = t("files.uploadLimit");
+  const existingNames = new Set(fileState.value.files.map(({ name }) => name));
+  let conflictingFile: File | undefined;
+  let oversized = false;
+  for (const file of files) {
+    if (file.size > 20 * 1024 * 1024) {
+      oversized = true;
+      continue;
+    }
+    if (existingNames.has(file.name)) {
+      conflictingFile ??= file;
+      continue;
+    }
+    try {
+      await queueUpload(file);
+      existingNames.add(file.name);
+    } catch (error) {
+      operationError.value = String(error);
+    }
+  }
+  if (oversized) operationError.value = t("files.uploadLimit");
+  if (conflictingFile) openDialog("overwrite", undefined, conflictingFile);
+}
+
+function isFileDrag(event: DragEvent) {
+  return [...(event.dataTransfer?.types ?? [])].includes("Files");
+}
+
+function handleUploadDragEnter(event: DragEvent) {
+  if (!isLive.value || !isFileDrag(event)) return;
+  uploadDragDepth.value += 1;
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+}
+
+function handleUploadDragOver(event: DragEvent) {
+  if (!isLive.value || !isFileDrag(event)) return;
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+}
+
+function handleUploadDragLeave(event: DragEvent) {
+  if (!isFileDrag(event)) return;
+  uploadDragDepth.value = Math.max(0, uploadDragDepth.value - 1);
+}
+
+function handleUploadDrop(event: DragEvent) {
+  uploadDragDepth.value = 0;
+  if (!isLive.value) return;
+  void uploadFiles([...(event.dataTransfer?.files ?? [])]);
+}
+
+function isNativeDropInsidePanel(event: Extract<DragDropEvent, { position: unknown }>) {
+  const rect = filePanel.value?.getBoundingClientRect();
+  if (!rect) return false;
+  const scale = window.devicePixelRatio || 1;
+  const x = event.position.x / scale;
+  const y = event.position.y / scale;
+  return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+}
+
+function localFileName(path: string) {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? "upload";
+}
+
+async function uploadNativePaths(paths: string[]) {
+  const files: File[] = [];
+  operationError.value = "";
+  for (const path of paths) {
+    try {
+      const data = await backend.readLocalFileForUpload(path);
+      files.push(new File([data], localFileName(path)));
+    } catch (error) {
+      operationError.value = String(error);
+    }
+  }
+  await uploadFiles(files);
+}
+
+function handleNativeDragDrop({ payload: event }: TauriEvent<DragDropEvent>) {
+  if (!isLive.value) {
+    uploadDragDepth.value = 0;
     return;
   }
-  if (fileState.value.files.some((entry) => entry.name === file.name)) {
-    openDialog("overwrite", undefined, file);
+  if (event.type === "leave") {
+    uploadDragDepth.value = 0;
     return;
   }
-  try {
-    await queueUpload(file);
-  } catch (error) {
-    operationError.value = String(error);
-  }
+  const inside = isNativeDropInsidePanel(event);
+  uploadDragDepth.value = inside && event.type !== "drop" ? 1 : 0;
+  if (inside && event.type === "drop") void uploadNativePaths(event.paths);
 }
 
 async function download(entry: FileEntry) {
@@ -422,11 +509,24 @@ onMounted(() => {
   document.addEventListener("pointerdown", closeContextMenu);
   if (isLive.value) void loadDirectory(currentPath.value);
 });
-onBeforeUnmount(() => document.removeEventListener("pointerdown", closeContextMenu));
+onMounted(async () => {
+  if (isTauri()) nativeDropUnlisten = await getCurrentWebview().onDragDropEvent(handleNativeDragDrop);
+});
+onBeforeUnmount(() => {
+  document.removeEventListener("pointerdown", closeContextMenu);
+  nativeDropUnlisten?.();
+});
 </script>
 
 <template>
-  <section class="work-panel file-panel">
+  <section
+    ref="filePanel"
+    class="work-panel file-panel"
+    @dragenter.prevent="handleUploadDragEnter"
+    @dragover.prevent="handleUploadDragOver"
+    @dragleave.prevent="handleUploadDragLeave"
+    @drop.prevent="handleUploadDrop"
+  >
     <header class="panel-header">
       <div class="file-panel-title"><span class="eyebrow">SFTP</span><strong>{{ t("files.title") }}</strong></div>
       <div class="header-actions">
@@ -437,9 +537,14 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeContextMe
         <button type="button" :title="t('files.transfers')" :class="{ active: transferQueueOpen }" @click="transferQueueOpen = !transferQueueOpen">
           <ArrowUpDown :size="15" /><i v-if="serverTransferCount">{{ serverTransferCount }}</i>
         </button>
-        <input ref="fileInput" class="hidden-file-input" type="file" @change="handleUpload" />
+        <input ref="fileInput" class="hidden-file-input" type="file" multiple @change="handleUpload" />
       </div>
     </header>
+    <div v-if="draggingUpload" class="file-upload-dropzone" role="status">
+      <Upload :size="28" />
+      <strong>{{ t("files.dropToUpload") }}</strong>
+      <small>{{ currentPath }}</small>
+    </div>
     <nav class="path-bar" :aria-label="t('files.title')">
       <button type="button" :title="t('files.goUp')" :disabled="currentPath === '/'" @click="goUp"><ChevronLeft :size="14" /></button>
       <form v-if="editingPath" class="path-editor" @submit.prevent="submitPath">
@@ -489,8 +594,6 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeContextMe
           </button>
           <div v-if="isLive" class="file-actions">
             <button v-if="file.kind === 'file'" type="button" :title="t('files.download')" @click.stop="download(file)"><Download :size="12" /></button>
-            <button type="button" :title="t('files.rename')" @click.stop="openDialog('rename', file)"><Pencil :size="12" /></button>
-            <button type="button" :title="t('files.remove')" @click.stop="openDialog('delete', file)"><Trash2 :size="12" /></button>
           </div>
         </div>
       </template>

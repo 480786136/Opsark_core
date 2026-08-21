@@ -220,6 +220,12 @@ export const backend = {
     await invoke("write_sftp_file", { ...connection, path, data: Array.from(data) });
   },
 
+  async readLocalFileForUpload(path: string) {
+    if (!isTauri()) return requireDesktopRuntime("读取拖放文件");
+    const bytes = await invoke<number[]>("read_local_file_for_upload", { path });
+    return new Uint8Array(bytes);
+  },
+
   async uploadSftpTransfer(
     connection: RuntimeConnection,
     transferId: string,

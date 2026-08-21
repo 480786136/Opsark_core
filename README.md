@@ -56,7 +56,12 @@ npm run tauri build -- --debug --no-bundle
 cargo test --manifest-path src-tauri/Cargo.toml --lib live_tests::generate_live_deepseek_plan -- --ignored --exact
 cargo test --manifest-path src-tauri/Cargo.toml --lib live_tests::probe_live_ssh_adapter -- --ignored --exact
 ```
+## 打包构建
 
+npm install
+npm run build:windows
+
+npm run build:macos
 ## 演示流程
 
 1. 在“服务器”页面打开预置的 `生产环境 · Web-01`。

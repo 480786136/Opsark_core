@@ -31,8 +31,8 @@ use json_contract::{parse_model_array_field, parse_model_json};
 use metrics::{get_realtime_metrics, get_ssh_metrics};
 use model::{check_model_availability, message_content, post_model_request};
 use sftp::{
-    create_sftp_directory, delete_sftp_entry, list_sftp_directory, read_sftp_file,
-    rename_sftp_entry, write_sftp_file,
+    create_sftp_directory, delete_sftp_entry, list_sftp_directory, read_local_file_for_upload,
+    read_sftp_file, rename_sftp_entry, write_sftp_file,
 };
 use sftp_transfer::{
     cancel_sftp_transfer, download_sftp_transfer, transfer_sftp_between_servers,
@@ -1201,6 +1201,7 @@ pub fn run() {
             rename_sftp_entry,
             delete_sftp_entry,
             read_sftp_file,
+            read_local_file_for_upload,
             write_sftp_file,
             upload_sftp_transfer,
             download_sftp_transfer,

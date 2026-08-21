@@ -10,6 +10,7 @@ import {
 describe("remotePath", () => {
   it("规范化并拼接 POSIX 路径", () => {
     expect(normalizeRemotePath("//var/./www/../log/")).toBe("/var/log");
+    expect(normalizeRemotePath(String.raw`/boot/loader\entries`)).toBe("/boot/loader/entries");
     expect(joinRemotePath("/var/www/", "release")).toBe("/var/www/release");
     expect(parentRemotePath("/var/www")).toBe("/var");
     expect(parentRemotePath("/")).toBe("/");
