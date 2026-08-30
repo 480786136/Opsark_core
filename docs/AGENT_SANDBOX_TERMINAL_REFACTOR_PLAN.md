@@ -1,7 +1,7 @@
 # Agent 沙箱终端与执行链路整体优化计划
 
 > 制定日期：2026-08-29
-> 当前状态：代码实施、自动化验收、真实 SSH/PTY/SFTP、双会话隔离、Shell 启动事务及 Opsark UI 主路径验收已完成；Git 私库凭据、真实断线恢复和发布观察期仍在进行
+> 当前状态：代码实施、自动化验收、真实 SSH/PTY/SFTP、双会话隔离、Shell 启动事务、Opsark UI 主路径及 v0.2.0 版本点已完成；Git 私库凭据、真实断线恢复和发布观察期仍在进行
 > 适用范围：Opsark Core 远程 Shell、Agent 执行、验收证据、任务编排、Skill 路由和完全托管恢复链路
 
 ## 0. 实施进度
@@ -11,7 +11,7 @@
 | 2026-08-29 | 基线 | 已完成 | 确认生产时序为 `ops.ts -> terminalSessionStore -> TerminalPanel -> 用户 PTY`；确认后端已有独立 SSH exec 备用通道 | 终端相关 4 个测试文件、35 项用例通过 |
 | 2026-08-29 | 阶段 0 | 已完成 | 建立 ADR-001 和 `agentSandboxTerminalV1` 开关；默认使用沙箱通道，回滚仅能切到独立无状态 SSH exec，不允许切回用户 PTY；已勘误两份历史文档 | 阶段 0 相关 4 个测试文件、35 项用例通过；`vue-tsc --noEmit` 通过；`git diff --check` 通过 |
 | 2026-08-29 | 阶段 1–2 | 已完成 | 增加作用域、AgentSession、证据和 Rust `AgentTerminalManager`；实现可选计划作用域/上下文协议、真实退出码、流式输出、进程组中断和凭据提示通道 | Rust 库测试现为 76 项通过、2 项真实环境测试按设计忽略 |
-| 2026-08-29 | 阶段 3–4 | 代码完成 | 新增独立 Agent 终端 UI/状态库；主命令、validation、取消、长任务、`server.connect` 和凭据解锁已路由到显式 execution target | 前端全量测试、生产构建和真实 SSH 底层链路通过；Opsark UI 串行人工验收待执行 |
+| 2026-08-29 | 阶段 3–4 | 主路径完成 | 新增独立 Agent 终端 UI/状态库；主命令、validation、取消、长任务、`server.connect` 和凭据解锁已路由到显式 execution target | 前端全量测试、生产构建、真实 SSH 底层链路和 Opsark UI 默认沙箱主路径通过；真实 transport 故障注入仍在观察 |
 | 2026-08-29 | 阶段 5–6 | 已完成 | 实现结构化 Shell 上下文、fresh shell 作用域、执行器快照/自动回滚事务、scope evidence 和当前轮次总结 | Shell/scope/ledger 单元测试和 TypeScript 检查通过 |
 | 2026-08-29 | 阶段 7–8 | 已完成 | Skill 允许零匹配；风险改为结构化变更语义；收口单一托管调度器；长任务加入 CPU/IO/子进程进展采样 | 托管竞态、风险、长任务回归通过 |
 | 2026-08-29 | 阶段 9 | 已完成 | 生产代码移除 READY/BEGIN/END、Agent 命令槽、用户键盘锁和 pane target 推断；用户 `TerminalPanel` 恢复为纯用户 Shell | 生产源码全局搜索无 Agent 注入调用；迁移测试通过 |
@@ -22,12 +22,13 @@
 | 2026-08-30 | Shell 启动事务与回归补齐 | 已完成 | 新增 `.bash_profile` 抢占 `.profile` 的 fresh login shell 回归；真实服务器上对既有 `/root/.bashrc`、`/root/.profile` 错误 `[-s` 做快照、原子最小修复和全新 SSH 登录验收 | 新回归通过；全新登录无报错，NVM `0.40.7`、Node `v22.23.2`、npm `10.9.8` 自动可用；原会话仍保持未加载状态；两个备份文件保留在服务器 |
 | 2026-08-30 | Opsark UI 主路径 | 已完成 | 在真实 Tauri 开发构建中连接 `192.168.1.237`；默认开关创建可见 Agent 沙箱终端；两个独立目标分别形成独立任务和 Agent 标签；完全托管自动批准只读计划；关闭服务器工作台标签后 30 秒 Agent 任务继续完成 | 主机名/Git 只读任务退出码 0；长任务连续输出 6 个时间点并以 `OPSARK_UI_LONG_DONE` 收口；重新进入工作台后输出、结果和隔离作用域均完整可见，未出现“生成调整方案”按钮 |
 | 2026-08-30 | v0.2.0 发布候选 | 观察中 | 应用版本提升到 `0.2.0`；基线提交 `da2271d` 已建立 `opsark-pre-agent-sandbox-v0.1.0` 回滚标签；新版本提交后建立 `opsark-v0.2.0-agent-sandbox` 标签；功能开关关闭仍回退到独立无状态 SSH exec | 原生 release 构建和 `Opsark.app` 打包通过；观察期从 v0.2.0 提交与标签创建后开始；不得在单次验收会话中伪造“一个完整版本观察期已结束” |
+| 2026-08-30 | UI transport 故障注入 | 本机授权阻塞 | 已建立独立控制 SSH，会话侧确认不存在既有 `sshd: root@notty`，准备仅终止测试任务新建的非 PTY 连接；未重启 SSH 服务、未终止用户 PTY、未产生远端变更 | v0.2.0 重编译后 macOS 要求重新授权开发版读取登录钥匙串中的 `com.opsark.desktop` 凭据；缺少 macOS 登录钥匙串授权时不得猜测密码或绕过系统 ACL，因此未启动故障命令，场景 6、7保持待验收 |
 
 进度记录约定：只有代码、测试和文档三者中适用的验收条件都已满足，才将清单标记为完成；已有实现也必须经过本次回归确认。
 
 当前 Vitest 中的 16 项 `skip` 是阶段 0 保留的旧共用 PTY 行为基线，它们引用的生产 API 已删除，不属于新架构未通过用例。Rust 的 2 项 `ignored` 分别需要显式提供真实模型 Key 和 SSH 凭据。
 
-用户已在 2026-08-30 明确授权 `192.168.1.237` 作为测试服务器，并通过会话提供 SSH 凭据；凭据未写入命令、URL、脚本或本文档。首次探测曾因执行环境网络暂不可达而超时，网络恢复后已经完成 SSH/PTY/SFTP、双会话隔离、关闭用户会话后的长任务存活、Shell 启动事务以及真实 Opsark UI 主路径验收。尚未完成的是需要独立 Gitee 凭据的私库重新克隆、真实传输断线/恢复注入、完全托管三轮异常续接的 UI 观察，以及一个完整版本的发布观察期。
+用户已在 2026-08-30 明确授权 `192.168.1.237` 作为测试服务器，并通过会话提供 SSH 凭据；凭据未写入命令、URL、脚本或本文档。首次探测曾因执行环境网络暂不可达而超时，网络恢复后已经完成 SSH/PTY/SFTP、双会话隔离、关闭用户会话后的长任务存活、Shell 启动事务以及真实 Opsark UI 主路径验收。尚未完成的是需要独立 Gitee 凭据的私库重新克隆、需要 macOS 重新授权开发版读取 Opsark 钥匙串凭据后才能进行的真实传输断线/恢复注入、完全托管三轮异常续接的 UI 观察，以及一个完整版本的发布观察期。
 
 测试服务器的 `/opt/ground_check` 已确认是完整 Git 工作树，origin 为 `https://gitee.com/songpenley/ground_check.git`，HEAD 为 `e3117df98bbde8a85f2faaf700fd3713379cc8ad`；这只证明现有仓库状态，不替代私有仓库凭据注入和原子克隆验收。服务器 SSH 密码不能作为 Gitee 凭据使用。
 
@@ -594,6 +595,7 @@ type ChangeOperation =
 | NVM 与 Shell 启动配置事务 | 自动回归补齐 `.bash_profile` 抢占 `.profile`；真实服务器既有 `[-s` 已经快照、原子修正并通过全新 SSH 登录验收。原用户 Shell 未被错误宣称已加载 NVM | “故意写坏后自动回滚”已有执行链路自动测试；如需 UI 人工复测，使用专用测试账号或临时 HOME，避免再次破坏 root 登录环境 |
 | 完全托管三轮续接、新独立目标 | 新独立目标 UI 验收通过：两个目标分别形成独立任务与 Agent 标签，旧主机名/Git 证据未污染长任务总结；三轮异常续接仍只有自动化覆盖 | 在发布观察期内使用可控、无破坏性的故障注入复测场景 8；不得为凑轮次制造服务器破坏 |
 | Opsark UI 默认沙箱主路径 | 已通过；两个独立目标分别创建独立任务和独立 Agent 标签，完全托管自动批准只读计划；关闭服务器工作台标签不影响正在执行的 30 秒任务 | 保持 v0.2.0 观察；异常三轮续接和 transport 故障注入仍单列观察，不用正常成功任务替代 |
+| Opsark UI transport 故障注入 | 已完成安全前置检查，但命令未启动；测试控制 SSH 可用，远端当时无既有 `sshd: root@notty`，因此具备精确识别新 Agent 连接的条件 | 先在 macOS 系统弹窗中由用户授权重编译后的 Opsark 读取登录钥匙串，再执行场景 6、7；不能使用测试服务器 root 密码代替 macOS 登录钥匙串密码 |
 
 本轮对测试服务器产生的持久变更仅是修复 `/root/.bashrc` 和 `/root/.profile` 中已有的 `[-s` 错误；原文件保留为 `/root/.bashrc.opsark-agent-20260830-shell-fix.bak` 和 `/root/.profile.opsark-agent-20260830-shell-fix.bak`。SFTP 集成测试的临时目录已清理，其他验收均为只读或会话内临时状态。
 
@@ -602,10 +604,11 @@ type ChangeOperation =
 - 发布候选：`0.2.0`。
 - 原生候选包：`src-tauri/target/release/bundle/macos/Opsark.app`，`tauri build --bundles app` 已通过。
 - 重构前回滚标签：`opsark-pre-agent-sandbox-v0.1.0`，指向 `da2271d`。
-- 重构版本标签：`opsark-v0.2.0-agent-sandbox`，指向本计划的发布提交。
+- 重构版本提交：`7fa3ab21c4306cc8c6f381a7127e484788ba2eb9`（`refactor: isolate agent execution in sandbox terminals`）。
+- 重构版本标签：`opsark-v0.2.0-agent-sandbox`，指向 `7fa3ab21c4306cc8c6f381a7127e484788ba2eb9`。
 - 通道快速回滚：将 `opsark.feature.agentSandboxTerminalV1` 设为 `0`，仅回退到独立无状态 SSH exec；禁止恢复用户 PTY 注入。
 - 已通过观察：真实 SSH/PTY/SFTP、双会话隔离、关闭用户工作台后的长任务存活、Shell 启动事务、独立目标任务隔离、Agent 标签隔离和完全托管成功主路径。
-- 观察中：真实 transport 断线前/后恢复、Git 私库凭据注入、三轮连续异常调整，以及 v0.2.0 一个完整版本周期内的崩溃、无效人工按钮、重复执行和凭据泄漏监测。
+- 观察中：真实 transport 断线前/后恢复、Git 私库凭据注入、三轮连续异常调整，以及 v0.2.0 一个完整版本周期内的崩溃、无效人工按钮、重复执行和凭据泄漏监测。transport 注入当前受 macOS 对重编译开发版的登录钥匙串重新授权阻塞，不属于测试服务器认证失败。
 
 ## 13. 回滚策略
 
