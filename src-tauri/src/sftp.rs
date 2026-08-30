@@ -18,6 +18,13 @@ pub(crate) struct RemoteFileEntry {
     modified: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteFilePrefix {
+    data: Vec<u8>,
+    total_bytes: u64,
+}
+
 fn open_sftp(host: &str, port: u16, username: &str, password: &str) -> Result<Sftp, String> {
     connect_ssh(host, port, username, password)?
         .sftp()
@@ -94,6 +101,13 @@ fn validate_download_size(size: u64) -> Result<(), String> {
 fn validate_upload_size(size: usize) -> Result<(), String> {
     if size > MAX_TRANSFER_SIZE {
         return Err("首版上传限制为 20 MB".into());
+    }
+    Ok(())
+}
+
+fn validate_content_read_size(size: usize) -> Result<(), String> {
+    if !(1..=262_144).contains(&size) {
+        return Err("文件内容读取上限必须介于 1 到 262144 字节".into());
     }
     Ok(())
 }
@@ -204,6 +218,32 @@ pub(crate) fn read_sftp_file(
 }
 
 #[tauri::command(async)]
+pub(crate) fn read_sftp_file_prefix(
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    path: String,
+    max_bytes: usize,
+) -> Result<RemoteFilePrefix, String> {
+    validate_content_read_size(max_bytes)?;
+    let sftp = open_sftp(&host, port, &username, &password)?;
+    let mut file = sftp
+        .open(Path::new(&path))
+        .map_err(|error| format!("打开远程文件失败：{error}"))?;
+    let total_bytes = file
+        .stat()
+        .map_err(|error| error.to_string())?
+        .size
+        .unwrap_or(0);
+    let mut data = Vec::with_capacity(max_bytes.min(total_bytes as usize));
+    file.take(max_bytes as u64)
+        .read_to_end(&mut data)
+        .map_err(|error| format!("读取远程文件失败：{error}"))?;
+    Ok(RemoteFilePrefix { data, total_bytes })
+}
+
+#[tauri::command(async)]
 pub(crate) fn write_sftp_file(
     host: String,
     port: u16,
@@ -279,5 +319,9 @@ mod tests {
         assert!(validate_upload_size(MAX_TRANSFER_SIZE).is_ok());
         assert!(validate_download_size(MAX_TRANSFER_SIZE as u64 + 1).is_err());
         assert!(validate_upload_size(MAX_TRANSFER_SIZE + 1).is_err());
+        assert!(validate_content_read_size(1).is_ok());
+        assert!(validate_content_read_size(262_144).is_ok());
+        assert!(validate_content_read_size(0).is_err());
+        assert!(validate_content_read_size(262_145).is_err());
     }
 }

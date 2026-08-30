@@ -14,11 +14,12 @@ describe("secret tool", () => {
 
   it("redacts known values and credential-shaped output", () => {
     const output = redactExecutionOutput(
-      "token=known-value\nurl=https://host/path?password=visible",
+      "token=known-value\nurl=https://host/path?password=visible\n\"apiKey\": \"json-visible\"",
       { TOKEN: "known-value" },
     );
     expect(output).not.toContain("known-value");
     expect(output).not.toContain("visible");
+    expect(output).not.toContain("json-visible");
     expect(output).toContain("••••••••");
   });
 });

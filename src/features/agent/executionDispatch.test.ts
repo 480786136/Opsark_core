@@ -17,6 +17,17 @@ describe("execution dispatch", () => {
     });
   });
 
+  it("rejects a tool forbidden by the active Skill before dispatch", () => {
+    const decision = resolveStepDispatch({
+      command: 'opsark-tool server.resolve_connection {"host":"gitee.com","port":443}',
+    }, [], "call-forbidden", undefined, [], ["server.resolve_connection", "server.connect"]);
+
+    expect(decision).toEqual({
+      kind: "invalid",
+      error: "当前激活 Skill 禁止调用工具：server.resolve_connection",
+    });
+  });
+
   it("returns a protocol error instead of throwing", () => {
     const decision = resolveStepDispatch({
       command: "opsark-tool files.get_structure []",
@@ -24,6 +35,17 @@ describe("execution dispatch", () => {
 
     expect(decision.kind).toBe("invalid");
     if (decision.kind === "invalid") expect(decision.error).toContain("JSON 对象");
+  });
+
+  it("rejects server.connect before execution when username or credential reference is missing", () => {
+    const decision = resolveStepDispatch({
+      command: "opsark-tool server.connect --host 192.168.1.237 --passwordSecretKey TARGET_SSH_PASSWORD",
+    }, [], "call-connect-invalid");
+
+    expect(decision).toMatchObject({ kind: "invalid" });
+    if (decision.kind === "invalid") {
+      expect(decision.error).toContain("同时提供 username 和 passwordSecretKey");
+    }
   });
 
   it("selects the first unconfirmed secret", () => {
@@ -49,5 +71,23 @@ describe("execution dispatch", () => {
     }, ["TOKEN"], "call-4");
 
     expect(decision).toEqual({ kind: "command" });
+  });
+
+  it("fails closed instead of injecting a user_action into the user shell", () => {
+    expect(resolveStepDispatch({
+      command: "source ~/.bashrc",
+      executionScope: "user_action",
+    }, [], "call-user-action")).toEqual({
+      kind: "invalid",
+      error: "user_action 只能由用户在自己的 Shell 中完成，Agent 拒绝自动执行",
+    });
+  });
+
+  it("reuses an available server secret across tasks and checks validation placeholders", () => {
+    expect(resolveStepDispatch({
+      command: "deploy",
+      validation: "verify --token ${secret.SAVED_TOKEN}",
+    }, [], "call-server-secret", undefined, ["SAVED_TOKEN"]))
+      .toEqual({ kind: "command" });
   });
 });

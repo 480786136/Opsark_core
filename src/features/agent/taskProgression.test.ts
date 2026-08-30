@@ -65,7 +65,7 @@ describe("taskProgression", () => {
   it("treats a completed user-input tool as discovery evidence", () => {
     const current = task([step({
       title: "Need parameters",
-      command: 'opsark-tool user.request_input {"title":"Deploy","fields":[]}',
+      command: 'opsark-tool user.request_input {"title":"Deploy","fields":[{"key":"PORT","label":"服务端口","description":"项目对外监听端口","type":"number","required":true}]}',
     })]);
     expect(resolveTaskProgression(current)).toEqual({ kind: "refine-discovery" });
   });
@@ -73,7 +73,7 @@ describe("taskProgression", () => {
   it("refines after a terminal tool when its catalog metadata requires follow-up", () => {
     const current = task([step({
       title: "连接并切换服务器",
-      command: 'opsark-tool server.connect {"host":"192.168.1.237"}',
+      command: 'opsark-tool server.connect {"host":"192.168.1.237","credentialRef":"managed-server:target"}',
     })], {
       activeSkillIds: ["ssh-terminal-jump"],
       executionConstraints: {

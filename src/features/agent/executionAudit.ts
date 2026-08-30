@@ -26,6 +26,7 @@ export function buildCommandResultAudit(input: CommandResultAuditInput): AuditEv
 }
 
 export interface ValidationResultAuditInput extends ExecutionAuditScope {
+  verificationMode?: "command_result" | "postcondition";
   accepted: boolean;
   validator?: StepValidator;
   result: StepResult;
@@ -33,7 +34,7 @@ export interface ValidationResultAuditInput extends ExecutionAuditScope {
   validationOutput: string;
 }
 
-/** Builds the deterministic program-evidence audit after independent validation. */
+/** Builds the deterministic evidence audit for command-result or postcondition verification. */
 export function buildValidationResultAudit(
   input: ValidationResultAuditInput,
 ): AuditEventDraft {
@@ -41,7 +42,7 @@ export function buildValidationResultAudit(
   return {
     category: "command",
     level: input.accepted ? (warning ? "warning" : "success") : "error",
-    title: `${input.stepTitle} · 程序证据校验`,
+    title: `${input.stepTitle} · ${input.verificationMode === "command_result" ? "观察证据" : "程序证据校验"}`,
     detail: JSON.stringify({
       validator: input.validator,
       result: input.result,
@@ -52,4 +53,3 @@ export function buildValidationResultAudit(
     taskId: input.taskId,
   };
 }
-

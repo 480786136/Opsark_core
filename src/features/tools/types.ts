@@ -52,6 +52,15 @@ export interface ToolResult<T = unknown> {
 
 export type UserInputFieldType = "text" | "password" | "number";
 
+export interface UserInputCredentialDescriptor {
+  /** Form-local identifier shared by the username and secret fields. */
+  group: string;
+  kind: "git-https" | "ssh-password" | "database" | "service";
+  role: "username" | "secret";
+  /** Authentication endpoint only; never a URL containing userinfo or a credential value. */
+  target: string;
+}
+
 export interface UserInputField {
   key: string;
   label: string;
@@ -59,6 +68,8 @@ export interface UserInputField {
   type: UserInputFieldType;
   placeholder?: string;
   required: boolean;
+  /** Explicit pairing contract. Credential storage must never be inferred from prose when present. */
+  credential?: UserInputCredentialDescriptor;
 }
 
 export interface UserInputRequest {
@@ -122,22 +133,55 @@ export interface FileStructureRequest {
   includeHidden?: boolean;
 }
 
-export interface FileStructureNode {
-  name: string;
-  relativePath: string;
-  kind: "file" | "directory" | "symlink" | "other";
-  size?: number;
-  children?: FileStructureNode[];
+export interface FileStructureResult {
+  tree: string;
 }
 
-export interface FileStructureResult {
-  rootPath: string;
-  nodes: FileStructureNode[];
-  excludedDirectories: string[];
-  totalNodes: number;
-  maxDepthReached: boolean;
+/** Backend-only scan metadata; only `tree` is exposed to the model. */
+export interface FileStructureScanResult extends FileStructureResult {
   truncated: boolean;
   warnings: string[];
+}
+
+export interface FileContentRequest {
+  path: string;
+  maxBytes?: number;
+}
+
+export interface FileContentResult {
+  path: string;
+  content: string;
+  totalBytes: number;
+  returnedBytes: number;
+  truncated: boolean;
+  encoding: "utf-8";
+}
+
+export interface SoftwareCheckRequest {
+  names: string[];
+  includeVersions?: boolean;
+}
+
+export interface SoftwareCheckItem {
+  name: string;
+  installed: boolean;
+  path?: string;
+  version?: string;
+}
+
+export interface SoftwareCheckResult {
+  items: SoftwareCheckItem[];
+}
+
+export interface PendingSecretRequest {
+  taskId: string;
+  stepId: string;
+  key: string;
+  label: string;
+  description: string;
+  unlockDescription: string;
+  /** A keychain persistence failure keeps the request open and reports here. */
+  error?: string;
 }
 
 export interface ServerFileTransferRequest {

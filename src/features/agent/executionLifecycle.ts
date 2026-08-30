@@ -1,4 +1,5 @@
 import type { RuntimeConnection, RuntimeModel } from "@/services/backend";
+import type { AgentRuntimeProgress } from "@/services/backend";
 import {
   executeStepCommand,
   executeStepValidation,
@@ -18,7 +19,10 @@ import type {
   LongRunningReviewAudit,
   StartLongRunningMonitorInput,
 } from "@/features/agent/longRunningMonitor";
-import { appendTerminalOutput } from "@/utils/terminal";
+import {
+  appendTerminalOutputChunk,
+  createTerminalOutputAccumulator,
+} from "@/utils/terminal";
 import type { OpsTask, PlanStep } from "@/types";
 
 type CommandExecutor = (input: ExecuteStepCommandInput) => Promise<ExecutionCommandResult>;
@@ -43,6 +47,7 @@ export interface RunCommandLifecycleInput {
   onAudit(audit: LongRunningReviewAudit): void;
   onError(title: string, detail: string): void;
   cancelExecution?(): Promise<void> | void;
+  sampleRuntimeProgress?(): Promise<AgentRuntimeProgress>;
 }
 
 export interface CommandLifecycleResult {
@@ -61,6 +66,7 @@ export async function runCommandLifecycle(
   startMonitor: MonitorStarter = startLongRunningMonitor,
 ): Promise<CommandLifecycleResult> {
   let streamedOutput = "";
+  let outputAccumulator = createTerminalOutputAccumulator();
   input.onExecutionChange(input.executionId);
   const monitor = startMonitor({
     task: input.task,
@@ -78,6 +84,7 @@ export async function runCommandLifecycle(
     onAudit: input.onAudit,
     onError: input.onError,
     cancelExecution: input.cancelExecution,
+    sampleRuntimeProgress: input.sampleRuntimeProgress,
   });
 
   let result: ExecutionCommandResult;
@@ -89,7 +96,8 @@ export async function runCommandLifecycle(
       executionId: input.executionId,
       secretValues: input.secretValues,
       onProgress: (safeChunk) => {
-        streamedOutput = appendTerminalOutput(streamedOutput, safeChunk);
+        outputAccumulator = appendTerminalOutputChunk(outputAccumulator, safeChunk);
+        streamedOutput = outputAccumulator.output;
         input.onProgress(safeChunk, streamedOutput);
       },
     });

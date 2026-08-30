@@ -14,7 +14,9 @@ export interface SkillOutputSignals {
 
 export function analyzeSkillOutputSignals(lines: string[], semantic = ""): SkillOutputSignals {
   const text = lines.join("\n");
-  const warningLines = lines.filter((line) => /\bWARN(?:ING)?\b|\bdeprecated\b|\bdeprecation\b/i.test(line));
+  const warningLines = lines.filter((line) =>
+    /\bWARN(?:ING)?\b|\bdeprecated\b|\bdeprecation\b|\bis not supported\b|\bchunks? (?:is|are) larger than\b/i.test(line),
+  );
   const missingAbiSymbols = [...new Set(
     [...text.matchAll(/(?:version\s+[`']?)((?:GLIBCXX|GLIBC|CXXABI)_[0-9.]+)(?:['`]?\s+not found)/gi)]
       .map((match) => match[1]),
@@ -49,6 +51,18 @@ export function analyzeSkillOutputSignals(lines: string[], semantic = ""): Skill
 }
 
 export function analyzeSkillCommandFailure(text: string) {
+  if (/could not read Username[^\n]*terminal prompts disabled|terminal prompts disabled/i.test(text)) {
+    return {
+      reason: "Git HTTPS 需要交互认证，但当前命令禁用了凭据提示",
+      facts: { category: "interactive_credential_required", credentialRejected: false },
+    };
+  }
+  if (/authentication failed|invalid (?:username|password|credentials?)|incorrect (?:user(?:name)?|account)(?: or|\/)? password|http basic:\s*access denied|access denied[^\n]*(?:token|password|credential)|permission denied \(publickey[^)]*password|(?:用户名|账号|账户).{0,8}密码.{0,8}(?:错误|不正确)|仓库认证未通过.*再次请求/i.test(text)) {
+    return {
+      reason: "仓库服务器拒绝了当前账户与密码/令牌组合",
+      facts: { category: "credential_rejected", credentialRejected: true },
+    };
+  }
   const missingAbiSymbols = [...new Set(
     [...text.matchAll(/(?:version\s+[`']?)((?:GLIBCXX|GLIBC|CXXABI)_[0-9.]+)(?:['`]?\s+not found)/gi)]
       .map((match) => match[1]),

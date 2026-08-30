@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   acceptStepApproval,
+  hasCurrentStepApproval,
   requestStepApproval,
 } from "@/features/agent/stepApproval";
 import type { PlanStep } from "@/types";
@@ -42,9 +43,35 @@ describe("step approval", () => {
 
     expect(acceptStepApproval(waiting)).toEqual({ taskStatus: "running", shouldExecute: true });
     expect(waiting.status).toBe("awaiting_approval");
+    expect(hasCurrentStepApproval(waiting)).toBe(true);
   });
 
   it("rejects approval for a step that is not waiting", () => {
     expect(acceptStepApproval(step("high"))).toBeUndefined();
+  });
+
+  it.each(["command", "validation", "risk"] as const)(
+    "binds approval to the exact %s shown to the user",
+    (field) => {
+      const waiting = step("high");
+      requestStepApproval("managed", waiting);
+      acceptStepApproval(waiting);
+      expect(hasCurrentStepApproval(waiting)).toBe(true);
+      if (field === "risk") waiting.risk = "medium";
+      else waiting[field] = `${waiting[field]} changed`;
+      expect(hasCurrentStepApproval(waiting)).toBe(false);
+    },
+  );
+
+  it("invalidates approval when execution scope or replayed context changes", () => {
+    const waiting = {
+      ...step("high"),
+      executionScope: "agent_session" as const,
+      sessionContextChange: { cwd: "/opt/app" },
+    };
+    requestStepApproval("managed", waiting);
+    acceptStepApproval(waiting);
+    waiting.sessionContextChange.cwd = "/opt/other";
+    expect(hasCurrentStepApproval(waiting)).toBe(false);
   });
 });

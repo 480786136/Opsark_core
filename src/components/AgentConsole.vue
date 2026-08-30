@@ -25,7 +25,7 @@ import {
 } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import { useOpsStore } from "@/stores/ops";
-import type { ObservationStatus, OpsTask, PlanStep } from "@/types";
+import type { ObservationStatus, OpsTask, PlanStep, TaskPlanHistory } from "@/types";
 import ModelSettingsModal from "@/components/ModelSettingsModal.vue";
 import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
 import { useWorkspaceLinkStore } from "@/features/workspace/workspaceLinkStore";
@@ -62,7 +62,11 @@ const task = computed(() => serverTasks.value.find((item) => item.id === workspa
 const pendingApproval = computed(() => task.value?.plan.find((step) => step.status === "awaiting_approval"));
 const failedStep = computed(() => task.value?.plan.find((step) => step.status === "failed"));
 const adjustmentLabel = computed(() =>
-  failedStep.value?.result?.executionStatus === "failed"
+  task.value?.status === "awaiting_continuation"
+    ? t("agent.continuationRequired")
+    : !failedStep.value && /(?:调整|后续)计划生成失败|计划生成未通过/.test(task.value?.pauseReason ?? "")
+    ? t("agent.planAdjustmentPaused")
+    : failedStep.value?.result?.executionStatus === "failed"
     ? t("agent.executionPaused")
     : t("agent.validationPaused"),
 );
@@ -72,13 +76,40 @@ const pendingSecretRequest = computed(() =>
 const pendingUserInputRequest = computed(() =>
   store.pendingUserInputs.find((request) => request.taskId === task.value?.id),
 );
-const isBusy = computed(() => task.value && ["planning", "running", "validating"].includes(task.value.status));
+const isBusy = computed(() => task.value && (
+  task.value.adjustmentInProgress
+  || ["planning", "running", "validating"].includes(task.value.status)
+));
 const canTerminate = computed(() =>
   Boolean(task.value && (
     task.value.currentExecutionId
     || ["planning", "running", "validating", "awaiting_input"].includes(task.value.status)
   )),
 );
+const showManualAdjustmentButton = computed(() => Boolean(task.value && (
+  task.value.permission !== "managed"
+  || task.value.managedAdjustmentPhase === "manual_required"
+)));
+
+function planProgressText(current: OpsTask) {
+  const completed = current.plan.filter((step) => step.status === "completed").length;
+  const safetyBlocked = current.plan.filter((step) => (
+    step.status === "failed" && step.result?.facts.category === "plan_safety_rejection"
+  )).length;
+  if (safetyBlocked) {
+    const pending = current.plan.filter((step) => ["pending", "awaiting_approval", "awaiting_input"].includes(step.status)).length;
+    return t("agent.safetyProgress", { completed, blocked: safetyBlocked, pending });
+  }
+  const processed = current.plan.filter((step) => ["completed", "skipped", "failed"].includes(step.status)).length;
+  return t("agent.processed", { done: processed, total: current.plan.length });
+}
+
+function archivedRoundResponse(round: TaskPlanHistory) {
+  if (round.response?.content) return round.response.content;
+  return round.plan.length
+    ? t("agent.generatedSteps", { count: round.plan.length })
+    : t("agent.planGenerationIncomplete");
+}
 
 watch(() => pendingUserInputRequest.value?.callId, () => {
   userInputValues.value = {};
@@ -88,6 +119,12 @@ async function submitUserInput() {
   if (!task.value || !pendingUserInputRequest.value) return;
   const submitted = await store.provideUserInput(task.value.id, userInputValues.value);
   if (submitted) userInputValues.value = {};
+}
+
+async function submitSecret() {
+  if (!secretInput.value) return;
+  const submitted = await store.provideSecret(secretInput.value);
+  if (submitted) secretInput.value = "";
 }
 const currentConversationMessages = computed(() => {
   if (!task.value) return [];
@@ -158,7 +195,20 @@ async function submit() {
     terminalReference.value,
     selectedTask.id,
   );
+  if (store.activeTaskId && store.activeTaskId !== workspaceState.activeTaskId) {
+    agentWorkspaces.updateServer(props.serverId, { activeTaskId: store.activeTaskId });
+  }
   terminalReference.value = "";
+}
+
+async function retryPlanning() {
+  const current = task.value;
+  if (!current) return;
+  input.value = current.currentInstruction
+    || current.rootGoal
+    || [...current.messages].reverse().find((message) => message.role === "user")?.content
+    || "";
+  await submit();
 }
 
 function selectFirstAvailableModel() {
@@ -240,11 +290,13 @@ function statusText(status?: string) {
   const labels: Record<string, string> = {
     draft: "agent.statusDraft",
     planning: "agent.statusPlanning",
+    planning_failed: "agent.statusPlanningFailed",
     awaiting_plan_approval: "agent.statusAwaitingPlan",
     running: "agent.statusRunning",
     awaiting_step_approval: "agent.statusAwaitingStep",
     awaiting_input: "agent.statusAwaitingInput",
     validating: "agent.statusValidating",
+    awaiting_continuation: "agent.statusContinuation",
     needs_adjustment: "agent.statusAdjustment",
     completed: "agent.statusCompleted",
     failed: "agent.statusFailed",
@@ -259,6 +311,8 @@ function summaryTitle(status?: string) {
     failed: "agent.summaryFailed",
     cancelled: "agent.summaryCancelled",
     needs_adjustment: "agent.summaryAdjustment",
+    awaiting_continuation: "agent.summaryContinuation",
+    planning_failed: "agent.summaryPlanningFailed",
   };
   return t(status && labels[status] ? labels[status] : "agent.summaryDefault");
 }
@@ -405,7 +459,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                   <strong>Opsark</strong>
                   <time>{{ new Date(round.response?.createdAt ?? round.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
                 </div>
-                <p>{{ round.response?.content ?? t("agent.generatedSteps", { count: round.plan.length }) }}</p>
+                <p>{{ archivedRoundResponse(round) }}</p>
               </div>
             </div>
 
@@ -435,7 +489,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                     </button>
                     <div v-if="expandedSteps.includes(`history-${round.id}-${step.id}`)" class="step-detail">
                       <label>{{ t("agent.command") }}</label><code>{{ step.command }}</code>
-                      <label>{{ t("agent.expectedValidation") }}</label><p>{{ step.expected }} · {{ step.validation }}</p>
+                      <label>{{ t("agent.expectedValidation") }}</label><p>{{ step.expected }} · {{ step.kind === "observe" ? t("agent.commandResultEvidence") : step.validation }}</p>
                       <template v-if="step.result">
                         <label>{{ t("agent.executionObservation") }}</label>
                         <div class="step-result-line">
@@ -469,12 +523,12 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
             </div>
 
             <div
-              v-if="(round.summary || round.pauseReason) && ['completed', 'failed', 'cancelled', 'needs_adjustment'].includes(round.status)"
+              v-if="(round.summary || round.pauseReason) && ['completed', 'failed', 'cancelled', 'needs_adjustment', 'awaiting_continuation', 'planning_failed'].includes(round.status)"
               :class="['summary-card', 'archived-summary', `summary-${round.status}`]"
             >
               <div class="summary-card-icon">
                 <Sparkles v-if="round.status === 'completed'" :size="17" />
-                <ShieldAlert v-else-if="['failed', 'needs_adjustment'].includes(round.status)" :size="17" />
+                <ShieldAlert v-else-if="['failed', 'needs_adjustment', 'awaiting_continuation', 'planning_failed'].includes(round.status)" :size="17" />
                 <Square v-else :size="15" />
               </div>
               <div><span>{{ summaryTitle(round.status) }}</span><p>{{ round.summary ?? round.pauseReason }}</p></div>
@@ -510,7 +564,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                     <CheckCircle2 v-else-if="task.status === 'completed'" :size="13" />
                     {{ statusText(task.status) }}
                   </span>
-                  <small class="plan-processed">{{ t("agent.processed", { done: task.plan.filter((step) => ["completed", "skipped", "failed"].includes(step.status)).length, total: task.plan.length }) }}</small>
+                  <small class="plan-processed">{{ planProgressText(task) }}</small>
                   <button
                     v-if="canTerminate"
                     class="terminate-business"
@@ -527,7 +581,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                   <span class="step-icon">
                     <CheckCircle2 v-if="step.status === 'completed'" :size="17" />
                     <LoaderCircle v-else-if="['running', 'validating'].includes(step.status)" class="spin" :size="17" />
-                    <ShieldAlert v-else-if="step.status === 'awaiting_approval'" :size="17" />
+                    <ShieldAlert v-else-if="step.status === 'awaiting_approval' || step.result?.facts.category === 'plan_safety_rejection'" :size="17" />
                     <KeyRound v-else-if="step.status === 'awaiting_input'" :size="17" />
                     <Circle v-else :size="17" />
                   </span>
@@ -539,7 +593,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                 </button>
                 <div v-if="expandedSteps.includes(step.id)" class="step-detail">
                   <label>{{ t("agent.willExecute") }}</label><code>{{ step.command }}</code>
-                  <label>{{ t("agent.expectedValidation") }}</label><p>{{ step.expected }} · {{ step.validation }}</p>
+                  <label>{{ t("agent.expectedValidation") }}</label><p>{{ step.expected }} · {{ step.kind === "observe" ? t("agent.commandResultEvidence") : step.validation }}</p>
                   <template v-if="step.result">
                     <label>{{ t("agent.executionObservation") }}</label>
                     <div class="step-result-line">
@@ -596,19 +650,53 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                 <button class="button primary" type="submit">{{ t('agent.confirmParameters') }}</button>
               </div>
             </form>
-            <form v-else-if="pendingSecretRequest" class="secret-input-bar" @submit.prevent="store.provideSecret(secretInput); secretInput = ''">
-              <span><KeyRound :size="14" />{{ pendingSecretRequest.key }}</span>
-              <input v-model="secretInput" type="password" autocomplete="off" :placeholder="t('agent.secretPlaceholder')" autofocus />
-              <button class="button primary" type="submit" :disabled="!secretInput">{{ t("agent.submitSecret") }}</button>
+            <form v-else-if="pendingSecretRequest" class="secret-unlock-card" @submit.prevent="submitSecret">
+              <div class="secret-unlock-head">
+                <span><KeyRound :size="16" /></span>
+                <div>
+                  <strong>{{ pendingSecretRequest.label }}</strong>
+                  <small>{{ pendingSecretRequest.description }}</small>
+                </div>
+                <code>{{ pendingSecretRequest.key }}</code>
+              </div>
+              <label class="secret-unlock-input">
+                <span>{{ t('agent.secretValueLabel') }}</span>
+                <input v-model="secretInput" type="password" autocomplete="new-password" :placeholder="t('agent.secretPlaceholder')" autofocus />
+              </label>
+              <p v-if="pendingSecretRequest.error" class="user-input-error">{{ pendingSecretRequest.error }}</p>
+              <div class="secret-unlock-actions">
+                <span><ShieldAlert :size="13" />{{ pendingSecretRequest.unlockDescription }}</span>
+                <button class="button primary" type="submit" :disabled="!secretInput">{{ t("agent.submitSecret") }}</button>
+              </div>
             </form>
-            <div v-else-if="task.status === 'needs_adjustment'" class="approval-bar warning">
+            <div v-else-if="task.status === 'planning_failed'" class="approval-bar warning">
+              <span class="adjustment-copy">
+                <ShieldAlert :size="15" />
+                <span><strong>{{ t("agent.summaryPlanningFailed") }}</strong><small v-if="task.pauseReason">{{ task.pauseReason }}</small></span>
+              </span>
+              <button class="button secondary" @click="store.rejectTask(task.id)">{{ t("agent.endTask") }}</button>
+              <button class="button primary" @click="retryPlanning">{{ t("agent.retryPlanning") }}</button>
+            </div>
+            <div v-else-if="['needs_adjustment', 'awaiting_continuation'].includes(task.status)" class="approval-bar warning">
               <span class="adjustment-copy">
                 <ShieldAlert :size="15" />
                 <span><strong>{{ adjustmentLabel }}</strong><small v-if="task.pauseReason">{{ task.pauseReason }}</small></span>
               </span>
               <button class="button secondary" @click="store.rejectTask(task.id)">{{ t("agent.endTask") }}</button>
-              <button class="button primary" @click="store.requestAdjustment(task.id)">
-                {{ t((task.adjustmentCount ?? 0) < 1 ? "agent.adjustOnce" : "agent.adjustAgain") }}
+              <span v-if="task.autoAdjustmentSeconds" class="managed-approval-countdown">
+                <LoaderCircle class="spin" :size="13" />{{ t('agent.managedAdjustmentCountdown', { seconds: task.autoAdjustmentSeconds }) }}
+              </span>
+              <span v-else-if="task.adjustmentInProgress || task.managedAdjustmentPhase === 'generating'" class="managed-approval-countdown">
+                <LoaderCircle class="spin" :size="13" />{{ t('agent.generatingAdjustment') }}
+              </span>
+              <span v-else-if="task.adjustmentIncident?.kind === 'transport' || task.managedAdjustmentPhase === 'waiting_transport'" class="managed-approval-countdown">
+                <LoaderCircle class="spin" :size="13" />{{ t('agent.waitingTerminalRecovery') }}
+              </span>
+              <span v-else-if="task.permission === 'managed' && !showManualAdjustmentButton" class="managed-approval-countdown">
+                <LoaderCircle class="spin" :size="13" />{{ t('agent.managedAutoContinuing') }}
+              </span>
+              <button v-else-if="showManualAdjustmentButton" class="button primary" @click="store.requestAdjustment(task.id)">
+                {{ t("agent.generateAdjustment") }}
               </button>
             </div>
           </div>
@@ -631,12 +719,12 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
           </div>
 
           <div
-            v-if="(task.summary || task.pauseReason) && ['completed', 'failed', 'cancelled', 'needs_adjustment'].includes(task.status)"
+            v-if="(task.summary || task.pauseReason) && ['completed', 'failed', 'cancelled', 'needs_adjustment', 'awaiting_continuation', 'planning_failed'].includes(task.status)"
             :class="['summary-card', `summary-${task.status}`]"
           >
             <div class="summary-card-icon">
               <Sparkles v-if="task.status === 'completed'" :size="17" />
-              <ShieldAlert v-else-if="['failed', 'needs_adjustment'].includes(task.status)" :size="17" />
+              <ShieldAlert v-else-if="['failed', 'needs_adjustment', 'awaiting_continuation', 'planning_failed'].includes(task.status)" :size="17" />
               <Square v-else :size="15" />
             </div>
             <div><span>{{ summaryTitle(task.status) }}</span><p>{{ task.summary ?? task.pauseReason }}</p></div>

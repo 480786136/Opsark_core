@@ -3,7 +3,6 @@ import {
   isReadOnlyDiagnosticStep,
   postconditionHasHardBlocker,
   remainingPlanCanRepairPostcondition,
-  requiresReadOnlyDiagnosis,
 } from "@/features/agent/evidenceReview";
 import type { PlanStep } from "@/types";
 
@@ -20,9 +19,9 @@ const step = (overrides: Partial<PlanStep> = {}): PlanStep => ({
 });
 
 describe("evidence review policy", () => {
-  it("separates diagnostic requests from requested changes", () => {
-    expect(requiresReadOnlyDiagnosis("检查页面为什么空白")).toBe(true);
-    expect(requiresReadOnlyDiagnosis("修复页面空白")).toBe(false);
+  it("uses the typed step effect before legacy text inference", () => {
+    expect(isReadOnlyDiagnosticStep(step({ kind: "observe", title: "collect snapshot", description: "read current facts" }))).toBe(true);
+    expect(isReadOnlyDiagnosticStep(step({ kind: "change", command: "systemctl restart app" }))).toBe(false);
     expect(isReadOnlyDiagnosticStep(step())).toBe(true);
   });
 
@@ -33,6 +32,15 @@ describe("evidence review policy", () => {
 
   it("keeps deterministic blockers above model review", () => {
     expect(postconditionHasHardBlocker(step(), [], 127)).toContain("不可执行");
+    expect(postconditionHasHardBlocker(step({
+      result: {
+        executionStatus: "success",
+        observationStatus: "unknown",
+        facts: { validationProtocolIncomplete: true },
+        warnings: [],
+        evidenceIds: [],
+      },
+    }), [])).toContain("不能将该步骤判定为成功");
     expect(postconditionHasHardBlocker(step({
       result: {
         executionStatus: "success",

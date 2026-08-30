@@ -1,9 +1,32 @@
 use ssh2::Session;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
+
+const MAX_CAPTURED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+
+pub(crate) struct InteractivePromptCredential {
+    pub(crate) kind: String,
+    pub(crate) username: Option<String>,
+    pub(crate) secret: String,
+    pub(crate) target: Option<String>,
+}
+
+fn append_bounded_output(output: &mut String, chunk: &str) {
+    output.push_str(chunk);
+    if output.len() <= MAX_CAPTURED_OUTPUT_BYTES {
+        return;
+    }
+    let desired = output.len() - MAX_CAPTURED_OUTPUT_BYTES;
+    let drain_to = output
+        .char_indices()
+        .map(|(index, _)| index)
+        .find(|index| *index >= desired)
+        .unwrap_or(output.len());
+    output.drain(..drain_to);
+}
 
 fn resolve_address(host: &str, port: u16) -> Result<SocketAddr, String> {
     format!("{host}:{port}")
@@ -124,7 +147,7 @@ where
             Ok(size) if size > 0 => {
                 received = true;
                 let chunk = String::from_utf8_lossy(&stdout_buffer[..size]).to_string();
-                combined.push_str(&chunk);
+                append_bounded_output(&mut combined, &chunk);
                 on_output(chunk, "stdout");
             }
             Ok(_) => {}
@@ -138,12 +161,149 @@ where
                 if !combined.is_empty() && !combined.ends_with('\n') {
                     combined.push('\n');
                 }
-                combined.push_str(&chunk);
+                append_bounded_output(&mut combined, &chunk);
                 on_output(chunk, "stderr");
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(format!("读取远程错误输出失败：{error}")),
+        }
+        if channel.eof() {
+            break;
+        }
+        if !received {
+            thread::sleep(Duration::from_millis(35));
+        }
+    }
+    session.set_blocking(true);
+    channel.wait_close().map_err(|error| error.to_string())?;
+    Ok((
+        combined.trim().to_string(),
+        channel.exit_status().unwrap_or(1),
+    ))
+}
+
+fn prompt_target_matches(buffer: &str, target: Option<&str>) -> bool {
+    target.is_none_or(|target| {
+        let normalized = target.trim().to_ascii_lowercase();
+        normalized.is_empty() || buffer.to_ascii_lowercase().contains(&normalized)
+    })
+}
+
+fn pending_prompt_response(
+    tail: &str,
+    credential: &InteractivePromptCredential,
+    username_sent: bool,
+    secret_sent: bool,
+) -> Option<(&'static str, String)> {
+    let lower = tail.to_ascii_lowercase();
+    if !username_sent
+        && credential.kind == "git-https"
+        && lower.contains("username for '")
+        && lower.trim_end().ends_with(':')
+        && prompt_target_matches(tail, credential.target.as_deref())
+    {
+        return credential
+            .username
+            .as_ref()
+            .map(|value| ("username", value.clone()));
+    }
+    if !secret_sent
+        && (lower.contains("password for '") || lower.contains("password:"))
+        && lower.trim_end().ends_with(':')
+        && prompt_target_matches(tail, credential.target.as_deref())
+    {
+        return Some(("secret", credential.secret.clone()));
+    }
+    None
+}
+
+/// Executes one command in an independent SSH PTY while answering only the
+/// explicitly bound username/password prompts. `stty -echo` prevents supplied
+/// values from being reflected into output, logs, or model evidence.
+pub(crate) fn ssh_exec_streaming_with_prompt<F>(
+    session: &Session,
+    execution_id: &str,
+    command: &str,
+    cancelled: &AtomicBool,
+    credential: &InteractivePromptCredential,
+    mut on_output: F,
+) -> Result<(String, i32), String>
+where
+    F: FnMut(String, &str),
+{
+    let tracked = streaming_command(execution_id, command)?;
+    let wrapped = format!(
+        "stty -echo 2>/dev/null || true; {}; code=$?; stty echo 2>/dev/null || true; exit \"$code\"",
+        tracked
+    );
+    let mut channel = session
+        .channel_session()
+        .map_err(|error| format!("无法创建 Agent SSH PTY 通道：{error}"))?;
+    channel
+        .request_pty("xterm", None, Some((120, 32, 0, 0)))
+        .map_err(|error| format!("无法申请 Agent SSH PTY：{error}"))?;
+    channel
+        .exec(&wrapped)
+        .map_err(|error| format!("无法执行 Agent SSH PTY 命令：{error}"))?;
+    session.set_blocking(false);
+    let mut combined = String::new();
+    let mut prompt_tail = String::new();
+    let mut username_sent = false;
+    let mut secret_sent = false;
+    let mut stdout_buffer = [0_u8; 8192];
+    let mut stderr_buffer = [0_u8; 8192];
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            let _ = channel.close();
+            return Ok((combined.trim().to_string(), 130));
+        }
+        let mut received = false;
+        for (stream, buffer) in [
+            ("stdout", &mut stdout_buffer),
+            ("stderr", &mut stderr_buffer),
+        ] {
+            let read = if stream == "stdout" {
+                channel.read(buffer)
+            } else {
+                channel.stderr().read(buffer)
+            };
+            match read {
+                Ok(size) if size > 0 => {
+                    received = true;
+                    let chunk = String::from_utf8_lossy(&buffer[..size]).to_string();
+                    append_bounded_output(&mut combined, &chunk);
+                    prompt_tail.push_str(&chunk);
+                    if prompt_tail.len() > 2048 {
+                        let keep_from = prompt_tail
+                            .char_indices()
+                            .map(|(index, _)| index)
+                            .find(|index| *index >= prompt_tail.len() - 2048)
+                            .unwrap_or(0);
+                        prompt_tail.drain(..keep_from);
+                    }
+                    on_output(chunk, stream);
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(format!("读取 Agent SSH PTY 输出失败：{error}")),
+            }
+        }
+        if let Some((role, value)) =
+            pending_prompt_response(&prompt_tail, credential, username_sent, secret_sent)
+        {
+            session.set_blocking(true);
+            channel
+                .write_all(format!("{value}\n").as_bytes())
+                .and_then(|_| channel.flush())
+                .map_err(|error| format!("响应 Agent 认证提示失败：{error}"))?;
+            session.set_blocking(false);
+            if role == "username" {
+                username_sent = true;
+            } else {
+                secret_sent = true;
+            }
+            prompt_tail.clear();
         }
         if channel.eof() {
             break;
@@ -194,5 +354,50 @@ mod tests {
     fn maps_invalid_addresses_without_opening_a_network_connection() {
         let error = resolve_address("\0", 22).unwrap_err();
         assert!(error.starts_with("无法解析服务器地址："));
+    }
+
+    #[test]
+    fn bounds_captured_output_on_utf8_boundaries() {
+        let mut output = "中".repeat(MAX_CAPTURED_OUTPUT_BYTES / 3 + 50);
+        append_bounded_output(&mut output, "文");
+        assert!(output.len() <= MAX_CAPTURED_OUTPUT_BYTES + 3);
+        assert!(output.is_char_boundary(0));
+        assert!(output.ends_with("文"));
+    }
+
+    #[test]
+    fn only_answers_bound_interactive_prompts_once() {
+        let credential = InteractivePromptCredential {
+            kind: "git-https".into(),
+            username: Some("developer@example.com".into()),
+            secret: "private".into(),
+            target: Some("gitee.com".into()),
+        };
+        assert_eq!(
+            pending_prompt_response(
+                "Username for 'https://gitee.com': ",
+                &credential,
+                false,
+                false
+            ),
+            Some(("username", "developer@example.com".into())),
+        );
+        assert!(pending_prompt_response(
+            "Username for 'https://other.test': ",
+            &credential,
+            false,
+            false
+        )
+        .is_none());
+        assert_eq!(
+            pending_prompt_response(
+                "Password for 'https://developer@gitee.com': ",
+                &credential,
+                true,
+                false
+            ),
+            Some(("secret", "private".into())),
+        );
+        assert!(pending_prompt_response("Password: ", &credential, true, true).is_none());
     }
 }

@@ -1,11 +1,35 @@
 import { trimEvidence } from "@/features/agent/agentContext";
+import {
+  compactReviewText,
+  LONG_RUNNING_COMMAND_CONTEXT_LIMIT,
+  textFingerprint,
+} from "@/features/agent/longRunningReviewOutput";
+import type { LongRunningOutputWindow } from "@/features/agent/longRunningReviewOutput";
 import type { OpsTask, PlanStep } from "@/types";
 
 interface PeriodicObservation {
   passed: boolean;
   detail: string;
   exitCode?: number;
-  output?: string;
+}
+
+export interface LongRunningProgressStatus {
+  workload: "bounded" | "progressive";
+  outputFingerprint: string;
+  outputChangedSinceLastReview: boolean;
+  lastOutputChangeAt: string;
+  noProgressSeconds: number;
+  noProgressReviewRounds: number;
+  consecutiveContinueRounds: number;
+  maxConsecutiveContinueRounds: number;
+  hardLimitSeconds?: number;
+  stalledNotice?: string;
+  runtimeActive?: boolean;
+  runtimeProcessCount?: number;
+  runtimeCpuPercent?: number;
+  runtimeIoBytes?: number;
+  runtimeIoChanged?: boolean;
+  runtimeIdleReviewRounds?: number;
 }
 
 function taskSnapshot(task: OpsTask) {
@@ -42,10 +66,11 @@ function historySnapshot(step: PlanStep, outputLimit = 1800) {
 }
 
 function evidenceSnapshot(step: PlanStep, trimRawOutput: boolean) {
-  return step.evidence?.map(({ type, source, facts, rawOutput }) => ({
+  return step.evidence?.map(({ type, source, facts, rawOutput, scope }) => ({
     type,
     source,
     facts,
+    scope,
     rawOutput: trimRawOutput ? trimEvidence(rawOutput) : rawOutput,
   }));
 }
@@ -84,17 +109,16 @@ export function buildPreconditionReviewContext(
 export function buildLongRunningReviewContext(input: {
   task: OpsTask;
   step: PlanStep;
-  requirement: string;
   reviewRound: number;
   elapsedSeconds: number;
-  streamedOutput: string;
   observation: PeriodicObservation;
+  progress: LongRunningProgressStatus;
+  outputWindow: LongRunningOutputWindow;
+  salientEvidence?: string[];
 }) {
-  const remainingSteps = input.task.plan
-    .filter((step) => step.status === "pending")
-    .map(plannedStepSnapshot);
+  const nextStep = input.task.plan.find((step) => step !== input.step && step.status === "pending");
   return {
-    trigger: "远程命令长时间未返回，定期获取状态并判断继续等待、停止等待进入正式校验或调整计划",
+    trigger: "periodic_long_running",
     reviewPolicy: {
       periodicLongRunningReview: true,
       decisionContinueMeansWait: true,
@@ -104,24 +128,29 @@ export function buildLongRunningReviewContext(input: {
     },
     reviewRound: input.reviewRound,
     elapsedSeconds: input.elapsedSeconds,
-    userRequirement: input.requirement,
-    executionConstraints: input.task.executionConstraints,
     currentStep: {
-      ...plannedStepSnapshot(input.step),
-      streamedOutput: trimEvidence(input.step.output ?? input.streamedOutput, 5000),
+      title: compactReviewText(input.step.title, 180),
+      description: compactReviewText(input.step.description, 360),
+      command: compactReviewText(input.step.command, LONG_RUNNING_COMMAND_CONTEXT_LIMIT),
+      commandFingerprint: textFingerprint(input.step.command),
+      expected: compactReviewText(input.step.expected, 360),
+      risk: input.step.risk,
     },
     periodicObservation: {
-      ...input.observation,
-      output: trimEvidence(input.observation.output, 3000),
+      passed: input.observation.passed,
+      exitCode: input.observation.exitCode,
+      detail: compactReviewText(input.observation.detail, 260),
     },
-    executionHistory: input.task.plan
-      .filter((step) => step !== input.step && step.status !== "pending")
-      .map((step) => historySnapshot(step, 1200)),
-    fullPlan: input.task.plan.map(planSnapshot),
-    remainingSteps: remainingSteps.map((step) => ({
-      ...step,
-      note: "这些是当前命令结束后才能执行的后续步骤；不得因它们存在而把 continue 解释为进入下一步",
-    })),
+    progress: input.progress,
+    salientEvidence: input.salientEvidence?.length ? input.salientEvidence : undefined,
+    terminalOutput: input.outputWindow,
+    nextStep: nextStep ? {
+      title: compactReviewText(nextStep.title, 180),
+      description: compactReviewText(nextStep.description, 280),
+      expected: compactReviewText(nextStep.expected, 280),
+      risk: nextStep.risk,
+      note: "仅供了解执行顺序；不得因存在下一步而把 continue 解释为进入下一步。",
+    } : undefined,
   };
 }
 
@@ -163,14 +192,18 @@ export function buildEvidenceReviewContext(
   requirement: string,
   postconditionReview: boolean,
 ) {
+  const validationProtocolIncomplete = Boolean(step.result?.facts.validationProtocolIncomplete);
   return {
     trigger: postconditionReview
-      ? "主命令执行成功，但独立后置校验未通过"
+      ? validationProtocolIncomplete
+        ? "主命令执行成功，但独立后置校验通道未返回真实结束标记"
+        : "主命令执行成功，但独立后置校验未通过"
       : "程序发现证据不可解释或相互冲突",
     reviewPolicy: postconditionReview ? {
       exceptionalReview: true,
       mainExecutionSucceeded: true,
       postconditionFailed: true,
+      validationProtocolIncomplete,
       modelMayExplainConflict: true,
       hardFactsCannotBeOverridden: true,
       mutationMayContinueOnlyWhenRemainingPlanRepairsPostcondition: true,

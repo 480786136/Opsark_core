@@ -20,13 +20,17 @@ describe("SkillManagementPanel", () => {
     await nextTick();
 
     expect(host.textContent).toContain("终端 SSH 跳转");
+    expect(host.textContent).toContain("连接与访问");
+    expect(host.textContent).toContain("源码与版本控制");
     host.querySelector<HTMLButtonElement>(".skill-add-button")?.click();
     await nextTick();
 
     const custom = store.skills.find((skill) => !skill.builtIn);
     expect(custom).toBeDefined();
+    expect(custom?.category).toBe("other");
     expect(host.textContent).toContain(custom!.id);
     expect(host.textContent).toContain("自定义 Skill");
+    expect(host.textContent).toContain("Skill 分类");
     app.unmount();
     host.remove();
   });

@@ -1,26 +1,46 @@
 import { normalizeFileStructureRequest } from "@/features/tools/fileStructure";
+import { defaultToolCatalog } from "@/features/tools/toolCatalog";
+import { normalizeSoftwareCheckRequest } from "@/features/tools/softwareCheck";
 import type {
+  FileContentRequest,
+  FileContentResult,
   FileStructureRequest,
   FileStructureResult,
+  FileStructureScanResult,
   ServerFileTransferRequest,
   ServerFileTransferResult,
   ServerConnectionLookupRequest,
   ServerConnectionLookupResult,
   ServerConnectRequest,
   ServerConnectResult,
+  SoftwareCheckRequest,
+  SoftwareCheckResult,
   ToolCall,
   ToolDefinition,
   ToolResult,
+  UserInputField,
   UserInputRequest,
   UserInputResult,
 } from "@/features/tools/types";
 
 export interface ToolExecutionDependencies {
-  getRemoteFileStructure(request: FileStructureRequest): Promise<FileStructureResult>;
+  getRemoteFileStructure(request: FileStructureRequest): Promise<FileStructureScanResult>;
+  readRemoteFileContent?(request: FileContentRequest): Promise<FileContentResult>;
+  checkSoftware?(request: SoftwareCheckRequest): Promise<SoftwareCheckResult>;
   transferFileBetweenServers?(request: ServerFileTransferRequest): Promise<ServerFileTransferResult>;
   requestUserInput?(request: UserInputRequest): Promise<UserInputResult>;
   connectServer?(request: ServerConnectRequest): Promise<ServerConnectResult>;
   resolveServerConnection?(request: ServerConnectionLookupRequest): Promise<ServerConnectionLookupResult>;
+}
+
+function parseFileContentArguments(value: Record<string, unknown>): FileContentRequest {
+  const path = typeof value.path === "string" ? value.path.trim() : "";
+  const maxBytes = value.maxBytes === undefined ? 65_536 : Number(value.maxBytes);
+  if (!path.startsWith("/")) throw new Error("path 必须是绝对路径");
+  if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > 262_144) {
+    throw new Error("maxBytes 必须介于 1 到 262144");
+  }
+  return { path, maxBytes };
 }
 
 function parseConnectionTarget(value: Record<string, unknown>): ServerConnectionLookupRequest {
@@ -63,9 +83,15 @@ function parseServerConnectArguments(value: Record<string, unknown>): ServerConn
   };
 }
 
-export function parseToolCommand(command: string, callId: string): ToolCall | undefined {
-  const match = command.trim().match(/^opsark-tool\s+([a-z0-9_.-]+)\s+([\s\S]+)$/i);
-  if (!match) return undefined;
+export function parseToolCommand(
+  command: string,
+  callId: string,
+  tools: ToolDefinition[] = defaultToolCatalog,
+): ToolCall | undefined {
+  const trimmed = command.trim();
+  if (!/^opsark-tool(?:\s|$)/i.test(trimmed)) return undefined;
+  const match = trimmed.match(/^opsark-tool\s+([a-z0-9_.-]+)\s+([\s\S]+)$/i);
+  if (!match) throw new Error("opsark-tool 命令必须包含唯一工具 ID 和参数对象");
   const argumentText = match[2].trim();
   let parsed: unknown;
   if (argumentText.startsWith("{") || argumentText.startsWith("[")
@@ -81,7 +107,68 @@ export function parseToolCommand(command: string, callId: string): ToolCall | un
     parsed = parseCliToolArguments(argumentText);
   }
   if (!isRecord(parsed)) throw new Error("工具命令参数必须是 JSON 对象");
-  return { id: callId, toolId: match[1], arguments: parsed };
+  // Older planners occasionally emitted `opsark-tool --files.get_structure ...`,
+  // treating the tool id like an option. Accept that one recoverable typo while
+  // keeping unknown tool ids and malformed arguments strict.
+  const toolId = match[1].replace(/^--(?=[a-z0-9])/, "");
+  const definition = tools.find((tool) => tool.id === toolId);
+  if (!definition) throw new Error(`工具不存在或未注册：${toolId}`);
+  validateToolArguments(definition, parsed);
+  const argumentsValue = normalizeKnownToolArguments(toolId, parsed);
+  validateToolArguments(definition, argumentsValue);
+  return { id: callId, toolId, arguments: argumentsValue };
+}
+
+function validateToolArguments(tool: ToolDefinition, value: Record<string, unknown>) {
+  validateSchemaValue(tool.inputSchema, value, `工具 ${tool.id} 参数`);
+}
+
+function validateSchemaValue(schema: Record<string, unknown>, value: unknown, path: string) {
+  const properties = isRecord(schema.properties) ? schema.properties : {};
+  const required = Array.isArray(schema.required) ? schema.required.filter((key): key is string => typeof key === "string") : [];
+  const type = schema.type;
+  const validType = type === "string" ? typeof value === "string"
+    : type === "boolean" ? typeof value === "boolean"
+      : type === "number" ? typeof value === "number" && Number.isFinite(value)
+        : type === "integer" ? typeof value === "number" && Number.isInteger(value)
+          : type === "array" ? Array.isArray(value)
+            : type === "object" ? isRecord(value)
+              : true;
+  if (!validType) throw new Error(`${path} 类型必须为 ${String(type)}`);
+  if (isRecord(value) && schema.additionalProperties === false) {
+    const unknown = Object.keys(value).find((key) => !(key in properties));
+    if (unknown) throw new Error(`${path} 不支持字段：${unknown}`);
+  }
+  if (isRecord(value)) {
+    const missing = required.find((key) => value[key] === undefined);
+    if (missing) throw new Error(`${path} 缺少必填字段：${missing}`);
+    for (const [key, rawRule] of Object.entries(properties)) {
+      if (value[key] !== undefined && isRecord(rawRule)) validateSchemaValue(rawRule, value[key], `${path}.${key}`);
+    }
+  }
+  if (typeof value === "number") {
+    if (typeof schema.minimum === "number" && value < schema.minimum) throw new Error(`${path} 小于最小值`);
+    if (typeof schema.maximum === "number" && value > schema.maximum) throw new Error(`${path} 超过最大值`);
+  }
+  if (typeof value === "string" && typeof schema.pattern === "string" && !new RegExp(schema.pattern).test(value)) {
+    throw new Error(`${path} 格式无效`);
+  }
+  if (Array.isArray(value)) {
+    if (typeof schema.minItems === "number" && value.length < schema.minItems) throw new Error(`${path} 数量不足`);
+    if (typeof schema.maxItems === "number" && value.length > schema.maxItems) throw new Error(`${path} 数量过多`);
+    const itemRule = isRecord(schema.items) ? schema.items : undefined;
+    if (itemRule) value.forEach((item, index) => validateSchemaValue(itemRule, item, `${path}[${index}]`));
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
+    throw new Error(`${path} 不在允许范围内`);
+  }
+}
+
+/** Validates built-in atomic tool contracts before a plan reaches execution. */
+function normalizeKnownToolArguments(toolId: string, value: Record<string, unknown>) {
+  if (toolId === "server.connect") return { ...parseServerConnectArguments(value) };
+  if (toolId === "user.request_input") return { ...parseUserInputArguments(value) };
+  return value;
 }
 
 function parseCliToolArguments(text: string): Record<string, unknown> {
@@ -139,6 +226,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isAuthenticationHost(value: string) {
+  if (value === "localhost" || /^\[[0-9a-f:.]+\]$/i.test(value)) return true;
+  if (!/^[a-z0-9.-]+$/i.test(value) || value.includes("..")) return false;
+  return value.split(".").every((label) => (
+    label.length > 0 && label.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label)
+  ));
+}
+
 export function parseUserInputArguments(value: Record<string, unknown>): UserInputRequest {
   const title = typeof value.title === "string" ? value.title.trim() : "";
   const description = typeof value.description === "string" ? value.description.trim() : undefined;
@@ -154,8 +249,40 @@ export function parseUserInputArguments(value: Record<string, unknown>): UserInp
     if (!label) throw new Error(`参数 ${key} 缺少显示名称`);
     if (!fieldDescription) throw new Error(`参数 ${key} 缺少用途说明`);
     if (!["text", "password", "number"].includes(String(field.type))) throw new Error(`参数 ${key} 的类型无效`);
+    if (/(?:PASSWORD|PASSWD|TOKEN|API_?KEY|SECRET|CREDENTIAL)$/i.test(key) && field.type !== "password") {
+      throw new Error(`敏感参数 ${key} 必须使用 password 类型`);
+    }
     if (typeof field.required !== "boolean") throw new Error(`参数 ${key} 必须明确是否必填`);
     if (field.placeholder !== undefined && typeof field.placeholder !== "string") throw new Error(`参数 ${key} 的输入提示无效`);
+    let credential: UserInputField["credential"];
+    if (field.credential !== undefined) {
+      if (!isRecord(field.credential)) throw new Error(`参数 ${key} 的 credential 必须是对象`);
+      const group = typeof field.credential.group === "string" ? field.credential.group.trim() : "";
+      const kind = String(field.credential.kind ?? "");
+      const role = String(field.credential.role ?? "");
+      const target = typeof field.credential.target === "string"
+        ? field.credential.target.trim().toLocaleLowerCase()
+        : "";
+      if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(group)) throw new Error(`参数 ${key} 的 credential.group 格式无效`);
+      if (!["git-https", "ssh-password", "database", "service"].includes(kind)) {
+        throw new Error(`参数 ${key} 的 credential.kind 无效`);
+      }
+      if (!["username", "secret"].includes(role)) throw new Error(`参数 ${key} 的 credential.role 无效`);
+      if (!target || /[\s/@]/.test(target) || target.includes("://")) {
+        throw new Error(`参数 ${key} 的 credential.target 必须是不含凭据的主机或服务标识`);
+      }
+      if (["git-https", "ssh-password"].includes(kind) && !isAuthenticationHost(target)) {
+        throw new Error(`参数 ${key} 的 credential.target 必须是精确主机名或 IP 地址`);
+      }
+      if (field.type !== "password") throw new Error(`凭据参数 ${key} 必须使用 password 类型`);
+      if (field.required !== true) throw new Error(`凭据参数 ${key} 必须设为必填`);
+      credential = {
+        group,
+        kind: kind as NonNullable<UserInputField["credential"]>["kind"],
+        role: role as NonNullable<UserInputField["credential"]>["role"],
+        target,
+      };
+    }
     return {
       key,
       label,
@@ -163,9 +290,28 @@ export function parseUserInputArguments(value: Record<string, unknown>): UserInp
       type: field.type as "text" | "password" | "number",
       placeholder: field.placeholder as string | undefined,
       required: field.required,
+      credential,
     };
   });
   if (new Set(fields.map((field) => field.key.toLowerCase())).size !== fields.length) throw new Error("参数 key 不能重复");
+  const credentialGroups = new Map<string, typeof fields>();
+  fields.filter((field) => field.credential).forEach((field) => {
+    const group = credentialGroups.get(field.credential!.group) ?? [];
+    group.push(field);
+    credentialGroups.set(field.credential!.group, group);
+  });
+  if (credentialGroups.size > 1) throw new Error("一次 user.request_input 只能收集一个凭据组");
+  for (const [group, groupedFields] of credentialGroups) {
+    const descriptor = groupedFields[0].credential!;
+    const roles = groupedFields.map((field) => field.credential!.role).sort();
+    if (groupedFields.length !== 2 || roles.join(",") !== "secret,username") {
+      throw new Error(`凭据组 ${group} 必须恰好包含一个 username 和一个 secret 字段`);
+    }
+    if (groupedFields.some((field) => field.credential!.kind !== descriptor.kind
+      || field.credential!.target !== descriptor.target)) {
+      throw new Error(`凭据组 ${group} 的 kind 和 target 必须完全一致`);
+    }
+  }
   return { title, description, fields };
 }
 
@@ -228,7 +374,18 @@ export async function executeToolCall(
     }
     if (tool.implementation === "getRemoteFileStructure") {
       const data = await dependencies.getRemoteFileStructure(parseFileStructureArguments(call.arguments));
+      const modelData: FileStructureResult = { tree: data.tree };
+      return { callId: call.id, toolId: call.toolId, success: true, data: modelData, truncated: data.truncated };
+    }
+    if (tool.implementation === "readRemoteFileContent") {
+      if (!dependencies.readRemoteFileContent) throw new Error("当前执行环境不支持远程文件内容读取");
+      const data = await dependencies.readRemoteFileContent(parseFileContentArguments(call.arguments));
       return { callId: call.id, toolId: call.toolId, success: true, data, truncated: data.truncated };
+    }
+    if (tool.implementation === "checkSoftware") {
+      if (!dependencies.checkSoftware) throw new Error("当前执行环境不支持软件检查");
+      const data = await dependencies.checkSoftware(normalizeSoftwareCheckRequest(call.arguments));
+      return { callId: call.id, toolId: call.toolId, success: true, data };
     }
     if (tool.implementation === "transferFileBetweenServers") {
       if (!dependencies.transferFileBetweenServers) throw new Error("当前执行环境不支持跨服务器文件传输");

@@ -65,6 +65,14 @@ describe("execution lifecycle", () => {
         decision: { decision: "complete", reason: "healthy", summary: "done", source: "model" },
         validationPassed: true,
         reviewRound: 1,
+        workload: "progressive",
+        outputFingerprint: "3:12345678",
+        lastOutputChangeAt: "2026-08-14T00:00:00.000Z",
+        noProgressSeconds: 0,
+        noProgressReviewRounds: 0,
+        consecutiveContinueRounds: 0,
+        salientEvidence: [],
+        runtimeIdleReviewRounds: 0,
       }),
     }));
 
@@ -97,7 +105,18 @@ describe("execution lifecycle", () => {
       throw new Error("connection closed");
     }, () => ({
       stop,
-      getState: () => ({ validationPassed: false, reviewRound: 0 }),
+      getState: () => ({
+        validationPassed: false,
+        reviewRound: 0,
+        workload: "bounded",
+        outputFingerprint: "0:811c9dc5",
+        lastOutputChangeAt: "2026-08-14T00:00:00.000Z",
+        noProgressSeconds: 0,
+        noProgressReviewRounds: 0,
+        consecutiveContinueRounds: 0,
+        salientEvidence: [],
+        runtimeIdleReviewRounds: 0,
+      }),
     }))).rejects.toThrow("connection closed");
 
     expect(stop).toHaveBeenCalledOnce();

@@ -3,28 +3,36 @@ use ssh2::{FileStat, Sftp};
 use std::collections::HashSet;
 use std::path::{Component, Path};
 
-const DEFAULT_EXCLUDES: &[&str] = &[];
+const DEFAULT_EXCLUDES: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".cache",
+    ".next",
+    ".nuxt",
+    ".venv",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "target",
+    "vendor",
+    "venv",
+];
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct FileStructureNode {
     name: String,
-    relative_path: String,
     kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    size: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     children: Option<Vec<FileStructureNode>>,
+    depth_limited: bool,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileStructureResult {
-    root_path: String,
-    nodes: Vec<FileStructureNode>,
-    excluded_directories: Vec<String>,
-    total_nodes: usize,
-    max_depth_reached: bool,
+    tree: String,
     truncated: bool,
     warnings: Vec<String>,
 }
@@ -39,7 +47,6 @@ struct ScanOptions {
 
 struct ScanState {
     total_nodes: usize,
-    max_depth_reached: bool,
     truncated: bool,
     warnings: Vec<String>,
 }
@@ -199,26 +206,65 @@ fn read_directory(
         state.total_nodes += 1;
         let mut node = FileStructureNode {
             name: name.clone(),
-            relative_path: relative_path.clone(),
             kind: kind.to_string(),
-            size: (kind != "directory").then_some(stat.size.unwrap_or(0)),
             children: (kind == "directory").then(Vec::new),
+            depth_limited: false,
         };
 
         if kind == "directory" {
-            if depth >= options.max_depth {
-                state.max_depth_reached = true;
-            } else {
+            if depth < options.max_depth {
                 let child_path = absolute_path.join(&name);
                 match read_directory(sftp, &child_path, &relative_path, depth + 1, options, state) {
                     Ok(children) => node.children = Some(children),
                     Err(error) => state.warnings.push(error),
                 }
+            } else {
+                node.depth_limited = true;
             }
         }
         nodes.push(node);
     }
     Ok(nodes)
+}
+
+fn printable_name(name: &str) -> String {
+    name.replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn render_tree_nodes(nodes: &[FileStructureNode], prefix: &str, output: &mut String) {
+    for (index, node) in nodes.iter().enumerate() {
+        let last = index + 1 == nodes.len();
+        output.push_str(prefix);
+        output.push_str(if last { "└── " } else { "├── " });
+        output.push_str(&printable_name(&node.name));
+        match node.kind.as_str() {
+            "directory" => output.push('/'),
+            "symlink" => output.push('@'),
+            "other" => output.push('?'),
+            _ => {}
+        }
+        output.push('\n');
+        if let Some(children) = &node.children {
+            let child_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
+            render_tree_nodes(children, &child_prefix, output);
+            if node.depth_limited {
+                output.push_str(&child_prefix);
+                output.push_str("└── …\n");
+            }
+        }
+    }
+}
+
+fn render_tree(root_path: &str, nodes: &[FileStructureNode]) -> String {
+    let mut output = if root_path == "/" {
+        "/\n".to_string()
+    } else {
+        format!("{}/\n", root_path.trim_end_matches('/'))
+    };
+    render_tree_nodes(nodes, "", &mut output);
+    output.trim_end().to_string()
 }
 
 pub fn scan_sftp(
@@ -246,18 +292,13 @@ pub fn scan_sftp(
 
     let mut state = ScanState {
         total_nodes: 0,
-        max_depth_reached: false,
         truncated: false,
         warnings: Vec::new(),
     };
     let nodes = read_directory(sftp, root, "", 1, &options, &mut state)?;
     Ok(FileStructureResult {
-        root_path: options.root_path,
-        nodes,
-        excluded_directories: options.excludes,
-        total_nodes: state.total_nodes,
-        max_depth_reached: state.max_depth_reached,
-        truncated: state.truncated,
+        tree: render_tree(&options.root_path, &nodes),
+        truncated: state.truncated || !state.warnings.is_empty(),
         warnings: state.warnings,
     })
 }
@@ -278,7 +319,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(options.root_path, "/opt/app");
-        assert!(!options.excludes.contains(&"node_modules".to_string()));
+        assert!(options.excludes.contains(&".git".to_string()));
+        assert!(options.excludes.contains(&"node_modules".to_string()));
         assert_eq!(
             options
                 .excludes
@@ -322,5 +364,33 @@ mod tests {
         assert_eq!(kind_from_stat(&stat(0o040755)), "directory");
         assert_eq!(kind_from_stat(&stat(0o100644)), "file");
         assert_eq!(kind_from_stat(&stat(0o120777)), "symlink");
+    }
+
+    #[test]
+    fn renders_a_compact_stable_tree() {
+        let nodes = vec![
+            FileStructureNode {
+                name: "src".into(),
+                kind: "directory".into(),
+                children: Some(vec![FileStructureNode {
+                    name: "main.rs".into(),
+                    kind: "file".into(),
+                    children: None,
+                    depth_limited: false,
+                }]),
+                depth_limited: false,
+            },
+            FileStructureNode {
+                name: "README.md".into(),
+                kind: "file".into(),
+                children: None,
+                depth_limited: false,
+            },
+        ];
+
+        assert_eq!(
+            render_tree("/opt/app", &nodes),
+            "/opt/app/\n├── src/\n│   └── main.rs\n└── README.md"
+        );
     }
 }

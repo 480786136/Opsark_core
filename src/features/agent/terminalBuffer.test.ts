@@ -5,7 +5,11 @@ import {
   appendTerminalStream,
   isTerminalProgressFrame,
 } from "@/features/agent/terminalBuffer";
-import { appendTerminalOutput } from "@/utils/terminal";
+import {
+  appendTerminalOutput,
+  appendTerminalOutputChunk,
+  createTerminalOutputAccumulator,
+} from "@/utils/terminal";
 
 describe("terminal buffer", () => {
   it("replaces carriage-return download frames and bounds retained output", () => {
@@ -14,6 +18,18 @@ describe("terminal buffer", () => {
     expect(output).toBe("downloading\n30%\nready\n");
 
     expect(appendTerminalOutput("old-line\n", "new-line-that-is-long", 12)).toBe("that-is-long");
+  });
+
+  it("removes ANSI sequences split across PTY chunks without leaking fragments", () => {
+    let state = createTerminalOutputAccumulator();
+    state = appendTerminalOutputChunk(state, "vite \u001b[");
+    state = appendTerminalOutputChunk(state, "1Gtransforming\r");
+    state = appendTerminalOutputChunk(state, "\u001b[36mindex.js\u001b[0");
+    state = appendTerminalOutputChunk(state, "m\n");
+
+    expect(state.pendingControl).toBe("");
+    expect(state.output).toBe("index.js\n");
+    expect(state.output).not.toMatch(/1G|36m|\u001b/);
   });
 
   it("recognizes and replaces adjacent percentage progress frames", () => {

@@ -4,15 +4,26 @@ import { normalizeSkillDefinition } from "@/features/skills/skillValidation";
 import type {
   ModelSkillDefinition,
   ModelSkillDirectoryEntry,
+  SkillCategory,
+  SkillCapability,
   SkillConfiguration,
   SkillDefinition,
   SkillOverride,
 } from "@/features/skills/types";
+import { SKILL_CATEGORY_IDS, SKILL_EFFECT_IDS, SKILL_OPERATION_IDS } from "@/features/skills/types";
 import type { OpsTask } from "@/types";
 
-const EDITABLE_FIELDS = ["name", "description", "enabled", "matchRules", "instructions"] as const;
+const EDITABLE_FIELDS = ["name", "category", "description", "enabled", "capabilities", "matchRules", "instructions"] as const;
 const LEGACY_PROJECT_SKILL_ID = "project-deployment";
 const SPLIT_PROJECT_SKILL_IDS = new Set(["project-source-acquisition", "project-build"]);
+const INSTRUCTION_CONTRACT_VERSIONS = new Map([
+  ["project-source-acquisition", 11],
+  ["project-build", 3],
+]);
+
+function cloneCapabilities(capabilities: SkillCapability[]) {
+  return capabilities.map(({ operation, effect }) => ({ operation, effect }));
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -22,12 +33,42 @@ function stringArray(value: unknown) {
   return Array.isArray(value) && value.every((item) => typeof item === "string") ? value : undefined;
 }
 
+function parseSkillCategory(value: unknown): SkillCategory | undefined {
+  return typeof value === "string" && (SKILL_CATEGORY_IDS as readonly string[]).includes(value)
+    ? value as SkillCategory
+    : undefined;
+}
+
+function parseSkillCapabilities(value: unknown): SkillCapability[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const capabilities = value.flatMap((item) => {
+    if (!isRecord(item)
+      || typeof item.operation !== "string"
+      || !(SKILL_OPERATION_IDS as readonly string[]).includes(item.operation)
+      || typeof item.effect !== "string"
+      || !(SKILL_EFFECT_IDS as readonly string[]).includes(item.effect)) return [];
+    return [{ operation: item.operation, effect: item.effect } as SkillCapability];
+  });
+  return capabilities.length === value.length ? capabilities : undefined;
+}
+
+const LEGACY_CUSTOM_CAPABILITIES: SkillCapability[] = SKILL_OPERATION_IDS.flatMap((operation) =>
+  SKILL_EFFECT_IDS.map((effect) => ({ operation, effect })),
+);
+
 function parseOverride(value: unknown): SkillOverride | undefined {
   if (!isRecord(value) || typeof value.id !== "string") return undefined;
   const result: SkillOverride = { id: value.id };
+  if (Number.isInteger(value.baseVersion) && Number(value.baseVersion) > 0) {
+    result.baseVersion = Number(value.baseVersion);
+  }
   if (typeof value.name === "string") result.name = value.name;
+  const category = parseSkillCategory(value.category);
+  if (category) result.category = category;
   if (typeof value.description === "string") result.description = value.description;
   if (typeof value.enabled === "boolean") result.enabled = value.enabled;
+  const capabilities = parseSkillCapabilities(value.capabilities);
+  if (capabilities) result.capabilities = capabilities;
   const matchRules = stringArray(value.matchRules);
   if (matchRules) result.matchRules = matchRules;
   if (typeof value.instructions === "string") result.instructions = value.instructions;
@@ -46,9 +87,13 @@ function parseCustomSkill(value: unknown): SkillDefinition | undefined {
   return {
     id: value.id,
     name: value.name,
+    category: parseSkillCategory(value.category) ?? "other",
     description: value.description,
     instructions: value.instructions,
     matchRules,
+    // Older custom Skills had no machine-readable scope. Preserve their behavior
+    // until the user narrows them in Skill management.
+    capabilities: parseSkillCapabilities(value.capabilities) ?? structuredClone(LEGACY_CUSTOM_CAPABILITIES),
     enabled: value.enabled !== false,
     builtIn: false,
     version: Number.isInteger(value.version) ? Number(value.version) : 1,
@@ -80,15 +125,25 @@ export function resolveSkillRegistry(
     const legacyOverride = SPLIT_PROJECT_SKILL_IDS.has(definition.id)
       ? overrideById.get(LEGACY_PROJECT_SKILL_ID)
       : undefined;
-    const override = directOverride ?? (typeof legacyOverride?.enabled === "boolean" ? {
+    const rawOverride = directOverride ?? (typeof legacyOverride?.enabled === "boolean" ? {
       id: definition.id,
       enabled: legacyOverride.enabled,
       ...(legacyOverride.updatedAt ? { updatedAt: legacyOverride.updatedAt } : {}),
     } : undefined);
-    if (!override) return structuredClone(definition);
+    if (!rawOverride) return structuredClone(definition);
+    const contractVersion = INSTRUCTION_CONTRACT_VERSIONS.get(definition.id);
+    const override = { ...rawOverride };
+    if (contractVersion && definition.version >= contractVersion
+      && override.instructions !== undefined
+      && (override.baseVersion ?? 0) < contractVersion) {
+      // A pre-contract prose override must not silently mask a rewritten
+      // built-in workflow. Preserve enablement and other user choices.
+      delete override.instructions;
+    }
+    const { baseVersion: _baseVersion, ...applicableOverride } = override;
     return {
       ...structuredClone(definition),
-      ...override,
+      ...applicableOverride,
       id: definition.id,
       builtIn: true,
       version: definition.version,
@@ -115,11 +170,14 @@ export function createSkillConfiguration(
     for (const field of EDITABLE_FIELDS) {
       if (JSON.stringify(skill[field]) !== JSON.stringify(defaultSkill[field])) {
         if (field === "enabled") override.enabled = skill.enabled;
+        else if (field === "category") override.category = skill.category;
+        else if (field === "capabilities") override.capabilities = cloneCapabilities(skill.capabilities);
         else if (field === "matchRules") override.matchRules = [...skill.matchRules];
         else override[field] = skill[field];
       }
     }
     if (Object.keys(override).length === 1) return [];
+    override.baseVersion = defaultSkill.version;
     override.updatedAt = skill.updatedAt;
     return [override];
   });
@@ -128,10 +186,12 @@ export function createSkillConfiguration(
     customSkills: skills.filter((skill) => !defaults.has(skill.id)).map((skill) => ({
       id: skill.id,
       name: skill.name,
+      category: skill.category,
       description: skill.description,
       enabled: skill.enabled,
       builtIn: false,
       version: skill.version,
+      capabilities: cloneCapabilities(skill.capabilities),
       matchRules: [...skill.matchRules],
       instructions: skill.instructions,
       updatedAt: skill.updatedAt,
@@ -143,7 +203,9 @@ export function createCustomSkill(id: string): SkillDefinition {
   return {
     id,
     name: "新建 Skill",
+    category: "other",
     description: "说明这个 Skill 负责处理的业务场景。",
+    capabilities: [{ operation: "diagnose", effect: "read" }],
     matchRules: [],
     instructions: "说明模型必须遵循的处理阶段、可用工具、阻断条件和最终验收要求。",
     enabled: true,
@@ -184,11 +246,13 @@ export function suggestSkillsByRules(requirement: string, catalog: SkillDefiniti
 export function buildSkillDirectory(skills: SkillDefinition[]): ModelSkillDirectoryEntry[] {
   return skills
     .filter((skill) => skill.enabled)
-    .map(({ id, name, description, version, matchRules }) => ({
+    .map(({ id, name, category, description, version, capabilities, matchRules }) => ({
       id,
       name,
+      category,
       description,
       version,
+      capabilities: cloneCapabilities(capabilities),
       selectionHints: [...matchRules],
     }));
 }
@@ -199,8 +263,9 @@ export function resolveTaskSkills(task: OpsTask, catalog: SkillDefinition[] = bu
 }
 
 export function buildSkillContext(skills: SkillDefinition[]): ModelSkillDefinition[] {
-  return skills.map(({ id, name, description, version, instructions }) => ({
-    id, name, description, version, instructions,
+  return skills.map(({ id, name, description, version, capabilities, instructions, forbiddenToolIds }) => ({
+    id, name, description, version, capabilities: cloneCapabilities(capabilities), instructions,
+    forbiddenToolIds: [...(forbiddenToolIds ?? [])],
   }));
 }
 

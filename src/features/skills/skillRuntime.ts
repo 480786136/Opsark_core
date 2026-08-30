@@ -1,12 +1,10 @@
 import type { OpsTask } from "@/types";
+import { allTaskSteps } from "@/features/agent/taskGoal";
 
 type SkillFactCollector = (task: OpsTask) => Record<string, unknown>;
 
 const collectProjectFacts: SkillFactCollector = (task) => {
-  const steps = [
-    ...(task.planHistory ?? []).flatMap((round) => round.plan),
-    ...task.plan,
-  ].filter((step) => step.status === "completed");
+  const steps = allTaskSteps(task).filter((step) => step.status === "completed");
   const repositoryUrls = new Set<string>();
   const workingDirectories = new Set<string>();
   for (const step of steps) {

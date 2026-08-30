@@ -15,6 +15,7 @@ import {
   validStatesForSkillValidator,
   type SkillOutputSignals,
 } from "@/features/skills/validationAdapters";
+import { buildStepScopeEvidence } from "@/features/agent/executionScope";
 
 export type NormalizedPlanStep = PlanStep & { validator: StepValidator };
 
@@ -64,7 +65,7 @@ export function isMutatingStepCommand(command: string) {
 }
 
 export function isReadOnlyStep(step: PlanStep) {
-  return !isMutatingStepCommand(step.command);
+  return step.kind === "observe" || !isMutatingStepCommand(step.command);
 }
 
 export function inferValidatorType(step: Pick<PlanStep, "title" | "description" | "command" | "validation">): ValidatorType {
@@ -115,13 +116,17 @@ export function classifyStepResult(
   rawStep: PlanStep,
   execution: CommandSnapshot,
   validation: ValidationSnapshot,
+  scopeTarget?: { targetId: string; sessionId?: string; generation?: number; shell?: string; cwd?: string },
 ): { result: StepResult; evidence: ExecutionEvidence[]; accepted: boolean; needsModelReview: boolean } {
   const step = ensureStepValidator(rawStep);
+  const commandResultOnly = step.kind === "observe";
   const validator = step.validator;
   const mainParsed = parseObservation(step, execution);
   const semantic = `${step.title}\n${step.description}\n${step.expected}`;
   const mainSignals = analyzeSkillOutputSignals(outputLines(mainOutput(execution.output)), semantic);
-  const validationSignals = analyzeSkillOutputSignals(outputLines(validation.output ?? ""), semantic);
+  const validationSignals = commandResultOnly
+    ? { facts: {}, warnings: [], blocking: false } as SkillOutputSignals
+    : analyzeSkillOutputSignals(outputLines(validation.output ?? ""), semantic);
   const outputSignals: SkillOutputSignals = {
     status: mainSignals.status === "unhealthy" || validationSignals.status === "unhealthy"
       ? "unhealthy"
@@ -145,7 +150,7 @@ export function classifyStepResult(
     blocking: mainSignals.blocking || validationSignals.blocking,
   };
   const validationLines = outputLines(validation.output ?? "");
-  let validationParsed = validation.output
+  let validationParsed = !commandResultOnly && validation.output
     ? parseObservation(step, {
         output: validation.output,
         success: validation.passed,
@@ -181,7 +186,7 @@ export function classifyStepResult(
       },
     };
   }
-  const validationAccepted = validation.passed
+  const validationAccepted = commandResultOnly || validation.passed
     || (readOnly && expectedDiagnosticExit(validator.type, validation.exitCode));
   const diagnosticFailureConsistent =
     !validation.passed
@@ -201,9 +206,10 @@ export function classifyStepResult(
       || (mainParsed.status === "unhealthy" && validationParsed.status === "healthy")
     ),
   );
-  const evidenceConflict =
+  const evidenceConflict = !commandResultOnly && (
     (!validation.passed && validationAccepted && !diagnosticFailureConsistent)
-    || semanticConflict;
+    || semanticConflict
+  );
   const accepted = execution.success && validationAccepted;
   const warnings = [
     ...outputSignals.warnings,
@@ -219,6 +225,7 @@ export function classifyStepResult(
     facts: parsed.facts,
     rawOutput: execution.output,
     collectedAt,
+    scope: scopeTarget ? buildStepScopeEvidence(step, "main", scopeTarget) : undefined,
   };
   const validationEvidence: ExecutionEvidence = {
     id: evidenceId("validation"),
@@ -234,11 +241,13 @@ export function classifyStepResult(
     },
     rawOutput: validation.output ?? "",
     collectedAt,
+    scope: scopeTarget ? buildStepScopeEvidence(step, "validation", scopeTarget) : undefined,
   };
+  const evidence = commandResultOnly ? [mainEvidence] : [mainEvidence, validationEvidence];
   return {
     accepted,
     needsModelReview: accepted && (parsed.status === "unknown" || evidenceConflict || outputSignals.blocking),
-    evidence: [mainEvidence, validationEvidence],
+    evidence,
     result: {
       executionStatus: execution.success ? "success" : "failed",
       observationStatus: parsed.status,
@@ -246,14 +255,15 @@ export function classifyStepResult(
       facts: {
         ...parsed.facts,
         mainObservationStatus: mainParsed.status,
+        verificationMode: commandResultOnly ? "command_result" : "postcondition",
         validationObservationStatus: validationParsed?.status,
         validatorType: validator.type,
-        validationPassed: validation.passed,
+        validationPassed: commandResultOnly ? undefined : validation.passed,
         evidenceConflict,
         blockingSignal: outputSignals.blocking,
       },
       warnings,
-      evidenceIds: [mainEvidence.id, validationEvidence.id],
+      evidenceIds: evidence.map((item) => item.id),
       failureReason: accepted
         ? undefined
         : outputSignals.facts.platformIncompatible

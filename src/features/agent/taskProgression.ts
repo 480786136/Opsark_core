@@ -7,18 +7,16 @@ import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 import { parseToolCommand } from "@/features/tools/toolExecutor";
 import type { ToolDefinition } from "@/features/tools/types";
 import type { OpsTask, PlanStep } from "@/types";
+import { taskGoal } from "@/features/agent/taskGoal";
 
 export type TaskProgression =
   | { kind: "execute-step"; step: PlanStep }
   | { kind: "refine-discovery" }
   | { kind: "complete" };
 
-/** Returns the latest user requirement while ignoring user-triggered event records. */
+/** Returns the stable overall goal; follow-up instructions must not silently replace it. */
 export function latestTaskRequirement(task: OpsTask) {
-  return [...task.messages]
-    .reverse()
-    .find((message) => message.role === "user" && message.kind === "message")?.content
-    ?? task.title;
+  return taskGoal(task);
 }
 
 /**
@@ -35,7 +33,7 @@ export function resolveTaskProgression(
   const latestCompletedStep = [...task.plan].reverse().find((step) => step.status === "completed");
   if (latestCompletedStep) {
     try {
-      const call = parseToolCommand(latestCompletedStep.command, `progress-${latestCompletedStep.id}`);
+      const call = parseToolCommand(latestCompletedStep.command, `progress-${latestCompletedStep.id}`, tools);
       const definition = call ? tools.find((tool) => tool.id === call.toolId) : undefined;
       if (definition?.completionMode === "complete") return { kind: "complete" };
       const refinementEnabled = definition?.refinementScope !== "active-skill"

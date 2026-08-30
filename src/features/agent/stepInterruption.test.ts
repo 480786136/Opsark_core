@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   cancelStep,
+  failValidationProtocol,
   failToolCommandParsing,
   failUnexpectedStep,
   resumeStepAfterSecret,
@@ -73,6 +74,24 @@ describe("step interruption", () => {
     expect(step.result?.facts.category).toBe("execution_exception");
   });
 
+  it("preserves main-command success when validation protocol is incomplete", () => {
+    const step = createStep("validating");
+
+    const outcome = failValidationProtocol(step, new Error("missing end marker"));
+
+    expect(outcome.pauseReason).toContain("未能确认真实退出");
+    expect(step.status).toBe("validating");
+    expect(step.result).toMatchObject({
+      executionStatus: "success",
+      observationStatus: "unknown",
+      facts: {
+        commandCompleted: true,
+        validationCompleted: false,
+        validationProtocolIncomplete: true,
+      },
+    });
+  });
+
   it("supports approval followed by sensitive input and resume", () => {
     const step = createStep("awaiting_approval");
 
@@ -84,4 +103,3 @@ describe("step interruption", () => {
     expect(step.status).toBe("pending");
   });
 });
-

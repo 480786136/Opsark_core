@@ -1,8 +1,10 @@
 # Opsark Core 重构与工具系统实施计划
 
-> 更新日期：2026-08-20
+> 更新日期：2026-08-26
 >
 > 执行原则：保留现有 Vue 3 + Pinia + Tauri 2 + Rust 可运行闭环，按依赖顺序小步迁移；每个阶段都必须可独立验证、可回退、可继续。
+
+> 2026-08-29 后续架构：Shell/Agent 执行平面的最终重构、实施进度与验收以 [Agent 沙箱终端重构计划](./AGENT_SANDBOX_TERMINAL_REFACTOR_PLAN.md) 为准；下文“当前可见终端执行”是历史阶段记录，不再是现行契约。
 
 > 实施进度：阶段 0 至阶段 8 已完成。智能需求处理、工具系统、文件结构工具、Rust 模块拆分、自动回归及真实环境人工验收均已完成；终端和 SFTP 的后续整体重做不属于本轮重构范围。
 
@@ -21,7 +23,12 @@
 - [x] 阶段 8（真实环境验收）：用户已确认真实模型交互、SSH 集成、终端、SFTP 及文件结构工具调用链路正常。
 - [x] 阶段 9：核心能力原子化、工具执行策略元数据化、领域逻辑 Skill 化。
 - [x] Skill 管理模块：支持新增、编辑、启停、模型选择提示、流程说明、删除自定义 Skill、恢复内置默认值和持久化。
-- [x] 当前自动检查：300 个前端测试、TypeScript 检查、前端构建和 42 个 Rust 单元测试通过；2 个需真实凭据的集成测试保持显式忽略。
+- [x] `project-source-acquisition` v11：源码获取保持准备、认证、获取、验收和错误处理五段流程，接入 `observe/change` 计划协议，删除观察步骤重复 validation 和过度 Shell 写法限制。
+- [x] 通用门禁优化：Skill 增加 `capabilities(operation/effect)` 机器可校验边界，需求分类允许零 Skill；不再使用“某类状态问题排除某 Skill”的业务文本硬编码。
+- [x] 删除 Rust 计划编译器中的“项目源码获取必须使用某一种 `mktemp/trap/mv`”专用业务门禁；通用层只校验步骤副作用、权限、凭据泄露、真实退出状态和工具协议，具体业务流程回归 Skill。
+- [x] 计划步骤增加 `kind=observe|change`：观察步骤直接使用主命令结果作为证据，只有变更步骤必须执行独立只读后置校验。
+- [x] 计划编译失败新增 `planning_failed` 状态：不再冒充业务 `needs_adjustment`，完全托管模式不会因此启动 5 秒调整倒计时。
+- [x] 当前自动检查：前端单元测试、TypeScript 检查和 Rust 单元测试均通过；2 个需真实凭据的集成测试保持显式忽略。
 
 ### 0.2 本次完成内容
 
@@ -46,41 +53,43 @@
 ```text
 用户需求
   -> 需求理解模型查看已启用 Skill 目录
-  -> 模型选择 0～N 个 Skill，程序校验 ID
+  -> 模型分类 operation/effect，并选择 0～N 个 Skill
+  -> 程序同时校验 Skill ID 和完整 capabilities 能力对
   -> 仅将所选 activeSkills 完整指令注入计划上下文
   -> 模型每次只规划当前证据允许的阶段
   -> ToolRegistry 提供原子能力与执行元数据
   -> 通用 TaskProgression 根据元数据续跑
-  -> 可见终端 PTY / 本地适配器执行
+  -> 独立 AgentSession / 无状态 SSH exec / 本地适配器执行
   -> Evidence + ValidationAdapter 独立验收
 ```
 
 核心层只保留以下通用职责：
 
 - 任务与步骤状态迁移、审批、取消和最多八次的有界阶段续跑。
-- 可见终端 PTY 命令执行、实时输出、真实退出码和生命周期跟踪。
+- AgentSession 命令执行、实时输出、真实退出码、作用域和生命周期跟踪；用户 PTY 仅接收用户输入。
+- Shell 启动文件变更由执行器在主命令前快照，通过 fresh interactive/login shell 独立验收，失败自动回滚；模型不负责猜测备份路径。
 - 原子工具协议、参数校验、工具路由、审计和脱敏。
 - 服务器凭据作用域、系统钥匙串访问和不可泄密的 `credentialRef`。
 - 通用风险门禁、证据结构和失败不可掩盖规则。
 
 领域层由 `src/features/skills/` 承载：
 
-- `skillCatalog.ts`：内置 Skill 的默认触发条件、阶段说明、工具选择与最终验收要求。
+- `skillCatalog.ts`：内置 Skill 的默认目录；大型内置 Skill 拆到 `builtins/<skill>/definition.ts`、结构化 workflow 和专用分支模块，由 `instructionBuilder.ts` 稳定编译为既有模型契约。
 - `skillRegistry.ts`：合并内置覆盖和用户自定义 Skill，完成持久化解析、轻量 Skill 目录序列化、模型多选结果装载和领域事实提取。
-- `SkillManagementView.vue`：独立 Skill 管理模块，可配置适用场景、普通语义或 `regex:` 选择提示、执行说明和启停状态。需求理解模型会从全部已启用 Skill 目录中选择 0～N 个 Skill 联合使用，选择后才加载完整领域指令。
-- Skill 只作为模型的领域参考，实际执行步骤仍由模型依据当前证据生成，并必须通过通用权限、风险和证据校验门禁。计划校验失败时，系统会把上一版完整步骤和具体错误返回模型，要求仅修复错误步骤或字段；不由程序自动编造命令。
+- `SkillManagementView.vue`：独立 Skill 管理模块，可配置分类、`operation/effect` 能力对、普通语义或 `regex:` 选择提示、执行说明和启停状态。分类只用于管理与导航；需求理解模型可选择 0～N 个 Skill，后端会拒绝任何与需求能力对不兼容的选择，选择通过后才加载完整领域指令。
+- Skill 提供模型的领域方法，也可声明确定性 `forbiddenToolIds`。实际执行步骤仍由模型依据当前证据生成，并必须通过通用权限、风险、Skill 工具策略和证据校验门禁。计划校验失败时，系统会把上一版完整步骤、具体字段和命中的不安全结构返回模型，最多连续进行两轮针对性修复；不由程序自动编造命令，执行分派还会再次 fail closed。
 - Skill 选择结果与计划生成结果分离保留。即使计划在针对性重试后仍失败，任务记录和审计日志仍会显示已选 `selectedSkillIds` 及最终 `planError`。
 - `validationAdapters.ts`：HTTP、进程、端口、SQL、服务、容器、日志、文件等领域观察解释器。
-- 当前内置 `ssh-terminal-jump`、`project-source-acquisition`、`project-build` 与 `file-transfer-integrity`。旧的 `project-deployment` 已拆分为独立的源码获取和依赖构建 Skill；旧配置的启停状态会安全迁移，混合领域说明不会被复制到新 Skill。后续领域流程可以直接在 Skill 管理中新增。内置 Skill 可修改并恢复默认，自定义 Skill 可删除，均不需要改核心状态机。
+- 当前内置 `ssh-terminal-jump`、`project-source-acquisition`、`software-installation`、`project-build` 与 `file-transfer-integrity`。源码获取 v6 以九个有序阶段分别处理目标、环境、路径、网络、认证、获取和验收；私有 HTTPS 仓库只在真实认证探测后收集缺失的账户+密码/令牌，并用 `credential.group/kind/role/target` 显式配对为当前服务器级长期凭据组；后续任务直接复用，多账号时必须选择，不交叉组合。该 Skill 禁止为 Git HTTPS 调用 `server.resolve_connection`/`server.connect`。缺少 Git 或项目工具链时可与通用软件安装 Skill 联合使用。软件安装覆盖发行版和架构识别、版本选择、包管理器并发、受信国内/企业镜像、签名校验及 Git、Node.js、Java/JDK、Docker 的专属验收。文件传输默认优先使用源服务器到目标服务器的前台直连 `scp`，只有直接传输前提不满足且用户允许时才使用受管中转；目标只给目录时沿用源文件名。旧的 `project-deployment` 已拆分为独立的源码获取和依赖构建 Skill；旧配置的启停状态会安全迁移，混合领域说明不会被复制到新 Skill。
 
 工具定义新增可信执行元数据：
 
 - `planMode`：普通步骤或必须单独执行的阶段步骤。
 - `completionMode`：完成、继续或依据结果重新规划下一阶段。
 - `refinementScope`：始终续跑，或仅在领域 Skill 激活时续跑。
-- `executionMode`：本地原子能力、当前可见终端或用户输入交互。
+- `executionMode`：本地原子能力、Agent execution target 或用户输入交互。
 
-SSH 跳转已迁移为完整 Skill：先在当前服务器检查网络可达性，再调用 `server.resolve_connection` 查询目标服务器管理记录和目标作用域凭据；缺少字段时调用 `user.request_input`；凭据齐全后由 `server.connect` 在当前可见终端执行真实 SSH；最后在已经跳转后的同一终端独立验证主机和用户身份。密码始终只存在于执行器与钥匙串，不进入模型上下文、命令文本或普通日志。
+SSH 目标切换先检查网络，再由 `server.resolve_connection` 查询纳管记录或服务器级 SSH 凭据组；缺失时用 `user.request_input` 同表单收集用户名和密码。`server.connect` 使用 `credentialRef` 验证目标并更新任务的显式 execution target，随后创建新 AgentSession 验证身份，不再跳转或占用用户当前 Shell。真实值只存在于执行器与钥匙串。
 
 ## 1. 目标与范围
 
@@ -894,3 +903,52 @@ cargo check --manifest-path src-tauri/Cargo.toml
 - [ ] 增加终端水平/垂直分屏及独立 PTY 生命周期。
 - [ ] 增加 SFTP 列表/紧凑视图切换与偏好持久化。
 - [ ] 完善 SFTP 权限错误、断线和目录恢复状态。
+
+### 12.13 任务核心语义重构（2026-08-22）
+
+- [x] 为任务增加稳定整体目标 `rootGoal` 与当前阶段指令 `currentInstruction`，续接、重试和补充不再覆盖原始目标。
+- [x] 需求理解增加 `new_goal / continue / supplement / side_question / replace_goal / cancel_goal` 关系分类；独立目标自动新建任务，旁问回答后恢复原任务状态，只有明确替换才取消旧目标。
+- [x] 调整计划替换前归档当前阶段，计划、执行结果、结构化证据和总结统一读取完整任务台账。
+- [x] 同目标续接自动合并既有 Skill 与本轮新增 Skill，并在 Rust 计划阶段强制加载既有领域说明。
+- [x] 增加整体目标完成门禁：当前计划队列结束后仍需结合完整台账和全部 Skill 最终验收复核；证据不足进入可恢复调整状态，不再把中间阶段误报为整体完成。
+- [x] 新增“应用部署与上线验收”内置 Skill，明确源码、依赖、配置、数据服务、进程托管和端到端可用性均属于同一部署目标的阶段。
+
+### 12.14 服务器级长期凭据组（2026-08-24）
+
+- [x] 用户名和密码/令牌改为同一服务器级 `credentialGroupId` 的两个钥匙串字段，不再把用户名仅保存在任务中。
+- [x] 新任务可直接复用当前服务器中用途和目标匹配的敏感变量或完整凭据组，不再要求任务级重复确认。
+- [x] 同一认证目标的多账号使用独立变量 key；无唯一匹配时执行器拒绝猜测，明确引用 `server-credential:<id>` 后才使用。
+- [x] 启动时将历史任务中的 Git 用户名与服务器令牌升级为凭据组；也会把旧版同一表单误存为两个孤立 `password` 项的用户名和令牌原地成组，并清理任务持久化中的用户名真实值。
+- [x] 敏感信息页面显示凭据组、目标和字段角色；删除组内任一字段时原子删除整组。
+
+### 12.15 项目源码获取 Skill v6 完全重构（2026-08-24）
+
+- [x] 保持 `project-source-acquisition` 稳定 ID，版本升级为 6；将原先集中在 `skillCatalog.ts` 的长指令拆分为 `definition.ts`、`workflow.ts` 和 `authentication.ts`。
+- [x] Skill override 记录 `baseVersion`；升级到 v6 时保留启停等用户选择，但不再让无版本或 v5 的旧认证说明覆盖新的确定性安全契约。
+- [x] 新增结构指令编译器，以稳定阶段 ID、进入条件、执行契约、退出证据、状态分支和禁止项生成模型可见说明。
+- [x] Git HTTPS 用户名与密码/令牌通过 `credential.group/kind/role/target` 显式配对；自然语言 key/label/description 只保留旧数据兼容，不参与新表单身份判定。
+- [x] 同服务器、同主机、同认证类型的唯一完整凭据组可跨任务直接复用；多账号时只能选择完整组，禁止把不同组的用户名和令牌交叉拼接。
+- [x] 内置 Skill 增加可执行的 `forbiddenToolIds` 策略；源码获取禁止使用 SSH 专用的 `server.resolve_connection` 和 `server.connect`，计划校验与执行分派均 fail closed。
+- [x] 回归测试锁定 v6 版本、九阶段顺序与唯一性、8000 字符上限、凭据角色、禁用工具 ID 以及编译结果确定性。
+
+### 12.16 计划门禁职责收敛与源码获取 v9（2026-08-25）
+
+- [x] 保留退出码掩盖、凭据泄漏、未受管后台进程、审批失效和临时 clone 泄漏等真正的安全阻断。
+- [x] 删除 Git clone 对 `mktemp -d`、`! -e`、`remote get-url`、`rev-parse`、`rmdir` 等固定字面组合的强制要求；只在计划显式引入事务临时 clone 却没有同步 `trap` 清理和 `mv` 最终提交时 fail closed。
+- [x] 允许直接获取最终路径及语义等价的路径冲突、仓库校验和临时目录清理写法；独立 validation 仍禁止通过 PID、`ls/find` 或通配符重新发现临时 clone。
+- [x] 移除“字符串完全相同的 command 一律拒绝”门禁；重复发现、稳定性复查和有界重试不再因形式相同被当成安全错误。
+
+### 12.17 项目源码获取 Skill v10 精简（2026-08-25）
+
+- [x] 将九阶段详细状态机合并为准备、认证、获取、验收和错误处理五段流程。
+- [x] 删除 `mktemp -d`、`rmdir`、特定探测命令、占位分支和镜像策略等过度说明，不再要求模型复制固定 Shell 写法。
+- [x] 保留服务器级 Git HTTPS 凭据组的唯一复用、多账号选择、缺失收集和拒绝后更新处理。
+- [x] 明确普通 Shell 步骤的 validation 必须简短但有业务意义，不得使用 `true`、`:`、`exit 0` 或 `/bin/true`。
+
+### 12.18 通用 Skill 能力边界与观察/变更计划协议（2026-08-26）
+
+- [x] Skill 分类只负责管理与导航；新增可持久化、可编辑的 `capabilities: {operation,effect}[]`，后端在加载 Skill 指令前必须验证完整能力对。
+- [x] 需求理解协议强制输出 `operation` 和 `effect`，支持 `selectedSkillIds=[]`，续跑时不再与历史 Skill 强制并集。
+- [x] 计划协议强制输出 `kind=observe|change`；`observe` 的 validation 为空且执行器直接使用主命令结果，`change` 才需要独立只读后置校验。
+- [x] 删除核心计划编译器中的 Git clone 专用事务写法门禁；源码获取 v11 只保留最终目录、认证通道、真实退出状态和最终仓库验收语义。
+- [x] 计划格式或安全校验失败进入 `planning_failed`，不再触发业务调整倒计时和“生成调整方案”动作。

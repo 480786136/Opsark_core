@@ -2,17 +2,19 @@ import { describe, expect, it } from "vitest";
 import { normalizeFileStructureRequest } from "@/features/tools/fileStructure";
 
 describe("file structure tool", () => {
-  it("normalizes only caller-provided exclusions and request limits", () => {
+  it("applies compact project-tree defaults and deduplicates caller exclusions", () => {
     const request = normalizeFileStructureRequest({
       rootPath: "/opt/app/",
       excludeDirectories: ["uploads", "storage/cache", "uploads"],
     });
 
     expect(request.rootPath).toBe("/opt/app");
-    expect(request.excludeDirectories).toEqual(["uploads", "storage/cache"]);
+    expect(request.excludeDirectories).toEqual(expect.arrayContaining([
+      ".git", "node_modules", "vendor", "target", "dist", "build", "uploads", "storage/cache",
+    ]));
     expect(request.excludeDirectories.filter((item) => item === "uploads")).toHaveLength(1);
-    expect(request.maxDepth).toBe(6);
-    expect(request.maxNodes).toBe(2000);
+    expect(request.maxDepth).toBe(4);
+    expect(request.maxNodes).toBe(600);
   });
 
   it("rejects unsafe paths and out-of-range limits", () => {

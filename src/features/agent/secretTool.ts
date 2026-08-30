@@ -10,6 +10,10 @@ export function redactExecutionOutput(value: string, secretValues: Record<string
     /^(\s*[\w.-]*(?:password|passwd|pwd|api[_-]?key|access[_-]?token|secret)[\w.-]*\s*[:=]\s*).+$/gim,
     "$1••••••••",
   );
+  output = output.replace(
+    /(["']?[\w.-]*(?:password|passwd|pwd|api[_-]?key|access[_-]?token|secret)[\w.-]*["']?\s*[:=]\s*["'])[^"'\r\n]+(["'])/gi,
+    "$1••••••••$2",
+  );
   return output.replace(
     /([?&](?:password|passwd|pwd|api[_-]?key|access[_-]?token|secret)=)[^&\s]+/gi,
     "$1••••••••",

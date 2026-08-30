@@ -1,6 +1,22 @@
 import type { FileStructureRequest } from "@/features/tools/types";
 
-export const DEFAULT_FILE_STRUCTURE_EXCLUDES: string[] = [];
+export const DEFAULT_FILE_STRUCTURE_EXCLUDES = [
+  ".git",
+  ".hg",
+  ".svn",
+  ".cache",
+  ".next",
+  ".nuxt",
+  ".venv",
+  "__pycache__",
+  "build",
+  "coverage",
+  "dist",
+  "node_modules",
+  "target",
+  "vendor",
+  "venv",
+] as const;
 
 export interface NormalizedFileStructureRequest {
   rootPath: string;
@@ -25,8 +41,8 @@ export function normalizeFileStructureRequest(
     }
     return [value];
   });
-  const maxDepth = Math.trunc(request.maxDepth ?? 6);
-  const maxNodes = Math.trunc(request.maxNodes ?? 2000);
+  const maxDepth = Math.trunc(request.maxDepth ?? 4);
+  const maxNodes = Math.trunc(request.maxNodes ?? 600);
   if (maxDepth < 1 || maxDepth > 20) throw new Error("遍历深度必须在 1 到 20 之间");
   if (maxNodes < 1 || maxNodes > 10_000) throw new Error("节点数量必须在 1 到 10000 之间");
 

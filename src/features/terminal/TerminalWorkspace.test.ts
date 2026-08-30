@@ -105,18 +105,17 @@ describe("TerminalWorkspace 终端选项卡", () => {
     app.unmount();
   });
 
-  it("智能任务绑定后只在发起终端标签显示 Agent 标识", async () => {
+  it("用户 Shell 标签不承载 Agent 绑定或标识", async () => {
     const pinia = createPinia();
     addServer(pinia);
     const app = createApp(TerminalWorkspace, { serverId: "server-a" });
     app.use(pinia).use(i18n).mount(host);
     const store = useTerminalSessionStore(pinia);
     store.addSession("server-a");
-    store.bindAgentTask("server-a", "task-1");
     await nextTick();
 
-    expect(host.querySelectorAll(".terminal-agent-mark")).toHaveLength(1);
-    expect(host.querySelectorAll<HTMLElement>(".terminal-panel-stub")[1].dataset.agentTaskId).toBe("task-1");
+    expect(host.querySelectorAll(".terminal-agent-mark")).toHaveLength(0);
+    expect(host.querySelectorAll<HTMLElement>(".terminal-panel-stub")[1].dataset.agentTaskId).toBeUndefined();
     expect(host.querySelectorAll<HTMLElement>(".terminal-panel-stub")[0].dataset.agentTaskId).toBeUndefined();
     app.unmount();
   });

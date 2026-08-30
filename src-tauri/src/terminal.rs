@@ -1,6 +1,6 @@
 use crate::ssh::connect_ssh;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -25,10 +25,87 @@ enum TerminalInput {
     Close,
 }
 
+enum QueuedTerminalInput {
+    Data { data: Vec<u8>, written: usize },
+    Resize(u32, u32),
+    Close,
+}
+
+impl From<TerminalInput> for QueuedTerminalInput {
+    fn from(input: TerminalInput) -> Self {
+        match input {
+            TerminalInput::Data(data) => Self::Data { data, written: 0 },
+            TerminalInput::Resize(cols, rows) => Self::Resize(cols, rows),
+            TerminalInput::Close => Self::Close,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum TerminalWriteProgress {
+    Progressed,
+    Blocked,
+    ControlReady,
+    Idle,
+}
+
+/// Advances the first queued data message without ever discarding an unwritten
+/// suffix. `ssh2::Channel` is non-blocking in terminal sessions, so both a
+/// partial write and `WouldBlock` are normal and must be resumed on a later
+/// loop iteration. A pending flush is completed before a following resize or
+/// close operation, preserving the order in which inputs were submitted.
+fn advance_terminal_write<W: Write>(
+    writer: &mut W,
+    pending: &mut VecDeque<QueuedTerminalInput>,
+    flush_pending: &mut bool,
+) -> std::io::Result<TerminalWriteProgress> {
+    if *flush_pending {
+        match writer.flush() {
+            Ok(()) => *flush_pending = false,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(TerminalWriteProgress::Blocked);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let Some(front) = pending.front_mut() else {
+        return Ok(TerminalWriteProgress::Idle);
+    };
+    let QueuedTerminalInput::Data { data, written } = front else {
+        return Ok(TerminalWriteProgress::ControlReady);
+    };
+
+    if *written >= data.len() {
+        pending.pop_front();
+        return Ok(TerminalWriteProgress::Progressed);
+    }
+
+    match writer.write(&data[*written..]) {
+        Ok(0) => Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "terminal channel accepted zero input bytes",
+        )),
+        Ok(size) => {
+            *written += size;
+            *flush_pending = true;
+            if *written == data.len() {
+                pending.pop_front();
+            }
+            Ok(TerminalWriteProgress::Progressed)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Ok(TerminalWriteProgress::Blocked)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TerminalEvent {
     terminal_id: String,
+    generation: u64,
     data: String,
     stream: String,
 }
@@ -135,11 +212,18 @@ fn is_retryable_terminal_error(error: &str) -> bool {
     !error.contains("身份认证失败") && !error.contains("密码")
 }
 
-fn emit_terminal(app: &AppHandle, terminal_id: &str, data: impl Into<String>, stream: &str) {
+fn emit_terminal(
+    app: &AppHandle,
+    terminal_id: &str,
+    generation: u64,
+    data: impl Into<String>,
+    stream: &str,
+) {
     let _ = app.emit(
         "terminal-output",
         TerminalEvent {
             terminal_id: terminal_id.to_string(),
+            generation,
             data: data.into(),
             stream: stream.to_string(),
         },
@@ -176,27 +260,53 @@ fn run_terminal_session(
     emit_terminal_status(app, terminal_id, generation, "connected", None, false);
 
     let mut buffer = [0_u8; 8192];
+    let mut pending_inputs = VecDeque::<QueuedTerminalInput>::new();
+    let mut input_flush_pending = false;
+    let mut receiver_disconnected = false;
     loop {
-        loop {
+        // Bound each drain so a continuously typing producer cannot starve
+        // pending writes or remote output handling.
+        for _ in 0..256 {
+            if receiver_disconnected {
+                break;
+            }
             match receiver.try_recv() {
-                Ok(TerminalInput::Data(data)) => {
-                    if let Err(error) = channel.write_all(&data) {
-                        if error.kind() != std::io::ErrorKind::WouldBlock {
-                            return Err(format!("终端输入发送失败：{error}"));
-                        }
-                    }
-                    let _ = channel.flush();
-                }
-                Ok(TerminalInput::Resize(cols, rows)) => {
-                    channel
-                        .request_pty_size(cols, rows, None, None)
-                        .map_err(|error| format!("终端尺寸调整失败：{error}"))?;
-                }
-                Ok(TerminalInput::Close) | Err(mpsc::TryRecvError::Disconnected) => {
-                    let _ = channel.close();
-                    return Ok(TerminalExit::ClosedByClient);
+                Ok(input) => pending_inputs.push_back(input.into()),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    receiver_disconnected = true;
+                    pending_inputs.push_back(QueuedTerminalInput::Close);
+                    break;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
+            }
+        }
+
+        // Keep Data, Resize, and Close in submission order. A blocked or
+        // partial data write remains at the front and is resumed next tick.
+        // The work budget keeps terminal output responsive during large pastes.
+        for _ in 0..256 {
+            match advance_terminal_write(
+                &mut channel,
+                &mut pending_inputs,
+                &mut input_flush_pending,
+            ) {
+                Ok(TerminalWriteProgress::Progressed) => continue,
+                Ok(TerminalWriteProgress::Blocked | TerminalWriteProgress::Idle) => break,
+                Ok(TerminalWriteProgress::ControlReady) => match pending_inputs.pop_front() {
+                    Some(QueuedTerminalInput::Resize(cols, rows)) => {
+                        channel
+                            .request_pty_size(cols, rows, None, None)
+                            .map_err(|error| format!("终端尺寸调整失败：{error}"))?;
+                    }
+                    Some(QueuedTerminalInput::Close) => {
+                        let _ = channel.close();
+                        return Ok(TerminalExit::ClosedByClient);
+                    }
+                    Some(QueuedTerminalInput::Data { .. }) | None => {
+                        unreachable!("terminal input queue changed while processing its front")
+                    }
+                },
+                Err(error) => return Err(format!("终端输入发送失败：{error}")),
             }
         }
 
@@ -204,6 +314,7 @@ fn run_terminal_session(
             Ok(size) if size > 0 => emit_terminal(
                 app,
                 terminal_id,
+                generation,
                 String::from_utf8_lossy(&buffer[..size]).to_string(),
                 "stdout",
             ),
@@ -216,6 +327,7 @@ fn run_terminal_session(
             Ok(size) if size > 0 => emit_terminal(
                 app,
                 terminal_id,
+                generation,
                 String::from_utf8_lossy(&buffer[..size]).to_string(),
                 "stderr",
             ),
@@ -272,6 +384,7 @@ pub(crate) fn start_ssh_terminal(
                 emit_terminal(
                     &app_handle,
                     &terminal_id,
+                    generation,
                     format!("\r\n[Opsark] {error}\r\n"),
                     "error",
                 );
@@ -289,6 +402,7 @@ pub(crate) fn start_ssh_terminal(
                 emit_terminal(
                     &app_handle,
                     &terminal_id,
+                    generation,
                     "\r\n[Opsark] 远程 SSH PTY 已断开\r\n",
                     "system",
                 );
@@ -305,6 +419,7 @@ pub(crate) fn start_ssh_terminal(
                 emit_terminal(
                     &app_handle,
                     &terminal_id,
+                    generation,
                     "\r\n[Opsark] SSH PTY 已关闭\r\n",
                     "system",
                 );
@@ -322,6 +437,7 @@ pub(crate) fn start_ssh_terminal(
             emit_terminal(
                 &app_handle,
                 &terminal_id,
+                generation,
                 format!("\r\n[Opsark] {error}\r\n"),
                 "error",
             );
@@ -360,6 +476,50 @@ pub(crate) fn close_ssh_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    enum WriteAttempt {
+        Accept(usize),
+        WouldBlock,
+    }
+
+    struct ScriptedWriter {
+        write_attempts: VecDeque<WriteAttempt>,
+        flush_attempts: VecDeque<std::io::Result<()>>,
+        accepted: Vec<u8>,
+    }
+
+    impl ScriptedWriter {
+        fn new(write_attempts: impl IntoIterator<Item = WriteAttempt>) -> Self {
+            Self {
+                write_attempts: write_attempts.into_iter().collect(),
+                flush_attempts: VecDeque::new(),
+                accepted: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for ScriptedWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            match self.write_attempts.pop_front() {
+                Some(WriteAttempt::Accept(limit)) => {
+                    let size = limit.min(buffer.len());
+                    self.accepted.extend_from_slice(&buffer[..size]);
+                    Ok(size)
+                }
+                Some(WriteAttempt::WouldBlock) => {
+                    Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                }
+                None => {
+                    self.accepted.extend_from_slice(buffer);
+                    Ok(buffer.len())
+                }
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flush_attempts.pop_front().unwrap_or(Ok(()))
+        }
+    }
 
     #[test]
     fn keeps_the_first_session_when_registering_a_duplicate_id() {
@@ -464,5 +624,113 @@ mod tests {
                 .unwrap_err(),
             "SSH PTY 已断开"
         );
+    }
+
+    #[test]
+    fn resumes_partial_and_would_block_writes_without_reordering_controls() {
+        let mut writer = ScriptedWriter::new([
+            WriteAttempt::Accept(2),
+            WriteAttempt::WouldBlock,
+            WriteAttempt::Accept(4),
+            WriteAttempt::Accept(3),
+        ]);
+        let mut pending = VecDeque::from([
+            QueuedTerminalInput::Data {
+                data: b"abcdef".to_vec(),
+                written: 0,
+            },
+            QueuedTerminalInput::Resize(120, 40),
+            QueuedTerminalInput::Data {
+                data: b"ghi".to_vec(),
+                written: 0,
+            },
+            QueuedTerminalInput::Close,
+        ]);
+        let mut flush_pending = false;
+
+        assert_eq!(
+            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            TerminalWriteProgress::Progressed
+        );
+        assert_eq!(writer.accepted, b"ab");
+        assert!(matches!(
+            pending.front(),
+            Some(QueuedTerminalInput::Data { written: 2, .. })
+        ));
+
+        assert_eq!(
+            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            TerminalWriteProgress::Blocked
+        );
+        assert_eq!(writer.accepted, b"ab");
+        assert!(matches!(
+            pending.front(),
+            Some(QueuedTerminalInput::Data { written: 2, .. })
+        ));
+
+        assert_eq!(
+            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            TerminalWriteProgress::Progressed
+        );
+        assert_eq!(writer.accepted, b"abcdef");
+        assert!(matches!(
+            pending.front(),
+            Some(QueuedTerminalInput::Resize(120, 40))
+        ));
+
+        assert_eq!(
+            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            TerminalWriteProgress::ControlReady
+        );
+        assert!(matches!(
+            pending.pop_front(),
+            Some(QueuedTerminalInput::Resize(120, 40))
+        ));
+
+        assert_eq!(
+            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            TerminalWriteProgress::Progressed
+        );
+        assert_eq!(writer.accepted, b"abcdefghi");
+        assert_eq!(
+            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            TerminalWriteProgress::ControlReady
+        );
+        assert!(matches!(pending.front(), Some(QueuedTerminalInput::Close)));
+    }
+
+    #[test]
+    fn retries_a_blocked_flush_before_allowing_close() {
+        let mut writer = ScriptedWriter::new([WriteAttempt::Accept(3)]);
+        writer
+            .flush_attempts
+            .push_back(Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)));
+        writer.flush_attempts.push_back(Ok(()));
+        let mut pending = VecDeque::from([
+            QueuedTerminalInput::Data {
+                data: b"bye".to_vec(),
+                written: 0,
+            },
+            QueuedTerminalInput::Close,
+        ]);
+        let mut flush_pending = false;
+
+        assert_eq!(
+            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            TerminalWriteProgress::Progressed
+        );
+        assert_eq!(
+            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            TerminalWriteProgress::Blocked
+        );
+        assert!(flush_pending);
+        assert!(matches!(pending.front(), Some(QueuedTerminalInput::Close)));
+
+        assert_eq!(
+            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            TerminalWriteProgress::ControlReady
+        );
+        assert!(!flush_pending);
+        assert_eq!(writer.accepted, b"bye");
     }
 }

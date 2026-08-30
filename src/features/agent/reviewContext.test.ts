@@ -46,12 +46,69 @@ describe("review context", () => {
     expect(buildLongRunningReviewContext({
       task: currentTask,
       step: current,
-      requirement: "requirement",
       reviewRound: 1,
       elapsedSeconds: 30,
-      streamedOutput: "running",
-      observation: { passed: false, detail: "waiting", output: "not ready" },
+      observation: { passed: false, detail: "waiting" },
+      progress: {
+        workload: "bounded",
+        outputFingerprint: "7:12345678",
+        outputChangedSinceLastReview: false,
+        lastOutputChangeAt: "2026-08-14T00:00:00.000Z",
+        noProgressSeconds: 30,
+        noProgressReviewRounds: 1,
+        consecutiveContinueRounds: 0,
+        maxConsecutiveContinueRounds: 2,
+        hardLimitSeconds: 90,
+      },
+      outputWindow: {
+        mode: "initial",
+        newCharacters: 7,
+        omittedCharacters: 0,
+        contentFingerprint: "7:12345678",
+        content: "running",
+      },
     }).reviewPolicy.periodicLongRunningReview).toBe(true);
+  });
+
+  it("keeps periodic long-running context bounded to goal-adjacent state", () => {
+    const currentTask = task();
+    currentTask.plan[1].command = `run ${"x".repeat(10_000)}`;
+    const context = buildLongRunningReviewContext({
+      task: currentTask,
+      step: currentTask.plan[1],
+      reviewRound: 3,
+      elapsedSeconds: 90,
+      observation: { passed: false, detail: "waiting" },
+      progress: {
+        workload: "progressive",
+        outputFingerprint: "100:12345678",
+        outputChangedSinceLastReview: true,
+        lastOutputChangeAt: "2026-08-14T00:01:30.000Z",
+        noProgressSeconds: 0,
+        noProgressReviewRounds: 0,
+        consecutiveContinueRounds: 0,
+        maxConsecutiveContinueRounds: 4,
+      },
+      outputWindow: {
+        mode: "delta",
+        newCharacters: 100,
+        omittedCharacters: 0,
+        contentFingerprint: "100:12345678",
+        content: "latest output",
+      },
+      salientEvidence: ["npm ERR! heap out of memory"],
+    });
+
+    expect(context.trigger).toBe("periodic_long_running");
+    expect(context.currentStep.command.length).toBeLessThanOrEqual(800);
+    expect(context.nextStep?.title).toBe("remaining");
+    expect(context.terminalOutput.content).toBe("latest output");
+    expect(context.salientEvidence).toEqual(["npm ERR! heap out of memory"]);
+    expect(context).not.toHaveProperty("fullPlan");
+    expect(context).not.toHaveProperty("executionHistory");
+    expect(context).not.toHaveProperty("userRequirement");
+    expect(JSON.stringify(context)).not.toContain("gggggggggg");
+    expect(JSON.stringify(context).length).toBeLessThan(5_000);
   });
 
   it("keeps pending and historical steps in separate collections", () => {

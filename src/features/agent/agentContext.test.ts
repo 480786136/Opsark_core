@@ -26,6 +26,46 @@ describe("agent context", () => {
     expect(JSON.stringify(context)).not.toContain("secretValues");
   });
 
+  it("exposes reusable server credential group metadata to every task without values", () => {
+    const shared = {
+      scope: "server" as const,
+      serverId: "server-1",
+      credentialGroupId: "gitee-main",
+      credentialKind: "git-https" as const,
+      credentialTarget: "gitee.com",
+      credentialLabel: "Gitee 主账号",
+    };
+    const context = buildAgentContext({
+      metrics: { cpu: 1, memory: 2, disk: 3, networkIn: 4, networkOut: 5, sampledAt: "now" },
+      permission: "safe",
+      conversationHistory: [],
+      knownExecutionFacts: {},
+      tools: resolveToolRegistry([]),
+      secretMetadata: [{
+        ...shared,
+        key: "GIT_USERNAME",
+        description: "Gitee 用户名",
+        credentialRole: "username",
+      }, {
+        ...shared,
+        key: "GIT_HTTP_CREDENTIAL",
+        description: "Gitee 令牌",
+        credentialRole: "secret",
+      }],
+      serverId: "server-1",
+    });
+
+    expect(context.serverCredentialGroups).toEqual([expect.objectContaining({
+      ref: "server-credential:gitee-main",
+      kind: "git-https",
+      target: "gitee.com",
+      usernamePlaceholder: "${secret.GIT_USERNAME}",
+      secretPlaceholder: "${secret.GIT_HTTP_CREDENTIAL}",
+    })]);
+    expect(JSON.stringify(context)).not.toContain("developer@example.com");
+    expect(JSON.stringify(context)).not.toContain("private-token");
+  });
+
   it("provides a selectable Skill directory without loading workflow instructions", () => {
     const skills = resolveSkillRegistry({ overrides: [], customSkills: [] });
     const context = buildAgentContext({
@@ -43,15 +83,20 @@ describe("agent context", () => {
     expect(context.skillSelection).toEqual({
       mode: "model",
       multiple: true,
+      allowEmpty: true,
       currentActiveSkillIds: ["ssh-terminal-jump"],
     });
     expect(context.skillDirectory.map((skill) => skill.id)).toEqual([
       "ssh-terminal-jump",
       "project-source-acquisition",
+      "software-installation",
       "project-build",
+      "database-inspection-operations",
+      "application-deployment",
       "file-transfer-integrity",
     ]);
     expect(context.activeSkills).toEqual([]);
+    expect(context.skillDirectory[0].category).toBe("connectivity");
     expect(JSON.stringify(context.skillDirectory)).not.toContain("server.resolve_connection");
   });
 
@@ -66,6 +111,114 @@ describe("agent context", () => {
       repositoryUrls: ["https://example.com/team/app.git"],
       workingDirectories: expect.arrayContaining(["/opt/app"]),
     });
+  });
+
+  it("preserves completed outputs and structured evidence from archived phases", () => {
+    const task = createTask();
+    task.plan = [];
+    task.phaseHistory = [{
+      id: "phase-1",
+      roundId: "round-1",
+      requirement: "部署项目",
+      reason: "adjustment",
+      createdAt: "now",
+      completedAt: "now",
+      plan: [{
+        id: "read-readme",
+        title: "读取 README",
+        description: "确认项目入口",
+        command: 'opsark-tool files.read_content {"path":"/opt/app/README.md"}',
+        expected: "返回文档",
+        validation: "true",
+        risk: "low",
+        status: "completed",
+        output: "requires PHP 8.2",
+        evidence: [{
+          id: "evidence-1",
+          type: "command-output",
+          source: "main",
+          facts: { path: "/opt/app/README.md" },
+          rawOutput: "requires PHP 8.2",
+          collectedAt: "now",
+        }],
+      }],
+    }];
+
+    const facts = extractKnownExecutionFacts(task);
+    expect(facts.completedSteps[0]).toMatchObject({
+      title: "读取 README",
+      output: "requires PHP 8.2",
+      evidence: [expect.objectContaining({ rawOutput: "requires PHP 8.2" })],
+    });
+  });
+
+  it("安全门禁调整上下文只携带命中字段、结构化规则和相邻标题", () => {
+    const task = createTask();
+    const failed = {
+      ...task.plan[0],
+      id: "blocked",
+      title: "验收数据库",
+      command: "mysql -e 'SELECT 1'",
+      validation: "test -f result; true",
+      status: "failed" as const,
+      output: `PRIVATE_OUTPUT_${"x".repeat(5_000)}`,
+      result: {
+        executionStatus: "blocked" as const,
+        observationStatus: "unknown" as const,
+        facts: {
+          category: "plan_safety_rejection",
+          field: "validation",
+          ruleId: "UNCONDITIONAL_SUCCESS_TAIL",
+          reason: "无条件 true 覆盖失败",
+          snippet: "; true",
+          repairable: false,
+          issues: [{
+            field: "validation",
+            ruleId: "UNCONDITIONAL_SUCCESS_TAIL",
+            reason: "无条件 true 覆盖失败",
+            snippet: "; true",
+            repairable: false,
+          }],
+        },
+        warnings: [],
+        evidenceIds: [],
+        failureReason: "执行前安全拦截",
+      },
+    };
+    task.plan = [
+      { ...task.plan[0], id: "before", title: "前置检查", command: "UNRELATED_SECRET_COMMAND", status: "completed" },
+      failed,
+      { ...task.plan[0], id: "after", title: "启动服务", command: "ANOTHER_UNRELATED_COMMAND", status: "pending" },
+    ];
+
+    const context = buildAdjustmentContext({
+      server: createServer(),
+      metrics: { cpu: 1, memory: 2, disk: 3, networkIn: 4, networkOut: 5, sampledAt: "now" },
+      task,
+      tools: resolveToolRegistry([]),
+      secretMetadata: [],
+    }, failed);
+    const serialized = JSON.stringify(context);
+
+    expect(context.failedStep).toMatchObject({
+      stepIndex: 2,
+      title: "验收数据库",
+      offendingField: "validation",
+      offendingFields: ["validation"],
+      previousStepTitle: "前置检查",
+      nextStepTitle: "启动服务",
+      safetyIssue: { ruleId: "UNCONDITIONAL_SUCCESS_TAIL" },
+    });
+    expect(context.previousPlan).toEqual([
+      { stepIndex: 1, title: "前置检查", status: "completed" },
+      { stepIndex: 2, title: "验收数据库", status: "failed" },
+      { stepIndex: 3, title: "启动服务", status: "pending" },
+    ]);
+    expect(serialized).not.toContain("PRIVATE_OUTPUT_");
+    expect(serialized).not.toContain("UNRELATED_SECRET_COMMAND");
+    expect(serialized).not.toContain("ANOTHER_UNRELATED_COMMAND");
+    expect(context.instruction).toContain("命令尚未发送到服务器");
+    expect(context.instruction).toContain("failedStep.offendingFields");
   });
 
   it("builds consistent adjustment and continuation contexts", () => {

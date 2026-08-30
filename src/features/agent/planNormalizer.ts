@@ -2,7 +2,14 @@ import { ensureStepValidator } from "@/services/validation";
 import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 import { parseToolCommand } from "@/features/tools/toolExecutor";
 import type { ToolDefinition } from "@/features/tools/types";
-import type { PlanStep } from "@/types";
+import type { PlanStep, RiskLevel } from "@/types";
+import { normalizePlanStepSafety } from "@/features/agent/planSafety";
+import {
+  normalizePlanStepExecutionScope,
+  validatePlanStepExecutionScope,
+} from "@/features/agent/executionScope";
+import { validateShellStartupTransaction } from "@/features/agent/shellStartupConfig";
+import { semanticRiskForCommand, validateAuthorizedChangeOperations } from "@/features/agent/changeOperation";
 
 export function normalizeSecretPlaceholders(value: string) {
   return value.replace(/\\+\$\{secret\.([A-Z0-9_]+)\}/g, "\${secret.$1}");
@@ -24,21 +31,39 @@ export function normalizeLongRunningCommandOutput(command: string) {
     .join("\n");
 }
 
+/** Canonicalizes the only recoverable tool-id typo without weakening argument validation. */
+export function normalizeToolCommandSyntax(command: string) {
+  return command.replace(
+    /^(\s*opsark-tool\s+)--(?=[a-z0-9][a-z0-9_.-]*\s)/i,
+    "$1",
+  );
+}
+
 export function normalizePlanPreconditions(
   steps: PlanStep[],
   requirement = "",
   tools: ToolDefinition[] = defaultToolCatalog,
-) {
-  let normalized = steps.map((step) => ({
+): PlanStep[] {
+  let normalized = steps.map((step) => normalizePlanStepExecutionScope(normalizePlanStepSafety({
     ...step,
-    command: normalizeLongRunningCommandOutput(normalizeSecretPlaceholders(step.command)),
+    // Preserve the previous execution contract for persisted plans. New model
+    // plans always provide kind explicitly.
+    kind: step.kind ?? "change",
+    command: normalizeToolCommandSyntax(
+      normalizeLongRunningCommandOutput(normalizeSecretPlaceholders(step.command)),
+    ),
     validation: normalizeSecretPlaceholders(step.validation),
-  }));
+  })));
   const toolById = new Map(tools.map((tool) => [tool.id, tool]));
+  normalized.forEach((step, index) => {
+    if (step.status === "pending" && /^opsark-tool(?:\s|$)/i.test(step.command.trim())) {
+      parseToolCommand(step.command, `normalize-strict-${index}`, tools);
+    }
+  });
   const standaloneStep = normalized.find((step, index) => {
     if (step.status !== "pending") return false;
     try {
-      const call = parseToolCommand(step.command, `normalize-${index}`);
+      const call = parseToolCommand(step.command, `normalize-${index}`, tools);
       return Boolean(call && toolById.get(call.toolId)?.planMode === "standalone");
     } catch {
       return false;
@@ -62,5 +87,18 @@ export function normalizePlanPreconditions(
       if (speculativeCleanup) normalized.splice(index, 1);
     }
   }
-  return normalized.map(ensureStepValidator);
+  const scoped = normalized.map((step) => {
+    const scoped = validatePlanStepExecutionScope(step);
+    validateShellStartupTransaction(scoped);
+    const semanticRisk = semanticRiskForCommand(scoped.command);
+    const risk: RiskLevel = semanticRisk === "high" || scoped.risk === "high"
+      ? "high"
+      : semanticRisk === "medium" || scoped.risk === "medium"
+        ? "medium"
+        : "low";
+    const riskNormalized = { ...scoped, risk };
+    return riskNormalized.kind === "observe" ? riskNormalized : ensureStepValidator(riskNormalized);
+  });
+  validateAuthorizedChangeOperations(scoped, requirement);
+  return scoped;
 }
