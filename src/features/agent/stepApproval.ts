@@ -27,7 +27,7 @@ export function planSafetySnapshot(step: Pick<PlanStep,
     validation: step.validation,
     executionScope: step.executionScope,
     validationScope: step.validationScope,
-    sessionContextChange: step.sessionContextChange
+    sessionContextChange: step.sessionContextChange != null
       ? structuredClone(step.sessionContextChange)
       : undefined,
     runtimeClass: step.runtimeClass,
@@ -43,7 +43,8 @@ export function hasCurrentStepApproval(step: PlanStep) {
     && approved.executionScope === step.executionScope
     && approved.validationScope === step.validationScope
     && approved.runtimeClass === step.runtimeClass
-    && JSON.stringify(approved.sessionContextChange) === JSON.stringify(step.sessionContextChange));
+    && JSON.stringify(approved.sessionContextChange ?? undefined)
+      === JSON.stringify(step.sessionContextChange ?? undefined));
 }
 
 /** Moves a pending step into approval wait and provides its user-facing event. */

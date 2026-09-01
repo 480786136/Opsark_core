@@ -25,6 +25,13 @@ function cloneStep(step: PlanStep): PlanStep {
   };
 }
 
+function clonePhase(phase: TaskExecutionPhase): TaskExecutionPhase {
+  return {
+    ...phase,
+    plan: phase.plan.map(cloneStep),
+  };
+}
+
 export function taskGoal(task: OpsTask) {
   return task.rootGoal?.trim() || [...task.messages]
     .reverse()
@@ -65,6 +72,7 @@ export function archiveActivePhase(
   task: OpsTask,
   reason: TaskExecutionPhase["reason"],
   timestamp = new Date().toISOString(),
+  summary = task.pauseReason,
 ) {
   if (!task.plan.length) return;
   task.currentRoundId ||= `round-${task.id}-${Date.parse(timestamp) || Date.now()}`;
@@ -75,6 +83,7 @@ export function archiveActivePhase(
     requirement: task.currentInstruction || taskGoal(task),
     reason,
     plan: task.plan.map(cloneStep),
+    summary: summary?.trim() || undefined,
     createdAt: task.plan.find((step) => step.startedAt)?.startedAt ?? task.updatedAt,
     completedAt: timestamp,
   });
@@ -92,6 +101,9 @@ export function capturePreviousRound(task: OpsTask, timestamp = new Date().toISO
     .find(({ message }) => message.role === "user" && message.kind === "message");
   if (!indexed) return undefined;
   const steps = activeRoundSteps(task);
+  const phases = (task.phaseHistory ?? [])
+    .filter((phase) => phase.roundId === task.currentRoundId)
+    .map(clonePhase);
   return {
     roundId: task.currentRoundId,
     history: {
@@ -99,6 +111,8 @@ export function capturePreviousRound(task: OpsTask, timestamp = new Date().toISO
       requirement: indexed.message.content,
       status: task.status,
       plan: steps.map(cloneStep),
+      finalPlan: task.plan.map(cloneStep),
+      phases: phases.length ? phases : undefined,
       response: task.messages
         .slice(indexed.index + 1)
         .find((message) => message.role === "assistant" && message.kind === "message"),

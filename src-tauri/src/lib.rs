@@ -26,7 +26,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, State};
 
 use agent_terminal::{
@@ -78,10 +78,13 @@ struct PlanStep {
     expected: String,
     validation: String,
     execution_scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     validation_scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     session_context_change: Option<Value>,
     runtime_class: String,
     status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<String>,
 }
 
@@ -123,7 +126,7 @@ observe 表示只读查询或诊断：主命令输出和退出状态就是观察
 模型工具例外：工具命令必须严格写成 opsark-tool <toolId> <JSON参数对象>，toolId 前不得添加 --，且必须按工具 inputSchema 提供必填参数；禁止只输出 opsark-tool、缺少参数或使用数组参数。当 command 以 opsark-tool 开头时，validation 固定为 true；该值是工具协议占位，不会被当作远端校验命令执行。工具上下文中 planMode=standalone 的工具必须是 steps 中唯一的步骤，完成后系统会依据 completionMode 继续编排。
 Shell 反斜杠在 JSON 字符串内必须写成双反斜杠，例如 Shell 的 \( 必须输出为 \\( 的 JSON 文本。
 输出前逐个检查七个字段，必须保证整个 JSON 对象完整闭合，不得截断任何字段。"#;
-const REQUIREMENT_CLASSIFICATION_CONTRACT: &str = r#"本阶段只做需求分类、任务关系判断、终端上下文判断、约束提取和 Skill 选择，禁止输出 steps、command、validation 或执行计划。context.taskGoal.rootGoal 是当前任务长期绑定的整体目标，currentInstruction 只是上一轮指令。必须判断本次输入与整体目标的关系：new_goal=独立的新执行目标；continue=继续/重试原目标；supplement=为原目标补充条件；side_question=临时咨询且不改变原目标；replace_goal=用户明确放弃原目标并替换；cancel_goal=明确取消原目标。不得仅因用户提出另一个问题就隐式覆盖原目标；新执行目标使用 new_goal，只有明确“改为/不要原目标/替换为”才用 replace_goal。必须先判断回答或计划是否依赖用户之前的终端输入/输出：如依赖且 terminalContext.content 未提供或范围不够，返回 terminal_context，terminalContextLines 必须大于当前 includedLines，且不超过 totalLines 和 400；不依赖则不得请求终端内容。对 execute 必须先分类主操作 operation：connect|acquire|install|build|inspect|diagnose|change|deploy|transfer，以及整体副作用 effect：read|write。查询现状、列表、检查是 inspect/read；定位故障原因是 diagnose/read；任何可能改变目标环境的目标都是 write。context.skillDirectory 中的 capabilities 是 Skill 的机器可校验边界；只有当 operation/effect 完整命中其中一组能力，且名称、description 或选择提示直接覆盖整体目标时才能选择。category 只用于导航，不得触发 Skill。不得因为目录中存在相近领域或关键词局部相似而强行匹配。零匹配是正常且合法的结果，此时 selectedSkillIds=[]，后续使用通用流程。selectedSkillIds 是本轮完整集合，continue/supplement 也必须移除不再适用或上轮误选的 Skill，程序不会自动并集。咨询类必须严格输出：{"intent":"answer","relation":"side_question|cancel_goal","operation":null,"effect":null,"answer":"非空回答","constraints":null,"terminalContextLines":0,"selectedSkillIds":[]}。执行类必须严格输出：{"intent":"execute","relation":"new_goal|continue|supplement|replace_goal","operation":"inspect","effect":"read","answer":"","constraints":{"changePolicy":"unspecified|read_only|requested_changes_only|allow_necessary_changes","environmentPolicy":"unspecified|preserve|allow_isolated_changes|allow_host_changes","failurePolicy":"unspecified|strict|best_effort","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},"terminalContextLines":0,"selectedSkillIds":[]}。需要更多终端内容时必须严格输出：{"intent":"terminal_context","relation":null,"operation":null,"effect":null,"answer":"","constraints":null,"terminalContextLines":80,"selectedSkillIds":[]}。顶层只允许 intent、relation、operation、effect、answer、constraints、terminalContextLines、selectedSkillIds 八个字段。"#;
+const REQUIREMENT_CLASSIFICATION_CONTRACT: &str = r#"本阶段只做需求分类、任务关系判断、终端上下文判断、执行约束提取和 Skill 选择，禁止输出 steps、command、validation 或执行计划。context.taskGoal.rootGoal 是当前任务长期绑定的整体目标，currentInstruction 只是上一轮指令。必须判断本次输入与整体目标的关系：new_goal=独立的新执行目标；continue=继续/重试原目标；supplement=为原目标补充条件；side_question=临时咨询且不改变原目标；replace_goal=用户明确放弃原目标并替换；cancel_goal=明确取消原目标。不得仅因用户提出另一个问题就隐式覆盖原目标；新执行目标使用 new_goal，只有明确“改为/不要原目标/替换为”才用 replace_goal。必须先判断回答或计划是否依赖用户之前的终端输入/输出：如依赖且 terminalContext.content 未提供或范围不够，返回 terminal_context，terminalContextLines 必须大于当前 includedLines，且不超过 totalLines 和 400；不依赖则不得请求终端内容。对 execute，constraints.changePolicy 是本轮权威的只读/变更边界：查询现状、列表、检查和定位故障必须为 read_only；用户明确要求安装、修改、构建、部署、传输或其他环境变更时为 requested_changes_only；只有用户明确允许为达成目标执行必要的附加变更时才为 allow_necessary_changes。execute 不得返回 unspecified。environmentPolicy、failurePolicy、prohibitedActions、requiredConditions 和 userDirectives 只能来自用户明确表达，不得猜测或自行增加。context.skillDirectory 中的名称、description 和 selectionHints 用于语义选择；category 只用于管理和导航，不得触发 Skill。只选择直接适用于整体目标、本轮显式子目标或已有证据证明必需阶段的 Skill，允许复合需求选择多个 Skill；不得因为目录中存在相近领域或关键词局部相似而强行匹配。零匹配是正常且合法的结果，此时 selectedSkillIds=[]，后续使用通用流程。selectedSkillIds 是本轮完整集合，continue/supplement 也必须移除不再适用或上轮误选的 Skill，程序不会自动并集。咨询类必须严格输出：{"intent":"answer","relation":"side_question|cancel_goal","answer":"非空回答","constraints":null,"terminalContextLines":0,"selectedSkillIds":[]}。执行类必须严格输出：{"intent":"execute","relation":"new_goal|continue|supplement|replace_goal","answer":"","constraints":{"changePolicy":"read_only|requested_changes_only|allow_necessary_changes","environmentPolicy":"unspecified|preserve|allow_isolated_changes|allow_host_changes","failurePolicy":"unspecified|strict|best_effort","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},"terminalContextLines":0,"selectedSkillIds":[]}。需要更多终端内容时必须严格输出：{"intent":"terminal_context","relation":null,"answer":"","constraints":null,"terminalContextLines":80,"selectedSkillIds":[]}。顶层只允许 intent、relation、answer、constraints、terminalContextLines、selectedSkillIds 六个字段。"#;
 const SECRET_PLACEHOLDER_RULE: &str = "敏感变量规则：${secret.NAME} 是 Opsark 的执行时传输占位符，不是要保留在远端文件里的字面量。必须原样写成 ${secret.NAME}，绝对不得在美元符号前添加反斜杠。程序会在 SSH 执行前注入真实值，并在输出、日志和模型上下文中脱敏。模型看到的 •••••••• 只表示真实值已被脱敏：它既不是远端文件的实际内容，也不能证明具体密码正确或错误，更不能据此声称占位符未解析。选择变量时名称和说明必须与目标凭据语义一致；若现有变量无法区分目标账户或用途，应使用新的、用途明确的变量名，由界面向用户索取，不能静默借用含义模糊的旧值。写入远端配置后应使用不泄露秘密的功能性后置条件校验；校验命令中仍可使用同一占位符供程序注入。不得要求远端保留 Opsark 占位符，也不得因脱敏标记判定泄露、写入失败或密码错误。除非用户明确禁止持久化密码，不得自行增加该限制。";
 const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
 
@@ -155,7 +158,7 @@ const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
 
 输出：只返回符合计划输出契约的 JSON 对象。"#;
 const GENERAL_DISCOVERY_RULES: &str = "对于需要发现实际实现方式的任务，先读取目标自带的说明、声明、配置、入口和已有状态，由证据确定依赖、运行方式、构建方式、部署方式和验收标准。核心不提供任何领域工具或技术栈的默认方案；只能使用当前证据明确展示的能力。发现步骤的校验只确认证据可获得，不要把可选信息缺失判为失败。";
-const GENERAL_REQUIREMENT_SYSTEM: &str = "你是通用运维需求分类、任务关系判断与 Skill 编排器，本阶段不生成计划。先将用户本次输入和 context.taskGoal.rootGoal 比较，区分继续、补充、旁问、独立新目标、明确替换或取消；不得让‘继续部署’、‘重试’取代整体目标，也不得让临时问题破坏原任务。判断用户是仅需要不依赖当前环境的知识性回答，还是需要读取或改变真实目标环境。需要当前状态、真实数据或任何环境变更时必须返回 execute。对 execute 先生成 operation/effect 语义类型，再用完整的能力对与 Skill capabilities 做包含匹配；不允许从业务关键词反向猜测某个 Skill 必须选中。结构化约束只能来自用户明确表达，不得猜测或自行增加。对执行类需求，从系统提供的 Skill 目录中只选择同时通过能力边界与语义适用性的 Skill，允许零个、一个或多个；没有直接匹配时必须返回空数组并使用通用流程，不得选择最相近的 Skill 凑数，也不得编造目录外 Skill。";
+const GENERAL_REQUIREMENT_SYSTEM: &str = "你是通用运维需求分类、任务关系判断与 Skill 编排器，本阶段不生成计划。先将用户本次输入和 context.taskGoal.rootGoal 比较，区分继续、补充、旁问、独立新目标、明确替换或取消；不得让‘继续部署’、‘重试’取代整体目标，也不得让临时问题破坏原任务。判断用户是仅需要不依赖当前环境的知识性回答，还是需要读取或改变真实目标环境。需要当前状态、真实数据或任何环境变更时必须返回 execute。对 execute 必须用 constraints.changePolicy 明确表达本轮只读或变更边界，不得返回 unspecified。从系统提供的 Skill 目录中依据名称、适用场景和选择提示进行语义选择，允许复合需求选择零个、一个或多个 Skill；没有直接适用 Skill 时必须返回空数组并使用通用流程，不得选择最相近的 Skill 凑数，也不得编造目录外 Skill。environmentPolicy、failurePolicy 和其他结构化约束只能来自用户明确表达，不得猜测或自行增加。";
 const GENERAL_SUMMARY_SYSTEM: &str = "你是通用运维结果总结器。仅根据当前轮用户目标和当前轮脱敏的真实执行证据总结，不得用旧轮证据回答新的状态问题。结构化 result、evidence.facts 和 evidence.scope 优先于预期文本和旧总结。证据只能证明自己的 scope/persistence：agent_session 成功不证明用户已打开 Shell 或新 Shell 自动加载，显式 source 成功不证明启动文件会自动加载。有效的“未发现”、“非健康”或“警告”是观察结果，不等于命令执行失败。若存在关键失败且无后续证据证明目标已达成，必须明确说明任务未完成、最终阻断、已确认结果和尚未满足的目标。不得虚构、输出命令或泄露敏感信息。使用一至三段中文纯文本。";
 const GENERAL_REVIEW_SYSTEM: &str = "你是通用运维执行复核员。根据当前轮用户目标、executionConstraints、currentRoundLedger、当前步骤证据和剩余步骤，判断 continue、adjust 或 complete。priorVerifiedFacts 只能用于避免重复，不能代替当前轮状态证据。只返回包含 decision、reason、summary 的 JSON。不得把真实失败改写为成功，不得虚构证据、命令或授权。证据作用域必须与 expected 一致：agent_session 不证明 user shell 或 new shell，isolated_exec 不证明会话内存状态。异常不阻断目标或剩余计划有确定恢复路径时 continue；已阻断、证据不足或作用域不匹配时 adjust；只有整体目标被作用域匹配的真实证据充分证明时 complete。overall_goal_completion 中缺结果时返回 adjust 并列出剩余目标。长任务定期复核只判断当前命令：输出、字节、CPU/IO、子进程或目标文件有进展时 continue；确定交互提示、明确错误或综合指标持续无进展时 adjust；未获得真实退出且 periodicObservation.passed=false 时不得 complete。安全拦截、审批、真实执行结果和程序门禁不可被覆盖。";
 const LONG_RUNNING_REVIEW_SYSTEM: &str = "你是长任务运行状态复核员。输入只包含压缩后的用户目标、当前步骤、下一步骤提示、跨轮关键证据、进度状态和本轮新增终端输出。只判断当前命令应 continue 还是 adjust：语义输出或可验证进度仍在变化时返回 continue；仅旋转图标、时间戳或重复行变化不算进展。连续无进展、出现认证或交互等待、明确错误、达到等待上限时返回 adjust。continue 仅表示继续等待当前命令，不能进入下一步；主命令未返回真实退出且 periodicObservation.passed=false 时不得 complete。terminalOutput.omittedCharacters 仅表示旧输出被压缩，不代表失败；salientEvidence 是前轮已保留的关键错误、警告或里程碑，不得忽略。不得虚构输出、退出码、命令或授权。只返回 decision、reason、summary 三个字段的简短 JSON，reason 和 summary 各不超过 60 个字。";
@@ -232,8 +235,6 @@ impl Default for AiGenerationSettings {
 struct AiRequirementDecision {
     intent: String,
     relation: Option<String>,
-    operation: Option<String>,
-    effect: Option<String>,
     answer: String,
     constraints: Value,
     #[serde(rename = "terminalContextLines")]
@@ -251,29 +252,9 @@ struct ModelSkillDefinition {
     name: String,
     description: String,
     version: usize,
-    capabilities: Vec<SkillCapability>,
     instructions: String,
     #[serde(default)]
     forbidden_tool_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-struct SkillCapability {
-    operation: String,
-    effect: String,
-}
-
-fn skill_supports_capability(
-    skill: &ModelSkillDefinition,
-    operation: Option<&str>,
-    effect: Option<&str>,
-) -> bool {
-    skill.capabilities.iter().any(|capability| {
-        Some(capability.operation.as_str()) == operation
-            && Some(capability.effect.as_str()) == effect
-    })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -292,8 +273,6 @@ struct ExecutionConstraints {
 struct RequirementProcessingResult {
     intent: String,
     relation: Option<String>,
-    operation: Option<String>,
-    effect: Option<String>,
     answer: Option<String>,
     plan: Vec<PlanStep>,
     constraints: Option<ExecutionConstraints>,
@@ -303,12 +282,61 @@ struct RequirementProcessingResult {
     selected_skill_ids: Vec<String>,
     #[serde(rename = "planError", skip_serializing_if = "Option::is_none")]
     plan_error: Option<String>,
+    #[serde(rename = "developerTrace")]
+    developer_trace: ModelDeveloperTrace,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelDeveloperTrace {
+    attempts: Vec<ModelAttemptTrace>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelAttemptTrace {
+    stage: String,
+    attempt: usize,
+    duration_ms: u64,
+    request: Value,
+    response: Option<Value>,
+    error: Option<String>,
+}
+
+const MODEL_TRACE_ERROR_PREFIX: &str = "OPSARK_MODEL_TRACE_V1:";
+
+fn record_model_attempt(
+    trace: &mut ModelDeveloperTrace,
+    stage: &str,
+    attempt: usize,
+    started_at: Instant,
+    request: Value,
+    response: Option<Value>,
+    error: Option<String>,
+) {
+    trace.attempts.push(ModelAttemptTrace {
+        stage: stage.to_string(),
+        attempt,
+        duration_ms: started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        request,
+        response,
+        error,
+    });
+}
+
+fn traced_model_error(message: String, trace: &ModelDeveloperTrace) -> String {
+    let payload = json!({
+        "message": message,
+        "developerTrace": trace,
+    });
+    format!("{MODEL_TRACE_ERROR_PREFIX}{payload}")
 }
 
 fn context_with_selected_skills(
     context: &str,
     skill_definitions: &[ModelSkillDefinition],
     selected_skill_ids: &[String],
+    execution_constraints: Option<&ExecutionConstraints>,
 ) -> Result<String, String> {
     let mut value: Value =
         serde_json::from_str(context).map_err(|error| format!("Skill 选择上下文无效：{error}"))?;
@@ -342,6 +370,13 @@ fn context_with_selected_skills(
         serde_json::to_value(selected)
             .map_err(|error| format!("Skill 上下文序列化失败：{error}"))?,
     );
+    if let Some(constraints) = execution_constraints {
+        object.insert(
+            "executionConstraints".to_string(),
+            serde_json::to_value(constraints)
+                .map_err(|error| format!("执行约束上下文序列化失败：{error}"))?,
+        );
+    }
     serde_json::to_string(&value).map_err(|error| format!("Skill 上下文序列化失败：{error}"))
 }
 
@@ -391,6 +426,22 @@ fn normalize_execution_constraints(
         required_conditions: normalize_items(constraints.required_conditions),
         user_directives: normalize_items(constraints.user_directives),
     }
+}
+
+fn execute_constraints_match_contract(value: &Value) -> bool {
+    let Ok(constraints) = serde_json::from_value::<ExecutionConstraints>(value.clone()) else {
+        return false;
+    };
+    matches!(
+        constraints.change_policy.as_str(),
+        "read_only" | "requested_changes_only" | "allow_necessary_changes"
+    ) && matches!(
+        constraints.environment_policy.as_str(),
+        "unspecified" | "preserve" | "allow_isolated_changes" | "allow_host_changes"
+    ) && matches!(
+        constraints.failure_policy.as_str(),
+        "unspecified" | "strict" | "best_effort"
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1889,6 +1940,29 @@ async fn generate_ai_plan(
     context: String,
     generation_settings: Option<AiGenerationSettings>,
 ) -> Result<Vec<PlanStep>, String> {
+    let mut developer_trace = ModelDeveloperTrace::default();
+    generate_ai_plan_with_trace(
+        api_key,
+        endpoint,
+        model,
+        requirement,
+        context,
+        generation_settings,
+        &mut developer_trace,
+    )
+    .await
+    .map_err(|error| traced_model_error(error, &developer_trace))
+}
+
+async fn generate_ai_plan_with_trace(
+    api_key: String,
+    endpoint: String,
+    model: String,
+    requirement: String,
+    context: String,
+    generation_settings: Option<AiGenerationSettings>,
+    developer_trace: &mut ModelDeveloperTrace,
+) -> Result<Vec<PlanStep>, String> {
     let generation_settings = generation_settings.unwrap_or_default();
     let forbidden_tool_ids = active_skill_forbidden_tool_ids(&context)?;
     let limit_rule = if generation_settings.limit_output {
@@ -1942,7 +2016,23 @@ async fn generate_ai_plan(
         if generation_settings.limit_output {
             body["max_tokens"] = json!(generation_settings.max_output_tokens.max(256));
         }
-        let payload = post_model_request(&url, &api_key, &body, "计划生成", 60).await?;
+        let request_snapshot = body.clone();
+        let started_at = Instant::now();
+        let payload = match post_model_request(&url, &api_key, &body, "计划生成", 60).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                record_model_attempt(
+                    developer_trace,
+                    "plan_generation",
+                    attempt + 1,
+                    started_at,
+                    request_snapshot,
+                    None,
+                    Some(error.clone()),
+                );
+                return Err(error);
+            }
+        };
         let finish_reason = payload
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str);
@@ -1955,6 +2045,15 @@ async fn generate_ai_plan(
                     finish_reason.unwrap_or("未知")
                 )
             };
+            record_model_attempt(
+                developer_trace,
+                "plan_generation",
+                attempt + 1,
+                started_at,
+                request_snapshot,
+                Some(payload),
+                Some(last_error.clone()),
+            );
             continue;
         }
         let parsed = message_content(&payload, "模型响应缺少计划内容").and_then(|content| {
@@ -1989,11 +2088,44 @@ async fn generate_ai_plan(
                     })
                     .and_then(|_| convert_ai_plan_steps(raw_steps))
                 {
-                    Ok(plan) => return Ok(plan),
-                    Err(error) => last_error = error,
+                    Ok(plan) => {
+                        record_model_attempt(
+                            developer_trace,
+                            "plan_generation",
+                            attempt + 1,
+                            started_at,
+                            request_snapshot,
+                            Some(payload),
+                            None,
+                        );
+                        return Ok(plan);
+                    }
+                    Err(error) => {
+                        last_error = error;
+                        record_model_attempt(
+                            developer_trace,
+                            "plan_generation",
+                            attempt + 1,
+                            started_at,
+                            request_snapshot,
+                            Some(payload),
+                            Some(last_error.clone()),
+                        );
+                    }
                 }
             }
-            Err(error) => last_error = error,
+            Err(error) => {
+                last_error = error;
+                record_model_attempt(
+                    developer_trace,
+                    "plan_generation",
+                    attempt + 1,
+                    started_at,
+                    request_snapshot,
+                    Some(payload),
+                    Some(last_error.clone()),
+                );
+            }
         }
     }
     if let Some(raw_steps) = last_repairable_steps {
@@ -2056,6 +2188,7 @@ async fn process_ai_requirement(
     let system = GENERAL_REQUIREMENT_SYSTEM;
     let mut last_error = "模型未返回需求理解结果".to_string();
     let mut valid_decision = None;
+    let mut developer_trace = ModelDeveloperTrace::default();
     for attempt in 0..STRUCTURED_OUTPUT_ATTEMPTS {
         let correction = if attempt == 0 {
             String::new()
@@ -2074,7 +2207,23 @@ async fn process_ai_requirement(
             "response_format": {"type": "json_object"},
             "max_tokens": 1200
         });
-        let payload = post_model_request(&url, &api_key, &body, "需求理解", 45).await?;
+        let request_snapshot = body.clone();
+        let started_at = Instant::now();
+        let payload = match post_model_request(&url, &api_key, &body, "需求理解", 45).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                record_model_attempt(
+                    &mut developer_trace,
+                    "requirement_classification",
+                    attempt + 1,
+                    started_at,
+                    request_snapshot,
+                    None,
+                    Some(error.clone()),
+                );
+                return Err(traced_model_error(error, &developer_trace));
+            }
+        };
         let parsed = message_content(&payload, "模型响应缺少需求理解结果").and_then(|content| {
             parse_model_json(content).map_err(|error| format!("需求理解结构解析失败：{error}"))
         });
@@ -2082,6 +2231,15 @@ async fn process_ai_requirement(
             Ok(decision) => decision,
             Err(error) => {
                 last_error = error;
+                record_model_attempt(
+                    &mut developer_trace,
+                    "requirement_classification",
+                    attempt + 1,
+                    started_at,
+                    request_snapshot,
+                    Some(payload),
+                    Some(last_error.clone()),
+                );
                 continue;
             }
         };
@@ -2094,53 +2252,19 @@ async fn process_ai_requirement(
             .iter()
             .map(String::as_str)
             .collect();
-        let operation = decision.operation.as_deref();
-        let effect = decision.effect.as_deref();
-        let operation_valid = matches!(
-            operation,
-            Some(
-                "connect"
-                    | "acquire"
-                    | "install"
-                    | "build"
-                    | "inspect"
-                    | "diagnose"
-                    | "change"
-                    | "deploy"
-                    | "transfer"
-            )
-        );
-        let effect_valid = matches!(effect, Some("read" | "write"));
         let skill_selection_error = if unique_skill_ids.len() != decision.selected_skill_ids.len() {
             Some("selectedSkillIds 不得包含重复 ID".to_string())
-        } else if let Some(id) = decision
-            .selected_skill_ids
-            .iter()
-            .find(|id| !available_skill_ids.contains(id.as_str()))
-        {
-            Some(format!("selectedSkillIds 包含未启用或不存在的 Skill：{id}"))
-        } else if operation_valid && effect_valid {
-            decision.selected_skill_ids.iter().find_map(|id| {
-                let skill = skill_definitions.iter().find(|skill| skill.id == *id)?;
-                if skill_supports_capability(skill, operation, effect) {
-                    None
-                } else {
-                    Some(format!(
-                        "Skill {id} 不支持需求的能力边界 {}/{}",
-                        operation.unwrap_or_default(),
-                        effect.unwrap_or_default()
-                    ))
-                }
-            })
         } else {
-            None
+            decision
+                .selected_skill_ids
+                .iter()
+                .find(|id| !available_skill_ids.contains(id.as_str()))
+                .map(|id| format!("selectedSkillIds 包含未启用或不存在的 Skill：{id}"))
         };
         let relation = decision.relation.as_deref();
         let contract_error = match decision.intent.as_str() {
             "answer"
                 if !decision.answer.trim().is_empty()
-                    && decision.operation.is_none()
-                    && decision.effect.is_none()
                     && decision.constraints.is_null()
                     && decision.terminal_context_lines == 0
                     && decision.selected_skill_ids.is_empty()
@@ -2153,12 +2277,7 @@ async fn process_ai_requirement(
             }
             "execute"
                 if decision.answer.trim().is_empty()
-                    && operation_valid
-                    && effect_valid
-                    && serde_json::from_value::<ExecutionConstraints>(
-                        decision.constraints.clone(),
-                    )
-                    .is_ok()
+                    && execute_constraints_match_contract(&decision.constraints)
                     && decision.terminal_context_lines == 0
                     && matches!(
                         relation,
@@ -2169,12 +2288,10 @@ async fn process_ai_requirement(
                 None
             }
             "execute" => Some(skill_selection_error.unwrap_or_else(|| {
-                "执行类响应必须提供合法 operation/effect，answer 必须为空字符串，constraints 必须包含合法字段".to_string()
+                "执行类响应的 answer 必须为空字符串，constraints 必须包含合法字段且 changePolicy 不得为 unspecified".to_string()
             })),
             "terminal_context"
                 if decision.answer.trim().is_empty()
-                    && decision.operation.is_none()
-                    && decision.effect.is_none()
                     && decision.constraints.is_null()
                     && decision.relation.is_none()
                     && decision.selected_skill_ids.is_empty()
@@ -2187,59 +2304,88 @@ async fn process_ai_requirement(
         };
         if let Some(error) = contract_error {
             last_error = error;
+            record_model_attempt(
+                &mut developer_trace,
+                "requirement_classification",
+                attempt + 1,
+                started_at,
+                request_snapshot,
+                Some(payload),
+                Some(last_error.clone()),
+            );
             continue;
         }
+        record_model_attempt(
+            &mut developer_trace,
+            "requirement_classification",
+            attempt + 1,
+            started_at,
+            request_snapshot,
+            Some(payload),
+            None,
+        );
         valid_decision = Some(decision);
         break;
     }
-    let decision = valid_decision
-        .ok_or_else(|| format!("{last_error}（已要求模型按严格 JSON 格式重试一次）"))?;
+    let decision = valid_decision.ok_or_else(|| {
+        traced_model_error(
+            format!("{last_error}（已携带具体分类错误重试一次）"),
+            &developer_trace,
+        )
+    })?;
     if decision.intent == "answer" {
         return Ok(RequirementProcessingResult {
             intent: "answer".into(),
             relation: decision.relation,
-            operation: None,
-            effect: None,
             answer: Some(decision.answer.trim().to_string()),
             plan: Vec::new(),
             constraints: None,
             terminal_context_lines: 0,
             selected_skill_ids: Vec::new(),
             plan_error: None,
+            developer_trace,
         });
     }
     if decision.intent == "terminal_context" {
         return Ok(RequirementProcessingResult {
             intent: "terminal_context".into(),
             relation: None,
-            operation: None,
-            effect: None,
             answer: None,
             plan: Vec::new(),
             constraints: None,
             terminal_context_lines: decision.terminal_context_lines,
             selected_skill_ids: Vec::new(),
             plan_error: None,
+            developer_trace,
         });
     }
 
     let relation = decision.relation;
-    let operation = decision.operation;
-    let effect = decision.effect;
     let selected_skill_ids = decision.selected_skill_ids;
     let constraints = serde_json::from_value::<ExecutionConstraints>(decision.constraints)
         .map(Some)
         .map(normalize_execution_constraints)
-        .map_err(|error| format!("需求分类 constraints 结构无效：{error}"))?;
-    let plan_context =
-        context_with_selected_skills(&context, &skill_definitions, &selected_skill_ids)?;
-    let plan_result = generate_ai_plan(
+        .map_err(|error| {
+            traced_model_error(
+                format!("需求分类 constraints 结构无效：{error}"),
+                &developer_trace,
+            )
+        })?;
+    let plan_context = context_with_selected_skills(
+        &context,
+        &skill_definitions,
+        &selected_skill_ids,
+        Some(&constraints),
+    )
+    .map_err(|error| traced_model_error(error, &developer_trace))?;
+    let plan_result = generate_ai_plan_with_trace(
         api_key,
         endpoint,
         model,
         requirement,
         plan_context,
         generation_settings,
+        &mut developer_trace,
     )
     .await;
     let (plan, plan_error) = match plan_result {
@@ -2252,14 +2398,13 @@ async fn process_ai_requirement(
     Ok(RequirementProcessingResult {
         intent: "execute".into(),
         relation,
-        operation,
-        effect,
         answer: None,
         plan,
         constraints: Some(constraints),
         terminal_context_lines: 0,
         selected_skill_ids,
         plan_error,
+        developer_trace,
     })
 }
 

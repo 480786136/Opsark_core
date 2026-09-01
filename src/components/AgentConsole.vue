@@ -26,7 +26,9 @@ import {
 import { useI18n } from "vue-i18n";
 import { useOpsStore } from "@/stores/ops";
 import type { ObservationStatus, OpsTask, PlanStep, TaskPlanHistory } from "@/types";
+import AgentExecutionPhase from "@/components/AgentExecutionPhase.vue";
 import ModelSettingsModal from "@/components/ModelSettingsModal.vue";
+import { isAdjustmentProgressMessage, isPlanProgressMessage } from "@/features/agent/taskMessages";
 import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
 import { useWorkspaceLinkStore } from "@/features/workspace/workspaceLinkStore";
 
@@ -111,6 +113,16 @@ function archivedRoundResponse(round: TaskPlanHistory) {
     : t("agent.planGenerationIncomplete");
 }
 
+function archivedFinalPlan(round: TaskPlanHistory) {
+  if (round.finalPlan) return round.finalPlan;
+  const phaseStepIds = new Set((round.phases ?? []).flatMap((phase) => phase.plan.map((step) => step.id)));
+  return round.plan.filter((step) => !phaseStepIds.has(step.id));
+}
+
+function conversationMessageContent(content: string) {
+  return isAdjustmentProgressMessage(content) ? t("agent.nextPhaseReady") : content;
+}
+
 watch(() => pendingUserInputRequest.value?.callId, () => {
   userInputValues.value = {};
 });
@@ -132,8 +144,17 @@ const currentConversationMessages = computed(() => {
     .map((message, index) => ({ message, index }))
     .reverse()
     .find(({ message }) => message.role === "user" && message.kind === "message")?.index ?? 0;
-  return task.value.messages.slice(start).filter((message) => message.kind === "message");
+  const messages = task.value.messages.slice(start).filter((message) => message.kind === "message");
+  let latestPlanProgressIndex = -1;
+  messages.forEach((message, index) => {
+    if (isPlanProgressMessage(message.content)) latestPlanProgressIndex = index;
+  });
+  return messages.filter((message, index) => (
+    !isPlanProgressMessage(message.content) || index === latestPlanProgressIndex
+  ));
 });
+const currentPhases = computed(() => (task.value?.phaseHistory ?? [])
+  .filter((phase) => phase.roundId === task.value?.currentRoundId));
 const currentRecords = computed(() => {
   if (!task.value) return [];
   const start = task.value.messages
@@ -147,7 +168,7 @@ const activeRecordId = computed(() => isBusy.value
   : undefined);
 
 watch(
-  () => [task.value?.messages.length, task.value?.plan.length, task.value?.status],
+  () => [task.value?.messages.length, task.value?.plan.length, task.value?.phaseHistory?.length, task.value?.status],
   async () => {
     await nextTick();
     timeline.value?.scrollTo({ top: timeline.value.scrollHeight, behavior: "smooth" });
@@ -463,11 +484,21 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
               </div>
             </div>
 
-            <div v-if="round.plan.length" :class="['plan-card', 'archived-plan', `task-card-${round.status}`]">
+            <AgentExecutionPhase
+              v-for="(phase, phaseIndex) in round.phases ?? []"
+              :key="phase.id"
+              :phase="phase"
+              :index="phaseIndex + 1"
+            />
+
+            <div v-if="archivedFinalPlan(round).length" :class="['plan-card', 'archived-plan', `task-card-${round.status}`]">
               <button class="plan-card-head archived-head" @click="toggleRound(round.id)">
                 <span>
                   <ClipboardCheck :size="15" />
-                  <span><strong>{{ t("agent.archivedPlan") }}</strong><small>{{ round.requirement }}</small></span>
+                  <span>
+                    <strong>{{ round.phases?.length ? t("agent.finalPhasePlan", { index: round.phases.length + 1 }) : t("agent.archivedPlan") }}</strong>
+                    <small>{{ round.requirement }}</small>
+                  </span>
                 </span>
                 <span>
                   <span class="history-time">{{ new Date(round.completedAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</span>
@@ -478,7 +509,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
               </button>
               <template v-if="expandedRounds.includes(round.id)">
                 <div class="steps">
-                  <div v-for="(step, index) in round.plan" :key="step.id" :class="['plan-step', step.status]">
+                  <div v-for="(step, index) in archivedFinalPlan(round)" :key="step.id" :class="['plan-step', step.status]">
                     <button class="step-main" @click="toggleStep(`history-${round.id}-${step.id}`)">
                       <span class="step-icon"><CheckCircle2 v-if="step.status === 'completed'" :size="17" /><LoaderCircle v-else-if="['running', 'validating'].includes(step.status)" class="spin" :size="17" /><Circle v-else :size="17" /></span>
                       <span class="step-copy"><strong>{{ index + 1 }}. {{ step.title }}</strong><small>{{ step.description }}</small></span>
@@ -549,9 +580,16 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                 <strong>{{ messageAuthor(message.role) }}</strong>
                 <time>{{ new Date(message.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
               </div>
-              <p>{{ message.content }}</p>
+              <p>{{ conversationMessageContent(message.content) }}</p>
             </div>
           </div>
+
+          <AgentExecutionPhase
+            v-for="(phase, phaseIndex) in currentPhases"
+            :key="phase.id"
+            :phase="phase"
+            :index="phaseIndex + 1"
+          />
 
           <div v-if="task.plan.length" :class="['plan-card', 'current-plan-card', `task-card-${task.status}`]">
             <div class="plan-card-head">

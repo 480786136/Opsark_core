@@ -944,24 +944,23 @@ fn backend_safety_rejection_does_not_echo_resolved_command_or_secret() {
 #[test]
 fn parses_answer_and_execute_requirement_intents() {
     let answer: AiRequirementDecision = serde_json::from_str(
-        r#"{"intent":"answer","relation":"side_question","operation":null,"effect":null,"answer":"这是风险咨询。","constraints":null,"selectedSkillIds":[]}"#,
+        r#"{"intent":"answer","relation":"side_question","answer":"这是风险咨询。","constraints":null,"selectedSkillIds":[]}"#,
     )
     .unwrap();
     assert_eq!(answer.intent, "answer");
     assert_eq!(answer.relation.as_deref(), Some("side_question"));
 
     let execute: AiRequirementDecision = serde_json::from_str(
-        r#"{"intent":"execute","relation":"continue","operation":"build","effect":"write","answer":"","constraints":{"changePolicy":"requested_changes_only","environmentPolicy":"preserve","failurePolicy":"best_effort","prohibitedActions":["升级宿主运行时"],"requiredConditions":["保留当前环境"],"userDirectives":["尽力尝试"]},"selectedSkillIds":["project-source-acquisition","project-build"]}"#,
+        r#"{"intent":"execute","relation":"continue","answer":"","constraints":{"changePolicy":"requested_changes_only","environmentPolicy":"preserve","failurePolicy":"best_effort","prohibitedActions":["升级宿主运行时"],"requiredConditions":["保留当前环境"],"userDirectives":["尽力尝试"]},"selectedSkillIds":["project-source-acquisition","project-build"]}"#,
     )
     .unwrap();
     assert_eq!(execute.intent, "execute");
     assert_eq!(execute.relation.as_deref(), Some("continue"));
-    assert_eq!(execute.operation.as_deref(), Some("build"));
-    assert_eq!(execute.effect.as_deref(), Some("write"));
     assert_eq!(
         execute.selected_skill_ids,
         vec!["project-source-acquisition", "project-build"]
     );
+    assert!(execute_constraints_match_contract(&execute.constraints));
     let constraints =
         normalize_execution_constraints(Some(serde_json::from_value(execute.constraints).unwrap()));
     assert_eq!(constraints.environment_policy, "preserve");
@@ -969,41 +968,92 @@ fn parses_answer_and_execute_requirement_intents() {
     assert_eq!(constraints.prohibited_actions, vec!["升级宿主运行时"]);
 
     let zero_match: AiRequirementDecision = serde_json::from_str(
-        r#"{"intent":"execute","relation":"new_goal","operation":"diagnose","effect":"read","answer":"","constraints":{"changePolicy":"read_only","environmentPolicy":"preserve","failurePolicy":"strict","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},"terminalContextLines":0,"selectedSkillIds":[]}"#,
+        r#"{"intent":"execute","relation":"new_goal","answer":"","constraints":{"changePolicy":"read_only","environmentPolicy":"preserve","failurePolicy":"strict","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},"terminalContextLines":0,"selectedSkillIds":[]}"#,
     )
     .unwrap();
     assert!(zero_match.selected_skill_ids.is_empty());
     assert!(REQUIREMENT_CLASSIFICATION_CONTRACT.contains("零匹配是正常且合法的结果"));
     assert!(GENERAL_REQUIREMENT_SYSTEM.contains("不得选择最相近的 Skill 凑数"));
+    assert!(execute_constraints_match_contract(&zero_match.constraints));
+
+    let unspecified_constraints = json!({
+        "changePolicy": "unspecified",
+        "environmentPolicy": "unspecified",
+        "failurePolicy": "unspecified",
+        "prohibitedActions": [],
+        "requiredConditions": [],
+        "userDirectives": []
+    });
+    assert!(!execute_constraints_match_contract(
+        &unspecified_constraints
+    ));
+
+    let legacy_capability_fields = r#"{"intent":"execute","relation":"new_goal","operation":"deploy","effect":"write","answer":"","constraints":{"changePolicy":"requested_changes_only","environmentPolicy":"unspecified","failurePolicy":"unspecified","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},"terminalContextLines":0,"selectedSkillIds":[]}"#;
+    assert!(serde_json::from_str::<AiRequirementDecision>(legacy_capability_fields).is_err());
 
     let mixed_stage = r#"{"intent":"execute","answer":"","constraints":null,"steps":[]}"#;
     assert!(serde_json::from_str::<AiRequirementDecision>(mixed_stage).is_err());
 }
 
 #[test]
-fn rejects_skill_selection_outside_the_declared_capability_pair() {
-    let deployment = ModelSkillDefinition {
-        id: "application-deployment".into(),
-        name: "应用部署".into(),
-        description: "部署应用".into(),
-        version: 1,
-        capabilities: vec![SkillCapability {
-            operation: "deploy".into(),
-            effect: "write".into(),
-        }],
-        instructions: "DEPLOY".into(),
-        forbidden_tool_ids: Vec::new(),
+fn serializes_model_failure_with_complete_developer_trace() {
+    let mut trace = ModelDeveloperTrace::default();
+    record_model_attempt(
+        &mut trace,
+        "requirement_classification",
+        1,
+        std::time::Instant::now(),
+        json!({"model": "test-model", "messages": [{"content": "request"}]}),
+        Some(json!({"choices": []})),
+        Some("模型响应缺少需求理解结果".into()),
+    );
+
+    let encoded = traced_model_error("分类失败".into(), &trace);
+    let payload: Value = serde_json::from_str(
+        encoded
+            .strip_prefix(MODEL_TRACE_ERROR_PREFIX)
+            .expect("trace prefix"),
+    )
+    .expect("valid trace json");
+
+    assert_eq!(payload["message"], "分类失败");
+    assert_eq!(
+        payload["developerTrace"]["attempts"][0]["stage"],
+        "requirement_classification"
+    );
+    assert_eq!(
+        payload["developerTrace"]["attempts"][0]["response"]["choices"],
+        json!([])
+    );
+    assert_eq!(
+        payload["developerTrace"]["attempts"][0]["error"],
+        "模型响应缺少需求理解结果"
+    );
+}
+
+#[test]
+fn omits_absent_optional_plan_fields_from_the_frontend_payload() {
+    let step = PlanStep {
+        id: "step-1".into(),
+        kind: "observe".into(),
+        title: "检查目录".into(),
+        description: "检查目录是否存在".into(),
+        command: "test -d /opt/ruoyi".into(),
+        risk: "low".into(),
+        expected: "得到目录状态".into(),
+        validation: String::new(),
+        execution_scope: "isolated_exec".into(),
+        validation_scope: None,
+        session_context_change: None,
+        runtime_class: "bounded".into(),
+        status: "pending".into(),
+        output: None,
     };
-    assert!(skill_supports_capability(
-        &deployment,
-        Some("deploy"),
-        Some("write")
-    ));
-    assert!(!skill_supports_capability(
-        &deployment,
-        Some("inspect"),
-        Some("read")
-    ));
+    let value = serde_json::to_value(step).unwrap();
+
+    assert!(value.get("validationScope").is_none());
+    assert!(value.get("sessionContextChange").is_none());
+    assert!(value.get("output").is_none());
 }
 
 #[test]
@@ -1014,10 +1064,6 @@ fn loads_only_model_selected_skills_into_plan_context() {
             name: "项目源码获取".into(),
             description: "获取代码项目".into(),
             version: 1,
-            capabilities: vec![SkillCapability {
-                operation: "acquire".into(),
-                effect: "write".into(),
-            }],
             instructions: "SOURCE_WORKFLOW".into(),
             forbidden_tool_ids: vec!["server.resolve_connection".into()],
         },
@@ -1026,10 +1072,6 @@ fn loads_only_model_selected_skills_into_plan_context() {
             name: "项目依赖与构建".into(),
             description: "构建代码项目".into(),
             version: 1,
-            capabilities: vec![SkillCapability {
-                operation: "build".into(),
-                effect: "write".into(),
-            }],
             instructions: "BUILD_WORKFLOW".into(),
             forbidden_tool_ids: Vec::new(),
         },
@@ -1039,7 +1081,16 @@ fn loads_only_model_selected_skills_into_plan_context() {
         "project-build".to_string(),
         "project-source-acquisition".to_string(),
     ];
-    let enriched = context_with_selected_skills(context, &definitions, &selected).unwrap();
+    let constraints = ExecutionConstraints {
+        change_policy: "read_only".into(),
+        environment_policy: "preserve".into(),
+        failure_policy: "strict".into(),
+        prohibited_actions: Vec::new(),
+        required_conditions: Vec::new(),
+        user_directives: vec!["只检查，不修改".into()],
+    };
+    let enriched =
+        context_with_selected_skills(context, &definitions, &selected, Some(&constraints)).unwrap();
     let value: Value = serde_json::from_str(&enriched).unwrap();
 
     assert!(value.get("skillDirectory").is_none());
@@ -1050,6 +1101,7 @@ fn loads_only_model_selected_skills_into_plan_context() {
     assert_eq!(value["activeSkills"][0]["id"], "project-build");
     assert_eq!(value["activeSkills"][1]["id"], "project-source-acquisition");
     assert_eq!(value["activeSkills"][0]["instructions"], "BUILD_WORKFLOW");
+    assert_eq!(value["executionConstraints"]["changePolicy"], "read_only");
     assert_eq!(
         value["activeSkills"][1]["forbiddenToolIds"],
         json!(["server.resolve_connection"])

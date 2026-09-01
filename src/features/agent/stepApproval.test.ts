@@ -46,6 +46,19 @@ describe("step approval", () => {
     expect(hasCurrentStepApproval(waiting)).toBe(true);
   });
 
+  it("treats a backend null session context as absent when approving", () => {
+    const waiting = {
+      ...step("high"),
+      sessionContextChange: null as unknown as PlanStep["sessionContextChange"],
+    };
+
+    requestStepApproval("managed", waiting);
+    acceptStepApproval(waiting);
+
+    expect(waiting.safetyApprovalSnapshot?.sessionContextChange).toBeUndefined();
+    expect(hasCurrentStepApproval(waiting)).toBe(true);
+  });
+
   it("rejects approval for a step that is not waiting", () => {
     expect(acceptStepApproval(step("high"))).toBeUndefined();
   });

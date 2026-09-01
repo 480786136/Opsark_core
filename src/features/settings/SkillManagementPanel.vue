@@ -6,11 +6,7 @@ import { useOpsStore } from "@/stores/ops";
 import { validateSkillDefinition } from "@/features/skills/skillValidation";
 import {
   SKILL_CATEGORY_IDS,
-  SKILL_EFFECT_IDS,
-  SKILL_OPERATION_IDS,
   type SkillCategory,
-  type SkillEffect,
-  type SkillOperation,
 } from "@/features/skills/types";
 
 const store = useOpsStore();
@@ -51,25 +47,9 @@ const validationIssues = computed(() => selectedSkill.value ? validateSkillDefin
 function fieldError(field: string) {
   const message = validationIssues.value.find((issue) => issue.field === field)?.message;
   if (message === "此字段不能为空") return t("skills.required");
-  if (message === "至少需要一项能力边界") return t("skills.capabilityRequired");
   if (message?.startsWith("正则表达式无效")) return t("skills.invalidRegex");
   const count = message?.match(/\d+/)?.[0];
   return count ? t("skills.maxChars", { count }) : message;
-}
-
-function hasCapability(operation: SkillOperation, effect: SkillEffect) {
-  return selectedSkill.value?.capabilities.some((item) =>
-    item.operation === operation && item.effect === effect,
-  ) ?? false;
-}
-
-function toggleCapability(operation: SkillOperation, effect: SkillEffect, enabled: boolean) {
-  if (!selectedSkill.value) return;
-  selectedSkill.value.capabilities = enabled
-    ? [...selectedSkill.value.capabilities, { operation, effect }]
-    : selectedSkill.value.capabilities.filter((item) =>
-      item.operation !== operation || item.effect !== effect,
-    );
 }
 
 function addSkill() {
@@ -156,27 +136,6 @@ function removeSkill() {
           <textarea v-model="selectedSkill.description" rows="3" maxlength="1000"></textarea>
           <small v-if="fieldError('description')" class="field-error">{{ fieldError("description") }}</small>
         </label>
-        <fieldset class="tool-field skill-capability-field">
-          <legend>{{ t("skills.capabilities") }}</legend>
-          <small class="tool-field-hint">{{ t("skills.capabilitiesHint") }}</small>
-          <div class="skill-capability-grid">
-            <div class="skill-capability-head"></div>
-            <strong v-for="effect in SKILL_EFFECT_IDS" :key="effect">
-              {{ t(`skills.effects.${effect}`) }}
-            </strong>
-            <template v-for="operation in SKILL_OPERATION_IDS" :key="operation">
-              <span>{{ t(`skills.operations.${operation}`) }}</span>
-              <label v-for="effect in SKILL_EFFECT_IDS" :key="`${operation}-${effect}`">
-                <input
-                  type="checkbox"
-                  :checked="hasCapability(operation, effect)"
-                  @change="toggleCapability(operation, effect, ($event.target as HTMLInputElement).checked)"
-                />
-              </label>
-            </template>
-          </div>
-          <small v-if="fieldError('capabilities')" class="field-error">{{ fieldError("capabilities") }}</small>
-        </fieldset>
         <label class="tool-field">
           <span>{{ t("skills.matchRules") }}</span>
           <textarea v-model="rulesText" rows="4" spellcheck="false"></textarea>

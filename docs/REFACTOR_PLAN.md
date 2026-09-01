@@ -1,6 +1,6 @@
 # Opsark Core 重构与工具系统实施计划
 
-> 更新日期：2026-08-26
+> 更新日期：2026-08-31
 >
 > 执行原则：保留现有 Vue 3 + Pinia + Tauri 2 + Rust 可运行闭环，按依赖顺序小步迁移；每个阶段都必须可独立验证、可回退、可继续。
 
@@ -24,7 +24,8 @@
 - [x] 阶段 9：核心能力原子化、工具执行策略元数据化、领域逻辑 Skill 化。
 - [x] Skill 管理模块：支持新增、编辑、启停、模型选择提示、流程说明、删除自定义 Skill、恢复内置默认值和持久化。
 - [x] `project-source-acquisition` v11：源码获取保持准备、认证、获取、验收和错误处理五段流程，接入 `observe/change` 计划协议，删除观察步骤重复 validation 和过度 Shell 写法限制。
-- [x] 通用门禁优化：Skill 增加 `capabilities(operation/effect)` 机器可校验边界，需求分类允许零 Skill；不再使用“某类状态问题排除某 Skill”的业务文本硬编码。
+- [x] Skill 路由收口：删除需求 `operation/effect` 和 Skill `capabilities` 能力边界；模型依据名称、适用场景和选择提示语义选择 0～N 个 Skill，程序只校验 ID、启用状态和重复项。
+- [x] 只读安全迁移：`constraints.changePolicy` 成为需求级权威边界，新的 execute 分类不允许 `unspecified`；计划步骤仍由 `kind=observe|change`、命令副作用检测、风险审批和工具策略实施执行门禁。
 - [x] 删除 Rust 计划编译器中的“项目源码获取必须使用某一种 `mktemp/trap/mv`”专用业务门禁；通用层只校验步骤副作用、权限、凭据泄露、真实退出状态和工具协议，具体业务流程回归 Skill。
 - [x] 计划步骤增加 `kind=observe|change`：观察步骤直接使用主命令结果作为证据，只有变更步骤必须执行独立只读后置校验。
 - [x] 计划编译失败新增 `planning_failed` 状态：不再冒充业务 `needs_adjustment`，完全托管模式不会因此启动 5 秒调整倒计时。
@@ -53,8 +54,8 @@
 ```text
 用户需求
   -> 需求理解模型查看已启用 Skill 目录
-  -> 模型分类 operation/effect，并选择 0～N 个 Skill
-  -> 程序同时校验 Skill ID 和完整 capabilities 能力对
+  -> 模型分类需求关系与执行约束，并语义选择 0～N 个 Skill
+  -> 程序校验 Skill ID、启用状态和重复项
   -> 仅将所选 activeSkills 完整指令注入计划上下文
   -> 模型每次只规划当前证据允许的阶段
   -> ToolRegistry 提供原子能力与执行元数据
@@ -76,7 +77,7 @@
 
 - `skillCatalog.ts`：内置 Skill 的默认目录；大型内置 Skill 拆到 `builtins/<skill>/definition.ts`、结构化 workflow 和专用分支模块，由 `instructionBuilder.ts` 稳定编译为既有模型契约。
 - `skillRegistry.ts`：合并内置覆盖和用户自定义 Skill，完成持久化解析、轻量 Skill 目录序列化、模型多选结果装载和领域事实提取。
-- `SkillManagementView.vue`：独立 Skill 管理模块，可配置分类、`operation/effect` 能力对、普通语义或 `regex:` 选择提示、执行说明和启停状态。分类只用于管理与导航；需求理解模型可选择 0～N 个 Skill，后端会拒绝任何与需求能力对不兼容的选择，选择通过后才加载完整领域指令。
+- `SkillManagementView.vue`：独立 Skill 管理模块，可配置分类、普通语义或 `regex:` 选择提示、执行说明和启停状态。分类只用于管理与导航；需求理解模型可按整体目标、显式子目标和已证明必需阶段选择 0～N 个 Skill，通过 ID、启用状态和重复项校验后才加载完整领域指令。
 - Skill 提供模型的领域方法，也可声明确定性 `forbiddenToolIds`。实际执行步骤仍由模型依据当前证据生成，并必须通过通用权限、风险、Skill 工具策略和证据校验门禁。计划校验失败时，系统会把上一版完整步骤、具体字段和命中的不安全结构返回模型，最多连续进行两轮针对性修复；不由程序自动编造命令，执行分派还会再次 fail closed。
 - Skill 选择结果与计划生成结果分离保留。即使计划在针对性重试后仍失败，任务记录和审计日志仍会显示已选 `selectedSkillIds` 及最终 `planError`。
 - `validationAdapters.ts`：HTTP、进程、端口、SQL、服务、容器、日志、文件等领域观察解释器。
@@ -947,8 +948,18 @@ cargo check --manifest-path src-tauri/Cargo.toml
 
 ### 12.18 通用 Skill 能力边界与观察/变更计划协议（2026-08-26）
 
+> 本节的能力边界是历史实施记录，已被 12.19 取代；`observe/change` 计划协议仍然有效。
+
 - [x] Skill 分类只负责管理与导航；新增可持久化、可编辑的 `capabilities: {operation,effect}[]`，后端在加载 Skill 指令前必须验证完整能力对。
 - [x] 需求理解协议强制输出 `operation` 和 `effect`，支持 `selectedSkillIds=[]`，续跑时不再与历史 Skill 强制并集。
 - [x] 计划协议强制输出 `kind=observe|change`；`observe` 的 validation 为空且执行器直接使用主命令结果，`change` 才需要独立只读后置校验。
 - [x] 删除核心计划编译器中的 Git clone 专用事务写法门禁；源码获取 v11 只保留最终目录、认证通道、真实退出状态和最终仓库验收语义。
 - [x] 计划格式或安全校验失败进入 `planning_failed`，不再触发业务调整倒计时和“生成调整方案”动作。
+
+### 12.19 移除需求操作类型与 Skill 能力边界（2026-08-31）
+
+- [x] 从需求分类 JSON、Rust/TypeScript 类型和处理结果中删除 `operation/effect`。
+- [x] 从内置与自定义 Skill、覆盖配置、模型目录、管理界面和后端校验中删除 `capabilities`；旧持久化字段读取时安全忽略，下次保存不再写回。
+- [x] Skill 选择改为名称、description 和 selectionHints 的语义匹配，允许复合需求联合多个 Skill；程序仍拒绝未知、未启用或重复 ID。
+- [x] `constraints.changePolicy` 接管需求级只读/变更边界；新 execute 结果必须为 `read_only|requested_changes_only|allow_necessary_changes`，不允许 `unspecified`。
+- [x] 计划层继续强制 `kind=observe|change`、变更后独立校验、实际命令副作用识别、风险审批、Skill `forbiddenToolIds` 和工具 schema，移除 Skill 能力边界不放宽执行安全。

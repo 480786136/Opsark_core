@@ -84,9 +84,58 @@ fn sort_directory_entries(entries: &mut [RemoteFileEntry]) {
     });
 }
 
-fn validate_delete_path(path: &str) -> Result<(), String> {
-    if path == "/" || path.trim().is_empty() {
+fn normalize_delete_path(path: &str) -> Result<String, String> {
+    if path.trim().is_empty() {
         return Err("安全策略禁止删除根目录".into());
+    }
+    if !path.starts_with('/') {
+        return Err("安全策略只允许删除绝对远程路径".into());
+    }
+
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            value => components.push(value),
+        }
+    }
+    if components.is_empty() {
+        return Err("安全策略禁止删除根目录".into());
+    }
+    Ok(format!("/{}", components.join("/")))
+}
+
+fn delete_sftp_directory_recursively(sftp: &Sftp, root: &Path) -> Result<(), String> {
+    // Use an explicit post-order stack so deeply nested remote trees cannot
+    // overflow the application stack. lstat prevents following directory
+    // symlinks outside the selected tree.
+    let mut pending = vec![(root.to_path_buf(), false)];
+    while let Some((path, children_visited)) = pending.pop() {
+        if children_visited {
+            sftp.rmdir(&path)
+                .map_err(|error| format!("删除远程目录 {} 失败：{error}", path.display()))?;
+            continue;
+        }
+
+        let entries = sftp
+            .readdir(&path)
+            .map_err(|error| format!("读取待删除目录 {} 失败：{error}", path.display()))?;
+        pending.push((path, true));
+        for (entry_path, _) in entries {
+            let stat = sftp
+                .lstat(&entry_path)
+                .map_err(|error| format!("读取待删除项 {} 失败：{error}", entry_path.display()))?;
+            if is_directory(stat.perm.unwrap_or(0)) {
+                pending.push((entry_path, false));
+            } else {
+                sftp.unlink(&entry_path).map_err(|error| {
+                    format!("删除远程项 {} 失败：{error}", entry_path.display())
+                })?;
+            }
+        }
     }
     Ok(())
 }
@@ -186,14 +235,26 @@ pub(crate) fn delete_sftp_entry(
     path: String,
     kind: String,
 ) -> Result<(), String> {
-    validate_delete_path(&path)?;
+    let path = normalize_delete_path(&path)?;
     let sftp = open_sftp(&host, port, &username, &password)?;
-    if kind == "directory" {
-        sftp.rmdir(Path::new(&path))
-            .map_err(|error| format!("只能删除空目录：{error}"))
-    } else {
-        sftp.unlink(Path::new(&path))
-            .map_err(|error| format!("删除文件失败：{error}"))
+    match kind.as_str() {
+        "directory" => {
+            let stat = sftp
+                .lstat(Path::new(&path))
+                .map_err(|error| format!("读取待删除目录 {path} 失败：{error}"))?;
+            if is_directory(stat.perm.unwrap_or(0)) {
+                delete_sftp_directory_recursively(&sftp, Path::new(&path))
+            } else {
+                // The entry may have changed since it was listed. Never follow
+                // a replacement symlink merely because the UI reported a directory.
+                sftp.unlink(Path::new(&path))
+                    .map_err(|error| format!("删除远程项 {path} 失败：{error}"))
+            }
+        }
+        "file" => sftp
+            .unlink(Path::new(&path))
+            .map_err(|error| format!("删除文件失败：{error}")),
+        _ => Err("不支持的远程项类型".into()),
     }
 }
 
@@ -301,16 +362,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_root_deletion_and_allows_regular_paths() {
+    fn normalizes_delete_paths_and_rejects_root_equivalents() {
         assert_eq!(
-            validate_delete_path("/").unwrap_err(),
+            normalize_delete_path("/").unwrap_err(),
             "安全策略禁止删除根目录"
         );
         assert_eq!(
-            validate_delete_path("  ").unwrap_err(),
+            normalize_delete_path("  ").unwrap_err(),
             "安全策略禁止删除根目录"
         );
-        assert!(validate_delete_path("/tmp/project").is_ok());
+        assert_eq!(
+            normalize_delete_path("/tmp/../.").unwrap_err(),
+            "安全策略禁止删除根目录"
+        );
+        assert_eq!(
+            normalize_delete_path("tmp/project").unwrap_err(),
+            "安全策略只允许删除绝对远程路径"
+        );
+        assert_eq!(
+            normalize_delete_path("/tmp//project/./build/.."),
+            Ok("/tmp/project".into())
+        );
     }
 
     #[test]

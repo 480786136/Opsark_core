@@ -350,8 +350,9 @@ Agent 终端的每个执行块显示：
 
 ### 9.1 Skill 选择
 
-- Skill 能力与 `operation/effect` 不匹配时，从当前选择中删除该 Skill，然后使用剩余 Skill 或零 Skill 通用流程。
-- 只有模型返回了不存在的 Skill ID、协议无法解析或安全边界冲突时才阻断。
+- Skill 依据名称、适用场景和选择提示进行语义多选，不再声明或校验 `operation/effect` 能力边界；复合需求可联合加载多个 Skill。
+- 只有模型返回了不存在、未启用或重复的 Skill ID，协议无法解析或安全边界冲突时才阻断。
+- `constraints.changePolicy` 是需求级只读/变更权威边界；计划层仍通过 `kind=observe|change`、命令副作用识别、风险审批和 Skill 工具策略防止越权。
 - 状态检查、Shell 上下文和通用故障诊断不得强行匹配相近 Skill。
 
 ### 9.2 任务轮次与总结
@@ -605,7 +606,7 @@ type ChangeOperation =
 - 原生候选包：`src-tauri/target/release/bundle/macos/Opsark.app`，`tauri build --bundles app` 已通过。
 - 重构前回滚标签：`opsark-pre-agent-sandbox-v0.1.0`，指向 `da2271d`。
 - 重构版本提交：`7fa3ab21c4306cc8c6f381a7127e484788ba2eb9`（`refactor: isolate agent execution in sandbox terminals`）。
-- 重构版本标签：`opsark-v0.2.0-agent-sandbox`，指向 `7fa3ab21c4306cc8c6f381a7127e484788ba2eb9`。
+- 重构版本标签：`opsark-v0.2.0-agent-sandbox`，∂cu GOU指向 `7fa3ab21c4306cc8c6f381a7127e484788ba2eb9`。
 - 通道快速回滚：将 `opsark.feature.agentSandboxTerminalV1` 设为 `0`，仅回退到独立无状态 SSH exec；禁止恢复用户 PTY 注入。
 - 已通过观察：真实 SSH/PTY/SFTP、双会话隔离、关闭用户工作台后的长任务存活、Shell 启动事务、独立目标任务隔离、Agent 标签隔离和完全托管成功主路径。
 - 观察中：真实 transport 断线前/后恢复、Git 私库凭据注入、三轮连续异常调整，以及 v0.2.0 一个完整版本周期内的崩溃、无效人工按钮、重复执行和凭据泄漏监测。transport 注入当前受 macOS 对重编译开发版的登录钥匙串重新授权阻塞，不属于测试服务器认证失败。

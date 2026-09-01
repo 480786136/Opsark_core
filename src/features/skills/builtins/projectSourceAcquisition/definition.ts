@@ -10,7 +10,6 @@ export const projectSourceAcquisitionSkill: SkillDefinition = {
   version: 11,
   enabled: true,
   builtIn: true,
-  capabilities: [{ operation: "acquire", effect: "write" }],
   matchRules: [
     "git clone",
     "克隆代码仓库",

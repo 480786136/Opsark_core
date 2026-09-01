@@ -53,6 +53,9 @@ export function normalizePlanPreconditions(
       normalizeLongRunningCommandOutput(normalizeSecretPlaceholders(step.command)),
     ),
     validation: normalizeSecretPlaceholders(step.validation),
+    // Rust versions that predate the omitted-Option wire format emitted null.
+    // Keep persisted/backend plans canonical before approval snapshots are made.
+    sessionContextChange: step.sessionContextChange ?? undefined,
   })));
   const toolById = new Map(tools.map((tool) => [tool.id, tool]));
   normalized.forEach((step, index) => {

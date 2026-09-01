@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { backend, buildExecutionSummary, isTauri, normalizePlanPreconditions } from "@/services/backend";
+import { backend, buildExecutionSummary, isTauri, ModelInvocationError, normalizePlanPreconditions } from "@/services/backend";
 import {
   classifyStepResult,
   ensureStepValidator,
@@ -56,6 +56,12 @@ import {
 } from "@/features/agent/stepExecutionEntry";
 import { createAuditEvent, prependAuditEvent } from "@/features/agent/auditTrail";
 import {
+  compactDeveloperLogs,
+  createDeveloperLog,
+  prependDeveloperLog,
+  type DeveloperLogDraft,
+} from "@/features/agent/developerLog";
+import {
   buildPeriodicReviewAudit,
 } from "@/features/agent/reviewAudit";
 import {
@@ -74,6 +80,7 @@ import {
   restoreWorkflowState,
   taskGoal,
 } from "@/features/agent/taskGoal";
+import { isPlanProgressMessage } from "@/features/agent/taskMessages";
 import {
   planTaskAdjustment,
   reviewTaskGoal,
@@ -130,6 +137,7 @@ import {
 import type {
   AiGenerationSettings,
   AuditEvent,
+  DeveloperLogEntry,
   Metrics,
   ModelAvailability,
   ModelProfile,
@@ -185,8 +193,6 @@ const adjustingTaskIds = new Set<string>();
 const managedAdjustmentSchedulers = new Map<string, { requested: boolean }>();
 const recoveringAdjustmentTaskIds = new Set<string>();
 const resumingTransportTaskIds = new Set<string>();
-const PLAN_PROGRESS_MESSAGE_PATTERN = /^(?:已生成\s+\d+\s+个执行步骤|已根据失败结果生成\s+\d+\s+个调整步骤|已根据发现证据生成\s+\d+\s+个后续步骤)(?:[，,。；;]|$)/u;
-
 const secretValueId = (serverId: string, key: string) => `${serverId}::${key}`;
 
 function serverSecretValues(values: Record<string, string>, serverId: string) {
@@ -414,6 +420,10 @@ function migrateFinishedSideQuestionDisplay(task: OpsTask) {
       requirement: previous.message.content,
       status: task.status,
       plan: activeRoundSteps(task).map((step) => structuredClone(step)),
+      finalPlan: task.plan.map((step) => structuredClone(step)),
+      phases: (task.phaseHistory ?? [])
+        .filter((phase) => phase.roundId === task.currentRoundId)
+        .map((phase) => structuredClone(phase)),
       response: task.messages
         .slice(previous.index + 1, latest.index)
         .find((message) => message.role === "assistant" && message.kind === "message"),
@@ -453,6 +463,10 @@ function initialTasks() {
     });
     task.planHistory?.forEach((round) => {
       round.plan = round.plan.map(ensureStepValidator);
+      round.finalPlan = round.finalPlan?.map(ensureStepValidator);
+      round.phases?.forEach((phase) => {
+        phase.plan = phase.plan.map(ensureStepValidator);
+      });
       if (round.status === "needs_adjustment" && round.summary) {
         round.pauseReason = round.summary;
         round.summary = undefined;
@@ -489,6 +503,14 @@ function initialLogs() {
     // readable after a server/task is renamed or removed.
     title: event.title || "未命名事件",
     detail: event.detail || "",
+  }));
+}
+
+function initialDeveloperLogs() {
+  return readSaved<DeveloperLogEntry[]>("opsark.developerLogs", []).map((event) => ({
+    ...event,
+    title: event.title || "未命名开发者事件",
+    summary: event.summary || "无摘要",
   }));
 }
 
@@ -541,6 +563,7 @@ export const useOpsStore = defineStore("ops", {
     skillSaveError: "",
     modelAvailability: {} as Record<string, ModelAvailability>,
     logs: initialLogs(),
+    developerLogs: initialDeveloperLogs(),
     metrics: {
       cpu: 0,
       memory: 0,
@@ -594,6 +617,7 @@ export const useOpsStore = defineStore("ops", {
         try {
           localStorage.setItem("opsark.tasks", JSON.stringify(compactPersistedTasks(store.tasks)));
           localStorage.setItem("opsark.logs", JSON.stringify(store.logs.slice(0, 300)));
+          localStorage.setItem("opsark.developerLogs", JSON.stringify(store.developerLogs.slice(0, 30)));
           localStorage.setItem("opsark.servers", JSON.stringify(store.servers));
           localStorage.setItem("opsark.models", JSON.stringify(store.models));
           localStorage.setItem("opsark.aiGenerationSettings", JSON.stringify(store.aiGenerationSettings));
@@ -607,6 +631,7 @@ export const useOpsStore = defineStore("ops", {
           try {
             localStorage.setItem("opsark.tasks", JSON.stringify(compactPersistedTasks(store.tasks, true)));
             localStorage.setItem("opsark.logs", JSON.stringify(store.logs.slice(0, 80)));
+            localStorage.setItem("opsark.developerLogs", JSON.stringify(compactDeveloperLogs(store.developerLogs)));
           } catch {
             // 极端情况下保留内存态，禁止把持久化失败误报为执行失败。
           }
@@ -876,6 +901,9 @@ export const useOpsStore = defineStore("ops", {
             this.logs = this.logs.map((event) => event.serverId === task.serverId
               ? scrubPersistedCredentialValue(event, username, `\${secret.${usernameKey}}`)
               : event);
+            this.developerLogs = this.developerLogs.map((event) => event.serverId === task.serverId
+              ? scrubPersistedCredentialValue(event, username, `\${secret.${usernameKey}}`)
+              : event);
             task.submittedSecretBindings![usernameKey] = {
               key: usernameKey,
               label: usernameInput.label,
@@ -927,6 +955,31 @@ export const useOpsStore = defineStore("ops", {
           serverName: event.serverName ?? server?.name,
           taskTitle: event.taskTitle ?? task?.title,
         }, uid("log"), now()),
+      );
+      this.persist();
+    },
+
+    addDeveloperLog(event: DeveloperLogDraft) {
+      const task = event.taskId
+        ? this.tasks.find((item) => item.id === event.taskId)
+        : undefined;
+      const serverId = event.serverId ?? task?.serverId;
+      const server = serverId
+        ? this.servers.find((item) => item.id === serverId)
+        : undefined;
+      const knownSecrets = {
+        ...this.serverPasswords,
+        ...this.modelApiKeys,
+        ...this.secretValues,
+      };
+      this.developerLogs = prependDeveloperLog(
+        this.developerLogs,
+        createDeveloperLog({
+          ...event,
+          serverId,
+          serverName: event.serverName ?? server?.name,
+          taskTitle: event.taskTitle ?? task?.title,
+        }, uid("devlog"), now(), knownSecrets),
       );
       this.persist();
     },
@@ -1386,7 +1439,7 @@ export const useOpsStore = defineStore("ops", {
         if (
           message.role === "assistant"
           && message.kind === "message"
-          && PLAN_PROGRESS_MESSAGE_PATTERN.test(message.content)
+          && isPlanProgressMessage(message.content)
         ) {
           message.kind = "event";
         }
@@ -1562,13 +1615,59 @@ export const useOpsStore = defineStore("ops", {
             secretMetadata: this.secretMetadata,
             serverId,
           }));
-          processed = await backend.processRequirement(content, {
-            apiKey: apiKey ?? "",
-            endpoint: model.endpoint,
-            model: model.model,
-            context,
+          const skillDefinitions = buildSkillContext(this.enabledSkills);
+          const developerRequest = {
+            command: "process_ai_requirement",
+            attempt: attempt + 1,
+            requirement: content,
+            context: JSON.parse(context),
+            skillDefinitions,
             generationSettings: this.aiGenerationSettings,
-          }, buildSkillContext(this.enabledSkills));
+          };
+          const startedAt = Date.now();
+          try {
+            processed = await backend.processRequirement(content, {
+              apiKey: apiKey ?? "",
+              endpoint: model.endpoint,
+              model: model.model,
+              context,
+              generationSettings: this.aiGenerationSettings,
+            }, skillDefinitions);
+            const { developerTrace, ...response } = processed;
+            this.addDeveloperLog({
+              level: processed.planError ? "error" : "success",
+              operation: "requirement_processing",
+              title: processed.planError ? "需求处理完成，但计划编译失败" : "需求处理模型调用完成",
+              summary: processed.planError ?? `模型返回 ${processed.intent}，共生成 ${processed.plan.length} 个计划步骤。`,
+              request: developerRequest,
+              response,
+              trace: developerTrace,
+              serverId,
+              taskId: task.id,
+              modelProfileId: model.id,
+              modelName: `${model.name} / ${model.model}`,
+              endpoint: model.endpoint,
+              durationMs: Date.now() - startedAt,
+            });
+          } catch (error) {
+            this.addDeveloperLog({
+              level: "error",
+              operation: "requirement_processing",
+              title: "需求处理模型调用失败",
+              summary: error instanceof Error ? error.message : String(error),
+              request: developerRequest,
+              trace: error instanceof ModelInvocationError ? error.developerTrace : undefined,
+              error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+              stack: error instanceof Error ? error.stack : undefined,
+              serverId,
+              taskId: task.id,
+              modelProfileId: model.id,
+              modelName: `${model.name} / ${model.model}`,
+              endpoint: model.endpoint,
+              durationMs: Date.now() - startedAt,
+            });
+            throw error;
+          }
           if (processed.intent !== "terminal_context") break;
           if (selectedLines.length) throw new Error("模型已获得用户标注的终端内容，仍无法判断需求");
           const nextRange = Math.min(
@@ -1751,13 +1850,11 @@ export const useOpsStore = defineStore("ops", {
           return;
         }
         task.executionConstraints = processed.constraints;
-        const requiresReadOnlyPlan =
-          processed.constraints?.changePolicy === "read_only"
-          || processed.effect === "read";
+        const requiresReadOnlyPlan = processed.constraints?.changePolicy === "read_only";
         task.plan = requiresReadOnlyPlan
           ? processed.plan.filter((step) => (
-              step.kind === "observe"
-              || (step.kind === undefined && !isMutatingStepCommand(step.command))
+              step.kind !== "change"
+              && !isMutatingStepCommand(step.command)
             )).map(ensureStepValidator)
           : processed.plan.map(ensureStepValidator);
         if (!task.plan.length) {
@@ -1771,8 +1868,6 @@ export const useOpsStore = defineStore("ops", {
           title: "模型执行计划已返回",
           detail: JSON.stringify({
             requirement: content,
-            operation: processed.operation,
-            effect: processed.effect,
             constraints: task.executionConstraints,
             selectedSkillIds: task.activeSkillIds ?? [],
             context: JSON.parse(context),
@@ -1799,7 +1894,8 @@ export const useOpsStore = defineStore("ops", {
         if (task.cancelRequested) return;
         transitionTask(task, "planning_failed");
         task.summary = undefined;
-        task.pauseReason = `本轮计划生成失败：${String(error)}。未执行服务器变更，可直接重试规划。`;
+        const message = error instanceof Error ? error.message : String(error);
+        task.pauseReason = `本轮计划生成失败：${message}。未执行服务器变更，可直接重试规划。`;
         this.pushMessage(task, { role: "assistant", kind: "summary", content: task.pauseReason });
         this.persist();
       }
@@ -1947,7 +2043,7 @@ export const useOpsStore = defineStore("ops", {
         transitionTask(task, "awaiting_plan_approval");
         this.pushPlanProgressMessage(
           task,
-          "终端已恢复，重新执行此前未发送成功的原步骤；未调用模型重拟计划。",
+          "已进入下一阶段，正在重试此前未发送成功的原步骤。",
         );
         this.persist();
         await this.approvePlan(taskId, true);
@@ -1956,7 +2052,7 @@ export const useOpsStore = defineStore("ops", {
       }
     },
 
-    async beginAdjustment(taskId: string, automatic = false, expectedFingerprint?: string) {
+    async beginAdjustment(taskId: string, _automatic = false, expectedFingerprint?: string) {
       if (adjustingTaskIds.has(taskId)) return;
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || !["needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)) return;
@@ -1972,6 +2068,7 @@ export const useOpsStore = defineStore("ops", {
         await this.hydrateCredentials();
         if (task.cancelRequested || !["needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)) return;
         if (expectedFingerprint && task.adjustmentIncident?.fingerprint !== expectedFingerprint) return;
+        const phaseSummary = task.pauseReason;
         task.pauseReason = undefined;
         const failed = task.plan.find((step) => step.status === "failed");
         const model = this.models.find((item) => item.id === task.modelId);
@@ -2004,18 +2101,14 @@ export const useOpsStore = defineStore("ops", {
             generationSettings: this.aiGenerationSettings,
             skills: resolveTaskSkills(task, this.skills),
           });
-          archiveActivePhase(task, "adjustment");
+          archiveActivePhase(task, "adjustment", now(), phaseSummary);
           task.plan = adjustment.plan;
           transitionTask(task, "awaiting_plan_approval");
           this.pushPlanProgressMessage(
             task,
             task.permission === "managed"
-              ? automatic
-                ? `已根据失败结果自动生成 ${adjustment.replacement.length} 个调整步骤，完全托管模式已自动批准并继续；高风险步骤仍需单独确认。`
-                : `已按用户请求生成 ${adjustment.replacement.length} 个调整步骤，完全托管模式已自动批准并继续；高风险步骤仍需单独确认。`
-              : automatic
-                ? `已根据执行异常自动生成 ${adjustment.replacement.length} 个调整步骤，请审查后手动批准执行。`
-                : `已按用户请求生成 ${adjustment.replacement.length} 个调整步骤，请审查后手动批准执行。`,
+              ? `已进入下一阶段，包含 ${adjustment.replacement.length} 个执行步骤。`
+              : `下一阶段计划已生成，包含 ${adjustment.replacement.length} 个执行步骤，等待批准。`,
           );
           this.addLog({
             category: "model",
@@ -2815,11 +2908,16 @@ export const useOpsStore = defineStore("ops", {
         const executeFrameworkCommand = async (
           command: string,
           frameworkExecutionId: string,
-          label: string,
           approvedHighRisk = false,
         ) => {
           task.currentExecutionId = frameworkExecutionId;
-          agentTerminals.begin(task.id, frameworkExecutionId, label, "isolated_exec", false);
+          agentTerminals.begin(
+            task.id,
+            frameworkExecutionId,
+            redactExecutionOutput(command, scopedSecrets),
+            "isolated_exec",
+            false,
+          );
           let frameworkStreamed = false;
           try {
             const frameworkResult = useAgentSandbox && prepared.connection && agentSession
@@ -2880,7 +2978,6 @@ export const useOpsStore = defineStore("ops", {
             const rollbackResult = await executeFrameworkCommand(
               startupTransaction.rollbackCommand,
               uid("startup-rollback"),
-              "[执行器] 回滚 Shell 启动文件事务",
               true,
             );
             startupRollbackSucceeded = rollbackResult.success;
@@ -2902,7 +2999,6 @@ export const useOpsStore = defineStore("ops", {
           const snapshotResult = await executeFrameworkCommand(
             startupTransaction.snapshotCommand,
             uid("startup-snapshot"),
-            "[执行器] 快照 Shell 启动文件",
           );
           if (!snapshotResult.success) {
             throw new Error(`Shell 启动文件快照失败（退出码 ${snapshotResult.exitCode ?? 1}）`);

@@ -3,6 +3,8 @@ import {
   activeRoundSteps,
   allTaskSteps,
   archiveActivePhase,
+  capturePreviousRound,
+  commitPreviousRound,
   mergeTaskSkillIds,
   normalizeRequirementRelation,
   taskGoal,
@@ -50,11 +52,22 @@ describe("task goal lifecycle", () => {
 
   it("preserves superseded adjustment phases in the complete evidence ledger", () => {
     const current = task();
+    current.pauseReason = "依赖已安装，但服务尚未启动。";
     archiveActivePhase(current, "adjustment", "2026-01-03T00:00:00.000Z");
     current.plan = [step("web-server", "pending")];
 
+    expect(current.phaseHistory?.[0]?.summary).toBe("依赖已安装，但服务尚未启动。");
     expect(activeRoundSteps(current).map(({ id }) => id)).toEqual(["composer", "web-server"]);
     expect(allTaskSteps(current).map(({ id }) => id)).toEqual(["composer", "web-server"]);
+
+    const snapshot = capturePreviousRound(current, "2026-01-04T00:00:00.000Z");
+    commitPreviousRound(current, snapshot);
+    expect(current.planHistory?.[0]?.phases?.[0]).toMatchObject({
+      reason: "adjustment",
+      summary: "依赖已安装，但服务尚未启动。",
+    });
+    expect(current.planHistory?.[0]?.finalPlan?.map(({ id }) => id)).toEqual(["web-server"]);
+    expect(current.phaseHistory).toEqual([]);
   });
 
   it("uses model relation when available and has a safe continuation fallback", () => {

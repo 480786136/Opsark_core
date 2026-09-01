@@ -41,8 +41,6 @@ export type RequirementRelation =
   | "side_question"
   | "replace_goal"
   | "cancel_goal";
-export type RequirementOperation = "connect" | "acquire" | "install" | "build" | "inspect" | "diagnose" | "change" | "deploy" | "transfer";
-export type RequirementEffect = "read" | "write";
 export type StepReviewDecision = "continue" | "adjust" | "complete";
 export type ExecutionStatus = "success" | "failed" | "cancelled" | "blocked";
 export type ObservationStatus =
@@ -216,6 +214,8 @@ export interface TaskPlanHistory {
   requirement: string;
   status: TaskStatus;
   plan: PlanStep[];
+  finalPlan?: PlanStep[];
+  phases?: TaskExecutionPhase[];
   response?: TaskMessage;
   records?: TaskMessage[];
   summary?: string;
@@ -231,6 +231,7 @@ export interface TaskExecutionPhase {
   requirement: string;
   reason: "adjustment" | "replan";
   plan: PlanStep[];
+  summary?: string;
   createdAt: string;
   completedAt: string;
 }
@@ -386,14 +387,48 @@ export interface AiGenerationSettings {
 export interface RequirementProcessingResult {
   intent: "answer" | "execute" | "terminal_context";
   relation?: RequirementRelation;
-  operation?: RequirementOperation;
-  effect?: RequirementEffect;
   answer?: string;
   plan: PlanStep[];
   constraints?: ExecutionConstraints;
   terminalContextLines?: number;
   selectedSkillIds?: string[];
   planError?: string;
+  developerTrace?: ModelDeveloperTrace;
+}
+
+export interface ModelDeveloperTrace {
+  attempts: ModelAttemptTrace[];
+}
+
+export interface ModelAttemptTrace {
+  stage: string;
+  attempt: number;
+  durationMs: number;
+  request: unknown;
+  response?: unknown;
+  error?: string;
+}
+
+export interface DeveloperLogEntry {
+  id: string;
+  level: "info" | "warning" | "error" | "success";
+  operation: string;
+  title: string;
+  summary: string;
+  request?: string;
+  response?: string;
+  trace?: string;
+  error?: string;
+  stack?: string;
+  serverId?: string;
+  serverName?: string;
+  taskId?: string;
+  taskTitle?: string;
+  modelProfileId?: string;
+  modelName?: string;
+  endpoint?: string;
+  durationMs?: number;
+  createdAt: string;
 }
 
 export interface AuditEvent {

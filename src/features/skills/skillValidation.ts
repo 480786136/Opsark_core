@@ -23,7 +23,6 @@ export function validateSkillDefinition(skill: SkillDefinition): SkillValidation
   }
   const invalidRule = skill.matchRules.map(validateSkillMatchRule).find(Boolean);
   if (invalidRule) issues.push({ field: "matchRules", message: invalidRule });
-  if (!skill.capabilities.length) issues.push({ field: "capabilities", message: "至少需要一项能力边界" });
   return issues;
 }
 
@@ -33,10 +32,6 @@ export function normalizeSkillDefinition(skill: SkillDefinition): SkillDefinitio
     name: skill.name.trim(),
     description: skill.description.trim(),
     instructions: skill.instructions.trim(),
-    capabilities: [...new Map(skill.capabilities.map((capability) => [
-      `${capability.operation}:${capability.effect}`,
-      capability,
-    ])).values()],
     matchRules: [...new Set(skill.matchRules.map((rule) => rule.trim()).filter(Boolean))],
     updatedAt: new Date().toISOString(),
   };

@@ -5,6 +5,7 @@ import { createPinia, setActivePinia } from "pinia";
 import {
   backend,
   buildExecutionSummary,
+  ModelInvocationError,
   normalizeLongRunningCommandOutput,
   normalizePlanPreconditions,
 } from "@/services/backend";
@@ -159,6 +160,65 @@ describe("智能任务状态机", () => {
       taskId: task.id,
       taskTitle: "检查 Web 服务",
     });
+  });
+
+  it("记录完整且脱敏的需求处理开发者日志", async () => {
+    const store = useOpsStore();
+    store.modelApiKeys["model-deepseek"] = "private-model-key";
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({
+      intent: "execute",
+      plan: structuredClone(plan),
+      developerTrace: {
+        attempts: [{
+          stage: "requirement_classification",
+          attempt: 1,
+          durationMs: 42,
+          request: { model: "test-model", messages: [{ content: "检查服务" }] },
+          response: { choices: [{ message: { content: "{\"intent\":\"execute\"}" } }] },
+        }],
+      },
+    });
+
+    await store.submitRequirement("srv-production-01", "检查服务", "safe", "model-deepseek");
+
+    expect(store.developerLogs[0]).toMatchObject({
+      level: "success",
+      operation: "requirement_processing",
+      serverId: "srv-production-01",
+      modelProfileId: "model-deepseek",
+    });
+    expect(store.developerLogs[0].request).toContain("process_ai_requirement");
+    expect(store.developerLogs[0].trace).toContain("requirement_classification");
+    expect(JSON.stringify(store.developerLogs[0])).not.toContain("private-model-key");
+  });
+
+  it("在计划编译失败时保留两次原始模型响应和校验错误", async () => {
+    const store = useOpsStore();
+    vi.mocked(backend.processRequirement).mockRejectedValueOnce(new ModelInvocationError(
+      "模型响应缺少需求理解结果（已携带具体分类错误重试一次）",
+      {
+        attempts: [1, 2].map((attempt) => ({
+          stage: "requirement_classification",
+          attempt,
+          durationMs: 30,
+          request: { messages: [{ content: `attempt-${attempt}` }] },
+          response: { choices: [] },
+          error: "模型响应缺少需求理解结果",
+        })),
+      },
+    ));
+
+    await store.submitRequirement("srv-production-01", "再次尝试", "safe", "model-deepseek");
+
+    expect(store.activeTask?.status).toBe("planning_failed");
+    expect(store.developerLogs[0]).toMatchObject({
+      level: "error",
+      title: "需求处理模型调用失败",
+    });
+    expect(store.developerLogs[0].trace).toContain('"attempt": 1');
+    expect(store.developerLogs[0].trace).toContain('"attempt": 2');
+    expect(store.developerLogs[0].trace).toContain('"choices": []');
+    expect(store.developerLogs[0].error).toContain("模型响应缺少需求理解结果");
   });
 
   it("安全模式自动执行低风险步骤，并在中风险步骤前暂停确认", async () => {
@@ -1913,7 +1973,8 @@ describe("智能任务状态机", () => {
 
     expect(task.status).toBe("awaiting_step_approval");
     expect(task.plan.find((step) => step.id === "adjusted-high-risk")?.status).toBe("awaiting_approval");
-    expect(task.messages.some((message) => message.content.includes("自动批准并继续"))).toBe(true);
+    expect(task.messages.some((message) => message.content.includes("已进入下一阶段"))).toBe(true);
+    expect(task.messages.some((message) => message.content.includes("自动批准并继续"))).toBe(false);
   });
 
   it("达到自动调整上限后用户仍可明确发起新的人工调整周期", async () => {
@@ -2022,7 +2083,12 @@ describe("智能任务状态机", () => {
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.rootGoal = "删除 /tmp/explicit-target";
     task.status = "awaiting_plan_approval";
-    task.plan = [{ ...structuredClone(plan[0]), risk: "high", command: "rm -rf /tmp/explicit-target" }];
+    task.plan = [{
+      ...structuredClone(plan[0]),
+      risk: "high",
+      command: "rm -rf /tmp/explicit-target",
+      sessionContextChange: null as unknown as PlanStep["sessionContextChange"],
+    }];
 
     await store.approvePlan(task.id);
     expect(task.status).toBe("awaiting_step_approval");
@@ -2761,8 +2827,14 @@ describe("智能任务状态机", () => {
     vi.mocked(backend.processRequirement).mockResolvedValueOnce({
       intent: "execute",
       relation: "new_goal",
-      operation: "inspect",
-      effect: "read",
+      constraints: {
+        changePolicy: "read_only",
+        environmentPolicy: "unspecified",
+        failurePolicy: "unspecified",
+        prohibitedActions: [],
+        requiredConditions: [],
+        userDirectives: [],
+      },
       selectedSkillIds: [],
       plan: [{
         id: "observe-service",
@@ -2972,6 +3044,15 @@ describe("智能任务状态机", () => {
     expect(normalized).toHaveLength(1);
     expect(normalized[0]).toEqual(expect.objectContaining(steps[0]));
     expect(normalized[0].validator?.command).toBe(steps[0].validation);
+  });
+
+  it("会把后端计划中的空会话上下文规范化为缺省值", () => {
+    const normalized = normalizePlanPreconditions([{
+      ...structuredClone(plan[1]),
+      sessionContextChange: null as unknown as PlanStep["sessionContextChange"],
+    }]);
+
+    expect(normalized[0].sessionContextChange).toBeUndefined();
   });
 
   it("会移除模型误加在敏感变量占位符前的反斜杠", () => {
@@ -3185,8 +3266,14 @@ describe("智能任务状态机", () => {
     const store = useOpsStore();
     vi.mocked(backend.processRequirement).mockResolvedValueOnce({
       intent: "execute",
-      operation: "diagnose",
-      effect: "read",
+      constraints: {
+        changePolicy: "read_only",
+        environmentPolicy: "unspecified",
+        failurePolicy: "unspecified",
+        prohibitedActions: [],
+        requiredConditions: [],
+        userDirectives: [],
+      },
       plan: [
         {
           ...structuredClone(plan[0]),
@@ -3197,6 +3284,7 @@ describe("智能任务状态机", () => {
         {
           ...structuredClone(plan[1]),
           id: "restart-o2oa",
+          kind: "observe",
           title: "重启 O2OA",
           command: "systemctl restart o2server",
         },

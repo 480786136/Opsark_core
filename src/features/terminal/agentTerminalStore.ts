@@ -19,6 +19,7 @@ export const useAgentTerminalStore = defineStore("agentTerminals", {
     sessionsByTask: {} as Record<string, AgentSessionRef>,
     entriesByTask: {} as Record<string, AgentTerminalEntry[]>,
     activeTaskByServer: {} as Record<string, string | undefined>,
+    hiddenTaskIdsByServer: {} as Record<string, string[]>,
     sequence: 0,
   }),
   actions: {
@@ -29,7 +30,11 @@ export const useAgentTerminalStore = defineStore("agentTerminals", {
         this.activeTaskByServer[previous.serverId] = undefined;
       }
       this.sessionsByTask[session.taskId] = structuredClone(session);
-      this.activeTaskByServer[session.serverId] = session.taskId;
+      // Open a newly-created Agent terminal once. Context updates and transport
+      // generation changes must never steal focus back from a user-owned Shell.
+      if (!previous && !this.isTaskHidden(session.serverId, session.taskId)) {
+        this.activeTaskByServer[session.serverId] = session.taskId;
+      }
     },
     restoreHistoricalTask(task: OpsTask) {
       if (!task.agentSessionId || this.sessionsByTask[task.id]) return;
@@ -60,7 +65,21 @@ export const useAgentTerminalStore = defineStore("agentTerminals", {
       }
     },
     activateTask(serverId: string, taskId?: string) {
+      if (taskId) {
+        this.hiddenTaskIdsByServer[serverId] = (this.hiddenTaskIdsByServer[serverId] ?? [])
+          .filter((id) => id !== taskId);
+      }
       this.activeTaskByServer[serverId] = taskId;
+    },
+    isTaskHidden(serverId: string, taskId: string) {
+      return (this.hiddenTaskIdsByServer[serverId] ?? []).includes(taskId);
+    },
+    dismissTask(serverId: string, taskId: string) {
+      const hidden = this.hiddenTaskIdsByServer[serverId] ??= [];
+      if (!hidden.includes(taskId)) hidden.push(taskId);
+      if (this.activeTaskByServer[serverId] === taskId) {
+        this.activeTaskByServer[serverId] = undefined;
+      }
     },
     begin(taskId: string, executionId: string, text: string, scope: ExecutionScope, validation = false) {
       this.append(taskId, {

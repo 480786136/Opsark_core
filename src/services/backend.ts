@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AgentSessionContext, AgentSessionRef, AiGenerationSettings, ExecutionScope, FileEntry, Metrics, PlanStep, RequirementProcessingResult, ServerInfo, StepReview } from "@/types";
+import type { AgentSessionContext, AgentSessionRef, AiGenerationSettings, ExecutionScope, FileEntry, Metrics, ModelDeveloperTrace, PlanStep, RequirementProcessingResult, ServerInfo, StepReview } from "@/types";
 import type { ModelSkillDefinition } from "@/features/skills/types";
 import {
   normalizeLongRunningCommandOutput,
@@ -32,6 +32,33 @@ export interface RuntimeModel {
   model: string;
   context: string;
   generationSettings?: AiGenerationSettings;
+}
+
+const MODEL_TRACE_ERROR_PREFIX = "OPSARK_MODEL_TRACE_V1:";
+
+export class ModelInvocationError extends Error {
+  developerTrace?: ModelDeveloperTrace;
+
+  constructor(message: string, developerTrace?: ModelDeveloperTrace) {
+    super(message);
+    this.name = "ModelInvocationError";
+    this.developerTrace = developerTrace;
+  }
+}
+
+function normalizeModelInvocationError(error: unknown) {
+  const raw = error instanceof Error ? error.message : String(error);
+  const marker = raw.indexOf(MODEL_TRACE_ERROR_PREFIX);
+  if (marker < 0) return error instanceof Error ? error : new Error(raw);
+  try {
+    const parsed = JSON.parse(raw.slice(marker + MODEL_TRACE_ERROR_PREFIX.length)) as {
+      message?: string;
+      developerTrace?: ModelDeveloperTrace;
+    };
+    return new ModelInvocationError(parsed.message || "模型调用失败", parsed.developerTrace);
+  } catch {
+    return new Error(raw);
+  }
 }
 
 export interface SshProbe {
@@ -451,15 +478,19 @@ export const backend = {
 
   async generatePlan(requirement: string, runtimeModel?: RuntimeModel): Promise<PlanStep[]> {
     if (isTauri() && runtimeModel?.apiKey) {
-      const steps = await invoke<PlanStep[]>("generate_ai_plan", {
-        apiKey: runtimeModel.apiKey,
-        endpoint: runtimeModel.endpoint,
-        model: runtimeModel.model,
-        requirement,
-        context: runtimeModel.context,
-        generationSettings: runtimeModel.generationSettings,
-      });
-      return normalizePlanPreconditions(steps, requirement);
+      try {
+        const steps = await invoke<PlanStep[]>("generate_ai_plan", {
+          apiKey: runtimeModel.apiKey,
+          endpoint: runtimeModel.endpoint,
+          model: runtimeModel.model,
+          requirement,
+          context: runtimeModel.context,
+          generationSettings: runtimeModel.generationSettings,
+        });
+        return normalizePlanPreconditions(steps, requirement);
+      } catch (error) {
+        throw normalizeModelInvocationError(error);
+      }
     }
     if (isTauri()) return Promise.reject(new Error("未配置真实大模型连接，拒绝生成预制计划"));
     return requireDesktopRuntime("智能计划生成");
@@ -484,16 +515,20 @@ export const backend = {
     skillDefinitions: ModelSkillDefinition[] = [],
   ): Promise<RequirementProcessingResult> {
     if (isTauri()) {
-      const result = await invoke<RequirementProcessingResult>("process_ai_requirement", {
-        apiKey: runtimeModel.apiKey,
-        endpoint: runtimeModel.endpoint,
-        model: runtimeModel.model,
-        requirement,
-        context: runtimeModel.context,
-        skillDefinitions,
-        generationSettings: runtimeModel.generationSettings,
-      });
-      return { ...result, plan: normalizePlanPreconditions(result.plan, requirement) };
+      try {
+        const result = await invoke<RequirementProcessingResult>("process_ai_requirement", {
+          apiKey: runtimeModel.apiKey,
+          endpoint: runtimeModel.endpoint,
+          model: runtimeModel.model,
+          requirement,
+          context: runtimeModel.context,
+          skillDefinitions,
+          generationSettings: runtimeModel.generationSettings,
+        });
+        return { ...result, plan: normalizePlanPreconditions(result.plan, requirement) };
+      } catch (error) {
+        throw normalizeModelInvocationError(error);
+      }
     }
     return requireDesktopRuntime("智能需求处理");
   },

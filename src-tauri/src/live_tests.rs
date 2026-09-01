@@ -122,6 +122,8 @@ fn probe_live_ssh_adapter() {
     let test_dir = format!("/tmp/opsark-sftp-test-{}", unix_seconds());
     let file_path = format!("{test_dir}/hello.txt");
     let renamed_path = format!("{test_dir}/renamed.txt");
+    let nested_dir = format!("{test_dir}/nested");
+    let nested_file = format!("{nested_dir}/content.txt");
     let mut cleanup = SftpCleanup {
         config: config.clone(),
         directory: test_dir.clone(),
@@ -163,15 +165,23 @@ fn probe_live_ssh_adapter() {
         renamed_path.clone(),
     )
     .expect("SFTP rename failed");
-    delete_sftp_entry(
+    create_sftp_directory(
         config.host.clone(),
         config.port,
         config.user.clone(),
         config.password.clone(),
-        renamed_path,
-        "file".into(),
+        nested_dir,
     )
-    .expect("SFTP file delete failed");
+    .expect("nested SFTP mkdir failed");
+    write_sftp_file(
+        config.host.clone(),
+        config.port,
+        config.user.clone(),
+        config.password.clone(),
+        nested_file,
+        b"OPSARK_RECURSIVE_DELETE_OK".to_vec(),
+    )
+    .expect("nested SFTP upload failed");
     delete_sftp_entry(
         config.host,
         config.port,

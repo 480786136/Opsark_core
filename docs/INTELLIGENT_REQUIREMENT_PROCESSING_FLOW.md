@@ -186,6 +186,8 @@ flowchart TD
 
 “查看数据库有哪些库”“检查服务为何未启动”虽然是查询，但需要真实服务器证据，应走 `execute` 的只读计划，而不是凭常识回答。
 
+需求分类协议不再输出 `operation/effect`。`execute` 必须用 `constraints.changePolicy` 明确本轮边界：查询、检查和诊断为 `read_only`；用户明确要求的变更为 `requested_changes_only`；只有用户明确允许目标所需附加变更时才为 `allow_necessary_changes`。新的 execute 分类不允许 `unspecified`。
+
 ### 6.2 Skill 选择流程
 
 ```mermaid
@@ -200,7 +202,7 @@ flowchart LR
 规则如下：
 
 1. 模型可以不选 Skill，也可以组合多个 Skill。
-2. `continue` 和 `supplement` 保留仍启用的既有 Skill，并允许追加新 Skill。
+2. `continue` 和 `supplement` 每轮都返回当前完整 Skill 集合，可移除已不适用的旧 Skill，也可加入已有证据证明必需的新 Skill；任务目标和既有证据不因 Skill 集合替换而丢失。
 3. `new_goal` 和 `replace_goal` 重新选择 Skill。
 4. 禁用、未知或重复的 Skill ID 不能进入执行上下文。
 5. Skill 的语义匹配和 `regex:` 规则只是选择提示，最终由模型结合完整需求选择。

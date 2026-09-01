@@ -24,7 +24,25 @@ vi.mock("@/components/TerminalPanel.vue", async () => {
   };
 });
 
+vi.mock("./AgentTerminalPanel.vue", async () => {
+  const { defineComponent, h } = await import("vue");
+  return {
+    default: defineComponent({
+      name: "AgentTerminalPanelStub",
+      props: { taskId: String, active: Boolean },
+      setup(props) {
+        return () => h("section", {
+          class: "agent-terminal-panel-stub",
+          "data-task-id": props.taskId,
+          "data-active": String(props.active),
+        });
+      },
+    }),
+  };
+});
+
 import TerminalWorkspace from "./TerminalWorkspace.vue";
+import { useAgentTerminalStore } from "./agentTerminalStore";
 import { useTerminalSessionStore } from "./terminalSessionStore";
 import { useOpsStore } from "@/stores/ops";
 
@@ -124,6 +142,50 @@ describe("TerminalWorkspace 终端选项卡", () => {
     const app = createApp(TerminalWorkspace, { serverId: "server-a", workspaceActive: false });
     app.use(createPinia()).use(i18n).mount(host);
     expect(host.querySelector(".terminal-panel-stub")?.getAttribute("data-active")).toBe("false");
+    app.unmount();
+  });
+
+  it("切回 Shell 后 Agent 更新不抢焦点，关闭 Agent 标签会真正移除视图", async () => {
+    const pinia = createPinia();
+    addServer(pinia);
+    const ops = useOpsStore(pinia);
+    const task = ops.createTask("server-a", "managed", "model-1");
+    task.title = "后台只读检查";
+    task.agentSessionId = "agent-1";
+    task.status = "running";
+    const agentTerminals = useAgentTerminalStore(pinia);
+    const session = {
+      id: "agent-1",
+      serverId: "server-a",
+      taskId: task.id,
+      generation: 1,
+      state: "busy" as const,
+      context: { environment: {}, sourceFiles: [], shell: "bash" as const, revision: 0 },
+      createdAt: new Date().toISOString(),
+    };
+    agentTerminals.registerSession(session);
+
+    const app = createApp(TerminalWorkspace, { serverId: "server-a" });
+    app.use(pinia).use(i18n).mount(host);
+    await nextTick();
+    expect(host.querySelector(".agent-sandbox-tab")).not.toBeNull();
+    expect(host.querySelector(".agent-terminal-panel-stub")?.getAttribute("data-active")).toBe("true");
+
+    host.querySelector<HTMLButtonElement>('.terminal-workspace-tab:not(.agent-sandbox-tab) [role="tab"]')?.click();
+    agentTerminals.registerSession({ ...session, generation: 2 });
+    await nextTick();
+    expect(agentTerminals.activeTaskByServer["server-a"]).toBeUndefined();
+    expect(host.querySelector(".terminal-panel-stub")?.getAttribute("data-active")).toBe("true");
+
+    host.querySelector<HTMLButtonElement>('.agent-sandbox-tab [role="tab"]')?.click();
+    await nextTick();
+    host.querySelector<HTMLButtonElement>(".agent-sandbox-tab .terminal-tab-close")?.click();
+    await nextTick();
+
+    expect(host.querySelector(".agent-sandbox-tab")).toBeNull();
+    expect(host.querySelector(".agent-terminal-panel-stub")).toBeNull();
+    expect(agentTerminals.sessionsByTask[task.id].state).toBe("busy");
+    expect(host.querySelector(".terminal-panel-stub")?.getAttribute("data-active")).toBe("true");
     app.unmount();
   });
 });

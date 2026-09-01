@@ -9,7 +9,6 @@ const sshTerminalJump: SkillDefinition = {
   version: 4,
   enabled: true,
   builtIn: true,
-  capabilities: [{ operation: "connect", effect: "write" }],
   matchRules: [
     "regex:(?:ssh).*(?:连接|登录|跳转)|(?:连接|登录|跳转).*(?:ssh)",
     "regex:(?:终端|shell).*(?:跳转|登录).*(?:服务器|主机|IP)|(?:跳转|登录).*(?:服务器|主机|IP).*(?:终端|shell)",
@@ -32,7 +31,6 @@ const softwareInstallation: SkillDefinition = {
   version: 1,
   enabled: true,
   builtIn: true,
-  capabilities: [{ operation: "install", effect: "write" }],
   matchRules: [
     "安装软件",
     "安装 Git",
@@ -77,7 +75,6 @@ const projectBuild: SkillDefinition = {
   version: 3,
   enabled: true,
   builtIn: true,
-  capabilities: [{ operation: "build", effect: "write" }],
   matchRules: [
     "构建项目",
     "编译源码",
@@ -106,11 +103,6 @@ const databaseInspectionAndOperations: SkillDefinition = {
   version: 1,
   enabled: true,
   builtIn: true,
-  capabilities: [
-    { operation: "inspect", effect: "read" },
-    { operation: "diagnose", effect: "read" },
-    { operation: "change", effect: "write" },
-  ],
   matchRules: [
     "查看数据库",
     "列出所有数据库",
@@ -138,7 +130,6 @@ const applicationDeployment: SkillDefinition = {
   version: 4,
   enabled: true,
   builtIn: true,
-  capabilities: [{ operation: "deploy", effect: "write" }],
   matchRules: [
     "部署项目",
     "继续部署",
@@ -169,7 +160,6 @@ const fileTransferIntegrity: SkillDefinition = {
   version: 5,
   enabled: true,
   builtIn: true,
-  capabilities: [{ operation: "transfer", effect: "write" }],
   matchRules: [
     "跨服务器文件传输",
     "发送文件到服务器",

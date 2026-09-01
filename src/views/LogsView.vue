@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { AlertTriangle, CheckCircle2, ChevronLeft, ChevronRight, RotateCcw, Search, ScrollText, Server, XCircle } from "lucide-vue-next";
+import { AlertTriangle, Bug, CheckCircle2, ChevronLeft, ChevronRight, RotateCcw, Search, ScrollText, Server, ShieldCheck, XCircle } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import { useOpsStore } from "@/stores/ops";
 import type { AuditEvent, TaskStatus } from "@/types";
+import DeveloperLogsPanel from "@/components/DeveloperLogsPanel.vue";
 
 const store = useOpsStore();
 const { t, locale } = useI18n();
+const logMode = ref<"audit" | "developer">("audit");
 const query = ref("");
 const serverFilter = ref("all");
 const taskFilter = ref("all");
@@ -127,11 +129,20 @@ function commandContent(log: AuditEvent) {
 <template>
   <div class="page logs-page">
     <header class="page-header logs-header">
-      <div><span class="eyebrow">AUDIT TRAIL / OPERATIONS</span><h1>{{ t("logs.title") }}</h1><p>{{ t("logs.subtitle") }}</p></div>
-      <div class="log-summary" aria-label="日志统计"><span><strong>{{ summary.total }}</strong>{{ t("logs.records") }}</span><span class="summary-success"><CheckCircle2 :size="14" />{{ summary.success }}</span><span class="summary-warning"><AlertTriangle :size="14" />{{ summary.warning }}</span><span class="summary-error"><XCircle :size="14" />{{ summary.error }}</span></div>
+      <div><span class="eyebrow">AUDIT TRAIL / DEVELOPER DIAGNOSTICS</span><h1>{{ logMode === "audit" ? t("logs.title") : t("logs.developerTitle") }}</h1><p>{{ logMode === "audit" ? t("logs.subtitle") : t("logs.developerSubtitle") }}</p></div>
+      <div class="log-header-actions">
+        <div class="log-mode-tabs" :aria-label="t('logs.logMode')">
+          <button type="button" :class="{ active: logMode === 'audit' }" @click="logMode = 'audit'"><ShieldCheck :size="14" />{{ t("logs.auditMode") }}</button>
+          <button type="button" :class="{ active: logMode === 'developer' }" @click="logMode = 'developer'"><Bug :size="14" />{{ t("logs.developerMode") }}</button>
+        </div>
+        <div v-if="logMode === 'audit'" class="log-summary" aria-label="日志统计"><span><strong>{{ summary.total }}</strong>{{ t("logs.records") }}</span><span class="summary-success"><CheckCircle2 :size="14" />{{ summary.success }}</span><span class="summary-warning"><AlertTriangle :size="14" />{{ summary.warning }}</span><span class="summary-error"><XCircle :size="14" />{{ summary.error }}</span></div>
+      </div>
     </header>
 
-    <section class="log-filters">
+    <DeveloperLogsPanel v-if="logMode === 'developer'" />
+
+    <template v-else>
+      <section class="log-filters">
       <label class="search-box"><Search :size="16" /><input v-model="query" :placeholder="t('logs.searchPlaceholder')" /></label>
       <select v-model="serverFilter" :aria-label="t('logs.serverFilter')"><option value="all">{{ t("logs.allServers") }}</option><option v-for="server in serverOptions" :key="server.id" :value="server.id">{{ server.name }}{{ server.host ? ` · ${server.host}` : "" }}</option></select>
       <select v-model="taskFilter" :aria-label="t('logs.taskFilter')"><option value="all">{{ t("logs.allTasks") }}</option><option v-for="task in taskOptions" :key="task.id" :value="task.id">{{ task.title }}</option></select>
@@ -177,6 +188,7 @@ function commandContent(log: AuditEvent) {
           </main>
         </div>
       </section>
-    </Transition>
+      </Transition>
+    </template>
   </div>
 </template>

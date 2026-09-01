@@ -331,6 +331,82 @@ describe("AgentConsole 服务器工作区隔离", () => {
     app.unmount();
   });
 
+  it("折叠重复调整提示，并可展开查看阶段总结和执行步骤", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    const task = ops.createTask("server-a", "managed", "model-deepseek");
+    task.status = "awaiting_plan_approval";
+    ops.pushMessage(task, { role: "user", kind: "message", content: "拉取并部署 RuoYi" });
+    [1, 2, 3].forEach((index) => {
+      ops.pushMessage(task, {
+        role: "assistant",
+        kind: "message",
+        content: `已根据失败结果自动生成 ${index} 个调整步骤，完全托管模式已自动批准并继续；高风险步骤仍需单独确认。`,
+      });
+    });
+    task.phaseHistory = [{
+      id: "phase-1",
+      roundId: task.currentRoundId!,
+      requirement: "拉取并部署 RuoYi",
+      reason: "adjustment",
+      summary: "Git 环境可用，但目标目录尚未创建，因此需要先获取源码。",
+      createdAt: "2026-08-31T16:29:00.000Z",
+      completedAt: "2026-08-31T16:30:00.000Z",
+      plan: [{
+        id: "check-source",
+        title: "检查目标目录与 Git 环境",
+        description: "确认源码获取前置条件",
+        command: "git --version",
+        expected: "Git 可用",
+        validation: "git --version",
+        risk: "low",
+        status: "failed",
+        result: {
+          executionStatus: "failed",
+          observationStatus: "unknown",
+          facts: { targetMissing: true },
+          warnings: [],
+          evidenceIds: [],
+          failureReason: "目标目录尚不存在",
+        },
+      }],
+    }];
+    task.plan = [{
+      id: "clone-source",
+      title: "获取源码",
+      description: "克隆仓库到目标目录",
+      command: "git clone https://gitee.com/y_project/RuoYi.git /opt/ruoyi",
+      expected: "源码目录可用",
+      validation: "test -d /opt/ruoyi/.git",
+      risk: "high",
+      status: "pending",
+    }];
+    useAgentWorkspaceStore(pinia).updateServer("server-a", {
+      activeTaskId: task.id,
+      automationEnabled: true,
+    });
+
+    const app = createApp(AgentConsole, { serverId: "server-a" }).use(pinia).use(i18n);
+    app.mount(host);
+    await nextTick();
+
+    expect(host.querySelectorAll(".task-message.assistant")).toHaveLength(1);
+    expect(host.textContent).toContain("下一阶段计划已生成。");
+    expect(host.textContent).not.toContain("完全托管模式已自动批准并继续");
+    expect(host.textContent).toContain("阶段 1");
+    expect(host.textContent).toContain("发现阻断，已转入下一方案");
+    expect(host.textContent).not.toContain("Git 环境可用，但目标目录尚未创建");
+
+    host.querySelector<HTMLButtonElement>(".phase-history-head")!.click();
+    await nextTick();
+
+    expect(host.textContent).toContain("本阶段执行总结");
+    expect(host.textContent).toContain("Git 环境可用，但目标目录尚未创建，因此需要先获取源码。");
+    expect(host.textContent).toContain("检查目标目录与 Git 环境");
+    app.unmount();
+  });
+
   it("敏感值安全保存失败时保留用户输入并显示原因", async () => {
     const pinia = createPinia();
     const ops = useOpsStore(pinia);

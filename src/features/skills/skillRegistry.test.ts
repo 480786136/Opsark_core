@@ -17,7 +17,6 @@ describe("skill registry", () => {
     expect(skills[0]).toMatchObject({
       version: 4,
       category: "connectivity",
-      capabilities: [{ operation: "connect", effect: "write" }],
     });
     expect(buildSkillContext(skills)[0].instructions).toContain("server.resolve_connection");
     expect(buildSkillContext(skills)[0].instructions).toContain("TARGET_SSH_USERNAME");
@@ -124,7 +123,7 @@ describe("skill registry", () => {
     expect(instructions).toContain("禁止复用 SSH、Git、API");
   });
 
-  it("uses capability boundaries instead of business-specific exclusions", () => {
+  it("uses semantic selection hints without business-specific core exclusions", () => {
     expect(suggestSkillsByRules("检查 /opt/ground_check 项目的前后端是否都在运行")).toEqual([]);
     const deployment = resolveSkillRegistry({ overrides: [], customSkills: [] })
       .find((skill) => skill.id === "application-deployment")!;
@@ -132,7 +131,6 @@ describe("skill registry", () => {
     expect(deployment).toMatchObject({
       version: 4,
       category: "deployment",
-      capabilities: [{ operation: "deploy", effect: "write" }],
     });
     expect(deployment.description).not.toContain("前后端");
   });
@@ -153,6 +151,7 @@ describe("skill registry", () => {
       description: expect.stringContaining("SSH"),
       selectionHints: expect.any(Array),
     });
+    expect(JSON.stringify(directory)).not.toContain("capabilities");
     expect(JSON.stringify(directory)).not.toContain("server.resolve_connection");
   });
 
@@ -189,11 +188,15 @@ describe("skill registry", () => {
         name: "旧 Skill",
         description: "旧版未保存分类",
         instructions: "执行旧流程。",
+        capabilities: [{ operation: "diagnose", effect: "read" }],
         matchRules: [],
       }],
     }));
 
-    expect(restored.find((skill) => skill.id === "skill-legacy")?.category).toBe("other");
+    const legacy = restored.find((skill) => skill.id === "skill-legacy")!;
+    expect(legacy.category).toBe("other");
+    expect(legacy).not.toHaveProperty("capabilities");
+    expect(createSkillConfiguration(restored).customSkills[0]).not.toHaveProperty("capabilities");
   });
 
   it("does not let a pre-v11 source override mask the typed-step contract", () => {
