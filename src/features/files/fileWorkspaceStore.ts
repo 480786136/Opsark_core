@@ -43,8 +43,8 @@ function createServerWorkspace(initialFiles: FileEntry[] = []): ServerFileWorksp
 export function classifyDirectoryLoadError(error: unknown, connected: boolean): DirectoryLoadErrorCode {
   if (!connected) return "disconnected";
   const message = String(error).toLocaleLowerCase();
-  if (/permission denied|access denied|eacces|权限|无权/.test(message)) return "permission";
-  if (/no such file|not found|enoent|不存在/.test(message)) return "notFound";
+  if (/permission denied|access denied|\beacces\b|权限|无权/.test(message)) return "permission";
+  if (/no such file|not found|\benoent\b|不存在/.test(message)) return "notFound";
   if (/disconnect|not connected|connection.*closed|broken pipe|连接.*断/.test(message)) return "disconnected";
   return "unknown";
 }

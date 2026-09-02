@@ -23,7 +23,8 @@ export const projectSourceAcquisitionContract: SkillInstructionContract = {
       title: "选择仓库认证方式",
       enterWhen: "仓库需要认证或认证状态尚未明确",
       actions: [
-        "HTTPS 先用 kind=observe 的有界探测和不携带凭据的原始 URL 判断是否可匿名读取；需要认证时优先复用当前服务器中 target 匹配的完整 Git HTTPS 凭据组",
+        "HTTPS 认证状态未知时，本轮只能生成 kind=observe 的有界匿名探测：使用原始 URL、设置 GIT_TERMINAL_PROMPT=0，并执行 git ls-remote；不得在同一轮生成 clone、凭据收集或其他依赖探测结果的步骤",
+        "只有匿名探测的真实结构化结果明确证明需要认证后，才优先复用当前服务器中 target 匹配的完整 Git HTTPS 凭据组；步骤必须用 server-credential 引用或敏感变量占位符显式表达认证要求，不得靠 description/expected 中的自然语言暗示认证",
         "有多个匹配账号时请用户选择；没有匹配组时才同表单收集用户名和密码或令牌",
         "凭据只由执行器通过前台 PTY 回答 Git 的 Username/Password 提示；计划命令保留不含凭据的原始 URL",
       ],

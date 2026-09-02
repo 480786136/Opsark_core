@@ -149,6 +149,60 @@ function requireDesktopRuntime(operation: string): never {
   throw new Error(`${operation} 仅支持 Opsark 桌面端真实连接`);
 }
 
+export interface PlanNormalizationRepair {
+  errorCode: "tool_schema_validation_failed" | "plan_normalization_failed";
+  fieldPath?: string;
+  expected?: string;
+  validationError: string;
+  previousModelOutput: PlanStep[];
+  instruction: string;
+}
+
+/** Builds the bounded, non-secret feedback used for one model protocol-repair attempt. */
+export function buildPlanNormalizationRepair(error: unknown, steps: PlanStep[]): PlanNormalizationRepair {
+  const validationError = String(error);
+  const stepNumber = validationError.match(/第\s*(\d+)\s*个计划步骤/)?.[1];
+  const credentialType = validationError.match(/凭据参数\s+([A-Za-z][A-Za-z0-9_]*)\s+必须使用 password 类型/);
+  return {
+    errorCode: validationError.includes("工具参数无效")
+      ? "tool_schema_validation_failed"
+      : "plan_normalization_failed",
+    fieldPath: credentialType
+      ? `steps[${Math.max(0, Number(stepNumber ?? 1) - 1)}].command.arguments.fields[key=${credentialType[1]}].type`
+      : stepNumber
+        ? `steps[${Math.max(0, Number(stepNumber) - 1)}]`
+        : undefined,
+    expected: credentialType ? "password" : undefined,
+    validationError,
+    previousModelOutput: steps,
+    instruction: "只修复上述结构或工具参数错误；保持业务目的、步骤范围、风险和用户授权不变，不增加无关步骤。",
+  };
+}
+
+function contextWithPlanRepair(context: string, repair: PlanNormalizationRepair) {
+  try {
+    const parsed = JSON.parse(context) as unknown;
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+      return JSON.stringify({ ...parsed, planGenerationRepair: repair });
+    }
+  } catch {
+    // Preserve an opaque legacy context without attempting to reinterpret it.
+  }
+  return JSON.stringify({ originalContext: context, planGenerationRepair: repair });
+}
+
+function assertPlanRepairScope(repair: PlanNormalizationRepair, repaired: PlanStep[]) {
+  if (repair.errorCode !== "tool_schema_validation_failed") return;
+  if (repair.previousModelOutput.length !== repaired.length) {
+    throw new Error("工具参数格式修复不得改变计划步骤数量");
+  }
+  const immutable = ["kind", "title", "description", "risk", "expected", "validation"] as const;
+  repair.previousModelOutput.forEach((previous, index) => {
+    const changed = immutable.find((field) => previous[field] !== repaired[index]?.[field]);
+    if (changed) throw new Error(`工具参数格式修复不得改写 steps[${index}].${changed}`);
+  });
+}
+
 export const backend = {
   async saveCredential(kind: CredentialKind, id: string, value: string) {
     if (!isTauri()) return;
@@ -478,8 +532,9 @@ export const backend = {
 
   async generatePlan(requirement: string, runtimeModel?: RuntimeModel): Promise<PlanStep[]> {
     if (isTauri() && runtimeModel?.apiKey) {
+      let steps: PlanStep[];
       try {
-        const steps = await invoke<PlanStep[]>("generate_ai_plan", {
+        steps = await invoke<PlanStep[]>("generate_ai_plan", {
           apiKey: runtimeModel.apiKey,
           endpoint: runtimeModel.endpoint,
           model: runtimeModel.model,
@@ -487,9 +542,27 @@ export const backend = {
           context: runtimeModel.context,
           generationSettings: runtimeModel.generationSettings,
         });
-        return normalizePlanPreconditions(steps, requirement);
       } catch (error) {
         throw normalizeModelInvocationError(error);
+      }
+      try {
+        return normalizePlanPreconditions(steps, requirement);
+      } catch (firstError) {
+        const repair = buildPlanNormalizationRepair(firstError, steps);
+        try {
+          const repaired = await invoke<PlanStep[]>("generate_ai_plan", {
+            apiKey: runtimeModel.apiKey,
+            endpoint: runtimeModel.endpoint,
+            model: runtimeModel.model,
+            requirement: `${requirement}\n\n上次计划未通过本地协议校验。请依据 context.planGenerationRepair 只修复格式并重新返回完整计划。`,
+            context: contextWithPlanRepair(runtimeModel.context, repair),
+            generationSettings: runtimeModel.generationSettings,
+          });
+          assertPlanRepairScope(repair, repaired);
+          return normalizePlanPreconditions(repaired, requirement);
+        } catch (repairError) {
+          throw normalizeModelInvocationError(repairError);
+        }
       }
     }
     if (isTauri()) return Promise.reject(new Error("未配置真实大模型连接，拒绝生成预制计划"));
@@ -515,8 +588,9 @@ export const backend = {
     skillDefinitions: ModelSkillDefinition[] = [],
   ): Promise<RequirementProcessingResult> {
     if (isTauri()) {
+      let result: RequirementProcessingResult;
       try {
-        const result = await invoke<RequirementProcessingResult>("process_ai_requirement", {
+        result = await invoke<RequirementProcessingResult>("process_ai_requirement", {
           apiKey: runtimeModel.apiKey,
           endpoint: runtimeModel.endpoint,
           model: runtimeModel.model,
@@ -525,9 +599,28 @@ export const backend = {
           skillDefinitions,
           generationSettings: runtimeModel.generationSettings,
         });
-        return { ...result, plan: normalizePlanPreconditions(result.plan, requirement) };
       } catch (error) {
         throw normalizeModelInvocationError(error);
+      }
+      try {
+        return { ...result, plan: normalizePlanPreconditions(result.plan, requirement) };
+      } catch (firstError) {
+        const repair = buildPlanNormalizationRepair(firstError, result.plan);
+        try {
+          const repaired = await invoke<RequirementProcessingResult>("process_ai_requirement", {
+            apiKey: runtimeModel.apiKey,
+            endpoint: runtimeModel.endpoint,
+            model: runtimeModel.model,
+            requirement: `${requirement}\n\n上次执行计划未通过本地协议校验。保持已判定的用户意图和任务关系，仅依据 context.planGenerationRepair 修复计划格式。`,
+            context: contextWithPlanRepair(runtimeModel.context, repair),
+            skillDefinitions,
+            generationSettings: runtimeModel.generationSettings,
+          });
+          assertPlanRepairScope(repair, repaired.plan);
+          return { ...result, plan: normalizePlanPreconditions(repaired.plan, requirement) };
+        } catch (repairError) {
+          throw normalizeModelInvocationError(repairError);
+        }
       }
     }
     return requireDesktopRuntime("智能需求处理");

@@ -82,7 +82,7 @@ describe("interactive SSH credential selection", () => {
     });
   });
 
-  it("requires an explicit saved group when multiple accounts match the same host", () => {
+  it("ignores saved accounts until a step explicitly selects a credential group", () => {
     const secondGroup = savedGitGroupMetadata.map((item) => ({
       ...item,
       key: `${item.key}_2`,
@@ -103,9 +103,9 @@ describe("interactive SSH credential selection", () => {
     expect(resolveInteractivePtyCredential(step, [], values, [
       ...savedGitGroupMetadata,
       ...secondGroup,
-    ])).toMatchObject({
-      status: "blocked",
-      code: "credential-group-ambiguous",
+    ])).toEqual({
+      status: "not-required",
+      reason: "anonymous-git",
     });
     expect(resolveInteractivePtyCredential({
       ...step,
@@ -497,13 +497,15 @@ describe("interactive SSH credential selection", () => {
       .toThrow("命令尚未发送到 PTY");
   });
 
-  it("fails closed when repository authentication is requested without an explicit binding", () => {
-    expect(() => resolveInteractiveSshPromptSecret({
+  it("does not infer a credential requirement from repository-authentication prose", () => {
+    expect(resolveInteractivePtyCredential({
       command: "git ls-remote https://gitee.com/team/app.git HEAD",
-      description: "检查仓库认证",
+      description: "检查仓库认证（若需要，后续再选择凭据）",
       expected: "获得 HEAD",
-    }, ["GIT_HTTP_CREDENTIAL"], { GIT_HTTP_CREDENTIAL: "git-token" }, gitMetadata))
-      .toThrow("没有唯一可绑定到 gitee.com 的凭据组或敏感变量");
+    }, ["GIT_HTTP_CREDENTIAL"], { GIT_HTTP_CREDENTIAL: "git-token" }, gitMetadata)).toEqual({
+      status: "not-required",
+      reason: "anonymous-git",
+    });
   });
 
   it("allows a public anonymous Git clone when no authentication is requested", () => {

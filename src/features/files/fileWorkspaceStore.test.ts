@@ -48,6 +48,7 @@ describe("fileWorkspaceStore", () => {
     expect(classifyDirectoryLoadError("No such file", true)).toBe("notFound");
     expect(classifyDirectoryLoadError("Connection closed", true)).toBe("disconnected");
     expect(classifyDirectoryLoadError("anything", false)).toBe("disconnected");
+    expect(classifyDirectoryLoadError("failed to index failureaccess-1.0.1.jar", true)).toBe("unknown");
   });
 
   it("按服务器隔离目录路径和文件快照", async () => {

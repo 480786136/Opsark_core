@@ -7,7 +7,7 @@ export const projectSourceAcquisitionSkill: SkillDefinition = {
   name: "项目源码获取",
   category: "source-control",
   description: "将公开或私有 Git 仓库获取到指定目录，处理服务器级凭据复用、常见错误和最终仓库验收。",
-  version: 11,
+  version: 12,
   enabled: true,
   builtIn: true,
   matchRules: [

@@ -9,6 +9,7 @@ import {
   normalizeRequirementRelation,
   taskGoal,
 } from "@/features/agent/taskGoal";
+import { buildTaskDecisionSnapshot } from "@/features/agent/taskDecisionSnapshot";
 import type { OpsTask, PlanStep } from "@/types";
 
 function step(id: string, status: PlanStep["status"] = "completed"): PlanStep {
@@ -68,6 +69,41 @@ describe("task goal lifecycle", () => {
     });
     expect(current.planHistory?.[0]?.finalPlan?.map(({ id }) => id)).toEqual(["web-server"]);
     expect(current.phaseHistory).toEqual([]);
+  });
+
+  it("keeps two recent phases detailed and rolls older evidence into a bounded checkpoint", () => {
+    const current = task();
+    for (let index = 1; index <= 4; index += 1) {
+      current.plan = [{
+        ...step(`phase-step-${index}`),
+        output: index === 1 ? "OLD_RAW_OUTPUT_MUST_NOT_REACH_MODEL" : `output-${index}`,
+        result: {
+          executionStatus: "success",
+          observationStatus: "matched",
+          exitCode: 0,
+          facts: { category: "verified", value: index },
+          warnings: [],
+          evidenceIds: [],
+        },
+      }];
+      archiveActivePhase(current, "adjustment", `2026-01-0${index + 2}T00:00:00.000Z`, `phase ${index}`);
+    }
+    current.plan = [step("current-pending", "pending")];
+
+    expect(current.historyCheckpoint).toMatchObject({
+      sourcePhaseCount: 2,
+      sourceStepCount: 2,
+    });
+    expect(current.historyCheckpoint?.verifiedFacts.map(({ stepId }) => stepId))
+      .toEqual(["phase-step-1", "phase-step-2"]);
+
+    const snapshot = buildTaskDecisionSnapshot(current);
+    expect(snapshot.recentPhases.map(({ steps }) => steps[0]?.stepId))
+      .toEqual(["phase-step-3", "phase-step-4"]);
+    expect(snapshot.historyCheckpoint?.phaseSummaries.map(({ summary }) => summary))
+      .toEqual(["phase 1", "phase 2"]);
+    expect(snapshot.progress.totalSteps).toBe(5);
+    expect(JSON.stringify(snapshot)).not.toContain("OLD_RAW_OUTPUT_MUST_NOT_REACH_MODEL");
   });
 
   it("uses model relation when available and has a safe continuation fallback", () => {

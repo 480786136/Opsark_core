@@ -17,6 +17,9 @@ import type {
 } from "@/types";
 import { credentialGroupContext } from "@/features/agent/serverCredentialGroup";
 import { allTaskSteps, taskGoal } from "@/features/agent/taskGoal";
+import { buildTaskDecisionSnapshot } from "@/features/agent/taskDecisionSnapshot";
+import { compactReviewText } from "@/features/agent/longRunningReviewOutput";
+import type { StepReview } from "@/types";
 
 export function trimEvidence(value: string | undefined, limit = 3200) {
   if (!value) return "";
@@ -44,48 +47,6 @@ export function extractKnownExecutionFacts(task: OpsTask, skills = resolveTaskSk
     })),
     instruction: "这些事实来自同一任务的已完成执行证据。后续步骤必须优先复用，不得在无新证据时猜测或重复已完成工作。",
   };
-}
-
-function adjustmentExecutionFacts(task: OpsTask, skills: SkillDefinition[]) {
-  const completed = allTaskSteps(task).filter((step) => step.status === "completed");
-  return {
-    skillFacts: collectSkillFacts(task, skills),
-    completedSteps: completed.slice(-8).map((step) => ({
-      title: step.title,
-      expected: step.expected,
-      result: step.result,
-      output: trimEvidence(step.output, 800),
-      evidenceFacts: step.evidence?.map(({ type, source, facts, scope }) => ({ type, source, facts, scope })),
-    })),
-    instruction: "只保留已完成阶段的结构化结论和有界证据；不得要求重复已完成步骤。",
-  };
-}
-
-function adjustmentPlanStep(step: PlanStep) {
-  return {
-    title: step.title,
-    description: step.description,
-    command: step.command,
-    expected: step.expected,
-    validation: step.validation,
-    risk: step.risk,
-    status: step.status,
-    failureConclusion: step.status === "failed" ? {
-      failureReason: step.result?.failureReason,
-      facts: step.result?.facts,
-      review: step.review,
-    } : undefined,
-  };
-}
-
-function adjustmentFailureStep(step?: PlanStep) {
-  return step ? {
-    ...adjustmentPlanStep(step),
-    output: trimEvidence(step.output, 1_200),
-    executionScope: step.executionScope,
-    validationScope: step.validationScope,
-    evidence: step.evidence?.map(({ type, source, facts, scope }) => ({ type, source, facts, scope })),
-  } : undefined;
 }
 
 function planSafetyAdjustmentContext(task: OpsTask, failedStep: PlanStep) {
@@ -220,7 +181,36 @@ interface WorkflowContextInput {
   skills?: SkillDefinition[];
 }
 
-export function buildAdjustmentContext(input: WorkflowContextInput, failedStep?: PlanStep) {
+export interface AdjustmentContextOptions {
+  sharedSnapshot?: Record<string, unknown>;
+  reviewDecision?: StepReview;
+  adjustmentReason?: string;
+}
+
+function boundedPlanningTools(tools: ToolDefinition[]) {
+  return buildToolContext(tools).map((tool) => ({
+    ...tool,
+    name: compactReviewText(tool.name, 120),
+    description: compactReviewText(tool.description, 240),
+    usageInstructions: compactReviewText(tool.usageInstructions, 480),
+    outputDescription: compactReviewText(tool.outputDescription, 240),
+  }));
+}
+
+function boundedPlanningSkills(skills: SkillDefinition[]) {
+  return buildSkillContext(skills).map((skill) => ({
+    ...skill,
+    name: compactReviewText(skill.name, 120),
+    description: compactReviewText(skill.description, 280),
+    instructions: compactReviewText(skill.instructions, 2_200),
+  }));
+}
+
+export function buildAdjustmentContext(
+  input: WorkflowContextInput,
+  failedStep?: PlanStep,
+  options: AdjustmentContextOptions = {},
+) {
   const activeSkills = input.skills ?? resolveTaskSkills(input.task);
   const planSafetyRejection = failedStep?.result?.facts.category === "plan_safety_rejection";
   const focusedSafety = planSafetyRejection && failedStep
@@ -228,23 +218,34 @@ export function buildAdjustmentContext(input: WorkflowContextInput, failedStep?:
     : undefined;
   return {
     workflowPhase: "adjust_after_failure",
-    taskGoal: {
-      rootGoal: taskGoal(input.task),
-      currentInstruction: input.task.currentInstruction,
-      relation: input.task.lastRequirementRelation,
+    // A deterministic safety-gate repair has its own deliberately narrow
+    // payload below. Re-attaching the general task snapshot here would leak
+    // unrelated commands and outputs into what must be a field-local rewrite.
+    baseSnapshot: planSafetyRejection
+      ? undefined
+      : options.sharedSnapshot ?? buildTaskDecisionSnapshot(input.task, failedStep),
+    adjustmentTrigger: {
+      reason: options.adjustmentReason
+        ? compactReviewText(options.adjustmentReason, 800)
+        : failedStep?.result?.failureReason
+          ? compactReviewText(failedStep.result.failureReason, 800)
+          : "当前阶段结束但整体目标尚未完成",
+      reviewDecision: options.reviewDecision ? {
+        decision: options.reviewDecision.decision,
+        reason: compactReviewText(options.reviewDecision.reason, 600),
+        summary: compactReviewText(options.reviewDecision.summary, 600),
+        source: options.reviewDecision.source,
+      } : undefined,
     },
     server: serverSnapshot(input.server),
     metrics: input.metrics,
-    permission: input.task.permission,
-    executionConstraints: input.task.executionConstraints,
-    knownExecutionFacts: adjustmentExecutionFacts(input.task, activeSkills),
-    tools: buildToolContext(input.tools),
-    activeSkills: buildSkillContext(activeSkills),
-    previousPlan: focusedSafety?.previousPlan ?? allTaskSteps(input.task).map(adjustmentPlanStep),
-    failedStep: focusedSafety?.failedStep ?? adjustmentFailureStep(failedStep),
+    tools: boundedPlanningTools(input.tools),
+    activeSkills: boundedPlanningSkills(activeSkills),
+    previousPlan: focusedSafety?.previousPlan,
+    failedStep: focusedSafety?.failedStep,
     instruction: planSafetyRejection
       ? "这是执行前确定性安全门禁，不是远端执行失败。命令尚未发送到服务器。只修复 failedStep.offendingFields 列出的字段，必须保留真实失败退出码；不要改写步骤标题、风险、预期结果、其他步骤或用户授权。只返回该步骤的一个完整替代步骤，它仍会重新经过统一安全门禁。"
-      : "仅根据已有证据和未完成目标生成最少必要的替代步骤。先确定上一步是执行失败、观察到有效异常，还是主命令与后置校验冲突。目标已被真实证据证明时不得再变更；未达成时必须更换有实质区别的方法，不得对已失败命令仅做表面改写后重复执行。发现步骤只验证证据可获得；可选信息缺失或目标不存在是有效观察。每步是独立非交互 Shell，必须在当步建立所需目录和环境。用户给出的命令、地址、标识符和协议必须保持语义不变。所有进程必须被执行器跟踪，不得脱离生命周期；不得重复输入、发现、变更或验收。不得预设技术栈、工具、路径、端口或服务名；存在 activeSkills 时继续遵循对应 Skill，并以其要求的独立验收结束。",
+      : "只根据 baseSnapshot、adjustmentTrigger 和尚未完成目标生成最少必要步骤。recentPhases 是最近两个阶段，historyCheckpoint 是更早历史的滚动摘要；不得要求重复其中已经完成的工作。计划描述和阶段总结不是成功证据，只有结构化 result/evidence 才能证明状态。失败方法必须有实质变化后才能重试。每步在独立非交互 Shell 中建立自身环境，并以 activeSkills 要求的独立验收结束。",
     secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),
     serverCredentialGroups: credentialGroupContext(input.secretMetadata, input.task.serverId),
   };

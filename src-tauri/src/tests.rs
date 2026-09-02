@@ -1076,7 +1076,7 @@ fn loads_only_model_selected_skills_into_plan_context() {
             forbidden_tool_ids: Vec::new(),
         },
     ];
-    let context = r#"{"skillDirectory":[{"id":"project-source-acquisition"},{"id":"project-build"}],"activeSkills":[]}"#;
+    let context = r#"{"skillDirectory":[{"id":"project-source-acquisition"},{"id":"project-build"}],"activeSkills":[],"tools":[{"id":"server.resolve_connection"},{"id":"files.read_content"}]}"#;
     let selected = vec![
         "project-build".to_string(),
         "project-source-acquisition".to_string(),
@@ -1106,6 +1106,21 @@ fn loads_only_model_selected_skills_into_plan_context() {
         value["activeSkills"][1]["forbiddenToolIds"],
         json!(["server.resolve_connection"])
     );
+    assert_eq!(value["tools"], json!([{"id":"files.read_content"}]));
+}
+
+#[test]
+fn classification_context_omits_planning_only_payloads() {
+    let context = r#"{"server":{"host":"example"},"tools":[{"id":"files.read_content","inputSchema":{"type":"object"}}],"secretVariables":[{"key":"TOKEN"}],"serverCredentialGroups":[{"ref":"group"}],"activeSkills":[{"id":"old"}],"skillDirectory":[{"id":"project-source-acquisition"}],"knownExecutionFacts":{"completedSteps":[]}}"#;
+    let compact = requirement_classification_context(context).unwrap();
+    let value: Value = serde_json::from_str(&compact).unwrap();
+
+    assert!(value.get("tools").is_none());
+    assert!(value.get("secretVariables").is_none());
+    assert!(value.get("serverCredentialGroups").is_none());
+    assert!(value.get("activeSkills").is_none());
+    assert!(value.get("skillDirectory").is_some());
+    assert!(value.get("knownExecutionFacts").is_some());
 }
 
 #[test]
@@ -1121,4 +1136,24 @@ fn grep_no_match_is_a_valid_empty_query_result() {
         2,
         "No such file"
     ));
+}
+
+#[test]
+fn routes_untracked_background_repair_to_a_proven_service_manager() {
+    let error = "第 4 个计划步骤将进程脱离执行器跟踪";
+    let instruction = plan_repair_instruction(error, None);
+
+    assert!(instruction.contains("systemctl"));
+    assert!(instruction.contains("Docker/Compose"));
+    assert!(instruction.contains("Supervisor"));
+    assert!(instruction.contains("kind=observe"));
+    assert!(instruction.contains("executionScope=managed_service"));
+    assert!(instruction.contains("只修改 executionScope"));
+}
+
+#[test]
+fn build_blockers_cannot_plan_deployment_before_artifact_evidence() {
+    assert!(GENERAL_PLAN_SYSTEM.contains("当前阻断发生在依赖解析、编译、打包或镜像构建阶段"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("构建产物未经结构化程序证据确认前"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("不得生成启动、后台运行、部署、端口探测或应用健康检查步骤"));
 }

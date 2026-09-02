@@ -95,4 +95,12 @@ describe("adjustment incident fingerprint", () => {
 
     expect(snapshot.kind).toBe("transport");
   });
+
+  it("不把远程业务输出中的 connection closed 误判为终端故障", () => {
+    const task = taskWith(failedStep("application database connection closed unexpectedly"));
+    const snapshot = buildAdjustmentBlockerSnapshot(task, task.plan[0], target);
+
+    expect(snapshot.category).toBe("command_failed");
+    expect(snapshot.kind).toBe("business");
+  });
 });

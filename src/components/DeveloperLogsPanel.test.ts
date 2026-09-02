@@ -18,7 +18,7 @@ describe("DeveloperLogsPanel", () => {
 
   afterEach(() => host.remove());
 
-  it("shows a concise entry and expands full request, trace, response, and error", async () => {
+  it("opens the server/task workspace and shows full diagnostics with token usage", async () => {
     const pinia = createPinia();
     const store = useOpsStore(pinia);
     store.addDeveloperLog({
@@ -39,18 +39,18 @@ describe("DeveloperLogsPanel", () => {
     app.mount(host);
     await nextTick();
 
-    expect(host.textContent).toContain("需求处理模型调用失败");
-    expect(host.textContent).toContain("DeepSeek V4 Flash");
     expect(host.textContent).not.toContain("再次尝试");
-
-    host.querySelector<HTMLButtonElement>(".developer-log-entry-head")!.click();
+    host.querySelector<HTMLButtonElement>(".developer-server-summary")!.click();
     await nextTick();
 
+    expect(host.textContent).toContain("需求处理模型调用失败");
+    expect(host.textContent).toContain("DeepSeek V4 Flash");
     expect(host.textContent).toContain("完整请求（不含鉴权头）");
     expect(host.textContent).toContain("再次尝试");
     expect(host.textContent).toContain('"choices": []');
     expect(host.textContent).toContain("ModelInvocationError: missing result");
-    expect([...host.querySelectorAll<HTMLElement>(".developer-log-detail pre")].every((block) => block.tabIndex === 0)).toBe(true);
+    expect(host.textContent).toContain("估算用量");
+    expect([...host.querySelectorAll<HTMLElement>(".developer-detail-card pre")].every((block) => block.tabIndex === 0)).toBe(true);
     app.unmount();
   });
 });

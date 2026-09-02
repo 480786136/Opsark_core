@@ -108,6 +108,8 @@ describe("agentService", () => {
       step("failed", "npm run deploy", "failed"),
     ];
     const replacement = step("repair", "npm ci", "pending");
+    const generatePlan = vi.fn().mockResolvedValue([replacement]);
+    const sharedSnapshot = { version: 1, snapshotFingerprint: "shared-snapshot" };
     const result = await planTaskAdjustment({
       task: currentTask,
       failedStep: currentTask.plan[5],
@@ -117,10 +119,23 @@ describe("agentService", () => {
       model,
       apiKey: "secret-key",
       generationSettings,
-    }, vi.fn().mockResolvedValue([replacement]));
+      sharedSnapshot,
+      reviewDecision: {
+        decision: "adjust",
+        reason: "acceptance missing",
+        summary: "continue deployment",
+        source: "model",
+      },
+    }, generatePlan);
 
     expect(result.plan.map((item) => item.id)).toEqual(["repair"]);
     expect(result.context).toMatchObject({ workflowPhase: "adjust_after_failure" });
+    const context = JSON.parse(generatePlan.mock.calls[0][1].context);
+    expect(context.baseSnapshot).toEqual(sharedSnapshot);
+    expect(context.adjustmentTrigger.reviewDecision).toMatchObject({
+      decision: "adjust",
+      summary: "continue deployment",
+    });
   });
 
   it("安全门禁局部调整只提交命中字段并接受单步精确修复", async () => {
@@ -443,10 +458,80 @@ describe("agentService", () => {
     expect(result.complete).toBe(false);
     expect(review).toHaveBeenCalledWith(
       currentTask.rootGoal,
-      expect.stringContaining("currentRoundLedger"),
+      expect.stringContaining("baseSnapshot"),
       expect.objectContaining({ apiKey: "secret-key" }),
     );
     expect(review.mock.calls[0][1]).not.toContain("dependencies");
+  });
+
+  it("bounds the overall-goal ledger and keeps only exceptional output content", async () => {
+    const currentTask = task();
+    const noisyFailure = [
+      "build started",
+      "ordinary progress".repeat(3_000),
+      "GOAL_REVIEW_MIDDLE_TOKEN_MUST_BE_OMITTED",
+      "ordinary progress".repeat(3_000),
+      "fatal: deployment artifact is missing",
+      "[exit: 1]",
+    ].join("\n");
+    currentTask.plan = Array.from({ length: 60 }, (_, index): PlanStep => ({
+      ...step(`step-${index}`, `deploy --token secret-${index}`, index === 30 ? "failed" : "completed"),
+      output: index === 30 ? noisyFailure : `successful raw output ${index}`,
+      result: {
+        executionStatus: index === 30 ? "failed" : "success",
+        observationStatus: index === 30 ? "unknown" : "matched",
+        exitCode: index === 30 ? 1 : 0,
+        facts: { category: index === 30 ? "deploy_failed" : "verified" },
+        warnings: [],
+        evidenceIds: [],
+        failureReason: index === 30 ? "部署产物缺失" : undefined,
+      },
+    }));
+    const review = vi.fn().mockResolvedValue({
+      decision: "adjust",
+      reason: "部署产物缺失",
+      summary: "需要修复构建产物后重新验收。",
+      source: "model",
+    });
+
+    await reviewTaskGoal({
+      task: currentTask,
+      model,
+      apiKey: "secret-key",
+      skills: [{
+        id: "deploy-skill",
+        name: "部署",
+        category: "deployment",
+        description: "部署并验收应用",
+        version: 1,
+        enabled: true,
+        builtIn: false,
+        matchRules: [],
+        instructions: `final acceptance ${"long rule ".repeat(1_000)}`,
+        updatedAt: "2026-08-14T00:00:00.000Z",
+      }],
+    }, review);
+
+    const serialized = review.mock.calls[0][1] as string;
+    const context = JSON.parse(serialized);
+    const successful = context.baseSnapshot.currentPlan.steps
+      .find((item: { title: string }) => item.title === "step-0");
+    const failed = context.baseSnapshot.currentIncident;
+    expect(context.baseSnapshot.currentPlan).toMatchObject({
+      totalSteps: 60,
+      includedSteps: 20,
+      omittedSteps: 40,
+      incidentIncludedSeparately: true,
+    });
+    expect(successful.output).toHaveProperty("totalCharacters");
+    expect(successful.output).not.toHaveProperty("content");
+    expect(failed.title).toBe("step-30");
+    expect(failed.output.content).toContain("fatal: deployment artifact is missing");
+    expect(failed.output.salientLines).toContain("fatal: deployment artifact is missing");
+    expect(context.activeSkillAcceptance[0].instructions.length).toBeLessThanOrEqual(1_600);
+    expect(serialized).not.toContain("GOAL_REVIEW_MIDDLE_TOKEN_MUST_BE_OMITTED");
+    expect(serialized).not.toContain("deploy --token secret-");
+    expect(serialized.length).toBeLessThan(30_000);
   });
 
 });

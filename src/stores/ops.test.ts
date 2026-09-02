@@ -187,8 +187,13 @@ describe("智能任务状态机", () => {
       serverId: "srv-production-01",
       modelProfileId: "model-deepseek",
     });
-    expect(store.developerLogs[0].request).toContain("process_ai_requirement");
-    expect(store.developerLogs[0].trace).toContain("requirement_classification");
+    expect(store.developerLogs[0].request).toBeUndefined();
+    expect(store.developerLogs[1]).toMatchObject({
+      operation: "requirement_classification",
+      title: "requirement_classification · 第 1 次模型请求",
+    });
+    expect(store.developerLogs[1].request).toContain("检查服务");
+    expect(store.developerLogs[1].response).toContain("execute");
     expect(JSON.stringify(store.developerLogs[0])).not.toContain("private-model-key");
   });
 
@@ -215,10 +220,12 @@ describe("智能任务状态机", () => {
       level: "error",
       title: "需求处理模型调用失败",
     });
-    expect(store.developerLogs[0].trace).toContain('"attempt": 1');
-    expect(store.developerLogs[0].trace).toContain('"attempt": 2');
-    expect(store.developerLogs[0].trace).toContain('"choices": []');
     expect(store.developerLogs[0].error).toContain("模型响应缺少需求理解结果");
+    expect(store.developerLogs.slice(1, 3).map((entry) => entry.operation)).toEqual([
+      "requirement_classification",
+      "requirement_classification",
+    ]);
+    expect(store.developerLogs.slice(1, 3).every((entry) => entry.response?.includes('"choices": []'))).toBe(true);
   });
 
   it("安全模式自动执行低风险步骤，并在中风险步骤前暂停确认", async () => {
@@ -1843,7 +1850,11 @@ describe("智能任务状态机", () => {
         source: "model",
       },
     }];
-    vi.mocked(backend.generatePlan).mockRejectedValueOnce(new Error("模型计划结构解析失败"));
+    vi.mocked(backend.generatePlan)
+      .mockRejectedValueOnce(new Error("模型计划结构解析失败"))
+      .mockResolvedValueOnce([
+        { ...structuredClone(plan[1]), id: "generation-retry", status: "pending" },
+      ]);
 
     await store.adjustTask(task.id);
 
@@ -1852,6 +1863,18 @@ describe("智能任务状态机", () => {
     expect(task.pauseReason).toContain("调整计划生成失败");
     expect(task.pauseReason).toContain("可生成调整方案");
     expect(task.plan[0].review?.summary).toContain("HTTP 虽返回 200");
+    expect(task.adjustmentIncident?.generationFailureCount).toBe(1);
+    expect(task.adjustmentIncident?.executionAttemptCount).toBe(0);
+    expect(task.adjustmentCount).toBe(0);
+
+    await store.adjustTask(task.id);
+
+    expect(backend.generatePlan).toHaveBeenCalledTimes(2);
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(task.plan.some((step) => step.id === "generation-retry")).toBe(true);
+    expect(task.adjustmentIncident?.generationFailureCount).toBe(1);
+    expect(task.adjustmentIncident?.executionAttemptCount).toBe(1);
+    expect(task.adjustmentCount).toBe(1);
   });
 
   it("已完成阶段的后续计划失败时不否定成功证据", async () => {
@@ -2637,6 +2660,10 @@ describe("智能任务状态机", () => {
       summary: "源码已就位，但运行配置、服务启动与端到端访问尚未验收。",
       source: "model",
     });
+    vi.mocked(backend.generatePlan).mockResolvedValueOnce([{
+      ...structuredClone(plan[2]),
+      id: "goal-review-continuation",
+    }]);
 
     await store.submitRequirement(
       "srv-production-01",
@@ -2649,7 +2676,19 @@ describe("智能任务状态机", () => {
     expect(store.activeTask?.rootGoal).toBe("部署 office 项目");
     expect(store.activeTask?.summary).toBeUndefined();
     expect(store.activeTask?.pauseReason).toContain("端到端访问");
-    store.rejectTask(store.activeTask!.id);
+    const task = store.activeTask!;
+    const goalContext = JSON.parse(vi.mocked(backend.reviewGoal).mock.calls[0][1]);
+    expect(task.latestGoalReview?.snapshot).toEqual(goalContext.baseSnapshot);
+
+    await store.beginAdjustment(task.id);
+
+    const adjustmentRuntime = vi.mocked(backend.generatePlan).mock.calls[0][1]!;
+    const adjustmentContext = JSON.parse(adjustmentRuntime.context);
+    expect(adjustmentContext.baseSnapshot).toEqual(goalContext.baseSnapshot);
+    expect(adjustmentContext.adjustmentTrigger.reviewDecision).toMatchObject({
+      decision: "adjust",
+      summary: "源码已就位，但运行配置、服务启动与端到端访问尚未验收。",
+    });
   });
 
   it("用户配置的 Skill 会持久化并进入模型可选目录", async () => {
@@ -3976,7 +4015,8 @@ describe("智能任务状态机", () => {
     const reviewContext = JSON.parse(vi.mocked(backend.reviewStep).mock.calls[0][1]);
     expect(reviewContext.executionConstraints.failurePolicy).toBe("best_effort");
     expect(reviewContext.executionConstraints.environmentPolicy).toBe("preserve");
-    expect(reviewContext.userRequirement).toContain("使用当前系统的版本");
+    expect(vi.mocked(backend.reviewStep).mock.calls[0][0]).toContain("使用当前系统的版本");
+    expect(reviewContext).not.toHaveProperty("userRequirement");
     expect(backend.executeCommand).toHaveBeenCalledTimes(1);
     expect(task.plan[1].status).toBe("completed");
     expect(task.status).toBe("completed");
@@ -4063,8 +4103,10 @@ describe("智能任务状态机", () => {
     expect(task.messages.some((message) => message.kind === "summary")).toBe(false);
     expect(backend.reviewStep).toHaveBeenCalledTimes(1);
     const reviewContext = JSON.parse(vi.mocked(backend.reviewStep).mock.calls[0][1]);
-    expect(reviewContext.userRequirement).toBe(task.title);
-    expect(reviewContext.fullPlan).toHaveLength(1);
+    expect(vi.mocked(backend.reviewStep).mock.calls[0][0]).toBe(task.title);
+    expect(reviewContext).not.toHaveProperty("userRequirement");
+    expect(reviewContext).not.toHaveProperty("fullPlan");
+    expect(reviewContext.planSummary.totalSteps).toBe(1);
     expect(reviewContext.currentStep.result.executionStatus).toBe("failed");
   });
 
@@ -4121,9 +4163,11 @@ describe("智能任务状态机", () => {
 
     expect(backend.reviewStep).toHaveBeenCalledTimes(1);
     const reviewContext = JSON.parse(vi.mocked(backend.reviewStep).mock.calls[0][1]);
-    expect(reviewContext.userRequirement).toContain("不要升级系统运行时");
-    expect(reviewContext.fullPlan).toHaveLength(2);
-    expect(reviewContext.remainingSteps[0].title).toBe("使用兼容容器构建");
+    expect(vi.mocked(backend.reviewStep).mock.calls[0][0]).toContain("不要升级系统运行时");
+    expect(reviewContext).not.toHaveProperty("userRequirement");
+    expect(reviewContext).not.toHaveProperty("fullPlan");
+    expect(reviewContext.planSummary.totalSteps).toBe(2);
+    expect(reviewContext.remainingSteps.items[0].title).toBe("使用兼容容器构建");
     expect(task.plan[0].status).toBe("failed");
     expect(task.plan[1].status).toBe("completed");
     expect(task.status).toBe("completed");

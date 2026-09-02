@@ -39,8 +39,10 @@ describe("LogsView developer mode", () => {
     await nextTick();
 
     expect(host.textContent).toContain("开发者日志");
-    expect(host.textContent).toContain("需求处理模型调用失败");
     expect(host.querySelector(".developer-log-panel")).not.toBeNull();
+    host.querySelector<HTMLButtonElement>(".developer-server-summary")!.click();
+    await nextTick();
+    expect(host.textContent).toContain("需求处理模型调用失败");
     app.unmount();
   });
 });

@@ -1,11 +1,20 @@
-import { trimEvidence } from "@/features/agent/agentContext";
 import {
   compactReviewText,
   LONG_RUNNING_COMMAND_CONTEXT_LIMIT,
   textFingerprint,
 } from "@/features/agent/longRunningReviewOutput";
 import type { LongRunningOutputWindow } from "@/features/agent/longRunningReviewOutput";
+import {
+  compactReviewEvidence,
+  compactReviewOutput,
+  compactReviewPlanStep,
+  compactReviewResult,
+  reviewPlanSummary,
+} from "@/features/agent/reviewPayload";
 import type { OpsTask, PlanStep } from "@/types";
+
+const REVIEW_HISTORY_STEP_LIMIT = 6;
+const REVIEW_REMAINING_STEP_LIMIT = 6;
 
 interface PeriodicObservation {
   passed: boolean;
@@ -37,15 +46,7 @@ function taskSnapshot(task: OpsTask) {
 }
 
 function planSnapshot(step: PlanStep) {
-  return {
-    title: step.title,
-    description: step.description,
-    command: step.command,
-    expected: step.expected,
-    validation: step.validation,
-    risk: step.risk,
-    status: step.status,
-  };
+  return compactReviewPlanStep(step);
 }
 
 function plannedStepSnapshot(step: PlanStep) {
@@ -53,35 +54,34 @@ function plannedStepSnapshot(step: PlanStep) {
   return snapshot;
 }
 
-function historySnapshot(step: PlanStep, outputLimit = 1800) {
+function historySnapshot(step: PlanStep) {
   return {
-    title: step.title,
-    description: step.description,
-    command: step.command,
-    expected: step.expected,
-    status: step.status,
-    result: step.result,
-    output: trimEvidence(step.output, outputLimit),
+    ...compactReviewPlanStep(step, { commandLimit: 420, validationLimit: 320 }),
+    result: compactReviewResult(step.result, 1_200),
+    output: step.status === "failed" || step.result?.executionStatus === "failed"
+      ? compactReviewOutput(step.output, 700, 400)
+      : undefined,
   };
 }
 
-function evidenceSnapshot(step: PlanStep, trimRawOutput: boolean) {
-  return step.evidence?.map(({ type, source, facts, rawOutput, scope }) => ({
-    type,
-    source,
-    facts,
-    scope,
-    rawOutput: trimRawOutput ? trimEvidence(rawOutput) : rawOutput,
-  }));
+function collectionWindow<T>(items: T[], limit: number, edge: "start" | "end") {
+  const selected = edge === "start" ? items.slice(0, limit) : items.slice(-limit);
+  return {
+    totalItems: items.length,
+    includedItems: selected.length,
+    omittedItems: Math.max(0, items.length - selected.length),
+    items: selected,
+  };
 }
 
 export function buildPreconditionReviewContext(
   task: OpsTask,
   currentStep: PlanStep,
   blockerStep: PlanStep,
-  requirement: string,
 ) {
   const stepIndex = task.plan.indexOf(currentStep);
+  const history = task.plan.slice(0, stepIndex).map((step) => historySnapshot(step));
+  const remaining = task.plan.slice(stepIndex).map(plannedStepSnapshot);
   return {
     trigger: "已发现未解决的阻断条件，即将执行变更操作，需结合用户目标和已有证据决定继续还是调整",
     reviewPolicy: {
@@ -90,19 +90,26 @@ export function buildPreconditionReviewContext(
       userMayExplicitlyAuthorizeAttempt: true,
       failureFactsCannotBeRewritten: true,
     },
-    userRequirement: requirement,
     executionConstraints: task.executionConstraints,
+    task: taskSnapshot(task),
     blockingEvidence: {
-      title: blockerStep.title,
-      command: blockerStep.command,
-      expected: blockerStep.expected,
-      result: blockerStep.result,
-      evidence: evidenceSnapshot(blockerStep, true),
+      ...compactReviewPlanStep(blockerStep, { commandLimit: 800, validationLimit: 480 }),
+      result: compactReviewResult(blockerStep.result, 1_800),
+      output: compactReviewOutput(blockerStep.output, 1_200, 600),
+      evidence: compactReviewEvidence(blockerStep.evidence, {
+        maxItems: 4,
+        mainOutputLimit: 0,
+        validationOutputLimit: 700,
+      }),
     },
-    executionHistory: task.plan.slice(0, stepIndex).map((step) => historySnapshot(step)),
-    currentPlannedStep: plannedStepSnapshot(currentStep),
-    fullPlan: task.plan.map(planSnapshot),
-    remainingSteps: task.plan.slice(stepIndex).map(plannedStepSnapshot),
+    executionHistory: collectionWindow(history, REVIEW_HISTORY_STEP_LIMIT, "end"),
+    currentPlannedStep: compactReviewPlanStep(currentStep, {
+      commandLimit: 800,
+      validationLimit: 600,
+      includeStatus: false,
+    }),
+    remainingSteps: collectionWindow(remaining, REVIEW_REMAINING_STEP_LIMIT, "start"),
+    planSummary: reviewPlanSummary(task.plan),
   };
 }
 
@@ -158,8 +165,11 @@ export function buildExecutionFailureReviewContext(
   task: OpsTask,
   step: PlanStep,
   remainingSteps: PlanStep[],
-  requirement: string,
 ) {
+  const executionHistory = task.plan
+    .filter((item) => item !== step && item.status !== "pending")
+    .map((item) => historySnapshot(item));
+  const remaining = remainingSteps.map(plannedStepSnapshot);
   return {
     trigger: "主命令执行失败，需要判断是否影响用户整体目标和剩余计划",
     reviewPolicy: {
@@ -169,19 +179,21 @@ export function buildExecutionFailureReviewContext(
       modelCannotRewriteFailureAsSuccess: true,
       userConstraintsMustBePreserved: true,
     },
-    userRequirement: requirement,
     executionConstraints: task.executionConstraints,
     task: taskSnapshot(task),
     currentStep: {
-      ...plannedStepSnapshot(step),
-      result: step.result,
-      evidence: evidenceSnapshot(step, true),
+      ...compactReviewPlanStep(step, { commandLimit: 1_000, validationLimit: 700 }),
+      result: compactReviewResult(step.result, 2_000),
+      output: compactReviewOutput(step.output, 2_200, 900),
+      evidence: compactReviewEvidence(step.evidence, {
+        maxItems: 4,
+        mainOutputLimit: 0,
+        validationOutputLimit: 900,
+      }),
     },
-    executionHistory: task.plan
-      .filter((item) => item !== step && item.status !== "pending")
-      .map((item) => historySnapshot(item)),
-    fullPlan: task.plan.map(planSnapshot),
-    remainingSteps: remainingSteps.map(plannedStepSnapshot),
+    executionHistory: collectionWindow(executionHistory, REVIEW_HISTORY_STEP_LIMIT, "end"),
+    remainingSteps: collectionWindow(remaining, REVIEW_REMAINING_STEP_LIMIT, "start"),
+    planSummary: reviewPlanSummary(task.plan),
   };
 }
 
@@ -189,10 +201,13 @@ export function buildEvidenceReviewContext(
   task: OpsTask,
   step: PlanStep,
   remainingSteps: PlanStep[],
-  requirement: string,
   postconditionReview: boolean,
 ) {
   const validationProtocolIncomplete = Boolean(step.result?.facts.validationProtocolIncomplete);
+  const completed = task.plan
+    .filter((item) => item.status === "completed")
+    .map((item) => historySnapshot(item));
+  const remaining = remainingSteps.map(plannedStepSnapshot);
   return {
     trigger: postconditionReview
       ? validationProtocolIncomplete
@@ -208,28 +223,21 @@ export function buildEvidenceReviewContext(
       hardFactsCannotBeOverridden: true,
       mutationMayContinueOnlyWhenRemainingPlanRepairsPostcondition: true,
     } : undefined,
-    userRequirement: requirement,
     executionConstraints: task.executionConstraints,
     task: taskSnapshot(task),
     currentStep: {
-      title: step.title,
-      description: step.description,
-      command: step.command,
-      expected: step.expected,
+      ...compactReviewPlanStep(step, { commandLimit: 1_000, validationLimit: 700 }),
       validator: step.validator,
-      result: step.result,
-      evidence: evidenceSnapshot(step, false),
+      result: compactReviewResult(step.result, 2_000),
+      output: compactReviewOutput(step.output, 2_200, 900),
+      evidence: compactReviewEvidence(step.evidence, {
+        maxItems: 4,
+        mainOutputLimit: 0,
+        validationOutputLimit: 900,
+      }),
     },
-    completedSteps: task.plan
-      .filter((item) => item.status === "completed")
-      .map((item) => historySnapshot(item)),
-    fullPlan: task.plan.map(planSnapshot),
-    remainingSteps: remainingSteps.map(({ title, description, command, expected, risk }) => ({
-      title,
-      description,
-      command,
-      expected,
-      risk,
-    })),
+    completedSteps: collectionWindow(completed, REVIEW_HISTORY_STEP_LIMIT, "end"),
+    remainingSteps: collectionWindow(remaining, REVIEW_REMAINING_STEP_LIMIT, "start"),
+    planSummary: reviewPlanSummary(task.plan),
   };
 }

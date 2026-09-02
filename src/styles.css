@@ -1110,6 +1110,15 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .developer-log-detail pre { max-height: min(640px, 60dvh); margin: 0; padding: 11px 12px; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; border: 1px solid var(--border); border-radius: 5px; outline: none; color: var(--terminal-text); background: var(--terminal-bg); font: 9px/1.6 DM Mono, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .developer-log-detail pre:focus { border-color: var(--accent-border); }
 .developer-log-empty { min-height: 300px; flex: 1 1 auto; }
+.developer-server-summary { grid-template-columns: 32px minmax(0, 1fr) auto 18px; }
+.developer-log-workspace { flex: 1 1 0; }
+.developer-log-content { min-height: 0; flex: 1 1 0; display: flex; overflow: hidden; }
+.developer-log-content > .log-overview { width: 100%; }
+.developer-event-summary { margin: 8px 0 0; color: var(--muted); font-size: 8.5px; line-height: 1.55; }
+.developer-detail-card section { margin-top: 10px; }
+.developer-detail-card section label { display: block; margin-bottom: 5px; color: var(--accent); font: 8px DM Mono, monospace; }
+.developer-detail-card .developer-log-identifiers { margin-bottom: 10px; }
+.developer-token-usage { color: var(--accent); }
 
 /* 智能需求处理：统一主题、强化信息层级与状态动效 */
 .agent-panel { container: agent / inline-size; background: linear-gradient(180deg, color-mix(in srgb, var(--panel) 96%, var(--accent) 4%), var(--panel)); }

@@ -58,6 +58,7 @@ import { createAuditEvent, prependAuditEvent } from "@/features/agent/auditTrail
 import {
   compactDeveloperLogs,
   createDeveloperLog,
+  MAX_DEVELOPER_LOGS,
   prependDeveloperLog,
   type DeveloperLogDraft,
 } from "@/features/agent/developerLog";
@@ -80,6 +81,7 @@ import {
   restoreWorkflowState,
   taskGoal,
 } from "@/features/agent/taskGoal";
+import { initializeTaskHistoryCheckpoint } from "@/features/agent/taskHistoryCheckpoint";
 import { isPlanProgressMessage } from "@/features/agent/taskMessages";
 import {
   planTaskAdjustment,
@@ -453,6 +455,11 @@ function initialTasks() {
   return readSaved<OpsTask[]>("opsark.tasks", []).map((task) => {
     task.permission = normalizePermissionLevel(task.permission);
     task.adjustmentInProgress = false;
+    if (task.adjustmentIncident) {
+      task.adjustmentIncident.executionAttemptCount ??= task.adjustmentIncident.attemptCount ?? 0;
+      task.adjustmentIncident.generationFailureCount ??= 0;
+      delete task.adjustmentIncident.attemptCount;
+    }
     task.confirmedSecretKeys = [];
     task.submittedInputs = normalizeSubmittedInputs(task.submittedInputs);
     task.submittedSecretBindings = normalizeSubmittedSecretBindings(task.submittedSecretBindings);
@@ -472,6 +479,7 @@ function initialTasks() {
         round.summary = undefined;
       }
     });
+    initializeTaskHistoryCheckpoint(task);
     if (task.status === "needs_adjustment" && task.summary) {
       task.pauseReason = task.summary;
       task.summary = undefined;
@@ -617,7 +625,7 @@ export const useOpsStore = defineStore("ops", {
         try {
           localStorage.setItem("opsark.tasks", JSON.stringify(compactPersistedTasks(store.tasks)));
           localStorage.setItem("opsark.logs", JSON.stringify(store.logs.slice(0, 300)));
-          localStorage.setItem("opsark.developerLogs", JSON.stringify(store.developerLogs.slice(0, 30)));
+          localStorage.setItem("opsark.developerLogs", JSON.stringify(store.developerLogs.slice(0, MAX_DEVELOPER_LOGS)));
           localStorage.setItem("opsark.servers", JSON.stringify(store.servers));
           localStorage.setItem("opsark.models", JSON.stringify(store.models));
           localStorage.setItem("opsark.aiGenerationSettings", JSON.stringify(store.aiGenerationSettings));
@@ -1634,14 +1642,29 @@ export const useOpsStore = defineStore("ops", {
               generationSettings: this.aiGenerationSettings,
             }, skillDefinitions);
             const { developerTrace, ...response } = processed;
+            developerTrace?.attempts.forEach((modelAttempt) => {
+              this.addDeveloperLog({
+                level: modelAttempt.error ? "error" : "success",
+                operation: modelAttempt.stage,
+                title: `${modelAttempt.stage} · 第 ${modelAttempt.attempt} 次模型请求`,
+                summary: modelAttempt.error ?? "已记录本次实际发送的请求和收到的原始响应。",
+                request: modelAttempt.request,
+                response: modelAttempt.response,
+                error: modelAttempt.error,
+                serverId,
+                taskId: sourceTask.id,
+                modelProfileId: model.id,
+                modelName: `${model.name} / ${model.model}`,
+                endpoint: model.endpoint,
+                durationMs: modelAttempt.durationMs,
+              });
+            });
             this.addDeveloperLog({
               level: processed.planError ? "error" : "success",
               operation: "requirement_processing",
               title: processed.planError ? "需求处理完成，但计划编译失败" : "需求处理模型调用完成",
               summary: processed.planError ?? `模型返回 ${processed.intent}，共生成 ${processed.plan.length} 个计划步骤。`,
-              request: developerRequest,
               response,
-              trace: developerTrace,
               serverId,
               taskId: task.id,
               modelProfileId: model.id,
@@ -1650,13 +1673,31 @@ export const useOpsStore = defineStore("ops", {
               durationMs: Date.now() - startedAt,
             });
           } catch (error) {
+            if (error instanceof ModelInvocationError) {
+              error.developerTrace?.attempts.forEach((modelAttempt) => {
+                this.addDeveloperLog({
+                  level: modelAttempt.error ? "error" : "success",
+                  operation: modelAttempt.stage,
+                  title: `${modelAttempt.stage} · 第 ${modelAttempt.attempt} 次模型请求`,
+                  summary: modelAttempt.error ?? "已记录本次实际发送的请求和收到的原始响应。",
+                  request: modelAttempt.request,
+                  response: modelAttempt.response,
+                  error: modelAttempt.error,
+                  serverId,
+                  taskId: sourceTask.id,
+                  modelProfileId: model.id,
+                  modelName: `${model.name} / ${model.model}`,
+                  endpoint: model.endpoint,
+                  durationMs: modelAttempt.durationMs,
+                });
+              });
+            }
             this.addDeveloperLog({
               level: "error",
               operation: "requirement_processing",
               title: "需求处理模型调用失败",
               summary: error instanceof Error ? error.message : String(error),
-              request: developerRequest,
-              trace: error instanceof ModelInvocationError ? error.developerTrace : undefined,
+              request: error instanceof ModelInvocationError ? undefined : developerRequest,
               error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
               stack: error instanceof Error ? error.stack : undefined,
               serverId,
@@ -1789,6 +1830,7 @@ export const useOpsStore = defineStore("ops", {
         task.adjustmentCount = 0;
         task.adjustmentInProgress = false;
         task.adjustmentIncident = undefined;
+        task.latestGoalReview = undefined;
         task.lastAdjustmentBlocker = undefined;
         task.transportRecovery = undefined;
         task.discoveryRefined = false;
@@ -2071,6 +2113,7 @@ export const useOpsStore = defineStore("ops", {
         const phaseSummary = task.pauseReason;
         task.pauseReason = undefined;
         const failed = task.plan.find((step) => step.status === "failed");
+        const reusableGoalReview = failed ? undefined : task.latestGoalReview;
         const model = this.models.find((item) => item.id === task.modelId);
         const apiKey = this.modelApiKeys[task.modelId];
         if (!model) {
@@ -2100,9 +2143,20 @@ export const useOpsStore = defineStore("ops", {
             apiKey,
             generationSettings: this.aiGenerationSettings,
             skills: resolveTaskSkills(task, this.skills),
+            sharedSnapshot: reusableGoalReview?.snapshot,
+            reviewDecision: reusableGoalReview?.decision,
+            adjustmentReason: phaseSummary,
           });
+          const adjustmentIncident = task.adjustmentIncident;
+          if (adjustmentIncident
+            && (!expectedFingerprint || adjustmentIncident.fingerprint === expectedFingerprint)) {
+            adjustmentIncident.executionAttemptCount =
+              (adjustmentIncident.executionAttemptCount ?? 0) + 1;
+            task.adjustmentCount = adjustmentIncident.executionAttemptCount;
+          }
           archiveActivePhase(task, "adjustment", now(), phaseSummary);
           task.plan = adjustment.plan;
+          task.latestGoalReview = undefined;
           transitionTask(task, "awaiting_plan_approval");
           this.pushPlanProgressMessage(
             task,
@@ -2127,6 +2181,12 @@ export const useOpsStore = defineStore("ops", {
             await this.approvePlan(task.id, true);
           }
         } catch (error) {
+          const adjustmentIncident = task.adjustmentIncident;
+          if (adjustmentIncident
+            && (!expectedFingerprint || adjustmentIncident.fingerprint === expectedFingerprint)) {
+            adjustmentIncident.generationFailureCount =
+              (adjustmentIncident.generationFailureCount ?? 0) + 1;
+          }
           const reason = `调整计划生成失败：${String(error)}`;
           this.pushMessage(task, { role: "system", kind: "event", content: reason });
           transitionTask(task, "needs_adjustment");
@@ -2231,7 +2291,7 @@ export const useOpsStore = defineStore("ops", {
       }
 
       const incident = task.adjustmentIncident!;
-      if (incident.attemptCount >= 1) {
+      if ((incident.executionAttemptCount ?? 0) >= 1) {
         if (task.permission === "managed") {
           task.managedAdjustmentPhase = "manual_required";
           task.managedStopReason = "retry_exhausted";
@@ -2244,9 +2304,7 @@ export const useOpsStore = defineStore("ops", {
         );
         return;
       }
-      incident.attemptCount += 1;
       incident.updatedAt = now();
-      task.adjustmentCount = incident.attemptCount;
       await this.beginAdjustment(taskId, automatic, incident.fingerprint);
     },
 
@@ -2498,6 +2556,11 @@ export const useOpsStore = defineStore("ops", {
           apiKey,
           skills: resolveTaskSkills(task, this.skills),
         });
+        task.latestGoalReview = goalReview.complete ? undefined : {
+          decision: goalReview.decision,
+          snapshot: goalReview.snapshot,
+          createdAt: now(),
+        };
         this.addLog({
           category: "model",
           level: goalReview.complete ? "success" : "warning",

@@ -22,12 +22,13 @@ mod tests;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use agent_terminal::{
     close_agent_terminal, create_agent_terminal, execute_agent_terminal_command,
@@ -128,6 +129,7 @@ Shell 反斜杠在 JSON 字符串内必须写成双反斜杠，例如 Shell 的 
 输出前逐个检查七个字段，必须保证整个 JSON 对象完整闭合，不得截断任何字段。"#;
 const REQUIREMENT_CLASSIFICATION_CONTRACT: &str = r#"本阶段只做需求分类、任务关系判断、终端上下文判断、执行约束提取和 Skill 选择，禁止输出 steps、command、validation 或执行计划。context.taskGoal.rootGoal 是当前任务长期绑定的整体目标，currentInstruction 只是上一轮指令。必须判断本次输入与整体目标的关系：new_goal=独立的新执行目标；continue=继续/重试原目标；supplement=为原目标补充条件；side_question=临时咨询且不改变原目标；replace_goal=用户明确放弃原目标并替换；cancel_goal=明确取消原目标。不得仅因用户提出另一个问题就隐式覆盖原目标；新执行目标使用 new_goal，只有明确“改为/不要原目标/替换为”才用 replace_goal。必须先判断回答或计划是否依赖用户之前的终端输入/输出：如依赖且 terminalContext.content 未提供或范围不够，返回 terminal_context，terminalContextLines 必须大于当前 includedLines，且不超过 totalLines 和 400；不依赖则不得请求终端内容。对 execute，constraints.changePolicy 是本轮权威的只读/变更边界：查询现状、列表、检查和定位故障必须为 read_only；用户明确要求安装、修改、构建、部署、传输或其他环境变更时为 requested_changes_only；只有用户明确允许为达成目标执行必要的附加变更时才为 allow_necessary_changes。execute 不得返回 unspecified。environmentPolicy、failurePolicy、prohibitedActions、requiredConditions 和 userDirectives 只能来自用户明确表达，不得猜测或自行增加。context.skillDirectory 中的名称、description 和 selectionHints 用于语义选择；category 只用于管理和导航，不得触发 Skill。只选择直接适用于整体目标、本轮显式子目标或已有证据证明必需阶段的 Skill，允许复合需求选择多个 Skill；不得因为目录中存在相近领域或关键词局部相似而强行匹配。零匹配是正常且合法的结果，此时 selectedSkillIds=[]，后续使用通用流程。selectedSkillIds 是本轮完整集合，continue/supplement 也必须移除不再适用或上轮误选的 Skill，程序不会自动并集。咨询类必须严格输出：{"intent":"answer","relation":"side_question|cancel_goal","answer":"非空回答","constraints":null,"terminalContextLines":0,"selectedSkillIds":[]}。执行类必须严格输出：{"intent":"execute","relation":"new_goal|continue|supplement|replace_goal","answer":"","constraints":{"changePolicy":"read_only|requested_changes_only|allow_necessary_changes","environmentPolicy":"unspecified|preserve|allow_isolated_changes|allow_host_changes","failurePolicy":"unspecified|strict|best_effort","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},"terminalContextLines":0,"selectedSkillIds":[]}。需要更多终端内容时必须严格输出：{"intent":"terminal_context","relation":null,"answer":"","constraints":null,"terminalContextLines":80,"selectedSkillIds":[]}。顶层只允许 intent、relation、answer、constraints、terminalContextLines、selectedSkillIds 六个字段。"#;
 const SECRET_PLACEHOLDER_RULE: &str = "敏感变量规则：${secret.NAME} 是 Opsark 的执行时传输占位符，不是要保留在远端文件里的字面量。必须原样写成 ${secret.NAME}，绝对不得在美元符号前添加反斜杠。程序会在 SSH 执行前注入真实值，并在输出、日志和模型上下文中脱敏。模型看到的 •••••••• 只表示真实值已被脱敏：它既不是远端文件的实际内容，也不能证明具体密码正确或错误，更不能据此声称占位符未解析。选择变量时名称和说明必须与目标凭据语义一致；若现有变量无法区分目标账户或用途，应使用新的、用途明确的变量名，由界面向用户索取，不能静默借用含义模糊的旧值。写入远端配置后应使用不泄露秘密的功能性后置条件校验；校验命令中仍可使用同一占位符供程序注入。不得要求远端保留 Opsark 占位符，也不得因脱敏标记判定泄露、写入失败或密码错误。除非用户明确禁止持久化密码，不得自行增加该限制。";
+const REVIEW_SECRET_PLACEHOLDER_RULE: &str = "复核上下文中的 ${secret.NAME} 是执行时占位符，•••••••• 表示真实值已脱敏；不得据此判断占位符未解析、执行失败或发生泄露。";
 const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
 
 目标：仅根据用户需求、当前上下文和已验证证据，生成当前确实可执行的最小计划。
@@ -137,6 +139,7 @@ const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
    context.taskGoal.rootGoal 存在时它是不可被“继续、重试、补充”等短指令覆盖的最终目标；currentInstruction 只决定本轮增量。计划必须继续满足整体目标，并复用历史已完成证据。
 2. 不得预设技术栈、工具、路径、端口、服务名或资源名。
 3. 证据不足时，只生成最少必要的只读发现步骤；不得同时生成依赖未知发现结果的推测性变更。
+   当当前阻断发生在依赖解析、编译、打包或镜像构建阶段时，本阶段只能生成修复构建及验收构建产物的最少步骤。构建产物未经结构化程序证据确认前，不得生成启动、后台运行、部署、端口探测或应用健康检查步骤；待产物验收成功后再续接独立部署阶段。
 4. 证据充足时，按“必要确认→变更→最终验收”生成最少必要的计划。
 5. 默认每步在独立非交互 Shell 中运行，所需目录和环境必须在当步建立。只有后续步骤确实需要复用工作目录、非敏感环境变量或 source 文件时，才可选用 executionScope=agent_session 并用 sessionContextChange 明确记录可重放状态；主 command 仍必须自行建立它当次依赖的环境。
 6. 用户只要求修改已有资源的部分字段时，必须保留无关内容并做可恢复备份；不得用新模板覆盖整个结构化配置，除非用户明确要求整体替换或证据证明这是完整目标内容。
@@ -160,7 +163,7 @@ const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
 const GENERAL_DISCOVERY_RULES: &str = "对于需要发现实际实现方式的任务，先读取目标自带的说明、声明、配置、入口和已有状态，由证据确定依赖、运行方式、构建方式、部署方式和验收标准。核心不提供任何领域工具或技术栈的默认方案；只能使用当前证据明确展示的能力。发现步骤的校验只确认证据可获得，不要把可选信息缺失判为失败。";
 const GENERAL_REQUIREMENT_SYSTEM: &str = "你是通用运维需求分类、任务关系判断与 Skill 编排器，本阶段不生成计划。先将用户本次输入和 context.taskGoal.rootGoal 比较，区分继续、补充、旁问、独立新目标、明确替换或取消；不得让‘继续部署’、‘重试’取代整体目标，也不得让临时问题破坏原任务。判断用户是仅需要不依赖当前环境的知识性回答，还是需要读取或改变真实目标环境。需要当前状态、真实数据或任何环境变更时必须返回 execute。对 execute 必须用 constraints.changePolicy 明确表达本轮只读或变更边界，不得返回 unspecified。从系统提供的 Skill 目录中依据名称、适用场景和选择提示进行语义选择，允许复合需求选择零个、一个或多个 Skill；没有直接适用 Skill 时必须返回空数组并使用通用流程，不得选择最相近的 Skill 凑数，也不得编造目录外 Skill。environmentPolicy、failurePolicy 和其他结构化约束只能来自用户明确表达，不得猜测或自行增加。";
 const GENERAL_SUMMARY_SYSTEM: &str = "你是通用运维结果总结器。仅根据当前轮用户目标和当前轮脱敏的真实执行证据总结，不得用旧轮证据回答新的状态问题。结构化 result、evidence.facts 和 evidence.scope 优先于预期文本和旧总结。证据只能证明自己的 scope/persistence：agent_session 成功不证明用户已打开 Shell 或新 Shell 自动加载，显式 source 成功不证明启动文件会自动加载。有效的“未发现”、“非健康”或“警告”是观察结果，不等于命令执行失败。若存在关键失败且无后续证据证明目标已达成，必须明确说明任务未完成、最终阻断、已确认结果和尚未满足的目标。不得虚构、输出命令或泄露敏感信息。使用一至三段中文纯文本。";
-const GENERAL_REVIEW_SYSTEM: &str = "你是通用运维执行复核员。根据当前轮用户目标、executionConstraints、currentRoundLedger、当前步骤证据和剩余步骤，判断 continue、adjust 或 complete。priorVerifiedFacts 只能用于避免重复，不能代替当前轮状态证据。只返回包含 decision、reason、summary 的 JSON。不得把真实失败改写为成功，不得虚构证据、命令或授权。证据作用域必须与 expected 一致：agent_session 不证明 user shell 或 new shell，isolated_exec 不证明会话内存状态。异常不阻断目标或剩余计划有确定恢复路径时 continue；已阻断、证据不足或作用域不匹配时 adjust；只有整体目标被作用域匹配的真实证据充分证明时 complete。overall_goal_completion 中缺结果时返回 adjust 并列出剩余目标。长任务定期复核只判断当前命令：输出、字节、CPU/IO、子进程或目标文件有进展时 continue；确定交互提示、明确错误或综合指标持续无进展时 adjust；未获得真实退出且 periodicObservation.passed=false 时不得 complete。安全拦截、审批、真实执行结果和程序门禁不可被覆盖。";
+const GENERAL_REVIEW_SYSTEM: &str = "你是运维执行复核员。根据用户目标、trigger、executionConstraints、当前步骤或 baseSnapshot 的结构化结果、关键错误和剩余步骤，判断 continue、adjust 或 complete。priorVerifiedFacts 只用于避免重复，不能代替当前状态证据。不得把失败改写为成功，不得虚构证据、命令或授权。证据作用域必须与 expected 一致。存在确定恢复路径时 continue；已阻断、证据不足或作用域不匹配时 adjust；只有目标被真实且作用域匹配的证据充分证明时 complete。安全拦截、审批、执行结果和程序门禁不可被覆盖。只返回包含 decision、reason、summary 的 JSON。";
 const LONG_RUNNING_REVIEW_SYSTEM: &str = "你是长任务运行状态复核员。输入只包含压缩后的用户目标、当前步骤、下一步骤提示、跨轮关键证据、进度状态和本轮新增终端输出。只判断当前命令应 continue 还是 adjust：语义输出或可验证进度仍在变化时返回 continue；仅旋转图标、时间戳或重复行变化不算进展。连续无进展、出现认证或交互等待、明确错误、达到等待上限时返回 adjust。continue 仅表示继续等待当前命令，不能进入下一步；主命令未返回真实退出且 periodicObservation.passed=false 时不得 complete。terminalOutput.omittedCharacters 仅表示旧输出被压缩，不代表失败；salientEvidence 是前轮已保留的关键错误、警告或里程碑，不得忽略。不得虚构输出、退出码、命令或授权。只返回 decision、reason、summary 三个字段的简短 JSON，reason 和 summary 各不超过 60 个字。";
 const STRUCTURED_OUTPUT_ATTEMPTS: usize = 2;
 const PLAN_GENERATION_ATTEMPTS: usize = 3;
@@ -332,6 +335,13 @@ fn traced_model_error(message: String, trace: &ModelDeveloperTrace) -> String {
     format!("{MODEL_TRACE_ERROR_PREFIX}{payload}")
 }
 
+fn developer_model_log_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|directory| directory.join("developer-model-calls.jsonl"))
+}
+
 fn context_with_selected_skills(
     context: &str,
     skill_definitions: &[ModelSkillDefinition],
@@ -357,6 +367,21 @@ fn context_with_selected_skills(
         })
         .collect::<Result<Vec<_>, _>>()?;
     object.remove("skillDirectory");
+    if let Some(Value::Array(tools)) = object.get_mut("tools") {
+        tools.retain(|tool| {
+            tool.get("id")
+                .and_then(Value::as_str)
+                .map(|id| {
+                    !selected.iter().any(|skill| {
+                        skill
+                            .forbidden_tool_ids
+                            .iter()
+                            .any(|forbidden| forbidden == id)
+                    })
+                })
+                .unwrap_or(true)
+        });
+    }
     object.insert(
         "skillSelection".to_string(),
         json!({
@@ -378,6 +403,21 @@ fn context_with_selected_skills(
         );
     }
     serde_json::to_string(&value).map_err(|error| format!("Skill 上下文序列化失败：{error}"))
+}
+
+fn requirement_classification_context(context: &str) -> Result<String, String> {
+    let mut value: Value =
+        serde_json::from_str(context).map_err(|error| format!("需求分类上下文无效：{error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "需求分类上下文必须是 JSON 对象".to_string())?;
+    // Classification selects intent and Skills; executable tool schemas and
+    // credentials are planning-only data and previously dominated this call.
+    object.remove("tools");
+    object.remove("secretVariables");
+    object.remove("serverCredentialGroups");
+    object.remove("activeSkills");
+    serde_json::to_string(&value).map_err(|error| format!("需求分类上下文序列化失败：{error}"))
 }
 
 fn normalize_execution_constraints(
@@ -927,7 +967,7 @@ fn plan_repair_instruction(error: &str, previous_steps: Option<&[AiPlanStep]>) -
     } else if error.contains("会等待终端标准输入") {
         "上次计划中的 validation 使用了没有文件、管道或输入重定向的 grep 等读取器。独立校验不会继承 command 的标准输出；请让 validation 重新读取真实目标状态，或显式指定文件/管道/输入重定向，确保它在非交互 Shell 中自行结束。"
     } else if error.contains("将进程脱离执行器跟踪") {
-        "上次计划使用了未受管的后台运行方式。请仅修复对应步骤，改为执行器可跟踪到真实退出的前台命令，或使用环境已有的受管服务机制并独立验收。"
+        "上次计划使用了未受管的后台运行方式。仅修复命中步骤，replacementSteps 中禁止出现任何裸 &、nohup 后台启动、disown、setsid -f 或 setsid --fork。有证据证明 systemd 服务单元存在时，使用 systemctl 前台命令启动，并设置 executionScope=managed_service、runtimeClass=persistent_service，validation 使用 systemctl is-active 独立验收。有证据证明项目由 Docker/Compose 或 Supervisor 管理时，分别使用 docker compose 或 supervisorctl 启动并独立查询状态。如果现有证据不能证明可用的服务管理器、服务名或启动方式，不得猜测或伪造受管声明；将原步骤替换为最少的 kind=observe 发现步骤，确认 systemd、Docker/Compose、Supervisor 或项目自带启动声明后再续接启动计划。只修改 executionScope 而保留脱管命令仍然非法。"
     } else if error.contains("缺少非空字段") || error.contains("change 步骤缺少非空 validation")
     {
         "上次计划存在必填字段缺失。请保留已经完整且正确的步骤和字段，只补齐错误所指的内容。"
@@ -1933,6 +1973,7 @@ fn get_remote_file_structure(
 
 #[tauri::command]
 async fn generate_ai_plan(
+    app: AppHandle,
     api_key: String,
     endpoint: String,
     model: String,
@@ -1941,6 +1982,7 @@ async fn generate_ai_plan(
     generation_settings: Option<AiGenerationSettings>,
 ) -> Result<Vec<PlanStep>, String> {
     let mut developer_trace = ModelDeveloperTrace::default();
+    let developer_log_path = developer_model_log_path(&app);
     generate_ai_plan_with_trace(
         api_key,
         endpoint,
@@ -1949,6 +1991,7 @@ async fn generate_ai_plan(
         context,
         generation_settings,
         &mut developer_trace,
+        developer_log_path.as_deref(),
     )
     .await
     .map_err(|error| traced_model_error(error, &developer_trace))
@@ -1962,6 +2005,7 @@ async fn generate_ai_plan_with_trace(
     context: String,
     generation_settings: Option<AiGenerationSettings>,
     developer_trace: &mut ModelDeveloperTrace,
+    developer_log_path: Option<&Path>,
 ) -> Result<Vec<PlanStep>, String> {
     let generation_settings = generation_settings.unwrap_or_default();
     let forbidden_tool_ids = active_skill_forbidden_tool_ids(&context)?;
@@ -2008,7 +2052,7 @@ async fn generate_ai_plan_with_trace(
             "model": model,
             "messages": [
                 {"role": "system", "content": format!("{system}\n{deployment_rules}\n{response_contract}\n{limit_rule}\n{SECRET_PLACEHOLDER_RULE}\n{STRICT_JSON_OUTPUT_RULE}")},
-                {"role": "user", "content": format!("服务器上下文：\n{context}\n\n用户需求：\n{requirement}\n\n返回前再次确认：{response_contract}\n{limit_rule}\n{STRICT_JSON_OUTPUT_RULE}{correction}")}
+                {"role": "user", "content": format!("服务器上下文：\n{context}\n\n用户需求：\n{requirement}\n\n严格按系统消息中的计划契约返回。{correction}")}
             ],
             "thinking": {"type": "disabled"},
             "response_format": {"type": "json_object"}
@@ -2018,21 +2062,24 @@ async fn generate_ai_plan_with_trace(
         }
         let request_snapshot = body.clone();
         let started_at = Instant::now();
-        let payload = match post_model_request(&url, &api_key, &body, "计划生成", 60).await {
-            Ok(payload) => payload,
-            Err(error) => {
-                record_model_attempt(
-                    developer_trace,
-                    "plan_generation",
-                    attempt + 1,
-                    started_at,
-                    request_snapshot,
-                    None,
-                    Some(error.clone()),
-                );
-                return Err(error);
-            }
-        };
+        let payload =
+            match post_model_request(&url, &api_key, &body, "计划生成", 60, developer_log_path)
+                .await
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    record_model_attempt(
+                        developer_trace,
+                        "plan_generation",
+                        attempt + 1,
+                        started_at,
+                        request_snapshot,
+                        None,
+                        Some(error.clone()),
+                    );
+                    return Err(error);
+                }
+            };
         let finish_reason = payload
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str);
@@ -2176,6 +2223,7 @@ async fn generate_ai_plan_with_trace(
 
 #[tauri::command]
 async fn process_ai_requirement(
+    app: AppHandle,
     api_key: String,
     endpoint: String,
     model: String,
@@ -2189,6 +2237,9 @@ async fn process_ai_requirement(
     let mut last_error = "模型未返回需求理解结果".to_string();
     let mut valid_decision = None;
     let mut developer_trace = ModelDeveloperTrace::default();
+    let developer_log_path = developer_model_log_path(&app);
+    let classification_context = requirement_classification_context(&context)
+        .map_err(|error| traced_model_error(error, &developer_trace))?;
     for attempt in 0..STRUCTURED_OUTPUT_ATTEMPTS {
         let correction = if attempt == 0 {
             String::new()
@@ -2201,7 +2252,7 @@ async fn process_ai_requirement(
             "model": model,
             "messages": [
                 {"role": "system", "content": format!("{system}\n{SECRET_PLACEHOLDER_RULE}\n{REQUIREMENT_CLASSIFICATION_CONTRACT}\n{STRICT_JSON_OUTPUT_RULE}")},
-                {"role": "user", "content": format!("服务器上下文：\n{context}\n\n用户输入：\n{requirement}\n\n返回前再次确认：{REQUIREMENT_CLASSIFICATION_CONTRACT}\n{STRICT_JSON_OUTPUT_RULE}{correction}")}
+                {"role": "user", "content": format!("服务器上下文：\n{classification_context}\n\n用户输入：\n{requirement}\n\n严格按系统消息中的分类契约返回。{correction}")}
             ],
             "thinking": {"type": "disabled"},
             "response_format": {"type": "json_object"},
@@ -2209,7 +2260,16 @@ async fn process_ai_requirement(
         });
         let request_snapshot = body.clone();
         let started_at = Instant::now();
-        let payload = match post_model_request(&url, &api_key, &body, "需求理解", 45).await {
+        let payload = match post_model_request(
+            &url,
+            &api_key,
+            &body,
+            "需求理解",
+            45,
+            developer_log_path.as_deref(),
+        )
+        .await
+        {
             Ok(payload) => payload,
             Err(error) => {
                 record_model_attempt(
@@ -2386,6 +2446,7 @@ async fn process_ai_requirement(
         plan_context,
         generation_settings,
         &mut developer_trace,
+        developer_log_path.as_deref(),
     )
     .await;
     let (plan, plan_error) = match plan_result {
@@ -2423,6 +2484,7 @@ async fn check_ai_model(
 
 #[tauri::command]
 async fn generate_ai_summary(
+    app: AppHandle,
     api_key: String,
     endpoint: String,
     model: String,
@@ -2440,7 +2502,16 @@ async fn generate_ai_summary(
         "thinking": {"type": "disabled"},
         "max_tokens": 700
     });
-    let payload = post_model_request(&url, &api_key, &body, "模型总结", 30).await?;
+    let developer_log_path = developer_model_log_path(&app);
+    let payload = post_model_request(
+        &url,
+        &api_key,
+        &body,
+        "模型总结",
+        30,
+        developer_log_path.as_deref(),
+    )
+    .await?;
     let content = message_content(&payload, "模型总结为空")?.trim();
     if content.is_empty() {
         Err("模型总结为空".to_string())
@@ -2459,6 +2530,7 @@ fn is_periodic_long_running_review(review_context: &str) -> bool {
 
 #[tauri::command]
 async fn review_ai_step(
+    app: AppHandle,
     api_key: String,
     endpoint: String,
     model: String,
@@ -2485,14 +2557,23 @@ async fn review_ai_step(
         let body = json!({
             "model": model,
             "messages": [
-                {"role": "system", "content": format!("{system}\n{SECRET_PLACEHOLDER_RULE}\n{STRICT_JSON_OUTPUT_RULE}")},
-                {"role": "user", "content": format!("用户目标：\n{requirement}\n\n执行复核上下文：\n{review_context}\n\n返回前再次确认：必须为 {{\"decision\":\"continue|adjust|complete\",\"reason\":\"非空字符串\",\"summary\":\"非空字符串\"}}。{STRICT_JSON_OUTPUT_RULE}{correction}")}
+                {"role": "system", "content": format!("{system}\n{REVIEW_SECRET_PLACEHOLDER_RULE}\n{STRICT_JSON_OUTPUT_RULE}")},
+                {"role": "user", "content": format!("用户目标：\n{requirement}\n\n执行复核上下文：\n{review_context}\n\n返回前再次确认：必须为 {{\"decision\":\"continue|adjust|complete\",\"reason\":\"非空字符串\",\"summary\":\"非空字符串\"}}。{correction}")}
             ],
             "thinking": {"type": "disabled"},
             "response_format": {"type": "json_object"},
             "max_tokens": max_tokens
         });
-        let payload = post_model_request(&url, &api_key, &body, "结果复核", 25).await?;
+        let developer_log_path = developer_model_log_path(&app);
+        let payload = post_model_request(
+            &url,
+            &api_key,
+            &body,
+            "结果复核",
+            25,
+            developer_log_path.as_deref(),
+        )
+        .await?;
         let parsed = message_content(&payload, "模型结果复核缺少内容").and_then(|content| {
             parse_model_json(content).map_err(|error| format!("模型结果复核结构解析失败：{error}"))
         });

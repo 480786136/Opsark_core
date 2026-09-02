@@ -105,7 +105,8 @@ function incidentKind(
   if (["terminal_transport", "terminal_recovery", "validation_protocol_exception"].includes(category)) {
     return "transport";
   }
-  const detail = [task.pauseReason, failedStep?.result?.failureReason, failedStep?.output]
+  if (failedStep) return "business";
+  const detail = [task.pauseReason]
     .filter(Boolean)
     .join("\n");
   return TERMINAL_RECOVERY_PATTERN.test(detail) ? "transport" : "business";
@@ -158,7 +159,8 @@ export function openAdjustmentIncident(
 ): AdjustmentIncident {
   return {
     ...snapshot,
-    attemptCount: 0,
+    executionAttemptCount: 0,
+    generationFailureCount: 0,
     automatic,
     createdAt: timestamp,
     updatedAt: timestamp,

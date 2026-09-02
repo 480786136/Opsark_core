@@ -19,6 +19,12 @@ describe("developer log safety", () => {
     expect(JSON.stringify(entry)).not.toContain("private-token");
     expect(JSON.stringify(entry)).not.toContain("database-secret");
     expect(entry.endpoint).toBe("https://example.com/v1");
+    expect(entry.tokenUsage?.source).toBe("estimated");
+  });
+
+  it("uses exact provider token usage when the raw trace includes it", () => {
+    const entry = createDeveloperLog({ level: "success", operation: "model", title: "ok", summary: "ok", request: "hello", trace: { attempts: [{ response: { usage: { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150 } } }] } }, "dev-2", "2026-08-31T18:18:00.000Z", {});
+    expect(entry.tokenUsage).toEqual({ input: 120, output: 30, total: 150, source: "api" });
   });
 
   it("keeps complete in-memory entries and only compacts the emergency persistence fallback", () => {

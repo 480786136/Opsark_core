@@ -7,6 +7,10 @@ import type {
   TaskPlanHistory,
   TaskStatus,
 } from "@/types";
+import {
+  mergeRoundIntoTaskHistoryCheckpoint,
+  refreshTaskHistoryCheckpoint,
+} from "@/features/agent/taskHistoryCheckpoint";
 
 function cloneStep(step: PlanStep): PlanStep {
   return {
@@ -87,6 +91,7 @@ export function archiveActivePhase(
     createdAt: task.plan.find((step) => step.startedAt)?.startedAt ?? task.updatedAt,
     completedAt: timestamp,
   });
+  refreshTaskHistoryCheckpoint(task);
 }
 
 export interface PreviousRoundSnapshot {
@@ -133,6 +138,7 @@ export function commitPreviousRound(task: OpsTask, snapshot?: PreviousRoundSnaps
   if (!snapshot) return;
   task.planHistory ??= [];
   task.planHistory.push(snapshot.history);
+  mergeRoundIntoTaskHistoryCheckpoint(task, snapshot.history);
   if (snapshot.roundId) {
     task.phaseHistory = (task.phaseHistory ?? []).filter((phase) => phase.roundId !== snapshot.roundId);
   }

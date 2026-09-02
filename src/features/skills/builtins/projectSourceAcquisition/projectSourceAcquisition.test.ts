@@ -16,11 +16,11 @@ const EXPECTED_STAGE_IDS = [
   "handle-error",
 ] as const;
 
-describe("project-source-acquisition v11", () => {
+describe("project-source-acquisition v12", () => {
   it("publishes the concise source acquisition contract", () => {
     expect(projectSourceAcquisitionSkill).toMatchObject({
       id: "project-source-acquisition",
-      version: 11,
+      version: 12,
       builtIn: true,
       forbiddenToolIds: ["server.resolve_connection", "server.connect"],
     });
@@ -73,6 +73,9 @@ describe("project-source-acquisition v11", () => {
     for (const stageId of EXPECTED_STAGE_IDS) expect(first).toContain(`[${stageId}]`);
     expect(first).toContain("serverCredentialGroups");
     expect(first).toContain("kind=observe");
+    expect(first).toContain("GIT_TERMINAL_PROMPT=0");
+    expect(first).toContain("不得在同一轮生成 clone");
+    expect(first).toContain("不得靠 description/expected");
     expect(first).toContain("主命令结果就是证据");
     expect(first).toContain("kind=change");
     expect(first).toContain("目标路径已存在时保留原内容");

@@ -40,9 +40,9 @@ describe("review context", () => {
     const current = currentTask.plan[1];
     const remaining = [currentTask.plan[2]];
 
-    expect(buildPreconditionReviewContext(currentTask, current, currentTask.plan[0], "requirement").reviewPolicy.preconditionGate).toBe(true);
-    expect(buildExecutionFailureReviewContext(currentTask, current, remaining, "requirement").reviewPolicy.commandExecutionFailed).toBe(true);
-    expect(buildEvidenceReviewContext(currentTask, current, remaining, "requirement", true).reviewPolicy?.postconditionFailed).toBe(true);
+    expect(buildPreconditionReviewContext(currentTask, current, currentTask.plan[0]).reviewPolicy.preconditionGate).toBe(true);
+    expect(buildExecutionFailureReviewContext(currentTask, current, remaining).reviewPolicy.commandExecutionFailed).toBe(true);
+    expect(buildEvidenceReviewContext(currentTask, current, remaining, true).reviewPolicy?.postconditionFailed).toBe(true);
     expect(buildLongRunningReviewContext({
       task: currentTask,
       step: current,
@@ -117,11 +117,58 @@ describe("review context", () => {
       currentTask,
       currentTask.plan[1],
       [currentTask.plan[2]],
-      "requirement",
     );
 
-    expect(context.executionHistory.map((item) => item.title)).toEqual(["blocker"]);
-    expect(context.remainingSteps.map((item) => item.title)).toEqual(["remaining"]);
-    expect(context.fullPlan).toHaveLength(3);
+    expect(context.executionHistory.items.map((item) => item.title)).toEqual(["blocker"]);
+    expect(context.remainingSteps.items.map((item) => item.title)).toEqual(["remaining"]);
+    expect(context.planSummary.totalSteps).toBe(3);
+    expect(context).not.toHaveProperty("fullPlan");
+    expect(context).not.toHaveProperty("userRequirement");
+  });
+
+  it("bounds repeated terminal output while retaining the final failure evidence", () => {
+    const currentTask = task();
+    const noisyOutput = [
+      "starting build",
+      "progress line".repeat(2_000),
+      "MIDDLE_TOKEN_MUST_BE_OMITTED",
+      "progress line".repeat(2_000),
+      "java.lang.NoSuchFieldError: missing compiler field",
+      "[exit: 1]",
+    ].join("\n");
+    const current = currentTask.plan[1];
+    current.status = "failed";
+    current.output = noisyOutput;
+    current.result = {
+      executionStatus: "failed",
+      observationStatus: "unknown",
+      exitCode: 1,
+      facts: { category: "build_failed" },
+      warnings: [],
+      evidenceIds: ["failure-evidence"],
+      failureReason: "编译失败",
+    };
+    current.evidence = [{
+      id: "failure-evidence",
+      type: "command-output",
+      source: "validation",
+      facts: { category: "build_failed" },
+      rawOutput: noisyOutput,
+      collectedAt: "2026-08-14T00:00:00.000Z",
+    }];
+
+    const context = buildExecutionFailureReviewContext(
+      currentTask,
+      current,
+      [currentTask.plan[2]],
+    );
+    const serialized = JSON.stringify(context);
+
+    expect(context.currentStep.output?.totalCharacters).toBeGreaterThan(40_000);
+    expect(context.currentStep.output?.content).toContain("NoSuchFieldError");
+    expect(context.currentStep.output?.salientLines).toContain("java.lang.NoSuchFieldError: missing compiler field");
+    expect(context.currentStep.evidence?.items[0].output?.content).toContain("[exit: 1]");
+    expect(serialized).not.toContain("MIDDLE_TOKEN_MUST_BE_OMITTED");
+    expect(serialized.length).toBeLessThan(12_000);
   });
 });

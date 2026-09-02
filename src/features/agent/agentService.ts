@@ -6,8 +6,10 @@ import {
   buildContinuationContext,
 } from "@/features/agent/agentContext";
 import { latestTaskRequirement, selectContinuationSteps } from "@/features/agent/taskProgression";
-import { activeRoundSteps, allTaskSteps, taskGoal } from "@/features/agent/taskGoal";
+import { activeRoundSteps, allTaskSteps } from "@/features/agent/taskGoal";
 import { buildSkillContext } from "@/features/skills/skillRegistry";
+import { compactReviewText } from "@/features/agent/longRunningReviewOutput";
+import { buildTaskDecisionSnapshot } from "@/features/agent/taskDecisionSnapshot";
 import type { ToolDefinition } from "@/features/tools/types";
 import type { SkillDefinition } from "@/features/skills/types";
 import type {
@@ -18,6 +20,7 @@ import type {
   PlanStep,
   SecretMetadata,
   ServerProfile,
+  StepReview,
 } from "@/types";
 
 type PlanGenerator = (requirement: string, runtimeModel?: RuntimeModel) => Promise<PlanStep[]>;
@@ -56,6 +59,9 @@ export interface PlanTaskAdjustmentInput {
   apiKey?: string;
   generationSettings: AiGenerationSettings;
   skills?: SkillDefinition[];
+  sharedSnapshot?: Record<string, unknown>;
+  reviewDecision?: StepReview;
+  adjustmentReason?: string;
 }
 
 export interface CompletionSummaryRequest {
@@ -113,6 +119,7 @@ const FAILURE_SUMMARY_STEP_LIMIT = 20;
 const FAILURE_SUMMARY_TEXT_LIMIT = 240;
 const FAILURE_SUMMARY_REASON_LIMIT = 480;
 const FAILURE_SUMMARY_REQUIREMENT_LIMIT = 1_200;
+const GOAL_REVIEW_SKILL_INSTRUCTION_LIMIT = 1_600;
 
 function sanitizeSummaryText(value: string) {
   return value
@@ -243,37 +250,19 @@ export async function reviewTaskGoal(
   review: GoalReviewer = backend.reviewGoal.bind(backend),
 ) {
   const requirement = latestTaskRequirement(input.task);
-  const steps = activeRoundSteps(input.task);
-  const currentIds = new Set(steps.map(({ id }) => id));
-  const priorVerifiedFacts = allTaskSteps(input.task)
-    .filter((step) => !currentIds.has(step.id) && step.status === "completed" && step.result)
-    .slice(-12)
-    .map((step) => ({
-      title: step.title,
-      result: step.result,
-      scopes: step.evidence?.map(({ scope }) => scope),
-    }));
+  const snapshot = buildTaskDecisionSnapshot(input.task);
+  const activeSkills = buildSkillContext(input.skills ?? []).map((skill) => ({
+    id: skill.id,
+    name: compactReviewText(skill.name, 120),
+    description: compactReviewText(skill.description, 280),
+    version: skill.version,
+    instructions: compactReviewText(skill.instructions, GOAL_REVIEW_SKILL_INSTRUCTION_LIMIT),
+  }));
   const context = {
     trigger: "overall_goal_completion",
-    rootGoal: taskGoal(input.task),
-    currentRoundRequirement: input.task.currentInstruction || requirement,
-    currentInstruction: input.task.currentInstruction,
-    executionConstraints: input.task.executionConstraints,
-    activeSkills: buildSkillContext(input.skills ?? []),
-    currentRoundLedger: steps.map(({ title, description, command, expected, status, output, result, evidence, executionScope, validationScope }) => ({
-      title,
-      description,
-      command,
-      expected,
-      status,
-      output,
-      result,
-      executionScope,
-      validationScope,
-      evidence: evidence?.map(({ type, source, facts, scope }) => ({ type, source, facts, scope })),
-    })),
-    priorVerifiedFacts,
-    instruction: "只能用 currentRoundLedger 回答当前轮问题；priorVerifiedFacts 仅能用于避免重复工作，不得把旧状态当成当前轮结果。只有 rootGoal 必要结果和 activeSkills 最终验收都有作用域匹配的真实证据时才可 complete。",
+    baseSnapshot: snapshot,
+    activeSkillAcceptance: activeSkills,
+    instruction: "用外层用户目标、baseSnapshot 的结构化结果和 activeSkillAcceptance 判断整体目标。输出元数据和阶段总结不等于成功证据；缺少最终验收证据时必须 adjust。若返回 adjust，reason 和 summary 必须明确指出尚未完成的目标，供调整计划直接复用。",
   };
   const decision = await review(
     requirement,
@@ -281,7 +270,7 @@ export async function reviewTaskGoal(
     createRuntimeModel(input.model, input.apiKey, ""),
   );
   const complete = decision.decision === "complete";
-  return { requirement, context, decision, complete };
+  return { requirement, snapshot, context, decision, complete };
 }
 
 /**
@@ -328,7 +317,11 @@ export async function planTaskAdjustment(
     tools: input.tools,
     secretMetadata: input.secretMetadata,
     skills: input.skills,
-  }, input.failedStep);
+  }, input.failedStep, {
+    sharedSnapshot: input.sharedSnapshot,
+    reviewDecision: input.reviewDecision,
+    adjustmentReason: input.adjustmentReason,
+  });
   const safetyFacts = input.failedStep?.result?.facts.category === "plan_safety_rejection"
     ? input.failedStep.result.facts
     : undefined;

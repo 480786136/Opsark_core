@@ -202,12 +202,15 @@ fn generate_live_deepseek_plan() {
         .unwrap_or_else(|_| "https://api.deepseek.com".into());
     let model =
         std::env::var("OPSARK_TEST_MODEL_NAME").unwrap_or_else(|_| "deepseek-v4-flash".into());
-    let plan = tauri::async_runtime::block_on(generate_ai_plan(
+    let mut developer_trace = ModelDeveloperTrace::default();
+    let plan = tauri::async_runtime::block_on(generate_ai_plan_with_trace(
         api_key,
         endpoint,
         model,
         "只读检查服务器磁盘空间".into(),
         r#"{"os":"CentOS 7","diskUsage":"82%","permission":"safe"}"#.into(),
+        None,
+        &mut developer_trace,
         None,
     ))
     .expect("DeepSeek plan generation failed");

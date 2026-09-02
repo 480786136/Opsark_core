@@ -12,6 +12,54 @@ export interface SkillOutputSignals {
   blocking: boolean;
 }
 
+const FAILURE_DIAGNOSTIC_SAMPLE_LIMIT = 360;
+
+function commandOutputLines(text: string) {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  // Failure causes normally occur at the tail. Preserve a small head for
+  // connection/authentication errors without repeatedly scanning huge build logs.
+  return lines.length > 2_400
+    ? [...lines.slice(0, 200), ...lines.slice(-2_200)]
+    : lines;
+}
+
+function diagnosticSample(line: string | undefined) {
+  if (!line) return undefined;
+  return line.length <= FAILURE_DIAGNOSTIC_SAMPLE_LIMIT
+    ? line
+    : `${line.slice(0, FAILURE_DIAGNOSTIC_SAMPLE_LIMIT)}…`;
+}
+
+function classifiedFailure(
+  reason: string,
+  category: string,
+  line?: string,
+  facts: Record<string, unknown> = {},
+) {
+  return {
+    reason,
+    facts: {
+      category,
+      ...facts,
+      classification: {
+        confidence: line ? "high" : "fallback",
+        sample: diagnosticSample(line),
+      },
+    },
+  };
+}
+
+function findDiagnosticLine(lines: string[], pattern: RegExp) {
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    pattern.lastIndex = 0;
+    if (pattern.test(lines[index])) return lines[index];
+  }
+  return undefined;
+}
+
 export function analyzeSkillOutputSignals(lines: string[], semantic = ""): SkillOutputSignals {
   const text = lines.join("\n");
   const warningLines = lines.filter((line) =>
@@ -51,31 +99,110 @@ export function analyzeSkillOutputSignals(lines: string[], semantic = ""): Skill
 }
 
 export function analyzeSkillCommandFailure(text: string) {
-  if (/could not read Username[^\n]*terminal prompts disabled|terminal prompts disabled/i.test(text)) {
-    return {
-      reason: "Git HTTPS 需要交互认证，但当前命令禁用了凭据提示",
-      facts: { category: "interactive_credential_required", credentialRejected: false },
-    };
-  }
-  if (/authentication failed|invalid (?:username|password|credentials?)|incorrect (?:user(?:name)?|account)(?: or|\/)? password|http basic:\s*access denied|access denied[^\n]*(?:token|password|credential)|permission denied \(publickey[^)]*password|(?:用户名|账号|账户).{0,8}密码.{0,8}(?:错误|不正确)|仓库认证未通过.*再次请求/i.test(text)) {
-    return {
-      reason: "仓库服务器拒绝了当前账户与密码/令牌组合",
-      facts: { category: "credential_rejected", credentialRejected: true },
-    };
-  }
+  const lines = commandOutputLines(text);
+  const interactiveCredential = findDiagnosticLine(
+    lines,
+    /could not read Username.*terminal prompts disabled|terminal prompts disabled.*(?:username|password)/i,
+  );
+  if (interactiveCredential) return classifiedFailure(
+    "Git HTTPS 需要交互认证，但当前命令禁用了凭据提示",
+    "interactive_credential_required",
+    interactiveCredential,
+    { credentialRejected: false },
+  );
+
+  const rejectedCredential = findDiagnosticLine(
+    lines,
+    /authentication failed|invalid (?:username|password|credentials?)|incorrect (?:user(?:name)?|account)(?: or|\/)? password|http basic:\s*access denied|access denied.*(?:token|password|credential)|permission denied \(publickey[^)]*password|(?:用户名|账号|账户).{0,8}密码.{0,8}(?:错误|不正确)|仓库认证未通过.*再次请求/i,
+  );
+  if (rejectedCredential) return classifiedFailure(
+    "仓库服务器拒绝了当前账户与密码/令牌组合",
+    "credential_rejected",
+    rejectedCredential,
+    { credentialRejected: true },
+  );
+
+  const jdkToolingIncompatible = findDiagnosticLine(
+    lines,
+    /\b(?:NoSuchFieldError|NoSuchMethodError|IllegalAccessError)\b.*\b(?:com\.sun\.tools\.javac|jdk\.compiler)\b/i,
+  );
+  if (jdkToolingIncompatible) return classifiedFailure(
+    "Java 编译器插件或注解处理器与当前 JDK 内部 API 不兼容",
+    "jdk_tooling_incompatible",
+    jdkToolingIncompatible,
+  );
+
+  const bytecodeIncompatible = findDiagnosticLine(
+    lines,
+    /\bUnsupportedClassVersionError\b|class file has wrong version|invalid target release|release version \d+ not supported/i,
+  );
+  if (bytecodeIncompatible) return classifiedFailure(
+    "Java 字节码或编译目标版本与当前 JDK 不兼容",
+    "jdk_version_incompatible",
+    bytecodeIncompatible,
+  );
+
   const missingAbiSymbols = [...new Set(
     [...text.matchAll(/(?:version\s+[`']?)((?:GLIBCXX|GLIBC|CXXABI)_[0-9.]+)(?:['`]?\s+not found)/gi)]
       .map((match) => match[1]),
   )];
-  if (missingAbiSymbols.length || /wrong ELF class|Exec format error|cannot execute binary file/i.test(text)) {
-    return { reason: missingAbiSymbols.length ? `目标程序与当前系统 ABI 不兼容，缺少 ${missingAbiSymbols.join("、")}` : "目标程序与当前操作系统或处理器架构不兼容", facts: { category: "platform_incompatible", platformIncompatible: true, missingAbiSymbols } };
-  }
-  if (/ENOSPC|no space left on device/i.test(text)) return { reason: "服务器磁盘空间不足", facts: { category: "disk_full" } };
-  if (/permission denied|EACCES/i.test(text)) return { reason: "当前用户没有完成该操作所需的权限", facts: { category: "permission_denied" } };
-  if (/command not found|not recognized as an internal/i.test(text)) return { reason: "命令或必要工具未安装", facts: { category: "command_not_found" } };
-  const unavailableResource = text.match(/(?:404|not found)[^\n]*(https?:\/\/\S+)/i);
-  if (unavailableResource) return { reason: "请求的远程资源不存在或地址无效", facts: { category: "resource_not_found", url: unavailableResource[1] } };
-  return { reason: "命令执行未成功", facts: { category: "command_failed" } };
+  const platformLine = findDiagnosticLine(
+    lines,
+    /(?:version\s+[`']?)(?:GLIBCXX|GLIBC|CXXABI)_[0-9.]+(?:['`]?\s+not found)|wrong ELF class|Exec format error|cannot execute binary file/i,
+  );
+  if (missingAbiSymbols.length || platformLine) return classifiedFailure(
+    missingAbiSymbols.length
+      ? `目标程序与当前系统 ABI 不兼容，缺少 ${missingAbiSymbols.join("、")}`
+      : "目标程序与当前操作系统或处理器架构不兼容",
+    "platform_incompatible",
+    platformLine,
+    { platformIncompatible: true, missingAbiSymbols },
+  );
+
+  const diskFull = findDiagnosticLine(lines, /\bENOSPC\b|no space left on device|disk quota exceeded/i);
+  if (diskFull) return classifiedFailure("服务器磁盘空间不足", "disk_full", diskFull);
+
+  // EACCES must be a standalone errno in an error-shaped line. The previous
+  // substring scan classified Maven's `failureaccess` artifact as EACCES.
+  const permissionDenied = findDiagnosticLine(
+    lines,
+    /(?:(?:npm|pnpm|yarn)\s+(?:ERR!|error)\s+(?:code|errno)\s+(?:EACCES|EPERM)\b|^(?:error|errno|code):?\s+(?:EACCES|EPERM)\b|\b(?:EACCES|EPERM)\b\s*:\s*(?:permission denied|operation not permitted)|(?:^|:\s)(?:permission denied|operation not permitted)(?:$|[,:.(\s])|\[Errno\s+13\].*permission denied|\bAccessDeniedException\b)/i,
+  );
+  if (permissionDenied) return classifiedFailure(
+    "当前用户没有完成该操作所需的权限",
+    "permission_denied",
+    permissionDenied,
+  );
+
+  const commandMissing = findDiagnosticLine(
+    lines,
+    /(?:^|:\s)(?:[^:]+:\s*)?command not found(?:$|\s)|not recognized as an internal or external command/i,
+  );
+  if (commandMissing) return classifiedFailure("命令或必要工具未安装", "command_not_found", commandMissing);
+
+  const networkFailure = findDiagnosticLine(
+    lines,
+    /\bcurl:\s*\(\d+\)|\b(?:ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENETUNREACH|EAI_AGAIN)\b|could not resolve host|network is unreachable|connection timed out|TLS handshake timeout|connect(?:ion)?\b.*(?:refused|timed out)/i,
+  );
+  if (networkFailure) return classifiedFailure("网络连接或远程地址解析失败", "network_failure", networkFailure);
+
+  const unavailableResourceLine = findDiagnosticLine(
+    lines,
+    /(?:HTTP\/\S+\s+404\b|curl:\s*\(22\).*\b404\b|(?:fatal|error).*repository.*not found|\b404\b.*https?:\/\/\S+)/i,
+  );
+  const unavailableResource = unavailableResourceLine?.match(/https?:\/\/\S+/i);
+  if (unavailableResourceLine) return classifiedFailure(
+    "请求的远程资源不存在或地址无效",
+    "resource_not_found",
+    unavailableResourceLine,
+    { url: unavailableResource?.[0] },
+  );
+
+  const genericError = findDiagnosticLine(
+    lines,
+    /\[(?:ERROR|FATAL)\]|\b(?:error|fatal|failed|failure|exception)\b|错误|失败/i,
+  ) ?? findDiagnosticLine(lines, /\b[A-Z][A-Za-z0-9_$]*(?:Error|Exception)\b/);
+  return classifiedFailure("命令执行未成功", "command_failed", genericError);
 }
 
 interface ValidationAdapter {

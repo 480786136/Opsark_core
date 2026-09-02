@@ -60,7 +60,11 @@ export function normalizePlanPreconditions(
   const toolById = new Map(tools.map((tool) => [tool.id, tool]));
   normalized.forEach((step, index) => {
     if (step.status === "pending" && /^opsark-tool(?:\s|$)/i.test(step.command.trim())) {
-      parseToolCommand(step.command, `normalize-strict-${index}`, tools);
+      try {
+        parseToolCommand(step.command, `normalize-strict-${index}`, tools);
+      } catch (error) {
+        throw new Error(`第 ${index + 1} 个计划步骤的工具参数无效：${String(error)}`);
+      }
     }
   });
   const standaloneStep = normalized.find((step, index) => {

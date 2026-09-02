@@ -77,4 +77,21 @@ describe("long-running review output", () => {
     expect(second.join("\n")).toContain("Connection refused （重复 2 次）");
     expect(second.join("\n")).toContain("built in 36.66s");
   });
+
+  it("不把依赖名中的 failureaccess 子串当成失败信号", () => {
+    expect(mergeLongRunningSalientEvidence([], "resolved artifact failureaccess-1.0.1.jar"))
+      .toEqual([]);
+
+    const evidence = mergeLongRunningSalientEvidence([], [
+      "ERROR first real failure",
+      "ERROR second real failure",
+      "ERROR third real failure",
+      "ERROR fourth real failure",
+      "ERROR fifth real failure",
+      "Downloading failureaccess-1.0.1.jar",
+    ].join("\n"));
+    expect(evidence.join("\n")).toContain("first real failure");
+    expect(mergeLongRunningSalientEvidence([], "java.lang.NoSuchFieldError: JCTree.qualid"))
+      .toEqual(["java.lang.NoSuchFieldError: JCTree.qualid"]);
+  });
 });

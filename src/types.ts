@@ -236,6 +236,47 @@ export interface TaskExecutionPhase {
   completedAt: string;
 }
 
+export interface TaskHistoryVerifiedFact {
+  stepId: string;
+  title: string;
+  result?: Record<string, unknown>;
+  evidence?: Record<string, unknown>;
+  scopes?: ExecutionScopeEvidence[];
+}
+
+export interface TaskHistoryIssue {
+  stepId: string;
+  title: string;
+  category?: string;
+  reason?: string;
+  status: PlanStep["status"];
+  commandFingerprint: string;
+  attemptCount: number;
+}
+
+export interface TaskHistoryPhaseSummary {
+  phaseId: string;
+  reason: string;
+  summary?: string;
+  totalSteps: number;
+  statusCounts: Record<string, number>;
+}
+
+/** Bounded rolling checkpoint for model context; raw plans remain in the task audit ledger. */
+export interface TaskHistoryCheckpoint {
+  version: 1;
+  sourceRoundCount: number;
+  sourcePhaseCount: number;
+  sourceStepCount: number;
+  statusCounts: Record<string, number>;
+  verifiedFacts: TaskHistoryVerifiedFact[];
+  unresolvedIssues: TaskHistoryIssue[];
+  phaseSummaries: TaskHistoryPhaseSummary[];
+  throughPhaseId?: string;
+  sourceHistoryFingerprint: string;
+  updatedAt: string;
+}
+
 export type AdjustmentIncidentKind = "business" | "transport";
 
 /**
@@ -251,7 +292,12 @@ export interface AdjustmentIncident {
   stepFingerprint: string;
   targetFingerprint: string;
   evidenceFingerprint: string;
-  attemptCount: number;
+  /** Plans that passed generation/safety checks and were admitted for execution. */
+  executionAttemptCount: number;
+  /** Model/contract/safety failures before a replacement plan was admitted. */
+  generationFailureCount: number;
+  /** @deprecated Persisted pre-split counter; migrated when saved tasks are loaded. */
+  attemptCount?: number;
   automatic: boolean;
   createdAt: string;
   updatedAt: string;
@@ -298,6 +344,14 @@ export interface OpsTask {
   currentRoundId?: string;
   /** Earlier plans from the active round that were superseded by an adjustment. */
   phaseHistory?: TaskExecutionPhase[];
+  /** Rolling, bounded summary of older phases used by review and adjustment model calls. */
+  historyCheckpoint?: TaskHistoryCheckpoint;
+  /** Bounded overall-review snapshot reused by the next adjustment request. */
+  latestGoalReview?: {
+    decision: StepReview;
+    snapshot: Record<string, unknown>;
+    createdAt: string;
+  };
   /** Remaining delay before managed mode automatically requests an adjustment plan. */
   autoAdjustmentSeconds?: number;
   /** Ephemeral UI state while adjustment prerequisites or a replacement plan are being prepared. */
@@ -428,6 +482,12 @@ export interface DeveloperLogEntry {
   modelName?: string;
   endpoint?: string;
   durationMs?: number;
+  tokenUsage?: {
+    input: number;
+    output: number;
+    total: number;
+    source: "api" | "estimated";
+  };
   createdAt: string;
 }
 

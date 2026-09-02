@@ -1,8 +1,53 @@
 use reqwest::StatusCode;
-use serde_json::Value;
-use std::time::Duration;
+use serde_json::{json, Value};
+use std::fs::{create_dir_all, OpenOptions};
+use std::io::Write;
+use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MODEL_RESPONSE_ATTEMPTS: usize = 3;
+
+fn append_model_log(path: Option<&Path>, event: Value) {
+    let Some(path) = path else { return };
+    let result = (|| -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|error| error.to_string())?;
+        serde_json::to_writer(&mut file, &event).map_err(|error| error.to_string())?;
+        file.write_all(b"\n").map_err(|error| error.to_string())?;
+        file.flush().map_err(|error| error.to_string())
+    })();
+    if let Err(error) = result {
+        eprintln!("开发者模型日志写入失败：{error}");
+    }
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn safe_model_url(url: &str) -> String {
+    let Some((scheme, remainder)) = url.split_once("://") else {
+        return url.split(['?', '#']).next().unwrap_or(url).to_string();
+    };
+    let authority_end = remainder.find('/').unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let suffix = &remainder[authority_end..];
+    let path = suffix.split(['?', '#']).next().unwrap_or(suffix);
+    format!("{scheme}://{host}{path}")
+}
 
 fn build_model_client(timeout_seconds: u64, force_http1: bool) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
@@ -35,10 +80,25 @@ pub(crate) async fn post_model_request(
     body: &Value,
     request_name: &str,
     timeout_seconds: u64,
+    developer_log_path: Option<&Path>,
 ) -> Result<Value, String> {
     let mut last_retryable_error = String::new();
 
     for attempt in 1..=MODEL_RESPONSE_ATTEMPTS {
+        let call_id = format!("model-{}-{attempt}", unix_millis());
+        append_model_log(
+            developer_log_path,
+            json!({
+                "event": "request_sent",
+                "callId": &call_id,
+                "timestampMs": unix_millis(),
+                "requestName": request_name,
+                "attempt": attempt,
+                "url": safe_model_url(url),
+                "timeoutSeconds": timeout_seconds,
+                "request": body,
+            }),
+        );
         // 每轮使用新连接，避免重用被上游代理截断的 HTTP 连接。
         // 最后一轮回退到 HTTP/1.1 + identity，兼容有问题的 HTTP/2/压缩网关。
         let force_http1 = attempt == MODEL_RESPONSE_ATTEMPTS;
@@ -59,6 +119,17 @@ pub(crate) async fn post_model_request(
             Ok(response) => response,
             Err(error) => {
                 last_retryable_error = format!("{request_name}请求失败：{error}");
+                append_model_log(
+                    developer_log_path,
+                    json!({
+                        "event": "request_failed",
+                        "callId": &call_id,
+                        "timestampMs": unix_millis(),
+                        "requestName": request_name,
+                        "attempt": attempt,
+                        "error": &last_retryable_error,
+                    }),
+                );
                 if attempt < MODEL_RESPONSE_ATTEMPTS {
                     wait_before_model_retry(attempt).await;
                     continue;
@@ -87,6 +158,21 @@ pub(crate) async fn post_model_request(
                     "{request_name}接口响应读取不完整（状态 {status}，Content-Encoding {content_encoding}，Content-Length {}）：{error}",
                     content_length.map_or_else(|| "未提供".to_string(), |value| value.to_string())
                 );
+                append_model_log(
+                    developer_log_path,
+                    json!({
+                        "event": "response_failed",
+                        "callId": &call_id,
+                        "timestampMs": unix_millis(),
+                        "requestName": request_name,
+                        "attempt": attempt,
+                        "status": status.as_u16(),
+                        "contentType": &content_type,
+                        "contentEncoding": &content_encoding,
+                        "contentLength": content_length,
+                        "error": &last_retryable_error,
+                    }),
+                );
                 if attempt < MODEL_RESPONSE_ATTEMPTS {
                     wait_before_model_retry(attempt).await;
                     continue;
@@ -101,6 +187,22 @@ pub(crate) async fn post_model_request(
                     "{request_name}接口返回了无法解析的 HTTP 响应（状态 {status}，Content-Type {content_type}，{} 字节）：{error}",
                     response_bytes.len()
                 );
+                append_model_log(
+                    developer_log_path,
+                    json!({
+                        "event": "response_failed",
+                        "callId": &call_id,
+                        "timestampMs": unix_millis(),
+                        "requestName": request_name,
+                        "attempt": attempt,
+                        "status": status.as_u16(),
+                        "contentType": &content_type,
+                        "contentEncoding": &content_encoding,
+                        "contentLength": content_length,
+                        "responseText": String::from_utf8_lossy(&response_bytes),
+                        "error": &last_retryable_error,
+                    }),
+                );
                 if attempt < MODEL_RESPONSE_ATTEMPTS {
                     wait_before_model_retry(attempt).await;
                     continue;
@@ -108,6 +210,22 @@ pub(crate) async fn post_model_request(
                 break;
             }
         };
+
+        append_model_log(
+            developer_log_path,
+            json!({
+                "event": "response_received",
+                "callId": &call_id,
+                "timestampMs": unix_millis(),
+                "requestName": request_name,
+                "attempt": attempt,
+                "status": status.as_u16(),
+                "contentType": &content_type,
+                "contentEncoding": &content_encoding,
+                "contentLength": content_length,
+                "response": &payload,
+            }),
+        );
 
         if status.is_success() {
             return Ok(payload);

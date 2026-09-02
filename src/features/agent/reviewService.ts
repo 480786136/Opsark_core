@@ -55,7 +55,6 @@ export async function reviewPrecondition(
     input.task,
     input.step,
     input.blockerStep,
-    requirement,
   );
   const modelDecision = await reviewStep(
     requirement,
@@ -88,7 +87,6 @@ export async function reviewExecutionFailure(
     input.task,
     input.step,
     remainingSteps,
-    requirement,
   );
   const modelDecision = await reviewStep(
     requirement,
@@ -156,7 +154,6 @@ export async function reviewExecutionEvidence(
       input.task,
       input.step,
       remainingSteps,
-      requirement,
       input.postconditionReview,
     );
     modelDecision = await reviewStep(
@@ -263,4 +260,3 @@ export async function reviewExecutionEvidence(
     continuedForDiagnostics,
   };
 }
-

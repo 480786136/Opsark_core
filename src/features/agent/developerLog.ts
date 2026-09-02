@@ -23,6 +23,41 @@ function serialize(value: unknown) {
   }
 }
 
+function estimatedTokens(value: unknown) {
+  const text = serialize(value) ?? "";
+  // CJK text is usually close to one token per character; latin/json text is
+  // commonly around four characters per token. This is deliberately labelled
+  // as an estimate in the UI rather than presented as billing data.
+  const cjk = (text.match(/[\u3400-\u9fff\uf900-\ufaff]/gu) ?? []).length;
+  return Math.max(0, Math.ceil(cjk + (text.length - cjk) / 4));
+}
+
+function apiTokenUsage(value: unknown) {
+  let input = 0;
+  let output = 0;
+  let found = false;
+  const visit = (current: unknown) => {
+    if (!current || typeof current !== "object") return;
+    const record = current as Record<string, unknown>;
+    const usage = record.usage;
+    if (usage && typeof usage === "object") {
+      const item = usage as Record<string, unknown>;
+      const prompt = Number(item.prompt_tokens ?? item.input_tokens ?? item.promptTokenCount);
+      const completion = Number(item.completion_tokens ?? item.output_tokens ?? item.candidatesTokenCount);
+      if (Number.isFinite(prompt) || Number.isFinite(completion)) {
+        input += Number.isFinite(prompt) ? prompt : 0;
+        output += Number.isFinite(completion) ? completion : 0;
+        found = true;
+      }
+    }
+    Object.entries(record).forEach(([key, child]) => {
+      if (key !== "usage") visit(child);
+    });
+  };
+  visit(value);
+  return found ? { input, output, total: input + output, source: "api" as const } : undefined;
+}
+
 function redactDeveloperText(value: string, secretValues: Record<string, string>) {
   const exactRedacted = Object.values(secretValues).reduce(
     (current, secret) => secret ? current.split(secret).join("••••••••") : current,
@@ -58,6 +93,14 @@ export function createDeveloperLog(
     const serialized = serialize(value);
     return serialized === undefined ? undefined : redactDeveloperText(serialized, secretValues);
   };
+  const exactUsage = apiTokenUsage(draft.trace) ?? apiTokenUsage(draft.response);
+  const tokenUsage = exactUsage ?? {
+    input: estimatedTokens(draft.request),
+    output: estimatedTokens(draft.response ?? draft.trace ?? draft.error),
+    total: 0,
+    source: "estimated" as const,
+  };
+  tokenUsage.total = tokenUsage.input + tokenUsage.output;
   return {
     ...draft,
     id,
@@ -70,6 +113,7 @@ export function createDeveloperLog(
     trace: redact(draft.trace),
     error: redact(draft.error),
     stack: redact(draft.stack),
+    tokenUsage,
   };
 }
 
@@ -83,7 +127,7 @@ function truncate(value: string | undefined, maxChars: number) {
 }
 
 export function compactDeveloperLogs(entries: DeveloperLogEntry[]) {
-  return entries.slice(0, 8).map((entry) => ({
+  return entries.slice(0, 30).map((entry) => ({
     ...entry,
     request: truncate(entry.request, 40_000),
     response: truncate(entry.response, 40_000),

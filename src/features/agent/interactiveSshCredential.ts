@@ -131,11 +131,6 @@ function referencedCredentialGroupIds(value: string) {
   return [...value.matchAll(/server-credential:([A-Za-z0-9_-]+)/g)].map((match) => match[1]);
 }
 
-function describesAuthentication(value: string) {
-  return /(?:认证|鉴权|登录|凭据|用户名|密码|口令|令牌|私有仓库|auth(?:entication|orization)?|credential|password|passwd|token|log[ -]?in|private\s+(?:git|repo|repository))/i
-    .test(value);
-}
-
 function submittedGitUsername(
   submittedInputs: Record<string, SubmittedTaskInput> | undefined,
   secretBinding: SubmittedSecretBinding | undefined,
@@ -193,7 +188,12 @@ export function resolveInteractivePtyCredential(
   const hasExplicitCredentialBinding = commandSecretKeys.length > 0
     || referencedSecretKeys.length > 0
     || groupRefs.length > 0;
-  const credentialExpected = hasExplicitCredentialBinding || describesAuthentication(semanticContext);
+  // Authentication is an execution contract, not a prose inference. Domain
+  // skills decide whether authentication is needed and express that decision
+  // with a credential reference/placeholder. Words such as "认证（若需要）"
+  // in a description must never turn an anonymous command into a credentialed
+  // one or prevent it from reaching the remote process.
+  const credentialExpected = hasExplicitCredentialBinding;
   const commandUsesOnlyGroupedSshUsernames = !gitCommand
     && commandSecretKeys.length > 0
     && commandSecretKeys.every((key) => metadata.some((item) => item.key === key

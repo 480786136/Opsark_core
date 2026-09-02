@@ -55,8 +55,17 @@ function isProgressLine(line: string) {
 
 const SPINNER_CHARACTERS = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g;
 const LEADING_TIMESTAMP = /^\s*(?:\[?\d{1,2}:\d{2}(?::\d{2})?\]?|\d{4}[-/]\d{1,2}[-/]\d{1,2}[T\s]\d{1,2}:\d{2}(?::\d{2})?)\s*/;
-const SALIENT_LINE = /(?:error|fatal|failed|failure|exception|oom|out of memory|killed|no space left|permission denied|access denied|connection refused|timed? out|timeout|not found|unsupported|warning|warn:|built in|build finished|download(?:ed|ing)?|installed|completed|success|succeed|错误|失败|拒绝|超时|内存不足|已完成|安装完成|构建完成)/i;
-const CRITICAL_LINE = /(?:error|fatal|failed|failure|exception|oom|out of memory|killed|no space left|permission denied|access denied|connection refused|timed? out|timeout|错误|失败|拒绝|超时|内存不足)/i;
+const SALIENT_LINE = /(?:\b(?:error|fatal|failed|failure|exception|oom|killed|timeout|unsupported|warning|installed|completed|success|succeed)\b|\bwarn:|\bout of memory\b|\bno space left\b|\bpermission denied\b|\baccess denied\b|\bconnection refused\b|\btimed? out\b|\bnot found\b|\bbuilt in\b|\bbuild finished\b|\bdownload(?:ed|ing)?\b|错误|失败|拒绝|超时|内存不足|已完成|安装完成|构建完成)/i;
+const CRITICAL_LINE = /(?:\b(?:error|fatal|failed|failure|exception|oom|killed|timeout)\b|\bout of memory\b|\bno space left\b|\bpermission denied\b|\baccess denied\b|\bconnection refused\b|\btimed? out\b|错误|失败|拒绝|超时|内存不足)/i;
+const NAMED_ERROR_LINE = /\b[A-Z][A-Za-z0-9_$]*(?:Error|Exception)\b/;
+
+function isSalientLine(line: string) {
+  return SALIENT_LINE.test(line) || NAMED_ERROR_LINE.test(line);
+}
+
+function isCriticalLine(line: string) {
+  return CRITICAL_LINE.test(line) || NAMED_ERROR_LINE.test(line);
+}
 
 function normalizeSemanticLine(line: string) {
   return line
@@ -129,7 +138,7 @@ export function mergeLongRunningSalientEvidence(previous: string[], output: stri
   const lines = sanitizeTerminalOutput(output)
     .split("\n")
     .map(normalizeSemanticLine)
-    .filter((line) => line && SALIENT_LINE.test(line));
+    .filter((line) => line && isSalientLine(line));
   const counts = new Map<string, { line: string; count: number; order: number }>();
   lines.forEach((line, order) => {
     const compacted = compactLongLine(line);
@@ -147,8 +156,8 @@ export function mergeLongRunningSalientEvidence(previous: string[], output: stri
   const merged = new Map<string, string>();
   for (const line of [...previous, ...current]) merged.set(evidenceKey(line), line);
   const values = [...merged.values()];
-  const critical = values.filter((line) => CRITICAL_LINE.test(line)).slice(-5);
-  const informative = values.filter((line) => !CRITICAL_LINE.test(line)).slice(-3);
+  const critical = values.filter(isCriticalLine).slice(-5);
+  const informative = values.filter((line) => !isCriticalLine(line)).slice(-3);
   while ([...critical, ...informative].join("\n").length > LONG_RUNNING_SALIENT_EVIDENCE_LIMIT) {
     if (informative.length > 1) informative.shift();
     else if (critical.length > 1) critical.shift();
