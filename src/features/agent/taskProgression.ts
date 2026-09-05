@@ -8,6 +8,7 @@ import { parseToolCommand } from "@/features/tools/toolExecutor";
 import type { ToolDefinition } from "@/features/tools/types";
 import type { OpsTask, PlanStep } from "@/types";
 import { taskGoal } from "@/features/agent/taskGoal";
+import { mayHaveChangedState } from "@/features/agent/attemptState";
 
 export type TaskProgression =
   | { kind: "execute-step"; step: PlanStep }
@@ -57,15 +58,69 @@ export function resolveTaskProgression(
 }
 
 /** Filters repeated commands so completed discovery work is not planned again. */
-export function selectContinuationSteps(existingPlan: PlanStep[], candidates: PlanStep[]) {
-  const existingCommands = new Set(existingPlan.map((step) => step.command.trim()));
+export function selectContinuationSteps(existingPlan: PlanStep[], candidates: PlanStep[], context?: string) {
+  const existingCommands = new Set(existingPlan.filter((step, index) =>
+    !attemptInvalidated(step, index, existingPlan, context),
+  ).map((step) => commandIdentity(step.command)));
   const selectedCommands = new Set<string>();
   return candidates.filter((step) => {
-    const command = step.command.trim();
+    const command = commandIdentity(step.command);
     if (!command || existingCommands.has(command) || selectedCommands.has(command)) return false;
     selectedCommands.add(command);
     return true;
   });
+}
+
+/**
+ * Filters adjustment output against still-valid attempts in the active round.
+ * A changed runtime context or intervening mutation permits fresh observations;
+ * completed mutations remain protected in the same runtime context. A
+ * validation-only repair for an ordinary shell step remains possible.
+ */
+export function selectAdjustmentSteps(existingPlan: PlanStep[], candidates: PlanStep[], context?: string) {
+  existingPlan = existingPlan.filter((step, index, steps) => !attemptInvalidated(step, index, steps, context));
+  const completedCommands = new Set(
+    existingPlan
+      .filter((step) => step.status === "completed")
+      .map((step) => commandIdentity(step.command)),
+  );
+  const failedAttempts = new Set(
+    existingPlan
+      .filter((step) => step.status === "failed")
+      .map((step) => `${commandIdentity(step.command)}\n${step.validation.trim()}`),
+  );
+  const selectedAttempts = new Set<string>();
+
+  return candidates.filter((step) => {
+    const command = commandIdentity(step.command);
+    const attempt = `${command}\n${step.validation.trim()}`;
+    if (!command
+      || completedCommands.has(command)
+      || failedAttempts.has(attempt)
+      || selectedAttempts.has(attempt)) return false;
+    selectedAttempts.add(attempt);
+    return true;
+  });
+}
+
+function attemptInvalidated(step: PlanStep, index: number, history: PlanStep[], context?: string) {
+  if (context && step.attemptContext && step.attemptContext !== context) return true;
+  if (step.status === "completed" && step.kind === "change") return false;
+  return history.slice(index + 1).some(mayHaveChangedState);
+}
+
+function commandIdentity(command: string) {
+  try {
+    const call = parseToolCommand(command, "identity");
+    if (call) {
+      const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical)
+        : value && typeof value === "object"
+          ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
+            .map(([key, item]) => [key, canonical(item)])) : value;
+      return JSON.stringify([call.toolId, canonical(call.arguments)]);
+    }
+  } catch { /* Invalid syntax is rejected by the protocol boundary. */ }
+  return command.trim();
 }
 
 /**

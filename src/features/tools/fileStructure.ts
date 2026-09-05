@@ -29,14 +29,23 @@ export interface NormalizedFileStructureRequest {
 export function normalizeFileStructureRequest(
   request: FileStructureRequest,
 ): NormalizedFileStructureRequest {
-  const rootPath = request.rootPath.trim().replace(/\/+$/, "") || "/";
-  if (!rootPath.startsWith("/")) throw new Error("根路径必须是远端绝对目录路径");
+  const rawRootPath = request.rootPath.trim();
+  if (!rawRootPath.startsWith("/") || rawRootPath.includes("\\") || rawRootPath.includes("\0")) {
+    throw new Error("根路径必须是远端 POSIX 绝对目录路径");
+  }
+  const rootSegments = rawRootPath.split("/").filter(Boolean);
+  if (rootSegments.some((segment) => segment === "." || segment === "..")) {
+    throw new Error("远端根路径不能包含 . 或 .. 路径段");
+  }
+  const rootPath = rootSegments.length ? `/${rootSegments.join("/")}` : "/";
 
   const customExcludes = (request.excludeDirectories ?? []).flatMap((item) => {
     const normalizedItem = item.trim().replace(/\\/g, "/");
     const value = normalizedItem.replace(/^\/+|\/+$/g, "");
     if (!value) return [];
-    if (normalizedItem.startsWith("/") || value.split("/").includes("..")) {
+    if (normalizedItem.startsWith("/")
+      || normalizedItem.includes("\0")
+      || value.split("/").some((segment) => segment === "." || segment === "..")) {
       throw new Error(`排除目录必须是目录名或根目录下的相对路径：${item}`);
     }
     return [value];

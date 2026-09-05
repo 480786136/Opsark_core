@@ -126,6 +126,13 @@ describe("智能任务状态机", () => {
       summary: "整体目标已完成。",
       source: "model",
     });
+    vi.spyOn(backend, "decideNextStage").mockResolvedValue({
+      decision: "complete",
+      reason: "整体目标已有完整验收证据",
+      summary: "整体目标已完成。",
+      source: "model",
+      steps: [],
+    });
     vi.spyOn(backend, "loadCredential").mockResolvedValue(null);
     vi.spyOn(backend, "saveCredential").mockResolvedValue();
     vi.spyOn(backend, "deleteCredential").mockResolvedValue();
@@ -681,6 +688,38 @@ describe("智能任务状态机", () => {
     expect(task.plan[0].status).toBe("completed");
     expect(task.plan[0].evidence?.[0].facts.toolId).toBe("files.get_structure");
     expect(task.status).toBe("completed");
+  });
+
+  it("已知路径只读批次全部结束后才请求一次后续计划，失败时停止剩余读取", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    task.status = "running";
+    task.activeSkillIds = ["application-deployment"];
+    const reads = ["README.md", "package.json"].map((name, index) => ({
+      ...structuredClone(plan[0]), id: `read-${index}`, kind: "observe", validation: "true",
+      command: `opsark-tool files.read_content ${JSON.stringify({ path: `/opt/app/${name}` })}`,
+    }));
+    task.plan = normalizePlanPreconditions(reads, "部署项目", store.tools);
+    const execute = vi.spyOn(store, "executeToolCall").mockImplementation(async (_serverId, call) => ({
+      callId: call.id, toolId: call.toolId, success: true, data: { content: "project evidence" },
+    }));
+    vi.mocked(backend.generatePlan).mockImplementationOnce(async () => {
+      expect(execute).toHaveBeenCalledTimes(2);
+      expect(task.plan.every((step) => step.status === "completed")).toBe(true);
+      return [{ ...structuredClone(plan[0]), id: "next-step", kind: "observe", validation: "", command: "pwd" }];
+    });
+    await store.runStep(task.id, "read-0");
+    expect(backend.generatePlan).toHaveBeenCalledTimes(1);
+    expect(backend.reviewStep).not.toHaveBeenCalled();
+    task.plan = structuredClone(reads);
+    task.status = "running";
+    execute.mockClear().mockResolvedValue({ callId: "failure", toolId: "files.read_content", success: false,
+      error: { code: "READ_FAILED", message: "read failed" } });
+    await store.runStep(task.id, "read-0");
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(task.plan[1].status).toBe("pending");
+    expect(task.status).toBe("needs_adjustment");
+    expect(backend.generatePlan).toHaveBeenCalledTimes(1);
   });
 
   it("用户输入工具展示参数用途，并在提交后以脱敏证据继续规划", async () => {
@@ -2654,16 +2693,16 @@ describe("智能任务状态机", () => {
       plan: [structuredClone(plan[0])],
       selectedSkillIds: ["application-deployment"],
     });
-    vi.mocked(backend.reviewGoal).mockResolvedValueOnce({
+    vi.mocked(backend.decideNextStage).mockResolvedValueOnce({
       decision: "adjust",
       reason: "只有源码检查证据",
       summary: "源码已就位，但运行配置、服务启动与端到端访问尚未验收。",
       source: "model",
+      steps: [{
+        ...structuredClone(plan[2]),
+        id: "goal-review-continuation",
+      }],
     });
-    vi.mocked(backend.generatePlan).mockResolvedValueOnce([{
-      ...structuredClone(plan[2]),
-      id: "goal-review-continuation",
-    }]);
 
     await store.submitRequirement(
       "srv-production-01",
@@ -2677,18 +2716,14 @@ describe("智能任务状态机", () => {
     expect(store.activeTask?.summary).toBeUndefined();
     expect(store.activeTask?.pauseReason).toContain("端到端访问");
     const task = store.activeTask!;
-    const goalContext = JSON.parse(vi.mocked(backend.reviewGoal).mock.calls[0][1]);
+    const goalContext = JSON.parse(vi.mocked(backend.decideNextStage).mock.calls[0][1]!.context);
     expect(task.latestGoalReview?.snapshot).toEqual(goalContext.baseSnapshot);
+    expect(task.latestGoalReview?.nextPlan?.map(({ id }) => id)).toEqual(["goal-review-continuation"]);
 
-    await store.beginAdjustment(task.id);
+    await store.requestAdjustment(task.id);
 
-    const adjustmentRuntime = vi.mocked(backend.generatePlan).mock.calls[0][1]!;
-    const adjustmentContext = JSON.parse(adjustmentRuntime.context);
-    expect(adjustmentContext.baseSnapshot).toEqual(goalContext.baseSnapshot);
-    expect(adjustmentContext.adjustmentTrigger.reviewDecision).toMatchObject({
-      decision: "adjust",
-      summary: "源码已就位，但运行配置、服务启动与端到端访问尚未验收。",
-    });
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(task.plan.map(({ id }) => id)).toContain("goal-review-continuation");
   });
 
   it("用户配置的 Skill 会持久化并进入模型可选目录", async () => {
@@ -3129,7 +3164,20 @@ describe("智能任务状态机", () => {
     expect(normalized.map((step) => step.command)).toEqual(steps.map((step) => step.command));
   });
 
-  it("按工具 planMode 元数据保留独占步骤", () => {
+  it("只读工具批次拒绝混入 Shell 或变更步骤", () => {
+    const read = {
+      ...structuredClone(plan[0]), id: "read", kind: "observe" as const,
+      command: 'opsark-tool files.get_structure {"rootPath":"/opt/app"}', validation: "true",
+    };
+    const shell = {
+      ...read, id: "shell", command: "pwd", validation: "",
+    };
+    expect(() => normalizePlanPreconditions([read, shell])).toThrow("只读批次不能混入");
+    expect(() => normalizePlanPreconditions([read, { ...read, id: "change", kind: "change" }]))
+      .toThrow("只读批次不能混入");
+  });
+
+  it("拒绝 standalone 工具与其他待执行步骤共存", () => {
     const connect = {
       ...structuredClone(plan[0]),
       id: "connect-target",
@@ -3143,12 +3191,11 @@ describe("智能任务状态机", () => {
       validation: "hostname",
     };
 
-    expect(normalizePlanPreconditions([connect, sourceValidation])).toEqual([
-      expect.objectContaining({ id: "connect-target" }),
-    ]);
+    expect(() => normalizePlanPreconditions([connect, sourceValidation]))
+      .toThrow("standalone 工具必须是唯一待执行步骤");
   });
 
-  it("多阶段 Skill 续跑时保留已完成证据，只裁剪本轮待执行步骤", () => {
+  it("多阶段 Skill 续跑时保留已完成证据并拒绝额外待执行步骤", () => {
     const completedLookup = {
       ...structuredClone(plan[0]),
       id: "lookup-completed",
@@ -3165,8 +3212,10 @@ describe("智能任务状态机", () => {
     };
     const prematureValidation = { ...structuredClone(plan[2]), id: "validation-pending" };
 
-    expect(normalizePlanPreconditions([completedLookup, connect, prematureValidation]).map((step) => step.id))
+    expect(normalizePlanPreconditions([completedLookup, connect]).map((step) => step.id))
       .toEqual(["lookup-completed", "connect-pending"]);
+    expect(() => normalizePlanPreconditions([completedLookup, connect, prematureValidation]))
+      .toThrow("standalone 工具必须是唯一待执行步骤");
   });
 
   it("包管理器命令保留实时输出和真实退出码", () => {

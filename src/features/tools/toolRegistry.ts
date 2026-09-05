@@ -51,6 +51,7 @@ export function resolveToolRegistry(
       completionMode: definition.completionMode,
       refinementScope: definition.refinementScope,
       executionMode: definition.executionMode,
+      modelExposure: definition.modelExposure,
       builtIn: definition.builtIn,
       version: definition.version,
     });

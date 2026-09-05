@@ -30,9 +30,13 @@ import {
   executeToolCall as executeRegisteredToolCall,
   parseUserInputArguments,
 } from "@/features/tools/toolExecutor";
+import { selectPlanningTools } from "@/features/tools/toolContext";
+import { taskAttemptContext } from "@/features/agent/attemptState";
+import { planningSkills } from "@/features/skills/skillPlanning";
 import {
   buildAgentContext,
   extractKnownExecutionFacts,
+  nextStagePolicyFingerprint,
   trimEvidence,
 } from "@/features/agent/agentContext";
 import { normalizePermissionLevel, requiresStepApproval } from "@/features/agent/approvalPolicy";
@@ -84,8 +88,8 @@ import {
 import { initializeTaskHistoryCheckpoint } from "@/features/agent/taskHistoryCheckpoint";
 import { isPlanProgressMessage } from "@/features/agent/taskMessages";
 import {
+  decideTaskNextStage,
   planTaskAdjustment,
-  reviewTaskGoal,
   summarizeFailedTask,
 } from "@/features/agent/agentService";
 import {
@@ -464,6 +468,9 @@ function initialTasks() {
     task.submittedInputs = normalizeSubmittedInputs(task.submittedInputs);
     task.submittedSecretBindings = normalizeSubmittedSecretBindings(task.submittedSecretBindings);
     task.plan = task.plan.map(ensureStepValidator);
+    if (task.latestGoalReview?.nextPlan) {
+      task.latestGoalReview.nextPlan = task.latestGoalReview.nextPlan.map(ensureStepValidator);
+    }
     task.phaseHistory ??= [];
     task.phaseHistory.forEach((phase) => {
       phase.plan = phase.plan.map(ensureStepValidator);
@@ -1201,6 +1208,13 @@ export const useOpsStore = defineStore("ops", {
             info: { agentTarget: true, credentialRef: request.credentialRef },
           };
         },
+        expandPlanningContext: async (skillId) => {
+          const current = this.tasks.find((candidate) => candidate.id === taskId);
+          if (!current || !resolveTaskSkills(current, this.skills).some((skill) => skill.id === skillId)) {
+            throw new Error("只能展开当前任务已激活的 Skill");
+          }
+          return { skillId };
+        },
         getRemoteFileStructure: (request) => backend.getRemoteFileStructure(connection, request),
         readRemoteFileContent: async (request: FileContentRequest): Promise<FileContentResult> => {
           const maxBytes = request.maxBytes ?? 65_536;
@@ -1623,7 +1637,7 @@ export const useOpsStore = defineStore("ops", {
             secretMetadata: this.secretMetadata,
             serverId,
           }));
-          const skillDefinitions = buildSkillContext(this.enabledSkills);
+          const skillDefinitions = buildSkillContext(planningSkills(task, this.enabledSkills));
           const developerRequest = {
             command: "process_ai_requirement",
             attempt: attempt + 1,
@@ -2094,7 +2108,7 @@ export const useOpsStore = defineStore("ops", {
       }
     },
 
-    async beginAdjustment(taskId: string, _automatic = false, expectedFingerprint?: string) {
+    async beginAdjustment(taskId: string, automatic = false, expectedFingerprint?: string) {
       if (adjustingTaskIds.has(taskId)) return;
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || !["needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)) return;
@@ -2111,42 +2125,78 @@ export const useOpsStore = defineStore("ops", {
         if (task.cancelRequested || !["needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)) return;
         if (expectedFingerprint && task.adjustmentIncident?.fingerprint !== expectedFingerprint) return;
         const phaseSummary = task.pauseReason;
-        task.pauseReason = undefined;
         const failed = task.plan.find((step) => step.status === "failed");
+        const currentIncidentFingerprint = task.adjustmentIncident?.fingerprint
+          ?? buildAdjustmentBlockerSnapshot(task, failed, this.adjustmentTargetState(task)).fingerprint;
+        task.pauseReason = undefined;
         const reusableGoalReview = failed ? undefined : task.latestGoalReview;
-        const model = this.models.find((item) => item.id === task.modelId);
-        const apiKey = this.modelApiKeys[task.modelId];
-        if (!model) {
-          await this.finalizeFailedTask(task.id, "调整计划失败：所选模型配置不存在。");
-          return;
-        }
-        if (model.provider !== "Built-in" && !apiKey) {
-          await this.finalizeFailedTask(
-            task.id,
-            `调整计划失败：“${model.name}”的 API Key 未恢复，请前往“模型与设置”重新保存。`,
-          );
-          return;
-        }
         const server = this.servers.find((item) => item.id === task.serverId);
+        const activeSkills = resolveTaskSkills(task, this.skills);
+        const currentPolicyFingerprint = nextStagePolicyFingerprint({
+          task,
+          server,
+          metrics: this.metrics,
+          tools: this.tools,
+          secretMetadata: this.secretMetadata,
+          skills: activeSkills,
+        });
+        const cachedPlanFresh = Boolean(
+          reusableGoalReview?.nextPlan?.length
+          && reusableGoalReview.policyFingerprint === currentPolicyFingerprint
+          && reusableGoalReview.continuationIncidentFingerprint
+          && reusableGoalReview.continuationIncidentFingerprint === currentIncidentFingerprint
+          && (!expectedFingerprint || reusableGoalReview.continuationIncidentFingerprint === expectedFingerprint),
+        );
         transitionTask(task, "planning");
-        this.pushMessage(task, { role: "system", kind: "event", content: "正在结合失败输出重新生成调整计划…" });
+        this.pushMessage(task, {
+          role: "system",
+          kind: "event",
+          content: cachedPlanFresh
+            ? "正在采用整体目标判断时已生成的下一阶段计划…"
+            : "正在结合失败输出重新生成调整计划…",
+        });
         this.persist();
         try {
-          const adjustment = await planTaskAdjustment({
-            task,
-            failedStep: failed,
-            server,
-            metrics: this.metrics,
-            tools: this.tools,
-            secretMetadata: this.secretMetadata,
-            model,
-            apiKey,
-            generationSettings: this.aiGenerationSettings,
-            skills: resolveTaskSkills(task, this.skills),
-            sharedSnapshot: reusableGoalReview?.snapshot,
-            reviewDecision: reusableGoalReview?.decision,
-            adjustmentReason: phaseSummary,
-          });
+          let adjustment;
+          if (cachedPlanFresh && reusableGoalReview?.nextPlan) {
+            // Persisted task state is reactive, so its steps may be Vue proxies.
+            // PlanStep is JSON-serializable by contract; serializing first avoids
+            // structuredClone(DataCloneError) and prevents an unnecessary replan.
+            const cachedPlan = JSON.parse(JSON.stringify(reusableGoalReview.nextPlan)) as PlanStep[];
+            adjustment = {
+              requirement: latestTaskRequirement(task),
+              context: {
+                workflowPhase: "cached_combined_next_stage",
+                snapshotFingerprint: reusableGoalReview.snapshot.snapshotFingerprint,
+                policyFingerprint: reusableGoalReview.policyFingerprint,
+              },
+              replacement: cachedPlan,
+              plan: cachedPlan,
+            };
+          } else {
+            const model = this.models.find((item) => item.id === task.modelId);
+            const apiKey = this.modelApiKeys[task.modelId];
+            if (!model) throw new Error("所选模型配置不存在，请重新选择模型");
+            if (model.provider !== "Built-in" && !apiKey) {
+              throw new Error(`“${model.name}”的 API Key 未恢复，请前往“模型与设置”重新保存一次。`);
+            }
+            adjustment = await planTaskAdjustment({
+              task,
+              failedStep: failed,
+              server,
+              metrics: this.metrics,
+              tools: this.tools,
+              secretMetadata: this.secretMetadata,
+              model,
+              apiKey,
+              generationSettings: this.aiGenerationSettings,
+              skills: activeSkills,
+              sharedSnapshot: reusableGoalReview?.snapshot,
+              reviewDecision: reusableGoalReview?.decision,
+              adjustmentReason: phaseSummary,
+              allowUnchangedFailureRetry: !automatic,
+            });
+          }
           const adjustmentIncident = task.adjustmentIncident;
           if (adjustmentIncident
             && (!expectedFingerprint || adjustmentIncident.fingerprint === expectedFingerprint)) {
@@ -2167,7 +2217,7 @@ export const useOpsStore = defineStore("ops", {
           this.addLog({
             category: "model",
             level: "warning",
-            title: "模型调整计划已返回",
+            title: cachedPlanFresh ? "已复用联合决策中的下一阶段计划" : "模型调整计划已返回",
             detail: JSON.stringify({
               context: adjustment.context,
               replacement: adjustment.replacement,
@@ -2491,6 +2541,7 @@ export const useOpsStore = defineStore("ops", {
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || !["running", "awaiting_step_approval"].includes(task.status)) return;
       const targetServerId = executionServerId(task);
+      const server = this.servers.find((item) => item.id === targetServerId);
       const progression = resolveTaskProgression(task, this.tools);
       if (progression.kind !== "execute-step") {
         if (progression.kind === "refine-discovery") {
@@ -2500,7 +2551,6 @@ export const useOpsStore = defineStore("ops", {
           const requirement = latestTaskRequirement(task);
           const model = this.models.find((item) => item.id === task.modelId);
           const apiKey = this.modelApiKeys[task.modelId];
-          const server = this.servers.find((item) => item.id === targetServerId);
           const refinement = await runDiscoveryRefinement({
             task,
             requirement,
@@ -2550,17 +2600,18 @@ export const useOpsStore = defineStore("ops", {
         this.persist();
         const model = this.models.find((item) => item.id === task.modelId);
         const apiKey = this.modelApiKeys[task.modelId];
-        const goalReview = await reviewTaskGoal({
+        const activeSkills = resolveTaskSkills(task, this.skills);
+        const goalReview = await decideTaskNextStage({
           task,
           model,
           apiKey,
-          skills: resolveTaskSkills(task, this.skills),
+          server,
+          metrics: this.metrics,
+          tools: this.tools,
+          secretMetadata: this.secretMetadata,
+          generationSettings: this.aiGenerationSettings,
+          skills: activeSkills,
         });
-        task.latestGoalReview = goalReview.complete ? undefined : {
-          decision: goalReview.decision,
-          snapshot: goalReview.snapshot,
-          createdAt: now(),
-        };
         this.addLog({
           category: "model",
           level: goalReview.complete ? "success" : "warning",
@@ -2568,6 +2619,7 @@ export const useOpsStore = defineStore("ops", {
           detail: JSON.stringify({
             rootGoal: goalReview.requirement,
             decision: goalReview.decision,
+            combinedFallback: "combinedError" in goalReview ? goalReview.combinedError : undefined,
           }, null, 2),
           serverId: targetServerId,
           taskId,
@@ -2575,6 +2627,26 @@ export const useOpsStore = defineStore("ops", {
         if (!goalReview.complete) {
           transitionTask(task, "awaiting_continuation");
           task.pauseReason = goalReview.decision.summary;
+          const continuationIncident = buildAdjustmentBlockerSnapshot(
+            task,
+            undefined,
+            this.adjustmentTargetState(task),
+          );
+          task.latestGoalReview = {
+            decision: {
+              decision: goalReview.decision.decision,
+              reason: goalReview.decision.reason,
+              summary: goalReview.decision.summary,
+              source: goalReview.decision.source,
+            },
+            snapshot: goalReview.snapshot,
+            nextPlan: goalReview.nextPlan?.map((step) => structuredClone(step)),
+            continuationIncidentFingerprint: goalReview.nextPlan?.length
+              ? continuationIncident.fingerprint
+              : undefined,
+            policyFingerprint: goalReview.policyFingerprint,
+            createdAt: now(),
+          };
           this.pushMessage(task, {
             role: "assistant",
             kind: "event",
@@ -2583,6 +2655,7 @@ export const useOpsStore = defineStore("ops", {
           this.persist();
           return;
         }
+        task.latestGoalReview = undefined;
         const completionPipeline = await runTaskCompletion({
           task,
           model,
@@ -2766,6 +2839,7 @@ export const useOpsStore = defineStore("ops", {
       const task = this.tasks.find((item) => item.id === taskId);
       const step = task?.plan.find((item) => item.id === stepId);
       if (!task || !step) return;
+      step.attemptContext = taskAttemptContext(task);
       const targetServerId = executionServerId(task);
       const incompatibleSecret = findSecretKeys(`${step.command}\n${step.validation}`)
         .map((key) => ({ key, metadata: this.secretMetadata.find((item) => item.key === key && item.serverId === targetServerId) }))
@@ -2778,13 +2852,15 @@ export const useOpsStore = defineStore("ops", {
         this.persist();
         return;
       }
+      const activeSkills = resolveTaskSkills(task, this.skills);
       const dispatch = resolveStepDispatch(
         step,
         task.confirmedSecretKeys ?? [],
         uid("tool-call"),
         this.tools,
         Object.keys(serverSecretValues(this.secretValues, targetServerId)),
-        [...new Set(resolveTaskSkills(task, this.skills).flatMap((skill) => skill.forbiddenToolIds ?? []))],
+        [...new Set(activeSkills.flatMap((skill) => skill.forbiddenToolIds ?? []))],
+        selectPlanningTools(this.tools, activeSkills).map(({ id }) => id),
       );
       const secretKey = dispatch.kind === "await-secret" ? dispatch.key : undefined;
       const metadata = secretKey

@@ -20,6 +20,7 @@ export function resolveStepDispatch(
   tools?: ToolDefinition[],
   availableServerSecretKeys: string[] = [],
   forbiddenToolIds: readonly string[] = [],
+  allowedToolIds?: readonly string[],
 ): StepDispatchDecision {
   if (step.executionScope === "user_action") {
     return {
@@ -37,6 +38,9 @@ export function resolveStepDispatch(
     if (call) {
       if (forbiddenToolIds.includes(call.toolId)) {
         return { kind: "invalid", error: `当前激活 Skill 禁止调用工具：${call.toolId}` };
+      }
+      if (allowedToolIds && !allowedToolIds.includes(call.toolId)) {
+        return { kind: "invalid", error: `当前规划上下文未开放工具：${call.toolId}` };
       }
       return { kind: "tool", call };
     }

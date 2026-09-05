@@ -1,0 +1,4103 @@
+DEVELOPER DIAGNOSTICS / TIMELINE
+新任务
+task-1788539562348-siefy9
+
+3 个事件
+requirement_processing
+需求处理模型调用完成
+成功
+2026/9/5 00:32:48
+模型返回 execute，共生成 1 个计划步骤。
+
+devlog-1788539568492-qy59om
+qwen3.8-27b / qwen3.8-27b
+6123 ms
+估算用量 331 (0 → 331)
+复制完整日志
+业务返回结果
+{
+  "intent": "execute",
+  "relation": "new_goal",
+  "answer": null,
+  "plan": [
+    {
+      "id": "ai-step-1788539568-0",
+      "kind": "observe",
+      "title": "检查 Git 可用性、目标目录状态与写入条件",
+      "description": "确认服务器上 Git 是否可用，/opt 目录是否存在且可写，以及 /opt/kaifangqian-base 是否已存在。这是获取源码前的必要环境发现步骤。",
+      "command": "git --version && ls -ld /opt && test -w /opt && echo \"WRITE_OK\" || echo \"WRITE_FAIL\"; if [ -d \"/opt/kaifangqian-base\" ]; then echo \"TARGET_EXISTS\"; else echo \"TARGET_NOT_EXISTS\"; fi",
+      "risk": "low",
+      "expected": "获得 Git 版本信息；确认 /opt 可写；明确 /opt/kaifangqian-base 目录是否已存在。",
+      "validation": "",
+      "executionScope": "isolated_exec",
+      "runtimeClass": "bounded",
+      "status": "pending"
+    }
+  ],
+  "constraints": {
+    "changePolicy": "requested_changes_only",
+    "environmentPolicy": "unspecified",
+    "failurePolicy": "unspecified",
+    "prohibitedActions": [],
+    "requiredConditions": [],
+    "userDirectives": []
+  },
+  "terminalContextLines": 0,
+  "selectedSkillIds": [
+    "project-source-acquisition",
+    "application-deployment"
+  ]
+}
+plan_generation
+plan_generation · 第 1 次模型请求
+成功
+2026/9/5 00:32:48
+已记录本次实际发送的请求和收到的原始响应。
+
+devlog-1788539568491-3t232z
+qwen3.8-27b / qwen3.8-27b
+4428 ms
+API 精确用量 6,219 (6,052 → 167)
+复制完整日志
+完整请求（不含鉴权头）
+{
+  "messages": [
+    {
+      "content": "角色：通用运维计划器。\n\n目标：仅根据用户需求、当前上下文和已验证证据，生成当前确实可执行的最小计划。\n\n决策顺序：\n1. 先识别用户的整体目标、明确约束和现有证据。\n   context.taskGoal.••••••••Goal 存在时它是不可被“继续、重试、补充”等短指令覆盖的最终目标；currentInstruction 只决定本轮增量。计划必须继续满足整体目标，并复用历史已完成证据。\n2. 不得预设技术栈、工具、路径、端口、服务名或资源名。\n3. 证据不足时，只生成最少必要的只读发现步骤；不得同时生成依赖未知发现结果的推测性变更。\n   当当前阻断发生在依赖解析、编译、打包或镜像构建阶段时，本阶段只能生成修复构建及验收构建产物的最少步骤。构建产物未经结构化程序证据确认前，不得生成启动、后台运行、部署、端口探测或应用健康检查步骤；待产物验收成功后再续接独立部署阶段。\n4. 证据充足时，按“必要确认→变更→最终验收”生成最少必要的计划。\n5. 默认每步在独立非交互 Shell 中运行，所需目录和环境必须在当步建立。只有后续步骤确实需要复用工作目录、非敏感环境变量或 source 文件时，才可选用 executionScope=agent_session 并用 sessionContextChange 明确记录可重放状态；主 command 仍必须自行建立它当次依赖的环境。\n6. 用户只要求修改已有资源的部分字段时，必须保留无关内容并做可恢复备份；不得用新模板覆盖整个结构化配置，除非用户明确要求整体替换或证据证明这是完整目标内容。\n7. 下载、安装、构建等可能长时间运行的命令必须保留实时标准输出和真实退出码；不得将整个主命令直接管道给非跟随模式的 tail/head 以截断输出。如需限制展示，应在主命令完成并保存真实退出状态后处理日志。\n8. 用户给出的明确命令、地址、标识符或协议必须保持语义不变，除非真实证据证明不可用并明确说明替代原因。\n9. 所有远程命令步骤都必须由执行器跟踪到真实退出；不得使用未受管的单独 &、disown、setsid -f 或伪造轮询让进程脱离执行生命周期，也不得用 || true、末尾 ; true 或失败分支 exit 0 掩盖主命令和校验的真实失败。有限操作必须前台执行；长驻进程应使用环境已有的受管机制，并通过独立只读证据校验状态。不得重复已完成的输入、发现、变更或验收步骤。\n10. context.activeSkills 是需求理解阶段从已启用目录中选出的领域工作流。存在多个 Skill 时，必须同时遵循全部 Skill 的阶段、工具选择和验收要求，将相容阶段合并且不得静默丢弃任一 Skill；如指令冲突，必须优先满足用户明确约束和核心安全规则，并仅规划可安全确定的阶段。没有激活 Skill 时仅使用通用最小证据流程。工具只能按 context.tools 中的输入协议、planMode 和 completionMode 调用，不得猜测工具能力。需要敏感变量时使用语义明确的 ${secret.NAME} 占位符，禁止把真实值写入计划。不同目标系统、账户、身份或用途的凭据不得静默复用；用途不一致时必须由对应 Skill 指定语义化变量并向用户收集。\n11. 用户提供的路径、文件名和其他可能包含空格、括号、通配符或非 ASCII 字符的值，作为 Shell 参数时必须逐项完整安全引用，并在命令支持时使用 -- 结束选项；不得依赖未引用文本恰好能被当前 Shell 解析。\n12. 必须先根据步骤本身的副作用选择 kind：只读查询、环境发现和故障诊断是 observe，主命令结果直接作为证据，不生成重复 validation；写入、安装、启停、构建、传输等是 change，必须用独立 validation 验收变更后状态。change 的 validation 运行在独立 Shell，不能读取 command 的变量或标准输出。command 若从配置动态解析目标，validation 必须重新读取同一配置，不得硬编码未证明值。只有 opsark-tool 步骤允许使用 JSON 字符串 \"true\" 作为 validation，即输出 \"validation\":\"true\"；不得输出 JSON 布尔值 true。\n13. 下载、包安装、依赖解析、编译和镜像构建可标记 runtimeClass=progressive；受系统服务管理器托管的长驻进程使用 executionScope=managed_service 与 runtimeClass=persistent_service。不确定时省略这些可选字段，由执行器安全分类。\n\n校验规则：\n- 以下 validation 规则只适用于 change 步骤：validation 必须独立、只读且可执行，退出码 0 表示已获得足够判断 expected 的证据。\n- validation 是新的非交互 Shell 命令，不能读取上一条 command 的标准输出；grep、awk、sed 等读取器必须显式提供文件、管道或输入重定向，禁止裸读终端 stdin。\n- 对象不存在、查询无匹配或观察到异常可以是有效发现，不等于命令失败。\n- 只读状态发现若把“不存在、未运行、未监听、无匹配”作为有效分类，必须显式区分所用命令文档定义的“无匹配”退出码与真正执行错误：只把已知无匹配码转换为分类输出，其他非零码原样退出；禁止用 command || echo 把所有错误都改成成功。\n- 认证失败、权限不足、网络不可达等只能作为阻断证据，不能当作用户查询或变更目标已完成；各领域的成功验收条件由已选 Skill 定义。\n- 不得重复已完成步骤，不得生成超出用户授权的不可逆操作。\n\n输出：只返回符合计划输出契约的 JSON 对象。\n对于需要发现实际实现方式的任务，先读取目标自带的说明、声明、配置、入口和已有状态，由证据确定依赖、运行方式、构建方式、部署方式和验收标准。核心不提供任何领域工具或技术栈的默认方案；只能使用当前证据明确展示的能力。发现步骤的校验只确认证据可获得，不要把可选信息缺失判为失败。\n输出必须是 {\"steps\":[...]} 对象，steps 必须至少有 1 个元素。\n每个元素必须严格包含：{\"kind\":\"observe|change\",\"title\":\"非空字符串\",\"description\":\"非空字符串\",\"command\":\"非空字符串\",\"expected\":\"非空字符串\",\"validation\":\"字符串\",\"risk\":\"low|medium|high\"}。可选字段只允许 executionScope、validationScope、runtimeClass 和 sessionContextChange；省略时程序使用安全默认值。executionScope 可为 agent_session|isolated_exec|managed_service|user_action；validationScope 可为 isolated_exec|fresh_interactive_shell|fresh_login_shell；runtimeClass 可为 bounded|progressive|persistent_service。sessionContextChange 仅能与 agent_session 同时使用，可包含绝对 cwd、非敏感 environment、绝对 sourceFiles 和 bash|sh|zsh shell；禁止放入凭据或 ${secret.NAME}。\nobserve 表示只读查询或诊断：主命令输出和退出状态就是观察证据，validation 必须为空字符串，不得生成第二条重复查询。change 表示会改变目标状态：validation 必须是非空、独立、只读的后置条件。command 和 validation 可以包含换行，但必须按标准 JSON 规则转义。\n模型工具例外：工具命令必须严格写成 opsark-tool <toolId> <JSON参数对象>，toolId 前不得添加 --，且必须按工具 inputSchema 提供必填参数；禁止只输出 opsark-tool、缺少参数或使用数组参数。当 command 以 opsark-tool 开头时，validation 必须固定为 JSON 字符串 \"true\"，即输出 \"validation\":\"true\"；禁止输出 JSON 布尔值 true。该字符串是工具协议占位，不会被当作远端校验命令执行。工具上下文中 planMode=standalone 的工具必须是 steps 中唯一的步骤，完成后系统会依据 completionMode 继续编排。\nShell 反斜杠在 JSON 字符串内必须写成双反斜杠，例如 Shell 的 \\( 必须输出为 \\\\( 的 JSON 文本。\n输出前逐个检查七个字段，必须保证整个 JSON 对象完整闭合，不得截断任何字段。\n用户未启用计划输出限制：不得因步骤数、字段长度或命令换行而省略必要内容；仍应保持计划最少且完整。\n敏感变量规则：${secret.NAME} 是 Opsark 的执行时传输占位符，不是要保留在远端文件里的字面量。必须原样写成 ${secret.NAME}，绝对不得在美元符号前添加反斜杠。程序会在 SSH 执行前注入真实值，并在输出、日志和模型上下文中脱敏。模型看到的 •••••••• 只表示真实值已被脱敏：它既不是远端文件的实际内容，也不能证明具体密码正确或错误，更不能据此声称占位符未解析。选择变量时名称和说明必须与目标凭据语义一致；若现有变量无法区分目标账户或用途，应使用新的、用途明确的变量名，由界面向用户索取，不能静默借用含义模糊的旧值。写入远端配置后应使用不泄露秘密的功能性后置条件校验；校验命令中仍可使用同一占位符供程序注入。不得要求远端保留 Opsark 占位符，也不得因脱敏标记判定泄露、写入失败或密码错误。除非用户明确禁止持久化密码，不得自行增加该限制。\n输出格式是强制协议：必须只返回一个完整、可由标准 JSON 解析器直接解析的对象；禁止 Markdown 代码块、前后说明、注释、尾随逗号、NaN/Infinity 和未转义的反斜杠。必须严格使用系统消息指定的字段、类型和枚举值，不得增加或省略必填字段。返回前请自检 JSON 语法和结构。",
+      "role": "system"
+    },
+    {
+      "content": "服务器上下文：\n{\"activeSkills\":[{\"allowedToolIds\":[\"user.request_input\"],\"description\":\"将公开或私有 Git 仓库获取到指定目录，处理服务器级凭据复用、常见错误和最终仓库验收。\",\"forbiddenToolIds\":[\"server.resolve_connection\",\"server.connect\"],\"id\":\"project-source-acquisition\",\"instructions\":\"只负责把 Git 项目源码获取到用户指定的最终目录并验证可用；不安装依赖、不构建、不部署。\\n根据已有真实证据生成最短的可执行计划；未知条件会改变后续操作时，先检查该条件，下一轮再继续。\\n\\n阶段状态机（每轮只规划当前证据允许的最小阶段）：\\n1. [prepare] 确认获取目标和环境\\n   进入条件：尚未确认仓库 URL、最终目录或目标现状\\n   执行契约：\\n   1. 从用户需求中确定原始仓库 URL、最终绝对目录和可选 ref；已经明确的 URL/路径直接写入步骤说明，不要为它单独生成 printf/echo 命令步骤\\n   2. 用 kind=observe 的只读步骤检查 Git 可用性、目标父目录可写性和最终目录是否已存在；主命令结果就是证据，不再生成重复 validation\\n   3. 已有目录不得自动删除或覆盖；如果是同源仓库，仅在用户要求更新时进入更新流程\\n   退出证据：\\n   1. 仓库 URL 与最终目录\\n   2. Git 和写入条件\\n   3. 目标目录状态\\n\\n2. [authenticate] 选择仓库认证方式\\n   进入条件：仓库需要认证或认证状态尚未明确\\n   执行契约：\\n   1. HTTPS 认证状态未知时，本轮只能生成 kind=observe 的有界匿名探测：使用原始 URL、设置 GIT_TERMINAL_PROMPT=0，并执行 git ls-remote；不得在同一轮生成 clone、凭据收集或其他依赖探测结果的步骤\\n   2. 只有匿名探测的真实结构化结果明确证明需要认证后，才优先复用当前服务器中 target 匹配的完整 Git HTTPS 凭据组；步骤必须用 server-credential 引用或敏感变量占位符显式表达认证要求，不得靠 description/expected 中的自然语言暗示认证\\n   3. 有多个匹配账号时请用户选择；没有匹配组时才同表单收集用户名和密码或令牌\\n   4. 凭据只由执行器通过前台 PTY 回答 Git 的 Username/Password 提示；计划命令保留不含凭据的原始 URL\\n   退出证据：\\n   1. 无需凭据，或唯一已选 server-credential 引用\\n   状态分支：\\n   - [public] 原始 URL 可直接读取：不收集凭据，直接获取源码\\n   - [saved-credential] HTTPS 需要认证，且当前服务器已有 target 匹配的完整 Git HTTPS 凭据组：只有一组时直接复用；有多组时请用户选择一组，不交叉组合字段\\n   - [request-credential] HTTPS 需要认证，但当前服务器没有匹配凭据组：调用 opsark-tool user.request_input {\\\"title\\\":\\\"Git HTTPS 凭据\\\",\\\"description\\\":\\\"收集 REPOSITORY_HOST 的仓库读取凭据，并按当前服务器长期保存。\\\",\\\"fields\\\":[{\\\"key\\\":\\\"GIT_USERNAME\\\",\\\"label\\\":\\\"Git HTTPS 用户名\\\",\\\"description\\\":\\\"用于 REPOSITORY_HOST 的 Git HTTPS 登录用户名。\\\",\\\"type\\\":\\\"password\\\",\\\"required\\\":true,\\\"credential\\\":{\\\"group\\\":\\\"git_https_repository\\\",\\\"kind\\\":\\\"git-https\\\",\\\"role\\\":\\\"username\\\",\\\"target\\\":\\\"REPOSITORY_HOST\\\"}},{\\\"key\\\":\\\"GIT_HTTP_CREDENTIAL\\\",\\\"label\\\":\\\"Git HTTPS 密码或访问令牌\\\",\\\"description\\\":\\\"用于 REPOSITORY_HOST 仓库读取认证的密码或个人访问令牌。\\\",\\\"type\\\":\\\"password\\\",\\\"required\\\":true,\\\"credential\\\":{\\\"group\\\":\\\"git_https_repository\\\",\\\"kind\\\":\\\"git-https\\\",\\\"role\\\":\\\"secret\\\",\\\"target\\\":\\\"REPOSITORY_HOST\\\"}}]}；将 REPOSITORY_HOST 替换为仓库 URL 的精确主机，提交后使用工具返回的凭据引用\\n   - [rejected] 远端明确拒绝已选凭据：停止重试同一凭据，请用户更新该组或选择另一组\\n   - [ssh] 原始 URL 为 SSH：使用已有 SSH Agent 或受信公钥；缺少公钥认证时报告配置需求\\n\\n3. [acquire] 获取源码到最终目录\\n   进入条件：目标路径可用，且仓库访问方式已确定\\n   执行契约：\\n   1. 用 kind=change 在可见 PTY 中前台执行 Git 获取命令并等待真实退出；使用用户要求的 ref、depth、submodule 或 LFS 选项\\n   2. 新仓库应在本步成功时位于用户指定的最终目录；可直接获取到最终目录，也可使用不泄漏中间状态的安全等价实现\\n   退出证据：\\n   1. Git 命令真实退出码\\n   2. 最终源码目录\\n\\n4. [verify] 验收最终仓库\\n   进入条件：Git 获取命令已成功退出\\n   执行契约：\\n   1. 仅从最终绝对目录检查它是 Git 工作树、origin 与原始 URL 一致、HEAD 存在，并在用户指定 ref 时校验该 ref\\n   2. 获取变更步骤的 validation 直接使用上述最终目录检查；如果验收被单独规划为 kind=observe，则直接使用该主命令结果，不再生成第二条校验\\n   退出证据：\\n   1. 工作树、origin、HEAD 和请求 ref 的真实结果\\n\\n5. [handle-error] 按真实错误恢复或停止\\n   进入条件：任一检查、认证、获取或验收步骤失败\\n   执行契约：\\n   1. 需要认证时进入凭据选择；远端明确拒绝凭据时停止并请用户更新或更换账号，不重复尝试同一凭据\\n   2. 目标路径已存在时保留原内容并报告冲突；网络、DNS 或 TLS 失败时报告原始错误，只对明确的短暂错误做有限重试\\n   3. Git 命令或最终验收失败时不宣告完成；仅清理本任务明确创建的临时内容，然后基于新证据生成一次针对性调整\\n   退出证据：\\n   1. 可操作的错误分类，或明确的完成验收结果\\n\\n全局硬约束：\\n   1. 保留用户的原始仓库 URL 和协议，不在 URL、命令、环境变量或文件中写入用户名、密码、令牌或敏感占位符。\\n   2. Git HTTPS 凭据只从当前服务器的 serverCredentialGroups 选择或通过 user.request_input 收集；不使用 server.resolve_connection 或 server.connect。\\n   3. 不覆盖或删除用户已有目录，不把临时目录当作最终结果，不把真实失败改写为成功。\",\"name\":\"项目源码获取\",\"version\":12},{\"allowedToolIds\":[\"files.get_structure\",\"files.read_content\",\"software.check\",\"user.request_input\"],\"description\":\"将已有项目部署、启动或上线，并完成端到端验收。\",\"forbiddenToolIds\":[],\"id\":\"application-deployment\",\"instructions\":\"这是面向整体目标的应用部署流程，必须与 project-source-acquisition、software-installation、project-build 等已选 Skill 联合复用证据，不能把某个中间阶段当作部署完成：\\n1. 发现阶段先用 files.get_structure 对项目目录做有界检查；随后按实际结构逐个用 files.read_content 读取 README、依赖声明、锁文件、示例配置、迁移/初始化脚本、容器编排文件、服务入口或 CI 配置。目录名、文件名或 server.basic_info 只能证明候选事实，不能证明项目一定需要 PHP、Node、Java、数据库、缓存、Nginx、Composer 或 Docker。每个 standalone 工具单独成轮，阶段证据必须在后续轮复用。\\n2. 将整体目标拆为有证据依赖关系的阶段：源码就位、运行环境、项目依赖/构建、运行配置与敏感变量、数据库/缓存等外部依赖、进程或容器托管、反向代理/防火墙（仅在项目与用户授权要求时）、启动、端到端验收。每轮只规划当前证据允许的步骤，但后续规划必须继续围绕 taskGoal.••••••••Goal，不得被“继续部署”“重试”替换。\\n3. 项目源码、工具版本、依赖安装和构建已由历史结构化证据确认时必须直接复用，不得重复 clone、重复安装或重复构建。调整计划被替换时，之前阶段仍属于同一整体任务，不能从上下文丢失。\\n4. 项目证据明确所需软件后，先用 software.check 精准检查这些命令的路径与版本，再决定是否联合 software-installation。不得先启用 EPEL、CRB 或第三方仓库；只有软件确实缺失、项目证据要求且当前系统仓库无法提供时，才规划仓库或镜像调整并独立验证。\\n5. 配置文件优先从项目示例最小化生成并保留无关内容；敏感值必须使用业务唯一的 key，例如 OFFICE_DATABASE_PASSWORD、PRODUCTION_REDIS_PASSWORD 或 TARGET_SSH_PASSWORD，禁止新建含义不明的 PASSWORD。现有变量元数据不能证明用途完全一致时，必须用 user.request_input 单独收集，并说明参数名称、用途、目标服务和提交后解锁的步骤；敏感值不得交给模型、写入日志或显示在命令中。\\n6. 任何数据库初始化、迁移、覆盖配置、开启服务、开放端口或替换线上版本都要遵守用户权限与风险审批；已有数据和配置先做只读识别，需要改动时建立可恢复备份。不得为了“能启动”关闭 TLS、认证、安全策略或清空数据。\\n7. 下载、依赖安装、构建、迁移与启动必须等待真实退出；安装 Composer/npm 包、镜像拉取或编译完成前不得提前验证。长驻应用使用项目证据支持的 systemd、容器编排或其他受管机制，不得用裸后台进程伪装部署成功。\\n8. 部署完成门禁必须同时具备：所需配置与依赖就绪、目标进程/容器真实健康、监听地址/端口符合预期、从正确入口进行的 HTTP/TCP/项目自带健康检查成功，以及必要数据库/缓存连接可用。仅源码存在、依赖安装成功、进程已启动、端口监听或命令 exit 0 都只是阶段成功，不得总结为整体部署完成。\\n9. 每个 Shell validation 都必须在独立 Shell 中重新读取同一目标的真实状态。command 若动态解析主机、端口、数据库名或用户，validation 也必须重新解析，不能硬编码未经证据确认的值；不得用 true、无条件 echo、忽略退出码的分支或依赖主命令 stdout 的裸 grep 验收。opsark-tool 步骤由严格 schema 与结构化结果承担证据，validation 固定为 true。\\n10. 若当前轮只完成中间阶段，结果必须明确“整体部署尚未完成”、列出已完成证据和剩余阶段，并自动进入可恢复的待继续状态；调整计划和托管审批不得清除已完成阶段证据。最终总结必须回到最初的部署目标，而不是总结最后一句“重试”。\",\"name\":\"应用部署与上线验收\",\"version\":4}],\"conversationHistory\":[],\"executionConstraints\":{\"changePolicy\":\"requested_changes_only\",\"environmentPolicy\":\"unspecified\",\"failurePolicy\":\"unspecified\",\"prohibitedActions\":[],\"requiredConditions\":[],\"userDirectives\":[]},\"knownExecutionFacts\":{\"completedSteps\":[],\"instruction\":\"这些事实来自同一任务的已完成执行证据。后续步骤必须优先复用，不得在无新证据时猜测或重复已完成工作。\",\"skillFacts\":{}},\"metrics\":{\"cpu\":9,\"disk\":48,\"memory\":77,\"networkIn\":0.00067051244,\"networkOut\":0.0010004621,\"sampledAt\":\"2026-09-04T16:32:39.773Z\"},\"permission\":\"managed\",\"secretVariables\":[],\"server\":{\"environment\":[],\"host\":\"192.168.1.242\",\"info\":{\"cores\":1,\"cpu\":\"远程服务器 CPU\",\"diskGb\":16,\"kernel\":\"Linux 6.12.0-213.el10.x86_64 x86_64\",\"memoryGb\":1,\"os\":\"CentOS Stream 10 (Coughlan)\",\"uptime\":\"5 days, 10 hours, 17 minutes\"},\"name\":\"192.168.1.242\"},\"serverCredentialGroups\":[],\"skillSelection\":{\"mode\":\"model\",\"multiple\":true,\"selectedSkillIds\":[\"project-source-acquisition\",\"application-deployment\"]},\"terminalContext\":{\"hasMore\":true,\"includedLines\":0,\"source\":\"automatic\",\"totalLines\":5},\"tools\":[{\"completionMode\":\"refine\",\"description\":\"以结构化表单请求用户补充任务必需信息，每个参数均显示名称、用途、必填状态和输入提示。\",\"id\":\"user.request_input\",\"inputSchema\":{\"additionalProperties\":false,\"properties\":{\"description\":{\"description\":\"表单整体说明，告知这些信息将用于什么操作。\",\"type\":\"string\"},\"fields\":{\"description\":\"用户需要填写的参数列表。\",\"items\":{\"additionalProperties\":false,\"properties\":{\"credential\":{\"additionalProperties\":false,\"description\":\"用户名/密码或令牌的显式凭据组契约。\",\"properties\":{\"group\":{\"description\":\"同一表单内两个凭据字段共用的组标识。\",\"type\":\"string\"},\"kind\":{\"enum\":[\"git-https\",\"ssh-password\",\"database\",\"service\"],\"type\":\"string\"},\"role\":{\"enum\":[\"username\",\"secret\"],\"type\":\"string\"},\"target\":{\"description\":\"认证目标主机或服务标识，不包含凭据。\",\"type\":\"string\"}},\"required\":[\"group\",\"kind\",\"role\",\"target\"],\"type\":\"object\"},\"description\":{\"description\":\"说明参数是什么、将用于什么操作。\",\"type\":\"string\"},\"key\":{\"description\":\"程序使用的参数名。\",\"type\":\"string\"},\"label\":{\"description\":\"展示给用户的参数名称。\",\"type\":\"string\"},\"placeholder\":{\"description\":\"不包含真实敏感值的输入示例。\",\"type\":\"string\"},\"required\":{\"description\":\"该参数是否必填。\",\"type\":\"boolean\"},\"type\":{\"enum\":[\"text\",\"password\",\"number\"],\"type\":\"string\"}},\"required\":[\"key\",\"label\",\"description\",\"type\",\"required\"],\"type\":\"object\"},\"maxItems\":8,\"minItems\":1,\"type\":\"array\"},\"title\":{\"description\":\"表单标题，说明需要用户补充什么信息。\",\"type\":\"string\"}},\"required\":[\"title\",\"fields\"],\"type\":\"object\"},\"name\":\"用户输入工具\",\"outputDescription\":\"返回非敏感字段值与敏感字段占位符；凭据真实值不会写入模型上下文或普通日志。\",\"planMode\":\"standalone\",\"usageInstructions\":\"仅在完成任务确实缺少用户信息时调用。必须作为当前计划唯一的信息收集步骤，提交后再生成后续计划。每个字段必须提供 label 和 description；敏感值必须使用 password 类型。收集用户名+密码/令牌时，两个字段必须各自提供 credential 对象，使用相同 group/kind/target 和不同 role，不得依赖 label/description 自然语言推断配对。完整凭据组会按服务器长期保存，后续任务应复用 serverCredentialGroups，不得重复索取。\",\"version\":3},{\"completionMode\":\"refine\",\"description\":\"只读获取远端指定目录的紧凑文本目录树。\",\"id\":\"files.get_structure\",\"inputSchema\":{\"additionalProperties\":false,\"properties\":{\"excludeDirectories\":{\"items\":{\"type\":\"string\"},\"type\":\"array\"},\"includeHidden\":{\"default\":false,\"type\":\"boolean\"},\"maxDepth\":{\"default\":4,\"maximum\":20,\"minimum\":1,\"type\":\"integer\"},\"maxNodes\":{\"default\":600,\"maximum\":10000,\"minimum\":1,\"type\":\"integer\"},\"••••••••Path\":{\"description\":\"远端绝对目录路径\",\"type\":\"string\"}},\"required\":[\"••••••••Path\"],\"type\":\"object\"},\"name\":\"文件数据结构获取工具\",\"outputDescription\":\"模型仅接收一个稳定排序的 tree 文本字段；截断状态由执行器单独记录，不返回节点对象、文件内容或重复元数据。\",\"planMode\":\"standalone\",\"usageInstructions\":\"固定格式为 opsark-tool files.get_structure {...}，工具 ID 前不得添加 --。输入绝对路径即可；默认排除版本库、依赖缓存和构建产物，默认最多 4 层、600 个节点。结果截断时应缩小 ••••••••Path 再获取，不要盲目提高上限。\",\"version\":2},{\"completionMode\":\"refine\",\"description\":\"有界、只读地读取远端 UTF-8 文本文件，为项目文档、声明文件和配置分析提供真实证据。\",\"id\":\"files.read_content\",\"inputSchema\":{\"additionalProperties\":false,\"properties\":{\"maxBytes\":{\"default\":65536,\"maximum\":262144,\"minimum\":1,\"type\":\"integer\"},\"path\":{\"description\":\"需要读取的远端文件绝对路径。\",\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"},\"name\":\"文件内容读取工具\",\"outputDescription\":\"返回脱敏后的 UTF-8 文本、文件总字节数、返回字节数和截断状态。\",\"planMode\":\"standalone\",\"usageInstructions\":\"仅在已确认的绝对文件路径上使用。默认最多读取 64 KiB，最大 256 KiB；二进制文件会拒绝读取，敏感值在进入模型上下文前脱敏。目录结构不足以证明技术栈时，应使用本工具读取 README、依赖声明、锁文件或示例配置。\",\"version\":1},{\"completionMode\":\"refine\",\"description\":\"在当前任务绑定终端中检查指定软件是否存在，并获取真实可执行路径和版本首行。\",\"id\":\"software.check\",\"inputSchema\":{\"additionalProperties\":false,\"properties\":{\"includeVersions\":{\"default\":true,\"type\":\"boolean\"},\"names\":{\"description\":\"要检查的精确命令名。\",\"items\":{\"type\":\"string\"},\"maxItems\":20,\"minItems\":1,\"type\":\"array\"}},\"required\":[\"names\"],\"type\":\"object\"},\"name\":\"软件可用性检查工具\",\"outputDescription\":\"返回每个软件的安装状态、命令路径和版本首行。\",\"planMode\":\"standalone\",\"usageInstructions\":\"一次检查 1 到 20 个由项目证据或用户需求明确指出的软件；不得借此扫描整台服务器或猜测技术栈。该工具只检查，不安装、不升级、不启动服务。\",\"version\":1}]}\n\n用户需求：\n拉取并部署项目https://gitee.com/kaifangqian/kaifangqian-base.git到/opt下\n\n严格按系统消息中的计划契约返回。",
+      "role": "user"
+    }
+  ],
+  "model": "qwen3.8-27b",
+  "response_format": {
+    "type": "json_object"
+  },
+  "thinking": {
+    "type": "disabled"
+  }
+}
+业务返回结果
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "{\"steps\":[{\"kind\":\"observe\",\"title\":\"检查 Git 可用性、目标目录状态与写入条件\",\"description\":\"确认服务器上 Git 是否可用，/opt 目录是否存在且可写，以及 /opt/kaifangqian-base 是否已存在。这是获取源码前的必要环境发现步骤。\",\"command\":\"git --version && ls -ld /opt && test -w /opt && echo \\\"WRITE_OK\\\" || echo \\\"WRITE_FAIL\\\"; if [ -d \\\"/opt/kaifangqian-base\\\" ]; then echo \\\"TARGET_EXISTS\\\"; else echo \\\"TARGET_NOT_EXISTS\\\"; fi\",\"expected\":\"获得 Git 版本信息；确认 /opt 可写；明确 /opt/kaifangqian-base 目录是否已存在。\",\"validation\":\"\",\"risk\":\"low\"}]}",
+        "reasoning_content": "",
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": 1788539564,
+  "id": "chatcmpl-da9395cf-b193-91d5-9e76-41113a0d5dcd",
+  "model": "qwen3.8-27b",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 167,
+    "completion_tokens_details": {},
+    "prompt_tokens": 6052,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "text_tokens": 6052
+    },
+    "total_tokens": 6219
+  }
+}
+错误详情
+null
+requirement_classification
+requirement_classification · 第 1 次模型请求
+成功
+2026/9/5 00:32:48
+已记录本次实际发送的请求和收到的原始响应。
+
+devlog-1788539568491-7bf2ct
+qwen3.8-27b / qwen3.8-27b
+1684 ms
+API 精确用量 2,554 (2,486 → 68)
+复制完整日志
+完整请求（不含鉴权头）
+{
+  "max_tokens": 1200,
+  "messages": [
+    {
+      "content": "你是通用运维需求分类、任务关系判断与 Skill 编排器，本阶段不生成计划。先将用户本次输入和 context.taskGoal.••••••••Goal 比较，区分继续、补充、旁问、独立新目标、明确替换或取消；不得让‘继续部署’、‘重试’取代整体目标，也不得让临时问题破坏原任务。判断用户是仅需要不依赖当前环境的知识性回答，还是需要读取或改变真实目标环境。需要当前状态、真实数据或任何环境变更时必须返回 execute。对 execute 必须用 constraints.changePolicy 明确表达本轮只读或变更边界，不得返回 unspecified。从系统提供的 Skill 目录中依据名称、适用场景和选择提示进行语义选择，允许复合需求选择零个、一个或多个 Skill；没有直接适用 Skill 时必须返回空数组并使用通用流程，不得选择最相近的 Skill 凑数，也不得编造目录外 Skill。environmentPolicy、failurePolicy 和其他结构化约束只能来自用户明确表达，不得猜测或自行增加。\n敏感变量规则：${secret.NAME} 是 Opsark 的执行时传输占位符，不是要保留在远端文件里的字面量。必须原样写成 ${secret.NAME}，绝对不得在美元符号前添加反斜杠。程序会在 SSH 执行前注入真实值，并在输出、日志和模型上下文中脱敏。模型看到的 •••••••• 只表示真实值已被脱敏：它既不是远端文件的实际内容，也不能证明具体密码正确或错误，更不能据此声称占位符未解析。选择变量时名称和说明必须与目标凭据语义一致；若现有变量无法区分目标账户或用途，应使用新的、用途明确的变量名，由界面向用户索取，不能静默借用含义模糊的旧值。写入远端配置后应使用不泄露秘密的功能性后置条件校验；校验命令中仍可使用同一占位符供程序注入。不得要求远端保留 Opsark 占位符，也不得因脱敏标记判定泄露、写入失败或密码错误。除非用户明确禁止持久化密码，不得自行增加该限制。\n本阶段只做需求分类、任务关系判断、终端上下文判断、执行约束提取和 Skill 选择，禁止输出 steps、command、validation 或执行计划。context.taskGoal.••••••••Goal 是当前任务长期绑定的整体目标，currentInstruction 只是上一轮指令。必须判断本次输入与整体目标的关系：new_goal=独立的新执行目标；continue=继续/重试原目标；supplement=为原目标补充条件；side_question=临时咨询且不改变原目标；replace_goal=用户明确放弃原目标并替换；cancel_goal=明确取消原目标。不得仅因用户提出另一个问题就隐式覆盖原目标；新执行目标使用 new_goal，只有明确“改为/不要原目标/替换为”才用 replace_goal。必须先判断回答或计划是否依赖用户之前的终端输入/输出：如依赖且 terminalContext.content 未提供或范围不够，返回 terminal_context，terminalContextLines 必须大于当前 includedLines，且不超过 totalLines 和 400；不依赖则不得请求终端内容。对 execute，constraints.changePolicy 是本轮权威的只读/变更边界：查询现状、列表、检查和定位故障必须为 read_only；用户明确要求安装、修改、构建、部署、传输或其他环境变更时为 requested_changes_only；只有用户明确允许为达成目标执行必要的附加变更时才为 allow_necessary_changes。execute 不得返回 unspecified。environmentPolicy、failurePolicy、prohibitedActions、requiredConditions 和 userDirectives 只能来自用户明确表达，不得猜测或自行增加。context.skillDirectory 中的名称、description 和 selectionHints 用于语义选择；category 只用于管理和导航，不得触发 Skill。只选择直接适用于整体目标、本轮显式子目标或已有证据证明必需阶段的 Skill，允许复合需求选择多个 Skill；不得因为目录中存在相近领域或关键词局部相似而强行匹配。零匹配是正常且合法的结果，此时 selectedSkillIds=[]，后续使用通用流程。selectedSkillIds 是本轮完整集合，continue/supplement 也必须移除不再适用或上轮误选的 Skill，程序不会自动并集。咨询类必须严格输出：{\"intent\":\"answer\",\"relation\":\"side_question|cancel_goal\",\"answer\":\"非空回答\",\"constraints\":null,\"terminalContextLines\":0,\"selectedSkillIds\":[]}。执行类必须严格输出：{\"intent\":\"execute\",\"relation\":\"new_goal|continue|supplement|replace_goal\",\"answer\":\"\",\"constraints\":{\"changePolicy\":\"read_only|requested_changes_only|allow_necessary_changes\",\"environmentPolicy\":\"unspecified|preserve|allow_isolated_changes|allow_host_changes\",\"failurePolicy\":\"unspecified|strict|best_effort\",\"prohibitedActions\":[],\"requiredConditions\":[],\"userDirectives\":[]},\"terminalContextLines\":0,\"selectedSkillIds\":[]}。需要更多终端内容时必须严格输出：{\"intent\":\"terminal_context\",\"relation\":null,\"answer\":\"\",\"constraints\":null,\"terminalContextLines\":80,\"selectedSkillIds\":[]}。顶层只允许 intent、relation、answer、constraints、terminalContextLines、selectedSkillIds 六个字段。\n输出格式是强制协议：必须只返回一个完整、可由标准 JSON 解析器直接解析的对象；禁止 Markdown 代码块、前后说明、注释、尾随逗号、NaN/Infinity 和未转义的反斜杠。必须严格使用系统消息指定的字段、类型和枚举值，不得增加或省略必填字段。返回前请自检 JSON 语法和结构。",
+      "role": "system"
+    },
+    {
+      "content": "服务器上下文：\n{\"conversationHistory\":[],\"knownExecutionFacts\":{\"completedSteps\":[],\"instruction\":\"这些事实来自同一任务的已完成执行证据。后续步骤必须优先复用，不得在无新证据时猜测或重复已完成工作。\",\"skillFacts\":{}},\"metrics\":{\"cpu\":9,\"disk\":48,\"memory\":77,\"networkIn\":0.00067051244,\"networkOut\":0.0010004621,\"sampledAt\":\"2026-09-04T16:32:39.773Z\"},\"permission\":\"managed\",\"server\":{\"environment\":[],\"host\":\"192.168.1.242\",\"info\":{\"cores\":1,\"cpu\":\"远程服务器 CPU\",\"diskGb\":16,\"kernel\":\"Linux 6.12.0-213.el10.x86_64 x86_64\",\"memoryGb\":1,\"os\":\"CentOS Stream 10 (Coughlan)\",\"uptime\":\"5 days, 10 hours, 17 minutes\"},\"name\":\"192.168.1.242\"},\"skillDirectory\":[{\"category\":\"connectivity\",\"description\":\"从当前可见终端登录或跳转到另一台 SSH 服务器，并验证登录后的终端身份。\",\"id\":\"ssh-terminal-jump\",\"name\":\"终端 SSH 跳转\",\"selectionHints\":[\"regex:(?:ssh).*(?:连接|登录|跳转)|(?:连接|登录|跳转).*(?:ssh)\",\"regex:(?:终端|shell).*(?:跳转|登录).*(?:服务器|主机|IP)|(?:跳转|登录).*(?:服务器|主机|IP).*(?:终端|shell)\"],\"version\":4},{\"category\":\"source-control\",\"description\":\"将公开或私有 Git 仓库获取到指定目录，处理服务器级凭据复用、常见错误和最终仓库验收。\",\"id\":\"project-source-acquisition\",\"name\":\"项目源码获取\",\"selectionHints\":[\"git clone\",\"克隆代码仓库\",\"下载或获取项目源码\",\"拉取私有仓库\",\"更新代码仓库\",\"检出指定分支或提交\",\"regex:(?:克隆|获取|下载|拉取|检出|同步|更新).*(?:仓库|代码|源码|项目)|(?:仓库|代码|源码|项目).*(?:克隆|获取|下载|拉取|检出|同步|更新)\"],\"version\":12},{\"category\":\"environment\",\"description\":\"在 Linux 服务器上安装或升级 Git、Node.js、Java/JDK、Docker 等通用软件；识别发行版、版本、权限、仓库、国内网络与镜像，并进行独立验收。\",\"id\":\"software-installation\",\"name\":\"通用软件安装\",\"selectionHints\":[\"安装软件\",\"安装 Git\",\"安装 Node\",\"安装 Node.js\",\"安装 Java\",\"安装 JDK\",\"安装 Docker\",\"安装 Python\",\"安装 Go\",\"安装 Rust\",\"安装 Nginx\",\"升级运行时\",\"配置软件源\",\"regex:(?:安装|部署|升级|配置).*(?:git|node(?:\\\\.js)?|npm|pnpm|yarn|java|jdk|maven|gradle|docker|docker compose|软件|运行时|工具链)\",\"regex:(?:安装|升级|卸载)\\\\s*(?:软件|程序|工具|软件包|[a-z][a-z0-9+._-]*)\"],\"version\":1},{\"category\":\"build\",\"description\":\"按项目证据分阶段完成工具链确认、依赖安装、构建和产物验收，并根据真实错误恢复。\",\"id\":\"project-build\",\"name\":\"项目依赖与构建\",\"selectionHints\":[\"构建项目\",\"编译源码\",\"安装项目依赖\",\"生成构建产物或安装包\",\"regex:(?:构建|编译|build|compile|package).*(?:项目|源码|代码|产物)|(?:项目|源码|代码|产物).*(?:构建|编译|build|compile|package)\"],\"version\":3},{\"category\":\"data\",\"description\":\"对 MySQL、MariaDB、PostgreSQL 等数据库执行库表查询、连接诊断、初始化、迁移和受控变更，以真实查询结果验收。\",\"id\":\"database-inspection-operations\",\"name\":\"数据库检查与操作\",\"selectionHints\":[\"查看数据库\",\"列出所有数据库\",\"查询数据库或表\",\"检查数据库连接\",\"数据库初始化或迁移\",\"regex:(?:mysql|mariadb|postgres(?:ql)?|数据库|sql).*(?:查询|查看|列出|检查|连接|初始化|迁移|创建|修改|删除)|(?:查询|查看|列出|检查|连接|初始化|迁移|创建|修改|删除).*(?:mysql|mariadb|postgres(?:ql)?|数据库|sql)\"],\"version\":1},{\"category\":\"deployment\",\"description\":\"将已有项目部署、启动或上线，并完成端到端验收。\",\"id\":\"application-deployment\",\"name\":\"应用部署与上线验收\",\"selectionHints\":[\"部署项目\",\"继续部署\",\"上线应用\",\"启动并验证项目\",\"配置 Web 服务\",\"regex:(?:部署|上线|发布|运行|启动).*(?:项目|应用|网站|服务)|(?:项目|应用|网站|服务).*(?:部署|上线|发布)\"],\"version\":4},{\"category\":\"transfer\",\"description\":\"在服务器之间安全传输文件；目标缺少受管凭据时向用户收集 SSH 登录信息，并使用字节数和 SHA-256 证据确认完整性。\",\"id\":\"file-transfer-integrity\",\"name\":\"文件传输与完整性验证\",\"selectionHints\":[\"跨服务器文件传输\",\"发送文件到服务器\",\"复制构建产物或安装包\",\"SHA-256 文件完整性校验\",\"regex:(?:传输|发送|复制|拷贝|同步).*(?:文件|安装包|备份|产物)|(?:文件|安装包|备份|产物).*(?:传输|发送|复制|拷贝|同步)\"],\"version\":5}],\"skillSelection\":{\"allowEmpty\":true,\"currentActiveSkillIds\":[],\"mode\":\"model\",\"multiple\":true},\"terminalContext\":{\"hasMore\":true,\"includedLines\":0,\"source\":\"automatic\",\"totalLines\":5}}\n\n用户输入：\n拉取并部署项目https://gitee.com/kaifangqian/kaifangqian-base.git到/opt下\n\n严格按系统消息中的分类契约返回。",
+      "role": "user"
+    }
+  ],
+  "model": "qwen3.8-27b",
+  "response_format": {
+    "type": "json_object"
+  },
+  "thinking": {
+    "type": "disabled"
+  }
+}
+业务返回结果
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "{\"intent\":\"execute\",\"relation\":\"new_goal\",\"answer\":\"\",\"constraints\":{\"changePolicy\":\"requested_changes_only\",\"environmentPolicy\":\"unspecified\",\"failurePolicy\":\"unspecified\",\"prohibitedActions\":[],\"requiredConditions\":[],\"userDirectives\":[]},\"terminalContextLines\":0,\"selectedSkillIds\":[\"project-source-acquisition\",\"application-deployment\"]}",
+        "reasoning_content": "",
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": 1788539562,
+  "id": "chatcmpl-879fdd69-4ceb-95ee-bf57-d0b119f7d603",
+  "model": "qwen3.8-27b",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 68,
+    "completion_tokens_details": {},
+    "prompt_tokens": 2486,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "text_tokens": 2486
+    },
+    "total_tokens": 2554
+  }
+}
+错误详情
+
+
+操作日志：
+TASK EXECUTION / TIMELINE
+拉取并部署项目https://gitee.c
+task-1788539562348-siefy9 · 失败
+
+36 个事件
+任务
+智能运维任务失败总结
+错误
+2026/9/5 00:34:48
+log-1788539688052-wnbe5s
+本轮任务未完成：相同阻塞事件在自动调整后仍无新证据，系统已停止重复重拟。新凭据、新终端代次或新执行证据出现后可开启新事件。
+最新阻断：步骤“获取项目目录结构”：根路径必须是远端绝对目录路径
+已确认事实：“检查 Git 可用性、目标目录状态与写入条件”已形成程序证据（success/matched，退出码 0）；“匿名探测仓库访问权限”已形成程序证据（success/matched，退出码 0）；“克隆项目源码到 /opt/kaifangqian-base”已形成程序证据（success/matched，退出码 0）；“确认目标目录存在性”已形成程序证据（success/matched，退出码 0）；“验证目标目录存在性”已形成程序证据（success/matched，退出码 0）。
+尚未确认：“获取项目目录结构”（failed）；“获取项目目录结构”（failed）；“获取项目目录结构”（failed）。
+
+补充说明（不改变以上程序结论）：当前部署任务未完成，处于最终阻断状态。已确认的事实是：Git 环境可用、仓库可匿名访问、项目源码已成功克隆至 /opt/kaifangqian-base，且该目标目录在远端真实存在并具备目录属性。
+
+导致任务停滞的关键失败在于“获取项目目录结构”步骤连续三次执行失败，原因均为“根路径必须是远端绝对目录路径”。这表明在执行列举目录树的命令时，传入的路径参数未满足工具对远端绝对路径的格式要求，导致无法识别主要源码目录、配置文件及构建脚本。由于缺乏对项目内部结构的认知，后续的依赖安装、配置修改或启动服务等部署动作均无法开展。
+
+尚未满足的目标包括：解析项目结构、执行具体的构建与部署流程、以及验证服务运行状态。系统已停止重复重拟该阻塞事件，需在新凭据、新终端代次或提供符合绝对路径规范的新执行证据出现后，方可开启新事件继续推进。
+任务
+执行计划已批准
+信息
+2026/9/5 00:34:37
+log-1788539677976-dqz4nw
+1 个步骤进入执行队列
+模型
+模型调整计划已返回
+警告
+2026/9/5 00:34:37
+log-1788539677975-yj0i3z
+{
+  "context": {
+    "workflowPhase": "adjust_after_failure",
+    "tools": [
+      {
+        "id": "user.request_input",
+        "name": "用户输入工具",
+        "description": "以结构化表单请求用户补充任务必需信息，每个参数均显示名称、用途、必填状态和输入提示。",
+        "usageInstructions": "仅在完成任务确实缺少用户信息时调用。必须作为当前计划唯一的信息收集步骤，提交后再生成后续计划。每个字段必须提供 label 和 description；敏感值必须使用 password 类型。收集用户名+密码/令牌时，两个字段必须各自提供 credential 对象，使用相同 group/kind/target 和不同 role，不得依赖 label/description 自然语言推断配对。完整凭据组会按服务器长期保存，后续任务应复用 serverCredentialGroups，不得重复索取。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "title": {
+              "type": "string",
+              "description": "表单标题，说明需要用户补充什么信息。"
+            },
+            "description": {
+              "type": "string",
+              "description": "表单整体说明，告知这些信息将用于什么操作。"
+            },
+            "fields": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8,
+              "description": "用户需要填写的参数列表。",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "key": {
+                    "type": "string",
+                    "description": "程序使用的参数名。"
+                  },
+                  "label": {
+                    "type": "string",
+                    "description": "展示给用户的参数名称。"
+                  },
+                  "description": {
+                    "type": "string",
+                    "description": "说明参数是什么、将用于什么操作。"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "text",
+                      "password",
+                      "number"
+                    ]
+                  },
+                  "placeholder": {
+                    "type": "string",
+                    "description": "不包含真实敏感值的输入示例。"
+                  },
+                  "required": {
+                    "type": "boolean",
+                    "description": "该参数是否必填。"
+                  },
+                  "credential": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "用户名/密码或令牌的显式凭据组契约。",
+                    "properties": {
+                      "group": {
+                        "type": "string",
+                        "description": "同一表单内两个凭据字段共用的组标识。"
+                      },
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "git-https",
+                          "ssh-password",
+                          "database",
+                          "service"
+                        ]
+                      },
+                      "role": {
+                        "type": "string",
+                        "enum": [
+                          "username",
+                          "secret"
+                        ]
+                      },
+                      "target": {
+                        "type": "string",
+                        "description": "认证目标主机或服务标识，不包含凭据。"
+                      }
+                    },
+                    "required": [
+                      "group",
+                      "kind",
+                      "role",
+                      "target"
+                    ]
+                  }
+                },
+                "required": [
+                  "key",
+                  "label",
+                  "description",
+                  "type",
+                  "required"
+                ]
+              }
+            }
+          },
+          "required": [
+            "title",
+            "fields"
+          ]
+        },
+        "outputDescription": "返回非敏感字段值与敏感字段占位符；凭据真实值不会写入模型上下文或普通日志。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 3
+      },
+      {
+        "id": "files.get_structure",
+        "name": "文件数据结构获取工具",
+        "description": "只读获取远端指定目录的紧凑文本目录树。",
+        "usageInstructions": "固定格式为 opsark-tool files.get_structure {...}，工具 ID 前不得添加 --。输入绝对路径即可；默认排除版本库、依赖缓存和构建产物，默认最多 4 层、600 个节点。结果截断时应缩小 rootPath 再获取，不要盲目提高上限。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "rootPath": {
+              "type": "string",
+              "description": "远端绝对目录路径"
+            },
+            "excludeDirectories": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "maxDepth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20,
+              "default": 4
+            },
+            "maxNodes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000,
+              "default": 600
+            },
+            "includeHidden": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "rootPath"
+          ]
+        },
+        "outputDescription": "模型仅接收一个稳定排序的 tree 文本字段；截断状态由执行器单独记录，不返回节点对象、文件内容或重复元数据。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 2
+      },
+      {
+        "id": "files.read_content",
+        "name": "文件内容读取工具",
+        "description": "有界、只读地读取远端 UTF-8 文本文件，为项目文档、声明文件和配置分析提供真实证据。",
+        "usageInstructions": "仅在已确认的绝对文件路径上使用。默认最多读取 64 KiB，最大 256 KiB；二进制文件会拒绝读取，敏感值在进入模型上下文前脱敏。目录结构不足以证明技术栈时，应使用本工具读取 README、依赖声明、锁文件或示例配置。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "需要读取的远端文件绝对路径。"
+            },
+            "maxBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 262144,
+              "default": 65536
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "outputDescription": "返回脱敏后的 UTF-8 文本、文件总字节数、返回字节数和截断状态。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 1
+      },
+      {
+        "id": "software.check",
+        "name": "软件可用性检查工具",
+        "description": "在当前任务绑定终端中检查指定软件是否存在，并获取真实可执行路径和版本首行。",
+        "usageInstructions": "一次检查 1 到 20 个由项目证据或用户需求明确指出的软件；不得借此扫描整台服务器或猜测技术栈。该工具只检查，不安装、不升级、不启动服务。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "names": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 20,
+              "items": {
+                "type": "string"
+              },
+              "description": "要检查的精确命令名。"
+            },
+            "includeVersions": {
+              "type": "boolean",
+              "default": true
+            }
+          },
+          "required": [
+            "names"
+          ]
+        },
+        "outputDescription": "返回每个软件的安装状态、命令路径和版本首行。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 1
+      }
+    ],
+    "activeSkills": [
+      {
+        "id": "project-source-acquisition",
+        "name": "项目源码获取",
+        "description": "将公开或私有 Git 仓库获取到指定目录，处理服务器级凭据复用、常见错误和最终仓库验收。",
+        "version": 12,
+        "instructions": "只负责把 Git 项目源码获取到用户指定的最终目录并验证可用；不安装依赖、不构建、不部署。\n根据已有真实证据生成最短的可执行计划；未知条件会改变后续操作时，先检查该条件，下一轮再继续。\n\n阶段状态机（每轮只规划当前证据允许的最小阶段）：\n1. [prepare] 确认获取目标和环境\n   进入条件：尚未确认仓库 URL、最终目录或目标现状\n   执行契约：\n   1. 从用户需求中确定原始仓库 URL、最终绝对目录和可选 ref；已经明确的 URL/路径直接写入步骤说明，不要为它单独生成 printf/echo 命令步骤\n   2. 用 kind=observe 的只读步骤检查 Git 可用性、目标父目录可写性和最终目录是否已存在；主命令结果就是证据，不再生成重复 validation\n   3. 已有目录不得自动删除或覆盖；如果是同源仓库，仅在用户要求更新时进入更新流程\n   退出证据：\n   1. 仓库 URL 与最终目录\n   2. Git 和写入条件\n   3. 目标目录状态\n\n2. [authenticate] 选择仓库认证方式\n   进入条件：仓库需要认证或认证状态尚未明确\n   执行契约：\n   1. HTTPS 认证状态未知时，本轮只能生成 kind=observe 的有界匿名探测：使用原始 URL、设置 GIT_TERMINAL_PROMPT=0，并执行 git ls-remote；不得在同一轮生成 clone、凭据收集或其他依赖探测结果的步骤\n   2. 只有匿名探测的真实结构化结果明确证明需要认证后，才优先复用当前服务器中 target 匹配的完整 Git HTTPS 凭据组；步骤必须用 server-credential 引用或敏感变量占位符显式表达认证要求，不得靠 description/expected 中的自然语言暗示认证\n   3. 有多个匹配账号时请用户选择；没有匹配组时才同表单收集用户名和密码或令牌\n   4. 凭据只由执行器通过前台 PTY 回答 Git 的 Use\n…[已压缩，原始 2941 字符，指纹 2941:2bc211e2]…\nd\",\"required\":true,\"credential\":{\"group\":\"git_https_repository\",\"kind\":\"git-https\",\"role\":\"secret\",\"target\":\"REPOSITORY_HOST\"}}]}；将 REPOSITORY_HOST 替换为仓库 URL 的精确主机，提交后使用工具返回的凭据引用\n   - [rejected] 远端明确拒绝已选凭据：停止重试同一凭据，请用户更新该组或选择另一组\n   - [ssh] 原始 URL 为 SSH：使用已有 SSH Agent 或受信公钥；缺少公钥认证时报告配置需求\n\n3. [acquire] 获取源码到最终目录\n   进入条件：目标路径可用，且仓库访问方式已确定\n   执行契约：\n   1. 用 kind=change 在可见 PTY 中前台执行 Git 获取命令并等待真实退出；使用用户要求的 ref、depth、submodule 或 LFS 选项\n   2. 新仓库应在本步成功时位于用户指定的最终目录；可直接获取到最终目录，也可使用不泄漏中间状态的安全等价实现\n   退出证据：\n   1. Git 命令真实退出码\n   2. 最终源码目录\n\n4. [verify] 验收最终仓库\n   进入条件：Git 获取命令已成功退出\n   执行契约：\n   1. 仅从最终绝对目录检查它是 Git 工作树、origin 与原始 URL 一致、HEAD 存在，并在用户指定 ref 时校验该 ref\n   2. 获取变更步骤的 validation 直接使用上述最终目录检查；如果验收被单独规划为 kind=observe，则直接使用该主命令结果，不再生成第二条校验\n   退出证据：\n   1. 工作树、origin、HEAD 和请求 ref 的真实结果\n\n5. [handle-error] 按真实错误恢复或停止\n   进入条件：任一检查、认证、获取或验收步骤失败\n   执行契约：\n   1. 需要认证时进入凭据选择；远端明确拒绝凭据时停止并请用户更新或更换账号，不重复尝试同一凭据\n   2. 目标路径已存在时保留原内容并报告冲突；网络、DNS 或 TLS 失败时报告原始错误，只对明确的短暂错误做有限重试\n   3. Git 命令或最终验收失败时不宣告完成；仅清理本任务明确创建的临时内容，然后基于新证据生成一次针对性调整\n   退出证据：\n   1. 可操作的错误分类，或明确的完成验收结果\n\n全局硬约束：\n   1. 保留用户的原始仓库 URL 和协议，不在 URL、命令、环境变量或文件中写入用户名、密码、令牌或敏感占位符。\n   2. Git HTTPS 凭据只从当前服务器的 serverCredentialGroups 选择或通过 user.request_input 收集；不使用 server.resolve_connection 或 server.connect。\n   3. 不覆盖或删除用户已有目录，不把临时目录当作最终结果，不把真实失败改写为成功。",
+        "allowedToolIds": [
+          "user.request_input"
+        ],
+        "forbiddenToolIds": [
+          "server.resolve_connection",
+          "server.connect"
+        ]
+      },
+      {
+        "id": "application-deployment",
+        "name": "应用部署与上线验收",
+        "description": "将已有项目部署、启动或上线，并完成端到端验收。",
+        "version": 4,
+        "instructions": "这是面向整体目标的应用部署流程，必须与 project-source-acquisition、software-installation、project-build 等已选 Skill 联合复用证据，不能把某个中间阶段当作部署完成：\n1. 发现阶段先用 files.get_structure 对项目目录做有界检查；随后按实际结构逐个用 files.read_content 读取 README、依赖声明、锁文件、示例配置、迁移/初始化脚本、容器编排文件、服务入口或 CI 配置。目录名、文件名或 server.basic_info 只能证明候选事实，不能证明项目一定需要 PHP、Node、Java、数据库、缓存、Nginx、Composer 或 Docker。每个 standalone 工具单独成轮，阶段证据必须在后续轮复用。\n2. 将整体目标拆为有证据依赖关系的阶段：源码就位、运行环境、项目依赖/构建、运行配置与敏感变量、数据库/缓存等外部依赖、进程或容器托管、反向代理/防火墙（仅在项目与用户授权要求时）、启动、端到端验收。每轮只规划当前证据允许的步骤，但后续规划必须继续围绕 taskGoal.rootGoal，不得被“继续部署”“重试”替换。\n3. 项目源码、工具版本、依赖安装和构建已由历史结构化证据确认时必须直接复用，不得重复 clone、重复安装或重复构建。调整计划被替换时，之前阶段仍属于同一整体任务，不能从上下文丢失。\n4. 项目证据明确所需软件后，先用 software.check 精准检查这些命令的路径与版本，再决定是否联合 software-installation。不得先启用 EPEL、CRB 或第三方仓库；只有软件确实缺失、项目证据要求且当前系统仓库无法提供时，才规划仓库或镜像调整并独立验证。\n5. 配置文件优先从项目示例最小化生成并保留无关内容；敏感值必须使用业务唯一的 key，例如 OFFICE_DATABASE_PASSWORD、PRODUCTION_REDIS_PASSWORD 或 TARGET_SSH_PASSWORD，禁止新建含义不明的 PASSWORD。现有变量元数据不能证明用途完全一致时，必须用 user.request_input 单独收集，并说明参数名称、用途、目标服务和提交后解锁的步骤；敏感值不得交给模型、写入日志或显示在命令中。\n6. 任何数据库初始化、迁移、覆盖配置、开启服务、开放端口或替换线上版本都要遵守用户权限与风险审批；已有数据和配置先做只读识别，需要改动时建立可恢复备份。不得为了“能启动”关闭 TLS、认证、安全策略或清空数据。\n7. 下载、依赖安装、构建、迁移与启动必须等待真实退出；安装 Composer/npm 包、镜像拉取或编译完成前不得提前验证。长驻应用使用项目证据支持的 systemd、容器编排或其他受管机制，不得用裸后台进程伪装部署成功。\n8. 部署完成门禁必须同时具备：所需配置与依赖就绪、目标进程/容器真实健康、监听地址/端口符合预期、从正确入口进行的 HTTP/TCP/项目自带健康检查成功，以及必要数据库/缓存连接可用。仅源码存在、依赖安装成功、进程已启动、端口监听或命令 exit 0 都只是阶段成功，不得总结为整体部署完成。\n9. 每个 Shell validation 都必须在独立 Shell 中重新读取同一目标的真实状态。command 若动态解析主机、端口、数据库名或用户，validation 也必须重新解析，不能硬编码未经证据确认的值；不得用 true、无条件 echo、忽略退出码的分支或依赖主命令 stdout 的裸 grep 验收。opsark-tool 步骤由严格 schema 与结构化结果承担证据，validation 固定为 true。\n10. 若当前轮只完成中间阶段，结果必须明确“整体部署尚未完成”、列出已完成证据和剩余阶段，并自动进入可恢复的待继续状态；调整计划和托管审批不得清除已完成阶段证据。最终总结必须回到最初的部署目标，而不是总结最后一句“重试”。",
+        "allowedToolIds": [
+          "files.get_structure",
+          "files.read_content",
+          "software.check",
+          "user.request_input"
+        ],
+        "forbiddenToolIds": []
+      }
+    ],
+    "instruction": "只根据 baseSnapshot、adjustmentTrigger 和尚未完成目标生成最少必要步骤。recentPhases 是最近两个阶段，historyCheckpoint 是更早历史的滚动摘要；不得要求重复其中已经完成的工作。计划描述和阶段总结不是成功证据，只有结构化 result/evidence 才能证明状态。失败方法必须有实质变化后才能重试。每步在独立非交互 Shell 中建立自身环境，并以 activeSkills 要求的独立验收结束。",
+    "server": {
+      "name": "192.168.1.242",
+      "host": "192.168.1.242",
+      "info": {
+        "os": "CentOS Stream 10 (Coughlan)",
+        "kernel": "Linux 6.12.0-213.el10.x86_64 x86_64",
+        "cpu": "远程服务器 CPU",
+        "cores": 1,
+        "memoryGb": 1,
+        "diskGb": 16,
+        "uptime": "5 days, 10 hours, 17 minutes"
+      },
+      "environment": []
+    },
+    "secretVariables": [],
+    "serverCredentialGroups": [],
+    "baseSnapshot": {
+      "version": 1,
+      "task": {
+        "title": "拉取并部署项目https://gitee.c",
+        "status": "planning",
+        "permission": "managed",
+        "relation": "new_goal"
+      },
+      "executionConstraints": {
+        "changePolicy": "requested_changes_only",
+        "environmentPolicy": "unspecified",
+        "failurePolicy": "unspecified",
+        "prohibitedActions": [],
+        "requiredConditions": [],
+        "userDirectives": []
+      },
+      "progress": {
+        "totalSteps": 7,
+        "statusCounts": {
+          "completed": 5,
+          "failed": 2
+        },
+        "totalRounds": 0,
+        "archivedPhases": 5,
+        "adjustmentCount": 0
+      },
+      "currentIncident": {
+        "title": "获取项目目录结构",
+        "description": "使用文件数据结构获取工具查看 /opt/kaifangqian-base 的目录树，以发现项目的技术栈、构建方式、配置入口和部署线索。这是应用部署发现阶段的第一步。",
+        "command": "opsark-tool files.get_structure {\"rootPath\":\"/opt/kaifangqian-base\",\"maxDepth\":4,\"maxNodes\":600}",
+        "commandFingerprint": "96:12d16677",
+        "expected": "获得项目目录的紧凑文本树，能够识别出主要源码目录、配置文件、依赖声明文件和构建脚本。",
+        "validation": "true",
+        "risk": "low",
+        "status": "failed",
+        "stepId": "ai-step-1788539667-0",
+        "result": {
+          "executionStatus": "failed",
+          "observationStatus": "unknown",
+          "facts": {
+            "toolId": "files.get_structure",
+            "errorCode": "TOOL_EXECUTION_FAILED"
+          },
+          "warnings": [],
+          "failureReason": "根路径必须是远端绝对目录路径"
+        },
+        "output": {
+          "totalCharacters": 14,
+          "omittedCharacters": 0,
+          "fingerprint": "14:18baa641",
+          "content": "根路径必须是远端绝对目录路径"
+        },
+        "executionScope": "isolated_exec"
+      },
+      "currentPlan": {
+        "totalSteps": 1,
+        "statusCounts": {
+          "failed": 1
+        },
+        "includedSteps": 1,
+        "incidentIncludedSeparately": true,
+        "omittedSteps": 0,
+        "steps": []
+      },
+      "recentPhases": [
+        {
+          "phaseId": "phase-task-1788539562348-siefy9-1788539642883-3",
+          "reason": "adjustment",
+          "summary": "已完成：Git 环境检查、匿名访问探测、源码克隆至 /opt/kaifangqian-base。当前处于部署发现阶段，需先验证目录状态，再获取项目结构以确定后续构建与部署步骤。",
+          "requirement": "拉取并部署项目https://gitee.com/kaifangqian/kaifangqian-base.git到/opt下",
+          "planSummary": {
+            "totalSteps": 1,
+            "statusCounts": {
+              "completed": 1
+            },
+            "includedSteps": 1,
+            "omittedSteps": 0
+          },
+          "steps": [
+            {
+              "stepId": "ai-step-1788539630-0",
+              "title": "确认目标目录存在性",
+              "action": "在调用 files.get_structure 前，先通过只读命令确认 /opt/kaifangqian-base 是否真实存在且为目录，以排除因路径不存在导致工具报错的原因。",
+              "expected": "输出 EXISTS 或 NOT_FOUND，明确目录状态。",
+              "risk": "low",
+              "status": "completed",
+              "commandFingerprint": "68:b640e11b",
+              "result": {
+                "executionStatus": "success",
+                "observationStatus": "matched",
+                "exitCode": 0,
+                "facts": {
+                  "found": true,
+                  "lineCount": 1,
+                  "mainObservationStatus": "matched",
+                  "verificationMode": "command_result",
+                  "validatorType": "file",
+                  "evidenceConflict": false,
+                  "blockingSignal": false
+                },
+                "warnings": []
+              },
+              "output": {
+                "totalCharacters": 16,
+                "fingerprint": "16:f082eaff"
+              },
+              "executionScope": "isolated_exec",
+              "evidence": {
+                "totalItems": 1,
+                "omittedItems": 0,
+                "items": [
+                  {
+                    "type": "file",
+                    "source": "main",
+                    "facts": {
+                      "found": true,
+                      "lineCount": 1
+                    },
+                    "scope": {
+                      "targetId": "srv-1788539453694-hxzphx",
+                      "sessionId": "agent-session-1",
+                      "generation": 1,
+                      "shell": "bash",
+                      "scope": "isolated_exec",
+                      "persistence": "command",
+                      "doesNotProve": [
+                        "agent_session_state",
+                        "user_shell_loaded",
+                        "new_shell_auto_load"
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "completedAt": "2026-09-04T16:34:02.883Z"
+        },
+        {
+          "phaseId": "phase-task-1788539562348-siefy9-1788539667869-4",
+          "reason": "adjustment",
+          "summary": "已完成：Git 环境检查、匿名访问探测、源码克隆至 /opt/kaifangqian-base。尚未完成：应用部署与上线验收（包括获取项目结构以确定技术栈、运行环境准备、依赖安装、构建、配置、服务启动及端到端健康检查）。需调整计划以进入部署发现阶段，优先通过只读命令或修正后的工具调用获取项目目录结构。",
+          "requirement": "拉取并部署项目https://gitee.com/kaifangqian/kaifangqian-base.git到/opt下",
+          "planSummary": {
+            "totalSteps": 1,
+            "statusCounts": {
+              "completed": 1
+            },
+            "includedSteps": 1,
+            "omittedSteps": 0
+          },
+          "steps": [
+            {
+              "stepId": "ai-step-1788539637-0",
+              "title": "验证目标目录存在性",
+              "action": "使用 ls -ld 确认 /opt/kaifangqian-base 是一个存在的目录，排除因路径错误导致后续工具调用失败的可能。",
+              "expected": "输出显示 /opt/kaifangqian-base 是一个目录（drwx...），退出码为 0。",
+              "risk": "low",
+              "status": "completed",
+              "commandFingerprint": "28:7ba4273a",
+              "result": {
+                "executionStatus": "success",
+                "observationStatus": "matched",
+                "exitCode": 0,
+                "facts": {
+                  "found": true,
+                  "lineCount": 1,
+                  "mainObservationStatus": "matched",
+                  "verificationMode": "command_result",
+                  "validatorType": "file",
+                  "evidenceConflict": false,
+                  "blockingSignal": false
+                },
+                "warnings": []
+              },
+              "output": {
+                "totalCharacters": 72,
+                "fingerprint": "72:40c25eb6"
+              },
+              "executionScope": "isolated_exec",
+              "evidence": {
+                "totalItems": 1,
+                "omittedItems": 0,
+                "items": [
+                  {
+                    "type": "file",
+                    "source": "main",
+                    "facts": {
+                      "found": true,
+                      "lineCount": 1
+                    },
+                    "scope": {
+                      "targetId": "srv-1788539453694-hxzphx",
+                      "sessionId": "agent-session-1",
+                      "generation": 1,
+                      "shell": "bash",
+                      "scope": "isolated_exec",
+                      "persistence": "command",
+                      "doesNotProve": [
+                        "agent_session_state",
+                        "user_shell_loaded",
+                        "new_shell_auto_load"
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "completedAt": "2026-09-04T16:34:27.869Z"
+        }
+      ],
+      "historyCheckpoint": {
+        "version": 1,
+        "sourceRoundCount": 0,
+        "sourcePhaseCount": 3,
+        "sourceStepCount": 4,
+        "statusCounts": {
+          "completed": 3,
+          "failed": 1
+        },
+        "verifiedFacts": [
+          {
+            "stepId": "ai-step-1788539568-0",
+            "title": "检查 Git 可用性、目标目录状态与写入条件",
+            "result": {
+              "executionStatus": "success",
+              "observationStatus": "matched",
+              "exitCode": 0,
+              "facts": {
+                "found": true,
+                "lineCount": 4,
+                "mainObservationStatus": "matched",
+                "verificationMode": "command_result",
+                "validatorType": "file",
+                "evidenceConflict": false,
+                "blockingSignal": false
+              },
+              "warnings": []
+            },
+            "evidence": {
+              "totalItems": 1,
+              "omittedItems": 0,
+              "items": [
+                {
+                  "type": "file",
+                  "source": "main",
+                  "facts": {
+                    "found": true,
+                    "lineCount": 4
+                  },
+                  "scope": {
+                    "targetId": "srv-1788539453694-hxzphx",
+                    "sessionId": "agent-session-1",
+                    "generation": 1,
+                    "shell": "bash",
+                    "scope": "isolated_exec",
+                    "persistence": "command",
+                    "doesNotProve": [
+                      "agent_session_state",
+                      "user_shell_loaded",
+                      "new_shell_auto_load"
+                    ]
+                  }
+                }
+              ]
+            },
+            "scopes": [
+              {
+                "targetId": "srv-1788539453694-hxzphx",
+                "sessionId": "agent-session-1",
+                "generation": 1,
+                "shell": "bash",
+                "scope": "isolated_exec",
+                "persistence": "command",
+                "doesNotProve": [
+                  "agent_session_state",
+                  "user_shell_loaded",
+                  "new_shell_auto_load"
+                ]
+              }
+            ]
+          },
+          {
+            "stepId": "ai-step-1788539573-0",
+            "title": "匿名探测仓库访问权限",
+            "result": {
+              "executionStatus": "success",
+              "observationStatus": "matched",
+              "exitCode": 0,
+              "facts": {
+                "lineCount": 2,
+                "outputPresent": true,
+                "mainObservationStatus": "matched",
+                "verificationMode": "command_result",
+                "validatorType": "command",
+                "evidenceConflict": false,
+                "blockingSignal": false
+              },
+              "warnings": []
+            },
+            "evidence": {
+              "totalItems": 1,
+              "omittedItems": 0,
+              "items": [
+                {
+                  "type": "command",
+                  "source": "main",
+                  "facts": {
+                    "lineCount": 2,
+                    "outputPresent": true
+                  },
+                  "scope": {
+                    "targetId": "srv-1788539453694-hxzphx",
+                    "sessionId": "agent-session-1",
+                    "generation": 1,
+                    "shell": "bash",
+                    "scope": "isolated_exec",
+                    "persistence": "command",
+                    "doesNotProve": [
+                      "agent_session_state",
+                      "user_shell_loaded",
+                      "new_shell_auto_load"
+                    ]
+                  }
+                }
+              ]
+            },
+            "scopes": [
+              {
+                "targetId": "srv-1788539453694-hxzphx",
+                "sessionId": "agent-session-1",
+                "generation": 1,
+                "shell": "bash",
+                "scope": "isolated_exec",
+                "persistence": "command",
+                "doesNotProve": [
+                  "agent_session_state",
+                  "user_shell_loaded",
+                  "new_shell_auto_load"
+                ]
+              }
+            ]
+          },
+          {
+            "stepId": "ai-step-1788539581-0",
+            "title": "克隆项目源码到 /opt/kaifangqian-base",
+            "result": {
+              "executionStatus": "success",
+              "observationStatus": "matched",
+              "exitCode": 0,
+              "facts": {
+                "found": true,
+                "lineCount": 3,
+                "mainObservationStatus": "matched",
+                "verificationMode": "postcondition",
+                "validationObservationStatus": "matched",
+                "validatorType": "file",
+                "validationPassed": true,
+                "evidenceConflict": false,
+                "blockingSignal": false
+              },
+              "warnings": []
+            },
+            "evidence": {
+              "totalItems": 2,
+              "omittedItems": 0,
+              "items": [
+                {
+                  "type": "file",
+                  "source": "main",
+                  "facts": {
+                    "found": true,
+                    "lineCount": 3
+                  },
+                  "scope": {
+                    "targetId": "srv-1788539453694-hxzphx",
+                    "sessionId": "agent-session-1",
+                    "generation": 1,
+                    "shell": "bash",
+                    "scope": "isolated_exec",
+                    "persistence": "command",
+                    "doesNotProve": [
+                      "agent_session_state",
+                      "user_shell_loaded",
+                      "new_shell_auto_load"
+                    ]
+                  }
+                },
+                {
+                  "type": "file",
+                  "source": "validation",
+                  "facts": {
+                    "passed": true,
+                    "exitCode": 0,
+                    "acceptedDiagnosticState": false,
+                    "detail": "后置校验通过",
+                    "observationStatus": "matched",
+                    "observationFacts": {
+                      "found": false,
+                      "lineCount": 0
+                    }
+                  },
+                  "scope": {
+                    "targetId": "srv-1788539453694-hxzphx",
+                    "sessionId": "agent-session-1",
+                    "generation": 1,
+                    "shell": "bash",
+                    "scope": "isolated_exec",
+                    "persistence": "command",
+                    "doesNotProve": [
+                      "agent_session_state",
+                      "user_shell_loaded",
+                      "new_shell_auto_load"
+                    ]
+                  }
+                }
+              ]
+            },
+            "scopes": [
+              {
+                "targetId": "srv-1788539453694-hxzphx",
+                "sessionId": "agent-session-1",
+                "generation": 1,
+                "shell": "bash",
+                "scope": "isolated_exec",
+                "persistence": "command",
+                "doesNotProve": [
+                  "agent_session_state",
+                  "user_shell_loaded",
+                  "new_shell_auto_load"
+                ]
+              },
+              {
+                "targetId": "srv-1788539453694-hxzphx",
+                "sessionId": "agent-session-1",
+                "generation": 1,
+                "shell": "bash",
+                "scope": "isolated_exec",
+                "persistence": "command",
+                "doesNotProve": [
+                  "agent_session_state",
+                  "user_shell_loaded",
+                  "new_shell_auto_load"
+                ]
+              }
+            ]
+          }
+        ],
+        "unresolvedIssues": [
+          {
+            "stepId": "ai-step-1788539621-0",
+            "title": "获取项目目录结构",
+            "reason": "根路径必须是远端绝对目录路径",
+            "status": "failed",
+            "commandFingerprint": "96:12d16677",
+            "attemptCount": 1
+          }
+        ],
+        "phaseSummaries": [
+          {
+            "phaseId": "phase-task-1788539562348-siefy9-1788539586671-0",
+            "reason": "adjustment",
+            "summary": "环境检查与匿名探测已完成，确认为公开仓库且目标路径可用。现在进入源码获取阶段，执行 git clone 到指定最终目录。",
+            "totalSteps": 2,
+            "statusCounts": {
+              "completed": 2
+            }
+          },
+          {
+            "phaseId": "phase-task-1788539562348-siefy9-1788539621335-1",
+            "reason": "adjustment",
+            "summary": "已完成：项目源码已拉取至 /opt/kaifangqian-base。尚未完成：应用部署与上线验收（包括环境检查、依赖安装、构建、配置、服务启动及健康检查）。需调整计划以进入部署阶段。",
+            "totalSteps": 1,
+            "statusCounts": {
+              "completed": 1
+            }
+          },
+          {
+            "phaseId": "phase-task-1788539562348-siefy9-1788539630495-2",
+            "reason": "adjustment",
+            "summary": "工具 files.get_structure 调用失败：根路径必须是远端绝对目录路径",
+            "totalSteps": 1,
+            "statusCounts": {
+              "failed": 1
+            }
+          }
+        ],
+        "sourceHistoryFingerprint": "24:cf450271",
+        "updatedAt": "2026-09-04T16:33:50.495Z",
+        "throughPhaseId": "phase-task-1788539562348-siefy9-1788539630495-2"
+      },
+      "omittedHistory": {
+        "compactedRounds": 0,
+        "compactedPhases": 3,
+        "compactedSteps": 4,
+        "fingerprint": "24:cf450271"
+      },
+      "instruction": "recentPhases 是最近两个执行阶段的有界详情；historyCheckpoint 是更早历史的结构化滚动摘要。只有 result/evidence 支持的内容属于已验证事实，计划描述和阶段总结不等于执行成功。",
+      "snapshotFingerprint": "9154:22908c6d"
+    },
+    "adjustmentTrigger": {
+      "reason": "工具 files.get_structure 调用失败：根路径必须是远端绝对目录路径"
+    },
+    "metrics": {
+      "cpu": 100,
+      "memory": 73,
+      "disk": 50,
+      "networkIn": 0.00097400765,
+      "networkOut": 0.0010612521,
+      "sampledAt": "2026-09-04T16:34:29.773Z"
+    }
+  },
+  "replacement": [
+    {
+      "id": "ai-step-1788539677-0",
+      "kind": "observe",
+      "title": "获取项目目录结构",
+      "description": "使用文件数据结构获取工具查看 /opt/kaifangqian-base 的目录树，以发现项目的技术栈、构建方式、配置入口和部署线索。这是应用部署发现阶段的第一步。",
+      "command": "opsark-tool files.get_structure {\"rootPath\":\"/opt/kaifangqian-base\",\"maxDepth\":4,\"maxNodes\":600}",
+      "risk": "low",
+      "expected": "获得项目目录的紧凑文本树，能够识别出主要源码目录、配置文件、依赖声明文件和构建脚本。",
+      "validation": "true",
+      "executionScope": "isolated_exec",
+      "runtimeClass": "bounded",
+      "status": "pending"
+    }
+  ]
+}
+任务
+执行计划已批准
+信息
+2026/9/5 00:34:27
+log-1788539667870-q29nnw
+1 个步骤进入执行队列
+模型
+模型调整计划已返回
+警告
+2026/9/5 00:34:27
+log-1788539667869-clpjil
+{
+  "context": {
+    "workflowPhase": "adjust_after_failure",
+    "tools": [
+      {
+        "id": "user.request_input",
+        "name": "用户输入工具",
+        "description": "以结构化表单请求用户补充任务必需信息，每个参数均显示名称、用途、必填状态和输入提示。",
+        "usageInstructions": "仅在完成任务确实缺少用户信息时调用。必须作为当前计划唯一的信息收集步骤，提交后再生成后续计划。每个字段必须提供 label 和 description；敏感值必须使用 password 类型。收集用户名+密码/令牌时，两个字段必须各自提供 credential 对象，使用相同 group/kind/target 和不同 role，不得依赖 label/description 自然语言推断配对。完整凭据组会按服务器长期保存，后续任务应复用 serverCredentialGroups，不得重复索取。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "title": {
+              "type": "string",
+              "description": "表单标题，说明需要用户补充什么信息。"
+            },
+            "description": {
+              "type": "string",
+              "description": "表单整体说明，告知这些信息将用于什么操作。"
+            },
+            "fields": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8,
+              "description": "用户需要填写的参数列表。",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "key": {
+                    "type": "string",
+                    "description": "程序使用的参数名。"
+                  },
+                  "label": {
+                    "type": "string",
+                    "description": "展示给用户的参数名称。"
+                  },
+                  "description": {
+                    "type": "string",
+                    "description": "说明参数是什么、将用于什么操作。"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "text",
+                      "password",
+                      "number"
+                    ]
+                  },
+                  "placeholder": {
+                    "type": "string",
+                    "description": "不包含真实敏感值的输入示例。"
+                  },
+                  "required": {
+                    "type": "boolean",
+                    "description": "该参数是否必填。"
+                  },
+                  "credential": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "用户名/密码或令牌的显式凭据组契约。",
+                    "properties": {
+                      "group": {
+                        "type": "string",
+                        "description": "同一表单内两个凭据字段共用的组标识。"
+                      },
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "git-https",
+                          "ssh-password",
+                          "database",
+                          "service"
+                        ]
+                      },
+                      "role": {
+                        "type": "string",
+                        "enum": [
+                          "username",
+                          "secret"
+                        ]
+                      },
+                      "target": {
+                        "type": "string",
+                        "description": "认证目标主机或服务标识，不包含凭据。"
+                      }
+                    },
+                    "required": [
+                      "group",
+                      "kind",
+                      "role",
+                      "target"
+                    ]
+                  }
+                },
+                "required": [
+                  "key",
+                  "label",
+                  "description",
+                  "type",
+                  "required"
+                ]
+              }
+            }
+          },
+          "required": [
+            "title",
+            "fields"
+          ]
+        },
+        "outputDescription": "返回非敏感字段值与敏感字段占位符；凭据真实值不会写入模型上下文或普通日志。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 3
+      },
+      {
+        "id": "files.get_structure",
+        "name": "文件数据结构获取工具",
+        "description": "只读获取远端指定目录的紧凑文本目录树。",
+        "usageInstructions": "固定格式为 opsark-tool files.get_structure {...}，工具 ID 前不得添加 --。输入绝对路径即可；默认排除版本库、依赖缓存和构建产物，默认最多 4 层、600 个节点。结果截断时应缩小 rootPath 再获取，不要盲目提高上限。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "rootPath": {
+              "type": "string",
+              "description": "远端绝对目录路径"
+            },
+            "excludeDirectories": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "maxDepth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20,
+              "default": 4
+            },
+            "maxNodes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000,
+              "default": 600
+            },
+            "includeHidden": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "rootPath"
+          ]
+        },
+        "outputDescription": "模型仅接收一个稳定排序的 tree 文本字段；截断状态由执行器单独记录，不返回节点对象、文件内容或重复元数据。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 2
+      },
+      {
+        "id": "files.read_content",
+        "name": "文件内容读取工具",
+        "description": "有界、只读地读取远端 UTF-8 文本文件，为项目文档、声明文件和配置分析提供真实证据。",
+        "usageInstructions": "仅在已确认的绝对文件路径上使用。默认最多读取 64 KiB，最大 256 KiB；二进制文件会拒绝读取，敏感值在进入模型上下文前脱敏。目录结构不足以证明技术栈时，应使用本工具读取 README、依赖声明、锁文件或示例配置。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "需要读取的远端文件绝对路径。"
+            },
+            "maxBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 262144,
+              "default": 65536
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "outputDescription": "返回脱敏后的 UTF-8 文本、文件总字节数、返回字节数和截断状态。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 1
+      },
+      {
+        "id": "software.check",
+        "name": "软件可用性检查工具",
+        "description": "在当前任务绑定终端中检查指定软件是否存在，并获取真实可执行路径和版本首行。",
+        "usageInstructions": "一次检查 1 到 20 个由项目证据或用户需求明确指出的软件；不得借此扫描整台服务器或猜测技术栈。该工具只检查，不安装、不升级、不启动服务。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "names": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 20,
+              "items": {
+                "type": "string"
+              },
+              "description": "要检查的精确命令名。"
+            },
+            "includeVersions": {
+              "type": "boolean",
+              "default": true
+            }
+          },
+          "required": [
+            "names"
+          ]
+        },
+        "outputDescription": "返回每个软件的安装状态、命令路径和版本首行。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 1
+      }
+    ],
+    "activeSkills": [
+      {
+        "id": "project-source-acquisition",
+        "name": "项目源码获取",
+        "description": "将公开或私有 Git 仓库获取到指定目录，处理服务器级凭据复用、常见错误和最终仓库验收。",
+        "version": 12,
+        "instructions": "只负责把 Git 项目源码获取到用户指定的最终目录并验证可用；不安装依赖、不构建、不部署。\n根据已有真实证据生成最短的可执行计划；未知条件会改变后续操作时，先检查该条件，下一轮再继续。\n\n阶段状态机（每轮只规划当前证据允许的最小阶段）：\n1. [prepare] 确认获取目标和环境\n   进入条件：尚未确认仓库 URL、最终目录或目标现状\n   执行契约：\n   1. 从用户需求中确定原始仓库 URL、最终绝对目录和可选 ref；已经明确的 URL/路径直接写入步骤说明，不要为它单独生成 printf/echo 命令步骤\n   2. 用 kind=observe 的只读步骤检查 Git 可用性、目标父目录可写性和最终目录是否已存在；主命令结果就是证据，不再生成重复 validation\n   3. 已有目录不得自动删除或覆盖；如果是同源仓库，仅在用户要求更新时进入更新流程\n   退出证据：\n   1. 仓库 URL 与最终目录\n   2. Git 和写入条件\n   3. 目标目录状态\n\n2. [authenticate] 选择仓库认证方式\n   进入条件：仓库需要认证或认证状态尚未明确\n   执行契约：\n   1. HTTPS 认证状态未知时，本轮只能生成 kind=observe 的有界匿名探测：使用原始 URL、设置 GIT_TERMINAL_PROMPT=0，并执行 git ls-remote；不得在同一轮生成 clone、凭据收集或其他依赖探测结果的步骤\n   2. 只有匿名探测的真实结构化结果明确证明需要认证后，才优先复用当前服务器中 target 匹配的完整 Git HTTPS 凭据组；步骤必须用 server-credential 引用或敏感变量占位符显式表达认证要求，不得靠 description/expected 中的自然语言暗示认证\n   3. 有多个匹配账号时请用户选择；没有匹配组时才同表单收集用户名和密码或令牌\n   4. 凭据只由执行器通过前台 PTY 回答 Git 的 Use\n…[已压缩，原始 2941 字符，指纹 2941:2bc211e2]…\nd\",\"required\":true,\"credential\":{\"group\":\"git_https_repository\",\"kind\":\"git-https\",\"role\":\"secret\",\"target\":\"REPOSITORY_HOST\"}}]}；将 REPOSITORY_HOST 替换为仓库 URL 的精确主机，提交后使用工具返回的凭据引用\n   - [rejected] 远端明确拒绝已选凭据：停止重试同一凭据，请用户更新该组或选择另一组\n   - [ssh] 原始 URL 为 SSH：使用已有 SSH Agent 或受信公钥；缺少公钥认证时报告配置需求\n\n3. [acquire] 获取源码到最终目录\n   进入条件：目标路径可用，且仓库访问方式已确定\n   执行契约：\n   1. 用 kind=change 在可见 PTY 中前台执行 Git 获取命令并等待真实退出；使用用户要求的 ref、depth、submodule 或 LFS 选项\n   2. 新仓库应在本步成功时位于用户指定的最终目录；可直接获取到最终目录，也可使用不泄漏中间状态的安全等价实现\n   退出证据：\n   1. Git 命令真实退出码\n   2. 最终源码目录\n\n4. [verify] 验收最终仓库\n   进入条件：Git 获取命令已成功退出\n   执行契约：\n   1. 仅从最终绝对目录检查它是 Git 工作树、origin 与原始 URL 一致、HEAD 存在，并在用户指定 ref 时校验该 ref\n   2. 获取变更步骤的 validation 直接使用上述最终目录检查；如果验收被单独规划为 kind=observe，则直接使用该主命令结果，不再生成第二条校验\n   退出证据：\n   1. 工作树、origin、HEAD 和请求 ref 的真实结果\n\n5. [handle-error] 按真实错误恢复或停止\n   进入条件：任一检查、认证、获取或验收步骤失败\n   执行契约：\n   1. 需要认证时进入凭据选择；远端明确拒绝凭据时停止并请用户更新或更换账号，不重复尝试同一凭据\n   2. 目标路径已存在时保留原内容并报告冲突；网络、DNS 或 TLS 失败时报告原始错误，只对明确的短暂错误做有限重试\n   3. Git 命令或最终验收失败时不宣告完成；仅清理本任务明确创建的临时内容，然后基于新证据生成一次针对性调整\n   退出证据：\n   1. 可操作的错误分类，或明确的完成验收结果\n\n全局硬约束：\n   1. 保留用户的原始仓库 URL 和协议，不在 URL、命令、环境变量或文件中写入用户名、密码、令牌或敏感占位符。\n   2. Git HTTPS 凭据只从当前服务器的 serverCredentialGroups 选择或通过 user.request_input 收集；不使用 server.resolve_connection 或 server.connect。\n   3. 不覆盖或删除用户已有目录，不把临时目录当作最终结果，不把真实失败改写为成功。",
+        "allowedToolIds": [
+          "user.request_input"
+        ],
+        "forbiddenToolIds": [
+          "server.resolve_connection",
+          "server.connect"
+        ]
+      },
+      {
+        "id": "application-deployment",
+        "name": "应用部署与上线验收",
+        "description": "将已有项目部署、启动或上线，并完成端到端验收。",
+        "version": 4,
+        "instructions": "这是面向整体目标的应用部署流程，必须与 project-source-acquisition、software-installation、project-build 等已选 Skill 联合复用证据，不能把某个中间阶段当作部署完成：\n1. 发现阶段先用 files.get_structure 对项目目录做有界检查；随后按实际结构逐个用 files.read_content 读取 README、依赖声明、锁文件、示例配置、迁移/初始化脚本、容器编排文件、服务入口或 CI 配置。目录名、文件名或 server.basic_info 只能证明候选事实，不能证明项目一定需要 PHP、Node、Java、数据库、缓存、Nginx、Composer 或 Docker。每个 standalone 工具单独成轮，阶段证据必须在后续轮复用。\n2. 将整体目标拆为有证据依赖关系的阶段：源码就位、运行环境、项目依赖/构建、运行配置与敏感变量、数据库/缓存等外部依赖、进程或容器托管、反向代理/防火墙（仅在项目与用户授权要求时）、启动、端到端验收。每轮只规划当前证据允许的步骤，但后续规划必须继续围绕 taskGoal.rootGoal，不得被“继续部署”“重试”替换。\n3. 项目源码、工具版本、依赖安装和构建已由历史结构化证据确认时必须直接复用，不得重复 clone、重复安装或重复构建。调整计划被替换时，之前阶段仍属于同一整体任务，不能从上下文丢失。\n4. 项目证据明确所需软件后，先用 software.check 精准检查这些命令的路径与版本，再决定是否联合 software-installation。不得先启用 EPEL、CRB 或第三方仓库；只有软件确实缺失、项目证据要求且当前系统仓库无法提供时，才规划仓库或镜像调整并独立验证。\n5. 配置文件优先从项目示例最小化生成并保留无关内容；敏感值必须使用业务唯一的 key，例如 OFFICE_DATABASE_PASSWORD、PRODUCTION_REDIS_PASSWORD 或 TARGET_SSH_PASSWORD，禁止新建含义不明的 PASSWORD。现有变量元数据不能证明用途完全一致时，必须用 user.request_input 单独收集，并说明参数名称、用途、目标服务和提交后解锁的步骤；敏感值不得交给模型、写入日志或显示在命令中。\n6. 任何数据库初始化、迁移、覆盖配置、开启服务、开放端口或替换线上版本都要遵守用户权限与风险审批；已有数据和配置先做只读识别，需要改动时建立可恢复备份。不得为了“能启动”关闭 TLS、认证、安全策略或清空数据。\n7. 下载、依赖安装、构建、迁移与启动必须等待真实退出；安装 Composer/npm 包、镜像拉取或编译完成前不得提前验证。长驻应用使用项目证据支持的 systemd、容器编排或其他受管机制，不得用裸后台进程伪装部署成功。\n8. 部署完成门禁必须同时具备：所需配置与依赖就绪、目标进程/容器真实健康、监听地址/端口符合预期、从正确入口进行的 HTTP/TCP/项目自带健康检查成功，以及必要数据库/缓存连接可用。仅源码存在、依赖安装成功、进程已启动、端口监听或命令 exit 0 都只是阶段成功，不得总结为整体部署完成。\n9. 每个 Shell validation 都必须在独立 Shell 中重新读取同一目标的真实状态。command 若动态解析主机、端口、数据库名或用户，validation 也必须重新解析，不能硬编码未经证据确认的值；不得用 true、无条件 echo、忽略退出码的分支或依赖主命令 stdout 的裸 grep 验收。opsark-tool 步骤由严格 schema 与结构化结果承担证据，validation 固定为 true。\n10. 若当前轮只完成中间阶段，结果必须明确“整体部署尚未完成”、列出已完成证据和剩余阶段，并自动进入可恢复的待继续状态；调整计划和托管审批不得清除已完成阶段证据。最终总结必须回到最初的部署目标，而不是总结最后一句“重试”。",
+        "allowedToolIds": [
+          "files.get_structure",
+          "files.read_content",
+          "software.check",
+          "user.request_input"
+        ],
+        "forbiddenToolIds": []
+      }
+    ],
+    "instruction": "只根据 baseSnapshot、adjustmentTrigger 和尚未完成目标生成最少必要步骤。recentPhases 是最近两个阶段，historyCheckpoint 是更早历史的滚动摘要；不得要求重复其中已经完成的工作。计划描述和阶段总结不是成功证据，只有结构化 result/evidence 才能证明状态。失败方法必须有实质变化后才能重试。每步在独立非交互 Shell 中建立自身环境，并以 activeSkills 要求的独立验收结束。",
+    "server": {
+      "name": "192.168.1.242",
+      "host": "192.168.1.242",
+      "info": {
+        "os": "CentOS Stream 10 (Coughlan)",
+        "kernel": "Linux 6.12.0-213.el10.x86_64 x86_64",
+        "cpu": "远程服务器 CPU",
+        "cores": 1,
+        "memoryGb": 1,
+        "diskGb": 16,
+        "uptime": "5 days, 10 hours, 17 minutes"
+      },
+      "environment": []
+    },
+    "secretVariables": [],
+    "serverCredentialGroups": [],
+    "baseSnapshot": {
+      "version": 1,
+      "task": {
+        "title": "拉取并部署项目https://gitee.c",
+        "status": "validating",
+        "permission": "managed",
+        "relation": "new_goal"
+      },
+      "executionConstraints": {
+        "changePolicy": "requested_changes_only",
+        "environmentPolicy": "unspecified",
+        "failurePolicy": "unspecified",
+        "prohibitedActions": [],
+        "requiredConditions": [],
+        "userDirectives": []
+      },
+      "progress": {
+        "totalSteps": 6,
+        "statusCounts": {
+          "completed": 5,
+          "failed": 1
+        },
+        "totalRounds": 0,
+        "archivedPhases": 4,
+        "adjustmentCount": 1
+      },
+      "currentPlan": {
+        "totalSteps": 1,
+        "statusCounts": {
+          "completed": 1
+        },
+        "includedSteps": 1,
+        "incidentIncludedSeparately": false,
+        "omittedSteps": 0,
+        "steps": [
+          {
+            "stepId": "ai-step-1788539637-0",
+            "title": "验证目标目录存在性",
+            "action": "使用 ls -ld 确认 /opt/kaifangqian-base 是一个存在的目录，排除因路径错误导致后续工具调用失败的可能。",
+            "expected": "输出显示 /opt/kaifangqian-base 是一个目录（drwx...），退出码为 0。",
+            "risk": "low",
+            "status": "completed",
+            "commandFingerprint": "28:7ba4273a",
+            "result": {
+              "executionStatus": "success",
+              "observationStatus": "matched",
+              "exitCode": 0,
+              "facts": {
+                "found": true,
+                "lineCount": 1,
+                "mainObservationStatus": "matched",
+                "verificationMode": "command_result",
+                "validatorType": "file",
+                "evidenceConflict": false,
+                "blockingSignal": false
+              },
+              "warnings": []
+            },
+            "output": {
+              "totalCharacters": 72,
+              "fingerprint": "72:40c25eb6"
+            },
+            "executionScope": "isolated_exec",
+            "evidence": {
+              "totalItems": 1,
+              "omittedItems": 0,
+              "items": [
+                {
+                  "type": "file",
+                  "source": "main",
+                  "facts": {
+                    "found": true,
+                    "lineCount": 1
+                  },
+                  "scope": {
+                    "targetId": "srv-1788539453694-hxzphx",
+                    "sessionId": "agent-session-1",
+                    "generation": 1,
+                    "shell": "bash",
+                    "scope": "isolated_exec",
+                    "persistence": "command",
+                    "doesNotProve": [
+                      "agent_session_state",
+                      "user_shell_loaded",
+                      "new_shell_auto_load"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "recentPhases": [
+        {
+          "phaseId": "phase-task-1788539562348-siefy9-1788539630495-2",
+          "reason": "adjustment",
+          "summary": "工具 files.get_structure 调用失败：根路径必须是远端绝对目录路径",
+          "requirement": "拉取并部署项目https://gitee.com/kaifangqian/kaifangqian-base.git到/opt下",
+          "planSummary": {
+            "totalSteps": 1,
+            "statusCounts": {
+              "failed": 1
+            },
+            "includedSteps": 1,
+            "omittedSteps": 0
+          },
+          "steps": [
+            {
+              "stepId": "ai-step-1788539621-0",
+              "title": "获取项目目录结构",
+              "action": "使用文件数据结构获取工具查看 /opt/kaifangqian-base 的目录树，以发现项目的技术栈、构建方式、配置入口和部署线索。这是应用部署发现阶段的第一步。",
+              "expected": "获得项目目录的紧凑文本树，能够识别出主要源码目录、配置文件、依赖声明文件和构建脚本。",
+              "risk": "low",
+              "status": "failed",
+              "command": "opsark-tool files.get_structure {\"rootPath\":\"/opt/kaifangqian-base\",\"maxDepth\":4,\"maxNodes\":600}",
+              "commandFingerprint": "96:12d16677",
+              "result": {
+                "executionStatus": "failed",
+                "observationStatus": "unknown",
+                "facts": {
+                  "toolId": "files.get_structure",
+                  "errorCode": "TOOL_EXECUTION_FAILED"
+                },
+                "warnings": [],
+                "failureReason": "根路径必须是远端绝对目录路径"
+              },
+              "output": {
+                "totalCharacters": 14,
+                "omittedCharacters": 0,
+                "fingerprint": "14:18baa641",
+                "content": "根路径必须是远端绝对目录路径"
+              },
+              "executionScope": "isolated_exec"
+            }
+          ],
+          "completedAt": "2026-09-04T16:33:50.495Z"
+        },
+        {
+          "phaseId": "phase-task-1788539562348-siefy9-1788539642883-3",
+          "reason": "adjustment",
+          "summary": "已完成：Git 环境检查、匿名访问探测、源码克隆至 /opt/kaifangqian-base。当前处于部署发现阶段，需先验证目录状态，再获取项目结构以确定后续构建与部署步骤。",
+          "requirement": "拉取并部署项目https://gitee.com/kaifangqian/kaifangqian-base.git到/opt下",
+          "planSummary": {
+            "totalSteps": 1,
+            "statusCounts": {
+              "completed": 1
+            },
+            "includedSteps": 1,
+            "omittedSteps": 0
+          },
+          "steps": [
+            {
+              "stepId": "ai-step-1788539630-0",
+              "title": "确认目标目录存在性",
+              "action": "在调用 files.get_structure 前，先通过只读命令确认 /opt/kaifangqian-base 是否真实存在且为目录，以排除因路径不存在导致工具报错的原因。",
+              "expected": "输出 EXISTS 或 NOT_FOUND，明确目录状态。",
+              "risk": "low",
+              "status": "completed",
+              "commandFingerprint": "68:b640e11b",
+              "result": {
+                "executionStatus": "success",
+                "observationStatus": "matched",
+                "exitCode": 0,
+                "facts": {
+                  "found": true,
+                  "lineCount": 1,
+                  "mainObservationStatus": "matched",
+                  "verificationMode": "command_result",
+                  "validatorType": "file",
+                  "evidenceConflict": false,
+                  "blockingSignal": false
+                },
+                "warnings": []
+              },
+              "output": {
+                "totalCharacters": 16,
+                "fingerprint": "16:f082eaff"
+              },
+              "executionScope": "isolated_exec",
+              "evidence": {
+                "totalItems": 1,
+                "omittedItems": 0,
+                "items": [
+                  {
+                    "type": "file",
+                    "source": "main",
+                    "facts": {
+                      "found": true,
+                      "lineCount": 1
+                    },
+                    "scope": {
+                      "targetId": "srv-1788539453694-hxzphx",
+                      "sessionId": "agent-session-1",
+                      "generation": 1,
+                      "shell": "bash",
+                      "scope": "isolated_exec",
+                      "persistence": "command",
+                      "doesNotProve": [
+                        "agent_session_state",
+                        "user_shell_loaded",
+                        "new_shell_auto_load"
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "completedAt": "2026-09-04T16:34:02.883Z"
+        }
+      ],
+      "historyCheckpoint": {
+        "version": 1,
+        "sourceRoundCount": 0,
+        "sourcePhaseCount": 2,
+        "sourceStepCount": 3,
+        "statusCounts": {
+          "completed": 3
+        },
+        "verifiedFacts": [
+          {
+            "stepId": "ai-step-1788539568-0",
+            "title": "检查 Git 可用性、目标目录状态与写入条件",
+            "result": {
+              "executionStatus": "success",
+              "observationStatus": "matched",
+              "exitCode": 0,
+              "facts": {
+                "found": true,
+                "lineCount": 4,
+                "mainObservationStatus": "matched",
+                "verificationMode": "command_result",
+                "validatorType": "file",
+                "evidenceConflict": false,
+                "blockingSignal": false
+              },
+              "warnings": []
+            },
+            "evidence": {
+              "totalItems": 1,
+              "omittedItems": 0,
+              "items": [
+                {
+                  "type": "file",
+                  "source": "main",
+                  "facts": {
+                    "found": true,
+                    "lineCount": 4
+                  },
+                  "scope": {
+                    "targetId": "srv-1788539453694-hxzphx",
+                    "sessionId": "agent-session-1",
+                    "generation": 1,
+                    "shell": "bash",
+                    "scope": "isolated_exec",
+                    "persistence": "command",
+                    "doesNotProve": [
+                      "agent_session_state",
+                      "user_shell_loaded",
+                      "new_shell_auto_load"
+                    ]
+                  }
+                }
+              ]
+            },
+            "scopes": [
+              {
+                "targetId": "srv-1788539453694-hxzphx",
+                "sessionId": "agent-session-1",
+                "generation": 1,
+                "shell": "bash",
+                "scope": "isolated_exec",
+                "persistence": "command",
+                "doesNotProve": [
+                  "agent_session_state",
+                  "user_shell_loaded",
+                  "new_shell_auto_load"
+                ]
+              }
+            ]
+          },
+          {
+            "stepId": "ai-step-1788539573-0",
+            "title": "匿名探测仓库访问权限",
+            "result": {
+              "executionStatus": "success",
+              "observationStatus": "matched",
+              "exitCode": 0,
+              "facts": {
+                "lineCount": 2,
+                "outputPresent": true,
+                "mainObservationStatus": "matched",
+                "verificationMode": "command_result",
+                "validatorType": "command",
+                "evidenceConflict": false,
+                "blockingSignal": false
+              },
+              "warnings": []
+            },
+            "evidence": {
+              "totalItems": 1,
+              "omittedItems": 0,
+              "items": [
+                {
+                  "type": "command",
+                  "source": "main",
+                  "facts": {
+                    "lineCount": 2,
+                    "outputPresent": true
+                  },
+                  "scope": {
+                    "targetId": "srv-1788539453694-hxzphx",
+                    "sessionId": "agent-session-1",
+                    "generation": 1,
+                    "shell": "bash",
+                    "scope": "isolated_exec",
+                    "persistence": "command",
+                    "doesNotProve": [
+                      "agent_session_state",
+                      "user_shell_loaded",
+                      "new_shell_auto_load"
+                    ]
+                  }
+                }
+              ]
+            },
+            "scopes": [
+              {
+                "targetId": "srv-1788539453694-hxzphx",
+                "sessionId": "agent-session-1",
+                "generation": 1,
+                "shell": "bash",
+                "scope": "isolated_exec",
+                "persistence": "command",
+                "doesNotProve": [
+                  "agent_session_state",
+                  "user_shell_loaded",
+                  "new_shell_auto_load"
+                ]
+              }
+            ]
+          },
+          {
+            "stepId": "ai-step-1788539581-0",
+            "title": "克隆项目源码到 /opt/kaifangqian-base",
+            "result": {
+              "executionStatus": "success",
+              "observationStatus": "matched",
+              "exitCode": 0,
+              "facts": {
+                "found": true,
+                "lineCount": 3,
+                "mainObservationStatus": "matched",
+                "verificationMode": "postcondition",
+                "validationObservationStatus": "matched",
+                "validatorType": "file",
+                "validationPassed": true,
+                "evidenceConflict": false,
+                "blockingSignal": false
+              },
+              "warnings": []
+            },
+            "evidence": {
+              "totalItems": 2,
+              "omittedItems": 0,
+              "items": [
+                {
+                  "type": "file",
+                  "source": "main",
+                  "facts": {
+                    "found": true,
+                    "lineCount": 3
+                  },
+                  "scope": {
+                    "targetId": "srv-1788539453694-hxzphx",
+                    "sessionId": "agent-session-1",
+                    "generation": 1,
+                    "shell": "bash",
+                    "scope": "isolated_exec",
+                    "persistence": "command",
+                    "doesNotProve": [
+                      "agent_session_state",
+                      "user_shell_loaded",
+                      "new_shell_auto_load"
+                    ]
+                  }
+                },
+                {
+                  "type": "file",
+                  "source": "validation",
+                  "facts": {
+                    "passed": true,
+                    "exitCode": 0,
+                    "acceptedDiagnosticState": false,
+                    "detail": "后置校验通过",
+                    "observationStatus": "matched",
+                    "observationFacts": {
+                      "found": false,
+                      "lineCount": 0
+                    }
+                  },
+                  "scope": {
+                    "targetId": "srv-1788539453694-hxzphx",
+                    "sessionId": "agent-session-1",
+                    "generation": 1,
+                    "shell": "bash",
+                    "scope": "isolated_exec",
+                    "persistence": "command",
+                    "doesNotProve": [
+                      "agent_session_state",
+                      "user_shell_loaded",
+                      "new_shell_auto_load"
+                    ]
+                  }
+                }
+              ]
+            },
+            "scopes": [
+              {
+                "targetId": "srv-1788539453694-hxzphx",
+                "sessionId": "agent-session-1",
+                "generation": 1,
+                "shell": "bash",
+                "scope": "isolated_exec",
+                "persistence": "command",
+                "doesNotProve": [
+                  "agent_session_state",
+                  "user_shell_loaded",
+                  "new_shell_auto_load"
+                ]
+              },
+              {
+                "targetId": "srv-1788539453694-hxzphx",
+                "sessionId": "agent-session-1",
+                "generation": 1,
+                "shell": "bash",
+                "scope": "isolated_exec",
+                "persistence": "command",
+                "doesNotProve": [
+                  "agent_session_state",
+                  "user_shell_loaded",
+                  "new_shell_auto_load"
+                ]
+              }
+            ]
+          }
+        ],
+        "unresolvedIssues": [],
+        "phaseSummaries": [
+          {
+            "phaseId": "phase-task-1788539562348-siefy9-1788539586671-0",
+            "reason": "adjustment",
+            "summary": "环境检查与匿名探测已完成，确认为公开仓库且目标路径可用。现在进入源码获取阶段，执行 git clone 到指定最终目录。",
+            "totalSteps": 2,
+            "statusCounts": {
+              "completed": 2
+            }
+          },
+          {
+            "phaseId": "phase-task-1788539562348-siefy9-1788539621335-1",
+            "reason": "adjustment",
+            "summary": "已完成：项目源码已拉取至 /opt/kaifangqian-base。尚未完成：应用部署与上线验收（包括环境检查、依赖安装、构建、配置、服务启动及健康检查）。需调整计划以进入部署阶段。",
+            "totalSteps": 1,
+            "statusCounts": {
+              "completed": 1
+            }
+          }
+        ],
+        "sourceHistoryFingerprint": "24:02b42de0",
+        "updatedAt": "2026-09-04T16:33:41.335Z",
+        "throughPhaseId": "phase-task-1788539562348-siefy9-1788539621335-1"
+      },
+      "omittedHistory": {
+        "compactedRounds": 0,
+        "compactedPhases": 2,
+        "compactedSteps": 3,
+        "fingerprint": "24:02b42de0"
+      },
+      "instruction": "recentPhases 是最近两个执行阶段的有界详情；historyCheckpoint 是更早历史的结构化滚动摘要。只有 result/evidence 支持的内容属于已验证事实，计划描述和阶段总结不等于执行成功。",
+      "snapshotFingerprint": "8663:5fbf780d"
+    },
+    "adjustmentTrigger": {
+      "reason": "已完成：Git 环境检查、匿名访问探测、源码克隆至 /opt/kaifangqian-base。尚未完成：应用部署与上线验收（包括获取项目结构以确定技术栈、运行环境准备、依赖安装、构建、配置、服务启动及端到端健康检查）。需调整计划以进入部署发现阶段，优先通过只读命令或修正后的工具调用获取项目目录结构。",
+      "reviewDecision": {
+        "decision": "adjust",
+        "reason": "整体目标包含“拉取”与“部署”两部分。当前证据仅确认源码已成功克隆至 /opt/kaifangqian-base，但尚未完成应用部署所需的依赖安装、构建、配置、服务启动及健康检查等关键步骤。files.get_structure 调用失败导致无法获取项目结构以规划后续部署路径，且缺少任何关于服务已启动或健康的验收证据。",
+        "summary": "已完成：Git 环境检查、匿名访问探测、源码克隆至 /opt/kaifangqian-base。尚未完成：应用部署与上线验收（包括获取项目结构以确定技术栈、运行环境准备、依赖安装、构建、配置、服务启动及端到端健康检查）。需调整计划以进入部署发现阶段，优先通过只读命令或修正后的工具调用获取项目目录结构。",
+        "source": "model"
+      }
+    },
+    "metrics": {
+      "cpu": 9,
+      "memory": 73,
+      "disk": 50,
+      "networkIn": 0.00087451754,
+      "networkOut": 0.0004972878,
+      "sampledAt": "2026-09-04T16:34:19.782Z"
+    }
+  },
+  "replacement": [
+    {
+      "id": "ai-step-1788539667-0",
+      "kind": "observe",
+      "title": "获取项目目录结构",
+      "description": "使用文件数据结构获取工具查看 /opt/kaifangqian-base 的目录树，以发现项目的技术栈、构建方式、配置入口和部署线索。这是应用部署发现阶段的第一步。",
+      "command": "opsark-tool files.get_structure {\"rootPath\":\"/opt/kaifangqian-base\",\"maxDepth\":4,\"maxNodes\":600}",
+      "risk": "low",
+      "expected": "获得项目目录的紧凑文本树，能够识别出主要源码目录、配置文件、依赖声明文件和构建脚本。",
+      "validation": "true",
+      "executionScope": "isolated_exec",
+      "runtimeClass": "bounded",
+      "status": "pending"
+    }
+  ]
+}
+模型
+当前阶段结束但整体目标尚未完成
+警告
+2026/9/5 00:34:18
+log-1788539658445-mbq1rw
+{
+  "rootGoal": "拉取并部署项目https://gitee.com/kaifangqian/kaifangqian-base.git到/opt下",
+  "decision": {
+    "decision": "adjust",
+    "reason": "整体目标包含“拉取”与“部署”两部分。当前证据仅确认源码已成功克隆至 /opt/kaifangqian-base，但尚未完成应用部署所需的依赖安装、构建、配置、服务启动及健康检查等关键步骤。files.get_structure 调用失败导致无法获取项目结构以规划后续部署路径，且缺少任何关于服务已启动或健康的验收证据。",
+    "summary": "已完成：Git 环境检查、匿名访问探测、源码克隆至 /opt/kaifangqian-base。尚未完成：应用部署与上线验收（包括获取项目结构以确定技术栈、运行环境准备、依赖安装、构建、配置、服务启动及端到端健康检查）。需调整计划以进入部署发现阶段，优先通过只读命令或修正后的工具调用获取项目目录结构。",
+    "source": "model"
+  },
+  "combinedFallback": "ModelInvocationError: 第 1 个模型工具步骤的 validation 必须固定为 JSON 字符串 \"true\""
+}
+系统
+验证目标目录存在性 · 确定性规则复核
+信息
+2026/9/5 00:34:03
+log-1788539643159-etv9s9
+{
+  "result": {
+    "executionStatus": "success",
+    "observationStatus": "matched",
+    "exitCode": 0,
+    "facts": {
+      "found": true,
+      "lineCount": 1,
+      "mainObservationStatus": "matched",
+      "verificationMode": "command_result",
+      "validatorType": "file",
+      "evidenceConflict": false,
+      "blockingSignal": false
+    },
+    "warnings": [],
+    "evidenceIds": [
+      "evidence-main-1788539643157-fwlayo"
+    ]
+  },
+  "modelReviewSkipped": true
+}
+命令
+验证目标目录存在性 · 观察证据
+成功
+2026/9/5 00:34:03
+log-1788539643157-zx9774
+{
+  "validator": {
+    "type": "file",
+    "command": "",
+    "validStates": [
+      "matched",
+      "not_found",
+      "unknown"
+    ]
+  },
+  "result": {
+    "executionStatus": "success",
+    "observationStatus": "matched",
+    "exitCode": 0,
+    "facts": {
+      "found": true,
+      "lineCount": 1,
+      "mainObservationStatus": "matched",
+      "verificationMode": "command_result",
+      "validatorType": "file",
+      "evidenceConflict": false,
+      "blockingSignal": false
+    },
+    "warnings": [],
+    "evidenceIds": [
+      "evidence-main-1788539643157-fwlayo"
+    ]
+  },
+  "validationCommand": "",
+  "validationOutput": ""
+}
+命令
+验证目标目录存在性
+成功
+2026/9/5 00:34:03
+log-1788539643156-h3xan3
+执行内容
+ls -ld /opt/kaifangqian-base
+完整返回内容
+drwxr-xr-x. 7 root root 142  9月 5日 00:33 /opt/kaifangqian-base
+[exit: 0]
+任务
+执行计划已批准
+信息
+2026/9/5 00:34:02
+log-1788539642883-mio9qg
+1 个步骤进入执行队列
+模型
+已复用联合决策中的下一阶段计划
+警告
+2026/9/5 00:34:02
+log-1788539642883-vkhlce
+{
+  "context": {
+    "workflowPhase": "cached_combined_next_stage",
+    "snapshotFingerprint": "7332:77bffd1e",
+    "policyFingerprint": "4526:5a93bc51"
+  },
+  "replacement": [
+    {
+      "id": "ai-step-1788539637-0",
+      "kind": "observe",
+      "title": "验证目标目录存在性",
+      "description": "使用 ls -ld 确认 /opt/kaifangqian-base 是一个存在的目录，排除因路径错误导致后续工具调用失败的可能。",
+      "command": "ls -ld /opt/kaifangqian-base",
+      "risk": "low",
+      "expected": "输出显示 /opt/kaifangqian-base 是一个目录（drwx...），退出码为 0。",
+      "validation": "",
+      "executionScope": "isolated_exec",
+      "runtimeClass": "bounded",
+      "status": "pending"
+    }
+  ]
+}
+模型
+当前阶段结束但整体目标尚未完成
+警告
+2026/9/5 00:33:57
+log-1788539637861-8sc4if
+{
+  "rootGoal": "拉取并部署项目https://gitee.com/kaifangqian/kaifangqian-base.git到/opt下",
+  "decision": {
+    "decision": "continue",
+    "reason": "源码已成功拉取到 /opt/kaifangqian-base，但应用部署阶段尚未开始。上一轮获取目录结构的工具调用失败，现在需要先通过只读命令确认目标目录存在且为有效目录，随后重新尝试获取项目结构以发现技术栈和部署线索。",
+    "summary": "已完成：Git 环境检查、匿名访问探测、源码克隆至 /opt/kaifangqian-base。当前处于部署发现阶段，需先验证目录状态，再获取项目结构以确定后续构建与部署步骤。",
+    "steps": [
+      {
+        "id": "ai-step-1788539637-0",
+        "kind": "observe",
+        "title": "验证目标目录存在性",
+        "description": "使用 ls -ld 确认 /opt/kaifangqian-base 是一个存在的目录，排除因路径错误导致后续工具调用失败的可能。",
+        "command": "ls -ld /opt/kaifangqian-base",
+        "risk": "low",
+        "expected": "输出显示 /opt/kaifangqian-base 是一个目录（drwx...），退出码为 0。",
+        "validation": "",
+        "executionScope": "isolated_exec",
+        "runtimeClass": "bounded",
+        "status": "pending"
+      }
+    ],
+    "source": "model"
+  }
+}
+系统
+确认目标目录存在性 · 确定性规则复核
+信息
+2026/9/5 00:33:50
+log-1788539630797-ydb4eg
+{
+  "result": {
+    "executionStatus": "success",
+    "observationStatus": "matched",
+    "exitCode": 0,
+    "facts": {
+      "found": true,
+      "lineCount": 1,
+      "mainObservationStatus": "matched",
+      "verificationMode": "command_result",
+      "validatorType": "file",
+      "evidenceConflict": false,
+      "blockingSignal": false
+    },
+    "warnings": [],
+    "evidenceIds": [
+      "evidence-main-1788539630796-c3o8wl"
+    ]
+  },
+  "modelReviewSkipped": true
+}
+命令
+确认目标目录存在性 · 观察证据
+成功
+2026/9/5 00:33:50
+log-1788539630796-nd1z8o
+{
+  "validator": {
+    "type": "file",
+    "command": "",
+    "validStates": [
+      "matched",
+      "not_found",
+      "unknown"
+    ]
+  },
+  "result": {
+    "executionStatus": "success",
+    "observationStatus": "matched",
+    "exitCode": 0,
+    "facts": {
+      "found": true,
+      "lineCount": 1,
+      "mainObservationStatus": "matched",
+      "verificationMode": "command_result",
+      "validatorType": "file",
+      "evidenceConflict": false,
+      "blockingSignal": false
+    },
+    "warnings": [],
+    "evidenceIds": [
+      "evidence-main-1788539630796-c3o8wl"
+    ]
+  },
+  "validationCommand": "",
+  "validationOutput": ""
+}
+命令
+确认目标目录存在性
+成功
+2026/9/5 00:33:50
+log-1788539630795-owdcx5
+执行内容
+test -d "/opt/kaifangqian-base" && echo "EXISTS" || echo "NOT_FOUND"
+完整返回内容
+EXISTS
+[exit: 0]
+任务
+执行计划已批准
+信息
+2026/9/5 00:33:50
+log-1788539630496-iss7w2
+1 个步骤进入执行队列
+模型
+模型调整计划已返回
+警告
+2026/9/5 00:33:50
+log-1788539630496-0uf1hp
+{
+  "context": {
+    "workflowPhase": "adjust_after_failure",
+    "tools": [
+      {
+        "id": "user.request_input",
+        "name": "用户输入工具",
+        "description": "以结构化表单请求用户补充任务必需信息，每个参数均显示名称、用途、必填状态和输入提示。",
+        "usageInstructions": "仅在完成任务确实缺少用户信息时调用。必须作为当前计划唯一的信息收集步骤，提交后再生成后续计划。每个字段必须提供 label 和 description；敏感值必须使用 password 类型。收集用户名+密码/令牌时，两个字段必须各自提供 credential 对象，使用相同 group/kind/target 和不同 role，不得依赖 label/description 自然语言推断配对。完整凭据组会按服务器长期保存，后续任务应复用 serverCredentialGroups，不得重复索取。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "title": {
+              "type": "string",
+              "description": "表单标题，说明需要用户补充什么信息。"
+            },
+            "description": {
+              "type": "string",
+              "description": "表单整体说明，告知这些信息将用于什么操作。"
+            },
+            "fields": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8,
+              "description": "用户需要填写的参数列表。",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "key": {
+                    "type": "string",
+                    "description": "程序使用的参数名。"
+                  },
+                  "label": {
+                    "type": "string",
+                    "description": "展示给用户的参数名称。"
+                  },
+                  "description": {
+                    "type": "string",
+                    "description": "说明参数是什么、将用于什么操作。"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "text",
+                      "password",
+                      "number"
+                    ]
+                  },
+                  "placeholder": {
+                    "type": "string",
+                    "description": "不包含真实敏感值的输入示例。"
+                  },
+                  "required": {
+                    "type": "boolean",
+                    "description": "该参数是否必填。"
+                  },
+                  "credential": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "用户名/密码或令牌的显式凭据组契约。",
+                    "properties": {
+                      "group": {
+                        "type": "string",
+                        "description": "同一表单内两个凭据字段共用的组标识。"
+                      },
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "git-https",
+                          "ssh-password",
+                          "database",
+                          "service"
+                        ]
+                      },
+                      "role": {
+                        "type": "string",
+                        "enum": [
+                          "username",
+                          "secret"
+                        ]
+                      },
+                      "target": {
+                        "type": "string",
+                        "description": "认证目标主机或服务标识，不包含凭据。"
+                      }
+                    },
+                    "required": [
+                      "group",
+                      "kind",
+                      "role",
+                      "target"
+                    ]
+                  }
+                },
+                "required": [
+                  "key",
+                  "label",
+                  "description",
+                  "type",
+                  "required"
+                ]
+              }
+            }
+          },
+          "required": [
+            "title",
+            "fields"
+          ]
+        },
+        "outputDescription": "返回非敏感字段值与敏感字段占位符；凭据真实值不会写入模型上下文或普通日志。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 3
+      },
+      {
+        "id": "files.get_structure",
+        "name": "文件数据结构获取工具",
+        "description": "只读获取远端指定目录的紧凑文本目录树。",
+        "usageInstructions": "固定格式为 opsark-tool files.get_structure {...}，工具 ID 前不得添加 --。输入绝对路径即可；默认排除版本库、依赖缓存和构建产物，默认最多 4 层、600 个节点。结果截断时应缩小 rootPath 再获取，不要盲目提高上限。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "rootPath": {
+              "type": "string",
+              "description": "远端绝对目录路径"
+            },
+            "excludeDirectories": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "maxDepth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20,
+              "default": 4
+            },
+            "maxNodes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000,
+              "default": 600
+            },
+            "includeHidden": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "rootPath"
+          ]
+        },
+        "outputDescription": "模型仅接收一个稳定排序的 tree 文本字段；截断状态由执行器单独记录，不返回节点对象、文件内容或重复元数据。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 2
+      },
+      {
+        "id": "files.read_content",
+        "name": "文件内容读取工具",
+        "description": "有界、只读地读取远端 UTF-8 文本文件，为项目文档、声明文件和配置分析提供真实证据。",
+        "usageInstructions": "仅在已确认的绝对文件路径上使用。默认最多读取 64 KiB，最大 256 KiB；二进制文件会拒绝读取，敏感值在进入模型上下文前脱敏。目录结构不足以证明技术栈时，应使用本工具读取 README、依赖声明、锁文件或示例配置。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "需要读取的远端文件绝对路径。"
+            },
+            "maxBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 262144,
+              "default": 65536
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "outputDescription": "返回脱敏后的 UTF-8 文本、文件总字节数、返回字节数和截断状态。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 1
+      },
+      {
+        "id": "software.check",
+        "name": "软件可用性检查工具",
+        "description": "在当前任务绑定终端中检查指定软件是否存在，并获取真实可执行路径和版本首行。",
+        "usageInstructions": "一次检查 1 到 20 个由项目证据或用户需求明确指出的软件；不得借此扫描整台服务器或猜测技术栈。该工具只检查，不安装、不升级、不启动服务。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "names": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 20,
+              "items": {
+                "type": "string"
+              },
+              "description": "要检查的精确命令名。"
+            },
+            "includeVersions": {
+              "type": "boolean",
+              "default": true
+            }
+          },
+          "required": [
+            "names"
+          ]
+        },
+        "outputDescription": "返回每个软件的安装状态、命令路径和版本首行。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 1
+      }
+    ],
+    "activeSkills": [
+      {
+        "id": "project-source-acquisition",
+        "name": "项目源码获取",
+        "description": "将公开或私有 Git 仓库获取到指定目录，处理服务器级凭据复用、常见错误和最终仓库验收。",
+        "version": 12,
+        "instructions": "只负责把 Git 项目源码获取到用户指定的最终目录并验证可用；不安装依赖、不构建、不部署。\n根据已有真实证据生成最短的可执行计划；未知条件会改变后续操作时，先检查该条件，下一轮再继续。\n\n阶段状态机（每轮只规划当前证据允许的最小阶段）：\n1. [prepare] 确认获取目标和环境\n   进入条件：尚未确认仓库 URL、最终目录或目标现状\n   执行契约：\n   1. 从用户需求中确定原始仓库 URL、最终绝对目录和可选 ref；已经明确的 URL/路径直接写入步骤说明，不要为它单独生成 printf/echo 命令步骤\n   2. 用 kind=observe 的只读步骤检查 Git 可用性、目标父目录可写性和最终目录是否已存在；主命令结果就是证据，不再生成重复 validation\n   3. 已有目录不得自动删除或覆盖；如果是同源仓库，仅在用户要求更新时进入更新流程\n   退出证据：\n   1. 仓库 URL 与最终目录\n   2. Git 和写入条件\n   3. 目标目录状态\n\n2. [authenticate] 选择仓库认证方式\n   进入条件：仓库需要认证或认证状态尚未明确\n   执行契约：\n   1. HTTPS 认证状态未知时，本轮只能生成 kind=observe 的有界匿名探测：使用原始 URL、设置 GIT_TERMINAL_PROMPT=0，并执行 git ls-remote；不得在同一轮生成 clone、凭据收集或其他依赖探测结果的步骤\n   2. 只有匿名探测的真实结构化结果明确证明需要认证后，才优先复用当前服务器中 target 匹配的完整 Git HTTPS 凭据组；步骤必须用 server-credential 引用或敏感变量占位符显式表达认证要求，不得靠 description/expected 中的自然语言暗示认证\n   3. 有多个匹配账号时请用户选择；没有匹配组时才同表单收集用户名和密码或令牌\n   4. 凭据只由执行器通过前台 PTY 回答 Git 的 Use\n…[已压缩，原始 2941 字符，指纹 2941:2bc211e2]…\nd\",\"required\":true,\"credential\":{\"group\":\"git_https_repository\",\"kind\":\"git-https\",\"role\":\"secret\",\"target\":\"REPOSITORY_HOST\"}}]}；将 REPOSITORY_HOST 替换为仓库 URL 的精确主机，提交后使用工具返回的凭据引用\n   - [rejected] 远端明确拒绝已选凭据：停止重试同一凭据，请用户更新该组或选择另一组\n   - [ssh] 原始 URL 为 SSH：使用已有 SSH Agent 或受信公钥；缺少公钥认证时报告配置需求\n\n3. [acquire] 获取源码到最终目录\n   进入条件：目标路径可用，且仓库访问方式已确定\n   执行契约：\n   1. 用 kind=change 在可见 PTY 中前台执行 Git 获取命令并等待真实退出；使用用户要求的 ref、depth、submodule 或 LFS 选项\n   2. 新仓库应在本步成功时位于用户指定的最终目录；可直接获取到最终目录，也可使用不泄漏中间状态的安全等价实现\n   退出证据：\n   1. Git 命令真实退出码\n   2. 最终源码目录\n\n4. [verify] 验收最终仓库\n   进入条件：Git 获取命令已成功退出\n   执行契约：\n   1. 仅从最终绝对目录检查它是 Git 工作树、origin 与原始 URL 一致、HEAD 存在，并在用户指定 ref 时校验该 ref\n   2. 获取变更步骤的 validation 直接使用上述最终目录检查；如果验收被单独规划为 kind=observe，则直接使用该主命令结果，不再生成第二条校验\n   退出证据：\n   1. 工作树、origin、HEAD 和请求 ref 的真实结果\n\n5. [handle-error] 按真实错误恢复或停止\n   进入条件：任一检查、认证、获取或验收步骤失败\n   执行契约：\n   1. 需要认证时进入凭据选择；远端明确拒绝凭据时停止并请用户更新或更换账号，不重复尝试同一凭据\n   2. 目标路径已存在时保留原内容并报告冲突；网络、DNS 或 TLS 失败时报告原始错误，只对明确的短暂错误做有限重试\n   3. Git 命令或最终验收失败时不宣告完成；仅清理本任务明确创建的临时内容，然后基于新证据生成一次针对性调整\n   退出证据：\n   1. 可操作的错误分类，或明确的完成验收结果\n\n全局硬约束：\n   1. 保留用户的原始仓库 URL 和协议，不在 URL、命令、环境变量或文件中写入用户名、密码、令牌或敏感占位符。\n   2. Git HTTPS 凭据只从当前服务器的 serverCredentialGroups 选择或通过 user.request_input 收集；不使用 server.resolve_connection 或 server.connect。\n   3. 不覆盖或删除用户已有目录，不把临时目录当作最终结果，不把真实失败改写为成功。",
+        "allowedToolIds": [
+          "user.request_input"
+        ],
+        "forbiddenToolIds": [
+          "server.resolve_connection",
+          "server.connect"
+        ]
+      },
+      {
+        "id": "application-deployment",
+        "name": "应用部署与上线验收",
+        "description": "将已有项目部署、启动或上线，并完成端到端验收。",
+        "version": 4,
+        "instructions": "这是面向整体目标的应用部署流程，必须与 project-source-acquisition、software-installation、project-build 等已选 Skill 联合复用证据，不能把某个中间阶段当作部署完成：\n1. 发现阶段先用 files.get_structure 对项目目录做有界检查；随后按实际结构逐个用 files.read_content 读取 README、依赖声明、锁文件、示例配置、迁移/初始化脚本、容器编排文件、服务入口或 CI 配置。目录名、文件名或 server.basic_info 只能证明候选事实，不能证明项目一定需要 PHP、Node、Java、数据库、缓存、Nginx、Composer 或 Docker。每个 standalone 工具单独成轮，阶段证据必须在后续轮复用。\n2. 将整体目标拆为有证据依赖关系的阶段：源码就位、运行环境、项目依赖/构建、运行配置与敏感变量、数据库/缓存等外部依赖、进程或容器托管、反向代理/防火墙（仅在项目与用户授权要求时）、启动、端到端验收。每轮只规划当前证据允许的步骤，但后续规划必须继续围绕 taskGoal.rootGoal，不得被“继续部署”“重试”替换。\n3. 项目源码、工具版本、依赖安装和构建已由历史结构化证据确认时必须直接复用，不得重复 clone、重复安装或重复构建。调整计划被替换时，之前阶段仍属于同一整体任务，不能从上下文丢失。\n4. 项目证据明确所需软件后，先用 software.check 精准检查这些命令的路径与版本，再决定是否联合 software-installation。不得先启用 EPEL、CRB 或第三方仓库；只有软件确实缺失、项目证据要求且当前系统仓库无法提供时，才规划仓库或镜像调整并独立验证。\n5. 配置文件优先从项目示例最小化生成并保留无关内容；敏感值必须使用业务唯一的 key，例如 OFFICE_DATABASE_PASSWORD、PRODUCTION_REDIS_PASSWORD 或 TARGET_SSH_PASSWORD，禁止新建含义不明的 PASSWORD。现有变量元数据不能证明用途完全一致时，必须用 user.request_input 单独收集，并说明参数名称、用途、目标服务和提交后解锁的步骤；敏感值不得交给模型、写入日志或显示在命令中。\n6. 任何数据库初始化、迁移、覆盖配置、开启服务、开放端口或替换线上版本都要遵守用户权限与风险审批；已有数据和配置先做只读识别，需要改动时建立可恢复备份。不得为了“能启动”关闭 TLS、认证、安全策略或清空数据。\n7. 下载、依赖安装、构建、迁移与启动必须等待真实退出；安装 Composer/npm 包、镜像拉取或编译完成前不得提前验证。长驻应用使用项目证据支持的 systemd、容器编排或其他受管机制，不得用裸后台进程伪装部署成功。\n8. 部署完成门禁必须同时具备：所需配置与依赖就绪、目标进程/容器真实健康、监听地址/端口符合预期、从正确入口进行的 HTTP/TCP/项目自带健康检查成功，以及必要数据库/缓存连接可用。仅源码存在、依赖安装成功、进程已启动、端口监听或命令 exit 0 都只是阶段成功，不得总结为整体部署完成。\n9. 每个 Shell validation 都必须在独立 Shell 中重新读取同一目标的真实状态。command 若动态解析主机、端口、数据库名或用户，validation 也必须重新解析，不能硬编码未经证据确认的值；不得用 true、无条件 echo、忽略退出码的分支或依赖主命令 stdout 的裸 grep 验收。opsark-tool 步骤由严格 schema 与结构化结果承担证据，validation 固定为 true。\n10. 若当前轮只完成中间阶段，结果必须明确“整体部署尚未完成”、列出已完成证据和剩余阶段，并自动进入可恢复的待继续状态；调整计划和托管审批不得清除已完成阶段证据。最终总结必须回到最初的部署目标，而不是总结最后一句“重试”。",
+        "allowedToolIds": [
+          "files.get_structure",
+          "files.read_content",
+          "software.check",
+          "user.request_input"
+        ],
+        "forbiddenToolIds": []
+      }
+    ],
+    "instruction": "只根据 baseSnapshot、adjustmentTrigger 和尚未完成目标生成最少必要步骤。recentPhases 是最近两个阶段，historyCheckpoint 是更早历史的滚动摘要；不得要求重复其中已经完成的工作。计划描述和阶段总结不是成功证据，只有结构化 result/evidence 才能证明状态。失败方法必须有实质变化后才能重试。每步在独立非交互 Shell 中建立自身环境，并以 activeSkills 要求的独立验收结束。",
+    "server": {
+      "name": "192.168.1.242",
+      "host": "192.168.1.242",
+      "info": {
+        "os": "CentOS Stream 10 (Coughlan)",
+        "kernel": "Linux 6.12.0-213.el10.x86_64 x86_64",
+        "cpu": "远程服务器 CPU",
+        "cores": 1,
+        "memoryGb": 1,
+        "diskGb": 16,
+        "uptime": "5 days, 10 hours, 17 minutes"
+      },
+      "environment": []
+    },
+    "secretVariables": [],
+    "serverCredentialGroups": [],
+    "baseSnapshot": {
+      "version": 1,
+      "task": {
+        "title": "拉取并部署项目https://gitee.c",
+        "status": "planning",
+        "permission": "managed",
+        "relation": "new_goal"
+      },
+      "executionConstraints": {
+        "changePolicy": "requested_changes_only",
+        "environmentPolicy": "unspecified",
+        "failurePolicy": "unspecified",
+        "prohibitedActions": [],
+        "requiredConditions": [],
+        "userDirectives": []
+      },
+      "progress": {
+        "totalSteps": 4,
+        "statusCounts": {
+          "completed": 3,
+          "failed": 1
+        },
+        "totalRounds": 0,
+        "archivedPhases": 2,
+        "adjustmentCount": 0
+      },
+      "currentIncident": {
+        "title": "获取项目目录结构",
+        "description": "使用文件数据结构获取工具查看 /opt/kaifangqian-base 的目录树，以发现项目的技术栈、构建方式、配置入口和部署线索。这是应用部署发现阶段的第一步。",
+        "command": "opsark-tool files.get_structure {\"rootPath\":\"/opt/kaifangqian-base\",\"maxDepth\":4,\"maxNodes\":600}",
+        "commandFingerprint": "96:12d16677",
+        "expected": "获得项目目录的紧凑文本树，能够识别出主要源码目录、配置文件、依赖声明文件和构建脚本。",
+        "validation": "true",
+        "risk": "low",
+        "status": "failed",
+        "stepId": "ai-step-1788539621-0",
+        "result": {
+          "executionStatus": "failed",
+          "observationStatus": "unknown",
+          "facts": {
+            "toolId": "files.get_structure",
+            "errorCode": "TOOL_EXECUTION_FAILED"
+          },
+          "warnings": [],
+          "failureReason": "根路径必须是远端绝对目录路径"
+        },
+        "output": {
+          "totalCharacters": 14,
+          "omittedCharacters": 0,
+          "fingerprint": "14:18baa641",
+          "content": "根路径必须是远端绝对目录路径"
+        },
+        "executionScope": "isolated_exec"
+      },
+      "currentPlan": {
+        "totalSteps": 1,
+        "statusCounts": {
+          "failed": 1
+        },
+        "includedSteps": 1,
+        "incidentIncludedSeparately": true,
+        "omittedSteps": 0,
+        "steps": []
+      },
+      "recentPhases": [
+        {
+          "phaseId": "phase-task-1788539562348-siefy9-1788539586671-0",
+          "reason": "adjustment",
+          "summary": "环境检查与匿名探测已完成，确认为公开仓库且目标路径可用。现在进入源码获取阶段，执行 git clone 到指定最终目录。",
+          "requirement": "拉取并部署项目https://gitee.com/kaifangqian/kaifangqian-base.git到/opt下",
+          "planSummary": {
+            "totalSteps": 2,
+            "statusCounts": {
+              "completed": 2
+            },
+            "includedSteps": 2,
+            "omittedSteps": 0
+          },
+          "steps": [
+            {
+              "stepId": "ai-step-1788539568-0",
+              "title": "检查 Git 可用性、目标目录状态与写入条件",
+              "action": "确认服务器上 Git 是否可用，/opt 目录是否存在且可写，以及 /opt/kaifangqian-base 是否已存在。这是获取源码前的必要环境发现步骤。",
+              "expected": "获得 Git 版本信息；确认 /opt 可写；明确 /opt/kaifangqian-base 目录是否已存在。",
+              "risk": "low",
+              "status": "completed",
+              "commandFingerprint": "181:a325b9e1",
+              "result": {
+                "executionStatus": "success",
+                "observationStatus": "matched",
+                "exitCode": 0,
+                "facts": {
+                  "found": true,
+                  "lineCount": 4,
+                  "mainObservationStatus": "matched",
+                  "verificationMode": "command_result",
+                  "validatorType": "file",
+                  "evidenceConflict": false,
+                  "blockingSignal": false
+                },
+                "warnings": []
+              },
+              "output": {
+                "totalCharacters": 101,
+                "fingerprint": "101:d5567f5c"
+              },
+              "executionScope": "isolated_exec",
+              "evidence": {
+                "totalItems": 1,
+                "omittedItems": 0,
+                "items": [
+                  {
+                    "type": "file",
+                    "source": "main",
+                    "facts": {
+                      "found": true,
+                      "lineCount": 4
+                    },
+                    "scope": {
+                      "targetId": "srv-1788539453694-hxzphx",
+                      "sessionId": "agent-session-1",
+                      "generation": 1,
+                      "shell": "bash",
+                      "scope": "isolated_exec",
+                      "persistence": "command",
+                      "doesNotProve": [
+                        "agent_session_state",
+                        "user_shell_loaded",
+                        "new_shell_auto_load"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "stepId": "ai-step-1788539573-0",
+              "title": "匿名探测仓库访问权限",
+              "action": "使用原始 HTTPS 仓库 URL，禁用终端提示，执行有界的 git ls-remote 以确认该 Gitee 仓库是否需要认证。这是选择认证方式前唯一允许的探测步骤。",
+              "expected": "获得结构化结果：若仓库公开则返回远程引用列表；若需要认证则返回明确的权限拒绝或认证失败信息。",
+              "risk": "low",
+              "status": "completed",
+              "commandFingerprint": "94:f5c522d7",
+              "result": {
+                "executionStatus": "success",
+                "observationStatus": "matched",
+                "exitCode": 0,
+                "facts": {
+                  "lineCount": 2,
+                  "outputPresent": true,
+                  "mainObservationStatus": "matched",
+                  "verificationMode": "command_result",
+                  "validatorType": "command",
+                  "evidenceConflict": false,
+                  "blockingSignal": false
+                },
+                "warnings": []
+              },
+              "output": {
+                "totalCharacters": 125,
+                "fingerprint": "125:a7c5b8a1"
+              },
+              "executionScope": "isolated_exec",
+              "evidence": {
+                "totalItems": 1,
+                "omittedItems": 0,
+                "items": [
+                  {
+                    "type": "command",
+                    "source": "main",
+                    "facts": {
+                      "lineCount": 2,
+                      "outputPresent": true
+                    },
+                    "scope": {
+                      "targetId": "srv-1788539453694-hxzphx",
+                      "sessionId": "agent-session-1",
+                      "generation": 1,
+                      "shell": "bash",
+                      "scope": "isolated_exec",
+                      "persistence": "command",
+                      "doesNotProve": [
+                        "agent_session_state",
+                        "user_shell_loaded",
+                        "new_shell_auto_load"
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "completedAt": "2026-09-04T16:33:06.671Z"
+        },
+        {
+          "phaseId": "phase-task-1788539562348-siefy9-1788539621335-1",
+          "reason": "adjustment",
+          "summary": "已完成：项目源码已拉取至 /opt/kaifangqian-base。尚未完成：应用部署与上线验收（包括环境检查、依赖安装、构建、配置、服务启动及健康检查）。需调整计划以进入部署阶段。",
+          "requirement": "拉取并部署项目https://gitee.com/kaifangqian/kaifangqian-base.git到/opt下",
+          "planSummary": {
+            "totalSteps": 1,
+            "statusCounts": {
+              "completed": 1
+            },
+            "includedSteps": 1,
+            "omittedSteps": 0
+          },
+          "steps": [
+            {
+              "stepId": "ai-step-1788539581-0",
+              "title": "克隆项目源码到 /opt/kaifangqian-base",
+              "action": "使用原始 HTTPS URL 将 Gitee 仓库克隆到用户指定的绝对路径 /opt/kaifangqian-base。这是获取源码的核心变更步骤。",
+              "expected": "Git clone 命令真实退出码为 0，且 /opt/kaifangqian-base 目录下存在完整的 Git 工作树。",
+              "risk": "low",
+              "status": "completed",
+              "commandFingerprint": "82:77761297",
+              "result": {
+                "executionStatus": "success",
+                "observationStatus": "matched",
+                "exitCode": 0,
+                "facts": {
+                  "found": true,
+                  "lineCount": 3,
+                  "mainObservationStatus": "matched",
+                  "verificationMode": "postcondition",
+                  "validationObservationStatus": "matched",
+                  "validatorType": "file",
+                  "validationPassed": true,
+                  "evidenceConflict": false,
+                  "blockingSignal": false
+                },
+                "warnings": []
+              },
+              "output": {
+                "totalCharacters": 554,
+                "fingerprint": "554:f8d5dadb"
+              },
+              "executionScope": "isolated_exec",
+              "validationScope": "isolated_exec",
+              "evidence": {
+                "totalItems": 2,
+                "omittedItems": 0,
+                "items": [
+                  {
+                    "type": "file",
+                    "source": "main",
+                    "facts": {
+                      "found": true,
+                      "lineCount": 3
+                    },
+                    "scope": {
+                      "targetId": "srv-1788539453694-hxzphx",
+                      "sessionId": "agent-session-1",
+                      "generation": 1,
+                      "shell": "bash",
+                      "scope": "isolated_exec",
+                      "persistence": "command",
+                      "doesNotProve": [
+                        "agent_session_state",
+                        "user_shell_loaded",
+                        "new_shell_auto_load"
+                      ]
+                    }
+                  },
+                  {
+                    "type": "file",
+                    "source": "validation",
+                    "facts": {
+                      "passed": true,
+                      "exitCode": 0,
+                      "acceptedDiagnosticState": false,
+                      "detail": "后置校验通过",
+                      "observationStatus": "matched",
+                      "observationFacts": {
+                        "found": false,
+                        "lineCount": 0
+                      }
+                    },
+                    "scope": {
+                      "targetId": "srv-1788539453694-hxzphx",
+                      "sessionId": "agent-session-1",
+                      "generation": 1,
+                      "shell": "bash",
+                      "scope": "isolated_exec",
+                      "persistence": "command",
+                      "doesNotProve": [
+                        "agent_session_state",
+                        "user_shell_loaded",
+                        "new_shell_auto_load"
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "completedAt": "2026-09-04T16:33:41.335Z"
+        }
+      ],
+      "instruction": "recentPhases 是最近两个执行阶段的有界详情；historyCheckpoint 是更早历史的结构化滚动摘要。只有 result/evidence 支持的内容属于已验证事实，计划描述和阶段总结不等于执行成功。",
+      "snapshotFingerprint": "5921:48b5bc3c"
+    },
+    "adjustmentTrigger": {
+      "reason": "工具 files.get_structure 调用失败：根路径必须是远端绝对目录路径"
+    },
+    "metrics": {
+      "cpu": 9,
+      "memory": 73,
+      "disk": 50,
+      "networkIn": 0.0010008167,
+      "networkOut": 0.0005364523,
+      "sampledAt": "2026-09-04T16:33:39.777Z"
+    }
+  },
+  "replacement": [
+    {
+      "id": "ai-step-1788539630-0",
+      "kind": "observe",
+      "title": "确认目标目录存在性",
+      "description": "在调用 files.get_structure 前，先通过只读命令确认 /opt/kaifangqian-base 是否真实存在且为目录，以排除因路径不存在导致工具报错的原因。",
+      "command": "test -d \"/opt/kaifangqian-base\" && echo \"EXISTS\" || echo \"NOT_FOUND\"",
+      "risk": "low",
+      "expected": "输出 EXISTS 或 NOT_FOUND，明确目录状态。",
+      "validation": "",
+      "executionScope": "isolated_exec",
+      "runtimeClass": "bounded",
+      "status": "pending"
+    }
+  ]
+}
+任务
+执行计划已批准
+信息
+2026/9/5 00:33:41
+log-1788539621336-eojeeh
+1 个步骤进入执行队列
+模型
+模型调整计划已返回
+警告
+2026/9/5 00:33:41
+log-1788539621335-i4qsm7
+{
+  "context": {
+    "workflowPhase": "adjust_after_failure",
+    "tools": [
+      {
+        "id": "user.request_input",
+        "name": "用户输入工具",
+        "description": "以结构化表单请求用户补充任务必需信息，每个参数均显示名称、用途、必填状态和输入提示。",
+        "usageInstructions": "仅在完成任务确实缺少用户信息时调用。必须作为当前计划唯一的信息收集步骤，提交后再生成后续计划。每个字段必须提供 label 和 description；敏感值必须使用 password 类型。收集用户名+密码/令牌时，两个字段必须各自提供 credential 对象，使用相同 group/kind/target 和不同 role，不得依赖 label/description 自然语言推断配对。完整凭据组会按服务器长期保存，后续任务应复用 serverCredentialGroups，不得重复索取。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "title": {
+              "type": "string",
+              "description": "表单标题，说明需要用户补充什么信息。"
+            },
+            "description": {
+              "type": "string",
+              "description": "表单整体说明，告知这些信息将用于什么操作。"
+            },
+            "fields": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8,
+              "description": "用户需要填写的参数列表。",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "key": {
+                    "type": "string",
+                    "description": "程序使用的参数名。"
+                  },
+                  "label": {
+                    "type": "string",
+                    "description": "展示给用户的参数名称。"
+                  },
+                  "description": {
+                    "type": "string",
+                    "description": "说明参数是什么、将用于什么操作。"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "text",
+                      "password",
+                      "number"
+                    ]
+                  },
+                  "placeholder": {
+                    "type": "string",
+                    "description": "不包含真实敏感值的输入示例。"
+                  },
+                  "required": {
+                    "type": "boolean",
+                    "description": "该参数是否必填。"
+                  },
+                  "credential": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "用户名/密码或令牌的显式凭据组契约。",
+                    "properties": {
+                      "group": {
+                        "type": "string",
+                        "description": "同一表单内两个凭据字段共用的组标识。"
+                      },
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "git-https",
+                          "ssh-password",
+                          "database",
+                          "service"
+                        ]
+                      },
+                      "role": {
+                        "type": "string",
+                        "enum": [
+                          "username",
+                          "secret"
+                        ]
+                      },
+                      "target": {
+                        "type": "string",
+                        "description": "认证目标主机或服务标识，不包含凭据。"
+                      }
+                    },
+                    "required": [
+                      "group",
+                      "kind",
+                      "role",
+                      "target"
+                    ]
+                  }
+                },
+                "required": [
+                  "key",
+                  "label",
+                  "description",
+                  "type",
+                  "required"
+                ]
+              }
+            }
+          },
+          "required": [
+            "title",
+            "fields"
+          ]
+        },
+        "outputDescription": "返回非敏感字段值与敏感字段占位符；凭据真实值不会写入模型上下文或普通日志。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 3
+      },
+      {
+        "id": "files.get_structure",
+        "name": "文件数据结构获取工具",
+        "description": "只读获取远端指定目录的紧凑文本目录树。",
+        "usageInstructions": "固定格式为 opsark-tool files.get_structure {...}，工具 ID 前不得添加 --。输入绝对路径即可；默认排除版本库、依赖缓存和构建产物，默认最多 4 层、600 个节点。结果截断时应缩小 rootPath 再获取，不要盲目提高上限。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "rootPath": {
+              "type": "string",
+              "description": "远端绝对目录路径"
+            },
+            "excludeDirectories": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "maxDepth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20,
+              "default": 4
+            },
+            "maxNodes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000,
+              "default": 600
+            },
+            "includeHidden": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "rootPath"
+          ]
+        },
+        "outputDescription": "模型仅接收一个稳定排序的 tree 文本字段；截断状态由执行器单独记录，不返回节点对象、文件内容或重复元数据。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 2
+      },
+      {
+        "id": "files.read_content",
+        "name": "文件内容读取工具",
+        "description": "有界、只读地读取远端 UTF-8 文本文件，为项目文档、声明文件和配置分析提供真实证据。",
+        "usageInstructions": "仅在已确认的绝对文件路径上使用。默认最多读取 64 KiB，最大 256 KiB；二进制文件会拒绝读取，敏感值在进入模型上下文前脱敏。目录结构不足以证明技术栈时，应使用本工具读取 README、依赖声明、锁文件或示例配置。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "需要读取的远端文件绝对路径。"
+            },
+            "maxBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 262144,
+              "default": 65536
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "outputDescription": "返回脱敏后的 UTF-8 文本、文件总字节数、返回字节数和截断状态。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 1
+      },
+      {
+        "id": "software.check",
+        "name": "软件可用性检查工具",
+        "description": "在当前任务绑定终端中检查指定软件是否存在，并获取真实可执行路径和版本首行。",
+        "usageInstructions": "一次检查 1 到 20 个由项目证据或用户需求明确指出的软件；不得借此扫描整台服务器或猜测技术栈。该工具只检查，不安装、不升级、不启动服务。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "names": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 20,
+              "items": {
+                "type": "string"
+              },
+              "description": "要检查的精确命令名。"
+            },
+            "includeVersions": {
+              "type": "boolean",
+              "default": true
+            }
+          },
+          "required": [
+            "names"
+          ]
+        },
+        "outputDescription": "返回每个软件的安装状态、命令路径和版本首行。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 1
+      }
+    ],
+    "activeSkills": [
+      {
+        "id": "project-source-acquisition",
+        "name": "项目源码获取",
+        "description": "将公开或私有 Git 仓库获取到指定目录，处理服务器级凭据复用、常见错误和最终仓库验收。",
+        "version": 12,
+        "instructions": "只负责把 Git 项目源码获取到用户指定的最终目录并验证可用；不安装依赖、不构建、不部署。\n根据已有真实证据生成最短的可执行计划；未知条件会改变后续操作时，先检查该条件，下一轮再继续。\n\n阶段状态机（每轮只规划当前证据允许的最小阶段）：\n1. [prepare] 确认获取目标和环境\n   进入条件：尚未确认仓库 URL、最终目录或目标现状\n   执行契约：\n   1. 从用户需求中确定原始仓库 URL、最终绝对目录和可选 ref；已经明确的 URL/路径直接写入步骤说明，不要为它单独生成 printf/echo 命令步骤\n   2. 用 kind=observe 的只读步骤检查 Git 可用性、目标父目录可写性和最终目录是否已存在；主命令结果就是证据，不再生成重复 validation\n   3. 已有目录不得自动删除或覆盖；如果是同源仓库，仅在用户要求更新时进入更新流程\n   退出证据：\n   1. 仓库 URL 与最终目录\n   2. Git 和写入条件\n   3. 目标目录状态\n\n2. [authenticate] 选择仓库认证方式\n   进入条件：仓库需要认证或认证状态尚未明确\n   执行契约：\n   1. HTTPS 认证状态未知时，本轮只能生成 kind=observe 的有界匿名探测：使用原始 URL、设置 GIT_TERMINAL_PROMPT=0，并执行 git ls-remote；不得在同一轮生成 clone、凭据收集或其他依赖探测结果的步骤\n   2. 只有匿名探测的真实结构化结果明确证明需要认证后，才优先复用当前服务器中 target 匹配的完整 Git HTTPS 凭据组；步骤必须用 server-credential 引用或敏感变量占位符显式表达认证要求，不得靠 description/expected 中的自然语言暗示认证\n   3. 有多个匹配账号时请用户选择；没有匹配组时才同表单收集用户名和密码或令牌\n   4. 凭据只由执行器通过前台 PTY 回答 Git 的 Use\n…[已压缩，原始 2941 字符，指纹 2941:2bc211e2]…\nd\",\"required\":true,\"credential\":{\"group\":\"git_https_repository\",\"kind\":\"git-https\",\"role\":\"secret\",\"target\":\"REPOSITORY_HOST\"}}]}；将 REPOSITORY_HOST 替换为仓库 URL 的精确主机，提交后使用工具返回的凭据引用\n   - [rejected] 远端明确拒绝已选凭据：停止重试同一凭据，请用户更新该组或选择另一组\n   - [ssh] 原始 URL 为 SSH：使用已有 SSH Agent 或受信公钥；缺少公钥认证时报告配置需求\n\n3. [acquire] 获取源码到最终目录\n   进入条件：目标路径可用，且仓库访问方式已确定\n   执行契约：\n   1. 用 kind=change 在可见 PTY 中前台执行 Git 获取命令并等待真实退出；使用用户要求的 ref、depth、submodule 或 LFS 选项\n   2. 新仓库应在本步成功时位于用户指定的最终目录；可直接获取到最终目录，也可使用不泄漏中间状态的安全等价实现\n   退出证据：\n   1. Git 命令真实退出码\n   2. 最终源码目录\n\n4. [verify] 验收最终仓库\n   进入条件：Git 获取命令已成功退出\n   执行契约：\n   1. 仅从最终绝对目录检查它是 Git 工作树、origin 与原始 URL 一致、HEAD 存在，并在用户指定 ref 时校验该 ref\n   2. 获取变更步骤的 validation 直接使用上述最终目录检查；如果验收被单独规划为 kind=observe，则直接使用该主命令结果，不再生成第二条校验\n   退出证据：\n   1. 工作树、origin、HEAD 和请求 ref 的真实结果\n\n5. [handle-error] 按真实错误恢复或停止\n   进入条件：任一检查、认证、获取或验收步骤失败\n   执行契约：\n   1. 需要认证时进入凭据选择；远端明确拒绝凭据时停止并请用户更新或更换账号，不重复尝试同一凭据\n   2. 目标路径已存在时保留原内容并报告冲突；网络、DNS 或 TLS 失败时报告原始错误，只对明确的短暂错误做有限重试\n   3. Git 命令或最终验收失败时不宣告完成；仅清理本任务明确创建的临时内容，然后基于新证据生成一次针对性调整\n   退出证据：\n   1. 可操作的错误分类，或明确的完成验收结果\n\n全局硬约束：\n   1. 保留用户的原始仓库 URL 和协议，不在 URL、命令、环境变量或文件中写入用户名、密码、令牌或敏感占位符。\n   2. Git HTTPS 凭据只从当前服务器的 serverCredentialGroups 选择或通过 user.request_input 收集；不使用 server.resolve_connection 或 server.connect。\n   3. 不覆盖或删除用户已有目录，不把临时目录当作最终结果，不把真实失败改写为成功。",
+        "allowedToolIds": [
+          "user.request_input"
+        ],
+        "forbiddenToolIds": [
+          "server.resolve_connection",
+          "server.connect"
+        ]
+      },
+      {
+        "id": "application-deployment",
+        "name": "应用部署与上线验收",
+        "description": "将已有项目部署、启动或上线，并完成端到端验收。",
+        "version": 4,
+        "instructions": "这是面向整体目标的应用部署流程，必须与 project-source-acquisition、software-installation、project-build 等已选 Skill 联合复用证据，不能把某个中间阶段当作部署完成：\n1. 发现阶段先用 files.get_structure 对项目目录做有界检查；随后按实际结构逐个用 files.read_content 读取 README、依赖声明、锁文件、示例配置、迁移/初始化脚本、容器编排文件、服务入口或 CI 配置。目录名、文件名或 server.basic_info 只能证明候选事实，不能证明项目一定需要 PHP、Node、Java、数据库、缓存、Nginx、Composer 或 Docker。每个 standalone 工具单独成轮，阶段证据必须在后续轮复用。\n2. 将整体目标拆为有证据依赖关系的阶段：源码就位、运行环境、项目依赖/构建、运行配置与敏感变量、数据库/缓存等外部依赖、进程或容器托管、反向代理/防火墙（仅在项目与用户授权要求时）、启动、端到端验收。每轮只规划当前证据允许的步骤，但后续规划必须继续围绕 taskGoal.rootGoal，不得被“继续部署”“重试”替换。\n3. 项目源码、工具版本、依赖安装和构建已由历史结构化证据确认时必须直接复用，不得重复 clone、重复安装或重复构建。调整计划被替换时，之前阶段仍属于同一整体任务，不能从上下文丢失。\n4. 项目证据明确所需软件后，先用 software.check 精准检查这些命令的路径与版本，再决定是否联合 software-installation。不得先启用 EPEL、CRB 或第三方仓库；只有软件确实缺失、项目证据要求且当前系统仓库无法提供时，才规划仓库或镜像调整并独立验证。\n5. 配置文件优先从项目示例最小化生成并保留无关内容；敏感值必须使用业务唯一的 key，例如 OFFICE_DATABASE_PASSWORD、PRODUCTION_REDIS_PASSWORD 或 TARGET_SSH_PASSWORD，禁止新建含义不明的 PASSWORD。现有变量元数据不能证明用途完全一致时，必须用 user.request_input 单独收集，并说明参数名称、用途、目标服务和提交后解锁的步骤；敏感值不得交给模型、写入日志或显示在命令中。\n6. 任何数据库初始化、迁移、覆盖配置、开启服务、开放端口或替换线上版本都要遵守用户权限与风险审批；已有数据和配置先做只读识别，需要改动时建立可恢复备份。不得为了“能启动”关闭 TLS、认证、安全策略或清空数据。\n7. 下载、依赖安装、构建、迁移与启动必须等待真实退出；安装 Composer/npm 包、镜像拉取或编译完成前不得提前验证。长驻应用使用项目证据支持的 systemd、容器编排或其他受管机制，不得用裸后台进程伪装部署成功。\n8. 部署完成门禁必须同时具备：所需配置与依赖就绪、目标进程/容器真实健康、监听地址/端口符合预期、从正确入口进行的 HTTP/TCP/项目自带健康检查成功，以及必要数据库/缓存连接可用。仅源码存在、依赖安装成功、进程已启动、端口监听或命令 exit 0 都只是阶段成功，不得总结为整体部署完成。\n9. 每个 Shell validation 都必须在独立 Shell 中重新读取同一目标的真实状态。command 若动态解析主机、端口、数据库名或用户，validation 也必须重新解析，不能硬编码未经证据确认的值；不得用 true、无条件 echo、忽略退出码的分支或依赖主命令 stdout 的裸 grep 验收。opsark-tool 步骤由严格 schema 与结构化结果承担证据，validation 固定为 true。\n10. 若当前轮只完成中间阶段，结果必须明确“整体部署尚未完成”、列出已完成证据和剩余阶段，并自动进入可恢复的待继续状态；调整计划和托管审批不得清除已完成阶段证据。最终总结必须回到最初的部署目标，而不是总结最后一句“重试”。",
+        "allowedToolIds": [
+          "files.get_structure",
+          "files.read_content",
+          "software.check",
+          "user.request_input"
+        ],
+        "forbiddenToolIds": []
+      }
+    ],
+    "instruction": "只根据 baseSnapshot、adjustmentTrigger 和尚未完成目标生成最少必要步骤。recentPhases 是最近两个阶段，historyCheckpoint 是更早历史的滚动摘要；不得要求重复其中已经完成的工作。计划描述和阶段总结不是成功证据，只有结构化 result/evidence 才能证明状态。失败方法必须有实质变化后才能重试。每步在独立非交互 Shell 中建立自身环境，并以 activeSkills 要求的独立验收结束。",
+    "server": {
+      "name": "192.168.1.242",
+      "host": "192.168.1.242",
+      "info": {
+        "os": "CentOS Stream 10 (Coughlan)",
+        "kernel": "Linux 6.12.0-213.el10.x86_64 x86_64",
+        "cpu": "远程服务器 CPU",
+        "cores": 1,
+        "memoryGb": 1,
+        "diskGb": 16,
+        "uptime": "5 days, 10 hours, 17 minutes"
+      },
+      "environment": []
+    },
+    "secretVariables": [],
+    "serverCredentialGroups": [],
+    "baseSnapshot": {
+      "version": 1,
+      "task": {
+        "title": "拉取并部署项目https://gitee.c",
+        "status": "validating",
+        "permission": "managed",
+        "relation": "new_goal"
+      },
+      "executionConstraints": {
+        "changePolicy": "requested_changes_only",
+        "environmentPolicy": "unspecified",
+        "failurePolicy": "unspecified",
+        "prohibitedActions": [],
+        "requiredConditions": [],
+        "userDirectives": []
+      },
+      "progress": {
+        "totalSteps": 3,
+        "statusCounts": {
+          "completed": 3
+        },
+        "totalRounds": 0,
+        "archivedPhases": 1,
+        "adjustmentCount": 1
+      },
+      "currentPlan": {
+        "totalSteps": 1,
+        "statusCounts": {
+          "completed": 1
+        },
+        "includedSteps": 1,
+        "incidentIncludedSeparately": false,
+        "omittedSteps": 0,
+        "steps": [
+          {
+            "stepId": "ai-step-1788539581-0",
+            "title": "克隆项目源码到 /opt/kaifangqian-base",
+            "action": "使用原始 HTTPS URL 将 Gitee 仓库克隆到用户指定的绝对路径 /opt/kaifangqian-base。这是获取源码的核心变更步骤。",
+            "expected": "Git clone 命令真实退出码为 0，且 /opt/kaifangqian-base 目录下存在完整的 Git 工作树。",
+            "risk": "low",
+            "status": "completed",
+            "commandFingerprint": "82:77761297",
+            "result": {
+              "executionStatus": "success",
+              "observationStatus": "matched",
+              "exitCode": 0,
+              "facts": {
+                "found": true,
+                "lineCount": 3,
+                "mainObservationStatus": "matched",
+                "verificationMode": "postcondition",
+                "validationObservationStatus": "matched",
+                "validatorType": "file",
+                "validationPassed": true,
+                "evidenceConflict": false,
+                "blockingSignal": false
+              },
+              "warnings": []
+            },
+            "output": {
+              "totalCharacters": 554,
+              "fingerprint": "554:f8d5dadb"
+            },
+            "executionScope": "isolated_exec",
+            "validationScope": "isolated_exec",
+            "evidence": {
+              "totalItems": 2,
+              "omittedItems": 0,
+              "items": [
+                {
+                  "type": "file",
+                  "source": "main",
+                  "facts": {
+                    "found": true,
+                    "lineCount": 3
+                  },
+                  "scope": {
+                    "targetId": "srv-1788539453694-hxzphx",
+                    "sessionId": "agent-session-1",
+                    "generation": 1,
+                    "shell": "bash",
+                    "scope": "isolated_exec",
+                    "persistence": "command",
+                    "doesNotProve": [
+                      "agent_session_state",
+                      "user_shell_loaded",
+                      "new_shell_auto_load"
+                    ]
+                  }
+                },
+                {
+                  "type": "file",
+                  "source": "validation",
+                  "facts": {
+                    "passed": true,
+                    "exitCode": 0,
+                    "acceptedDiagnosticState": false,
+                    "detail": "后置校验通过",
+                    "observationStatus": "matched",
+                    "observationFacts": {
+                      "found": false,
+                      "lineCount": 0
+                    }
+                  },
+                  "scope": {
+                    "targetId": "srv-1788539453694-hxzphx",
+                    "sessionId": "agent-session-1",
+                    "generation": 1,
+                    "shell": "bash",
+                    "scope": "isolated_exec",
+                    "persistence": "command",
+                    "doesNotProve": [
+                      "agent_session_state",
+                      "user_shell_loaded",
+                      "new_shell_auto_load"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "recentPhases": [
+        {
+          "phaseId": "phase-task-1788539562348-siefy9-1788539586671-0",
+          "reason": "adjustment",
+          "summary": "环境检查与匿名探测已完成，确认为公开仓库且目标路径可用。现在进入源码获取阶段，执行 git clone 到指定最终目录。",
+          "requirement": "拉取并部署项目https://gitee.com/kaifangqian/kaifangqian-base.git到/opt下",
+          "planSummary": {
+            "totalSteps": 2,
+            "statusCounts": {
+              "completed": 2
+            },
+            "includedSteps": 2,
+            "omittedSteps": 0
+          },
+          "steps": [
+            {
+              "stepId": "ai-step-1788539568-0",
+              "title": "检查 Git 可用性、目标目录状态与写入条件",
+              "action": "确认服务器上 Git 是否可用，/opt 目录是否存在且可写，以及 /opt/kaifangqian-base 是否已存在。这是获取源码前的必要环境发现步骤。",
+              "expected": "获得 Git 版本信息；确认 /opt 可写；明确 /opt/kaifangqian-base 目录是否已存在。",
+              "risk": "low",
+              "status": "completed",
+              "commandFingerprint": "181:a325b9e1",
+              "result": {
+                "executionStatus": "success",
+                "observationStatus": "matched",
+                "exitCode": 0,
+                "facts": {
+                  "found": true,
+                  "lineCount": 4,
+                  "mainObservationStatus": "matched",
+                  "verificationMode": "command_result",
+                  "validatorType": "file",
+                  "evidenceConflict": false,
+                  "blockingSignal": false
+                },
+                "warnings": []
+              },
+              "output": {
+                "totalCharacters": 101,
+                "fingerprint": "101:d5567f5c"
+              },
+              "executionScope": "isolated_exec",
+              "evidence": {
+                "totalItems": 1,
+                "omittedItems": 0,
+                "items": [
+                  {
+                    "type": "file",
+                    "source": "main",
+                    "facts": {
+                      "found": true,
+                      "lineCount": 4
+                    },
+                    "scope": {
+                      "targetId": "srv-1788539453694-hxzphx",
+                      "sessionId": "agent-session-1",
+                      "generation": 1,
+                      "shell": "bash",
+                      "scope": "isolated_exec",
+                      "persistence": "command",
+                      "doesNotProve": [
+                        "agent_session_state",
+                        "user_shell_loaded",
+                        "new_shell_auto_load"
+                      ]
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "stepId": "ai-step-1788539573-0",
+              "title": "匿名探测仓库访问权限",
+              "action": "使用原始 HTTPS 仓库 URL，禁用终端提示，执行有界的 git ls-remote 以确认该 Gitee 仓库是否需要认证。这是选择认证方式前唯一允许的探测步骤。",
+              "expected": "获得结构化结果：若仓库公开则返回远程引用列表；若需要认证则返回明确的权限拒绝或认证失败信息。",
+              "risk": "low",
+              "status": "completed",
+              "commandFingerprint": "94:f5c522d7",
+              "result": {
+                "executionStatus": "success",
+                "observationStatus": "matched",
+                "exitCode": 0,
+                "facts": {
+                  "lineCount": 2,
+                  "outputPresent": true,
+                  "mainObservationStatus": "matched",
+                  "verificationMode": "command_result",
+                  "validatorType": "command",
+                  "evidenceConflict": false,
+                  "blockingSignal": false
+                },
+                "warnings": []
+              },
+              "output": {
+                "totalCharacters": 125,
+                "fingerprint": "125:a7c5b8a1"
+              },
+              "executionScope": "isolated_exec",
+              "evidence": {
+                "totalItems": 1,
+                "omittedItems": 0,
+                "items": [
+                  {
+                    "type": "command",
+                    "source": "main",
+                    "facts": {
+                      "lineCount": 2,
+                      "outputPresent": true
+                    },
+                    "scope": {
+                      "targetId": "srv-1788539453694-hxzphx",
+                      "sessionId": "agent-session-1",
+                      "generation": 1,
+                      "shell": "bash",
+                      "scope": "isolated_exec",
+                      "persistence": "command",
+                      "doesNotProve": [
+                        "agent_session_state",
+                        "user_shell_loaded",
+                        "new_shell_auto_load"
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "completedAt": "2026-09-04T16:33:06.671Z"
+        }
+      ],
+      "instruction": "recentPhases 是最近两个执行阶段的有界详情；historyCheckpoint 是更早历史的结构化滚动摘要。只有 result/evidence 支持的内容属于已验证事实，计划描述和阶段总结不等于执行成功。",
+      "snapshotFingerprint": "4735:3c638803"
+    },
+    "adjustmentTrigger": {
+      "reason": "已完成：项目源码已拉取至 /opt/kaifangqian-base。尚未完成：应用部署与上线验收（包括环境检查、依赖安装、构建、配置、服务启动及健康检查）。需调整计划以进入部署阶段。",
+      "reviewDecision": {
+        "decision": "adjust",
+        "reason": "用户目标是“拉取并部署项目到/opt下”。当前证据仅证明源码已成功克隆到 /opt/kaifangqian-base（git clone 退出码为 0，目录存在且校验通过），但没有任何关于运行环境、依赖安装、构建、配置、服务启动或端到端验收的证据。根据 application-deployment Skill 的约束，仅源码就位不等于部署完成，必须继续执行后续部署阶段。",
+        "summary": "已完成：项目源码已拉取至 /opt/kaifangqian-base。尚未完成：应用部署与上线验收（包括环境检查、依赖安装、构建、配置、服务启动及健康检查）。需调整计划以进入部署阶段。",
+        "source": "model"
+      }
+    },
+    "metrics": {
+      "cpu": 100,
+      "memory": 73,
+      "disk": 50,
+      "networkIn": 0.0004946645,
+      "networkOut": 0.0005139903,
+      "sampledAt": "2026-09-04T16:33:29.801Z"
+    }
+  },
+  "replacement": [
+    {
+      "id": "ai-step-1788539621-0",
+      "kind": "observe",
+      "title": "获取项目目录结构",
+      "description": "使用文件数据结构获取工具查看 /opt/kaifangqian-base 的目录树，以发现项目的技术栈、构建方式、配置入口和部署线索。这是应用部署发现阶段的第一步。",
+      "command": "opsark-tool files.get_structure {\"rootPath\":\"/opt/kaifangqian-base\",\"maxDepth\":4,\"maxNodes\":600}",
+      "risk": "low",
+      "expected": "获得项目目录的紧凑文本树，能够识别出主要源码目录、配置文件、依赖声明文件和构建脚本。",
+      "validation": "true",
+      "executionScope": "isolated_exec",
+      "runtimeClass": "bounded",
+      "status": "pending"
+    }
+  ]
+}
+模型
+当前阶段结束但整体目标尚未完成
+警告
+2026/9/5 00:33:27
+log-1788539607358-ct1wn9
+{
+  "rootGoal": "拉取并部署项目https://gitee.com/kaifangqian/kaifangqian-base.git到/opt下",
+  "decision": {
+    "decision": "adjust",
+    "reason": "用户目标是“拉取并部署项目到/opt下”。当前证据仅证明源码已成功克隆到 /opt/kaifangqian-base（git clone 退出码为 0，目录存在且校验通过），但没有任何关于运行环境、依赖安装、构建、配置、服务启动或端到端验收的证据。根据 application-deployment Skill 的约束，仅源码就位不等于部署完成，必须继续执行后续部署阶段。",
+    "summary": "已完成：项目源码已拉取至 /opt/kaifangqian-base。尚未完成：应用部署与上线验收（包括环境检查、依赖安装、构建、配置、服务启动及健康检查）。需调整计划以进入部署阶段。",
+    "source": "model"
+  },
+  "combinedFallback": "ModelInvocationError: 第 1 个模型工具步骤的 validation 必须固定为 JSON 字符串 \"true\""
+}
+系统
+克隆项目源码到 /opt/kaifangqian-base · 确定性规则复核
+信息
+2026/9/5 00:33:16
+log-1788539596399-p4rfj6
+{
+  "result": {
+    "executionStatus": "success",
+    "observationStatus": "matched",
+    "exitCode": 0,
+    "facts": {
+      "found": true,
+      "lineCount": 3,
+      "mainObservationStatus": "matched",
+      "verificationMode": "postcondition",
+      "validationObservationStatus": "matched",
+      "validatorType": "file",
+      "validationPassed": true,
+      "evidenceConflict": false,
+      "blockingSignal": false
+    },
+    "warnings": [],
+    "evidenceIds": [
+      "evidence-main-1788539596398-8iawpt",
+      "evidence-validation-1788539596398-6jkfr4"
+    ]
+  },
+  "modelReviewSkipped": true
+}
+命令
+克隆项目源码到 /opt/kaifangqian-base · 程序证据校验
+成功
+2026/9/5 00:33:16
+log-1788539596398-1sfzhw
+{
+  "validator": {
+    "type": "file",
+    "command": "test -d \"/opt/kaifangqian-base/.git\" && cd \"/opt/kaifangqian-base\" && git remote get-url origin | grep -q \"https://gitee.com/kaifangqian/kaifangqian-base.git\" && git rev-parse HEAD >/dev/null 2>&1",
+    "validStates": [
+      "matched",
+      "not_found",
+      "unknown"
+    ]
+  },
+  "result": {
+    "executionStatus": "success",
+    "observationStatus": "matched",
+    "exitCode": 0,
+    "facts": {
+      "found": true,
+      "lineCount": 3,
+      "mainObservationStatus": "matched",
+      "verificationMode": "postcondition",
+      "validationObservationStatus": "matched",
+      "validatorType": "file",
+      "validationPassed": true,
+      "evidenceConflict": false,
+      "blockingSignal": false
+    },
+    "warnings": [],
+    "evidenceIds": [
+      "evidence-main-1788539596398-8iawpt",
+      "evidence-validation-1788539596398-6jkfr4"
+    ]
+  },
+  "validationCommand": "test -d \"/opt/kaifangqian-base/.git\" && cd \"/opt/kaifangqian-base\" && git remote get-url origin | grep -q \"https://gitee.com/kaifangqian/kaifangqian-base.git\" && git rev-parse HEAD >/dev/null 2>&1",
+  "validationOutput": "命令未产生输出\n[exit: 0]"
+}
+命令
+克隆项目源码到 /opt/kaifangqian-base
+成功
+2026/9/5 00:33:16
+log-1788539596058-1e7goi
+执行内容
+git clone https://gitee.com/kaifangqian/kaifangqian-base.git /opt/kaifangqian-base
+完整返回内容
+正克隆到 '/opt/kaifangqian-base'...
+正在更新文件:  83% (4448/5332)
+正在更新文件:  84% (4479/5332)
+正在更新文件:  85% (4533/5332)
+正在更新文件:  86% (4586/5332)
+正在更新文件:  87% (4639/5332)
+正在更新文件:  88% (4693/5332)
+正在更新文件:  89% (4746/5332)
+正在更新文件:  90% (4799/5332)
+正在更新文件:  91% (4853/5332)
+正在更新文件:  92% (4906/5332)
+正在更新文件:  93% (4959/5332)
+正在更新文件:  94% (5013/5332)
+正在更新文件:  95% (5066/5332)
+正在更新文件:  96% (5119/5332)
+正在更新文件:  97% (5173/5332)
+正在更新文件:  98% (5226/5332)
+正在更新文件:  99% (5279/5332)
+正在更新文件: 100% (5332/5332)
+正在更新文件: 100% (5332/5332), 完成.
+[exit: 0]
+任务
+执行计划已批准
+信息
+2026/9/5 00:33:06
+log-1788539586672-kfr28e
+1 个步骤进入执行队列
+模型
+已复用联合决策中的下一阶段计划
+警告
+2026/9/5 00:33:06
+log-1788539586671-f3nawg
+{
+  "context": {
+    "workflowPhase": "cached_combined_next_stage",
+    "snapshotFingerprint": "2778:5a698e84",
+    "policyFingerprint": "4526:5a93bc51"
+  },
+  "replacement": [
+    {
+      "id": "ai-step-1788539581-0",
+      "kind": "change",
+      "title": "克隆项目源码到 /opt/kaifangqian-base",
+      "description": "使用原始 HTTPS URL 将 Gitee 仓库克隆到用户指定的绝对路径 /opt/kaifangqian-base。这是获取源码的核心变更步骤。",
+      "command": "git clone https://gitee.com/kaifangqian/kaifangqian-base.git /opt/kaifangqian-base",
+      "risk": "low",
+      "expected": "Git clone 命令真实退出码为 0，且 /opt/kaifangqian-base 目录下存在完整的 Git 工作树。",
+      "validation": "test -d \"/opt/kaifangqian-base/.git\" && cd \"/opt/kaifangqian-base\" && git remote get-url origin | grep -q \"https://gitee.com/kaifangqian/kaifangqian-base.git\" && git rev-parse HEAD >/dev/null 2>&1",
+      "executionScope": "isolated_exec",
+      "validationScope": "isolated_exec",
+      "runtimeClass": "bounded",
+      "status": "pending",
+      "validator": {
+        "type": "file",
+        "command": "test -d \"/opt/kaifangqian-base/.git\" && cd \"/opt/kaifangqian-base\" && git remote get-url origin | grep -q \"https://gitee.com/kaifangqian/kaifangqian-base.git\" && git rev-parse HEAD >/dev/null 2>&1",
+        "validStates": [
+          "matched",
+          "not_found",
+          "unknown"
+        ]
+      }
+    }
+  ]
+}
+模型
+当前阶段结束但整体目标尚未完成
+警告
+2026/9/5 00:33:01
+log-1788539581640-b5dxt4
+{
+  "rootGoal": "拉取并部署项目https://gitee.com/kaifangqian/kaifangqian-base.git到/opt下",
+  "decision": {
+    "decision": "continue",
+    "reason": "当前已验证 Git 可用、/opt 可写、目标目录不存在，且仓库匿名访问成功（公开）。源码获取和部署尚未开始，整体目标未完成。下一步应执行最小变更：将项目克隆到 /opt/kaifangqian-base。",
+    "summary": "环境检查与匿名探测已完成，确认为公开仓库且目标路径可用。现在进入源码获取阶段，执行 git clone 到指定最终目录。",
+    "steps": [
+      {
+        "id": "ai-step-1788539581-0",
+        "kind": "change",
+        "title": "克隆项目源码到 /opt/kaifangqian-base",
+        "description": "使用原始 HTTPS URL 将 Gitee 仓库克隆到用户指定的绝对路径 /opt/kaifangqian-base。这是获取源码的核心变更步骤。",
+        "command": "git clone https://gitee.com/kaifangqian/kaifangqian-base.git /opt/kaifangqian-base",
+        "risk": "low",
+        "expected": "Git clone 命令真实退出码为 0，且 /opt/kaifangqian-base 目录下存在完整的 Git 工作树。",
+        "validation": "test -d \"/opt/kaifangqian-base/.git\" && cd \"/opt/kaifangqian-base\" && git remote get-url origin | grep -q \"https://gitee.com/kaifangqian/kaifangqian-base.git\" && git rev-parse HEAD >/dev/null 2>&1",
+        "executionScope": "isolated_exec",
+        "validationScope": "isolated_exec",
+        "runtimeClass": "bounded",
+        "status": "pending",
+        "validator": {
+          "type": "file",
+          "command": "test -d \"/opt/kaifangqian-base/.git\" && cd \"/opt/kaifangqian-base\" && git remote get-url origin | grep -q \"https://gitee.com/kaifangqian/kaifangqian-base.git\" && git rev-parse HEAD >/dev/null 2>&1",
+          "validStates": [
+            "matched",
+            "not_found",
+            "unknown"
+          ]
+        }
+      }
+    ],
+    "source": "model"
+  }
+}
+系统
+匿名探测仓库访问权限 · 确定性规则复核
+信息
+2026/9/5 00:32:54
+log-1788539574317-i6dlk6
+{
+  "result": {
+    "executionStatus": "success",
+    "observationStatus": "matched",
+    "exitCode": 0,
+    "facts": {
+      "lineCount": 2,
+      "outputPresent": true,
+      "mainObservationStatus": "matched",
+      "verificationMode": "command_result",
+      "validatorType": "command",
+      "evidenceConflict": false,
+      "blockingSignal": false
+    },
+    "warnings": [],
+    "evidenceIds": [
+      "evidence-main-1788539574315-z76gum"
+    ]
+  },
+  "modelReviewSkipped": true
+}
+命令
+匿名探测仓库访问权限 · 观察证据
+成功
+2026/9/5 00:32:54
+log-1788539574315-mbt5v6
+{
+  "validator": {
+    "type": "command",
+    "command": "",
+    "validStates": [
+      "matched",
+      "not_found",
+      "unknown"
+    ]
+  },
+  "result": {
+    "executionStatus": "success",
+    "observationStatus": "matched",
+    "exitCode": 0,
+    "facts": {
+      "lineCount": 2,
+      "outputPresent": true,
+      "mainObservationStatus": "matched",
+      "verificationMode": "command_result",
+      "validatorType": "command",
+      "evidenceConflict": false,
+      "blockingSignal": false
+    },
+    "warnings": [],
+    "evidenceIds": [
+      "evidence-main-1788539574315-z76gum"
+    ]
+  },
+  "validationCommand": "",
+  "validationOutput": ""
+}
+命令
+匿名探测仓库访问权限
+成功
+2026/9/5 00:32:54
+log-1788539574315-xdm6w3
+执行内容
+GIT_TERMINAL_PROMPT=0 git ls-remote --heads https://gitee.com/kaifangqian/kaifangqian-base.git
+完整返回内容
+99e8e6b44525b85ac4c914c2e8e6bef1fe2c78a5	refs/heads/master
+ce582089b35fe2f51f20c6fa74693f3fece4bd00	refs/heads/open
+[exit: 0]
+任务
+执行计划已批准
+信息
+2026/9/5 00:32:53
+log-1788539573802-wg1lj3
+2 个步骤进入执行队列
+系统
+检查 Git 可用性、目标目录状态与写入条件 · 确定性规则复核
+信息
+2026/9/5 00:32:48
+log-1788539568776-71phzm
+{
+  "result": {
+    "executionStatus": "success",
+    "observationStatus": "matched",
+    "exitCode": 0,
+    "facts": {
+      "found": true,
+      "lineCount": 4,
+      "mainObservationStatus": "matched",
+      "verificationMode": "command_result",
+      "validatorType": "file",
+      "evidenceConflict": false,
+      "blockingSignal": false
+    },
+    "warnings": [],
+    "evidenceIds": [
+      "evidence-main-1788539568773-54d6el"
+    ]
+  },
+  "modelReviewSkipped": true
+}
+命令
+检查 Git 可用性、目标目录状态与写入条件 · 观察证据
+成功
+2026/9/5 00:32:48
+log-1788539568774-8ouw8n
+{
+  "validator": {
+    "type": "file",
+    "command": "",
+    "validStates": [
+      "matched",
+      "not_found",
+      "unknown"
+    ]
+  },
+  "result": {
+    "executionStatus": "success",
+    "observationStatus": "matched",
+    "exitCode": 0,
+    "facts": {
+      "found": true,
+      "lineCount": 4,
+      "mainObservationStatus": "matched",
+      "verificationMode": "command_result",
+      "validatorType": "file",
+      "evidenceConflict": false,
+      "blockingSignal": false
+    },
+    "warnings": [],
+    "evidenceIds": [
+      "evidence-main-1788539568773-54d6el"
+    ]
+  },
+  "validationCommand": "",
+  "validationOutput": ""
+}
+命令
+检查 Git 可用性、目标目录状态与写入条件
+成功
+2026/9/5 00:32:48
+log-1788539568772-m3k7b7
+执行内容
+git --version && ls -ld /opt && test -w /opt && echo "WRITE_OK" || echo "WRITE_FAIL"; if [ -d "/opt/kaifangqian-base" ]; then echo "TARGET_EXISTS"; else echo "TARGET_NOT_EXISTS"; fi
+完整返回内容
+git version 2.52.0
+drwxr-xr-x. 9 root root 121  8月31日 21:08 /opt
+WRITE_OK
+TARGET_NOT_EXISTS
+[exit: 0]
+任务
+执行计划已批准
+信息
+2026/9/5 00:32:48
+log-1788539568493-6sun0v
+1 个步骤进入执行队列
+模型
+模型执行计划已返回
+成功
+2026/9/5 00:32:48
+log-1788539568493-63ev5g
+{
+  "requirement": "拉取并部署项目https://gitee.com/kaifangqian/kaifangqian-base.git到/opt下",
+  "constraints": {
+    "changePolicy": "requested_changes_only",
+    "environmentPolicy": "unspecified",
+    "failurePolicy": "unspecified",
+    "prohibitedActions": [],
+    "requiredConditions": [],
+    "userDirectives": []
+  },
+  "selectedSkillIds": [
+    "project-source-acquisition",
+    "application-deployment"
+  ],
+  "context": {
+    "server": {
+      "name": "192.168.1.242",
+      "host": "192.168.1.242",
+      "info": {
+        "os": "CentOS Stream 10 (Coughlan)",
+        "kernel": "Linux 6.12.0-213.el10.x86_64 x86_64",
+        "cpu": "远程服务器 CPU",
+        "cores": 1,
+        "memoryGb": 1,
+        "diskGb": 16,
+        "uptime": "5 days, 10 hours, 17 minutes"
+      },
+      "environment": []
+    },
+    "metrics": {
+      "cpu": 9,
+      "memory": 77,
+      "disk": 48,
+      "networkIn": 0.00067051244,
+      "networkOut": 0.0010004621,
+      "sampledAt": "2026-09-04T16:32:39.773Z"
+    },
+    "permission": "managed",
+    "terminalContext": {
+      "source": "automatic",
+      "totalLines": 5,
+      "includedLines": 0,
+      "hasMore": true
+    },
+    "conversationHistory": [],
+    "knownExecutionFacts": {
+      "skillFacts": {},
+      "completedSteps": [],
+      "instruction": "这些事实来自同一任务的已完成执行证据。后续步骤必须优先复用，不得在无新证据时猜测或重复已完成工作。"
+    },
+    "tools": [
+      {
+        "id": "server.resolve_connection",
+        "name": "服务器连接资料查询工具",
+        "description": "按目标地址查询服务器管理记录或当前服务器长期保存的 SSH 凭据组。",
+        "usageInstructions": "输入目标 host 和 port。工具优先返回已纳管服务器引用，否则可返回唯一匹配的 server-credential 引用；不返回凭据组中的用户名或密码真实值。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "host": {
+              "type": "string",
+              "description": "目标服务器 IP 地址或域名。"
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535,
+              "default": 22
+            }
+          },
+          "required": [
+            "host"
+          ]
+        },
+        "outputDescription": "返回目标是否有可用连接资料、端口和 credentialRef；只有已纳管服务器可返回公开用户名，服务器凭据组不返回真实值。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 2
+      },
+      {
+        "id": "server.connect",
+        "name": "SSH 服务器连接工具",
+        "description": "在当前可见终端的真实 PTY 中执行 SSH 登录，并让后续命令继续运行在目标服务器。",
+        "usageInstructions": "输入需要登录的目标地址，并优先使用 server.resolve_connection 或 serverCredentialGroups 给出的 credentialRef；仅兼容旧流程时使用 username + passwordSecretKey。缺少匹配凭据时必须先调用 user.request_input 同表单收集用户名和密码。工具会改变当前终端所在服务器，只用于用户要求的终端 SSH 登录，不是 scp 或服务器间文件传输的凭据准备/中转步骤。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "host": {
+              "type": "string",
+              "description": "目标服务器 IP 地址或域名。"
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535,
+              "default": 22,
+              "description": "SSH 服务端口。"
+            },
+            "username": {
+              "type": "string",
+              "description": "SSH 登录用户名。"
+            },
+            "passwordSecretKey": {
+              "type": "string",
+              "description": "已由用户输入工具安全收集的密码参数 key，不是密码值。"
+            },
+            "credentialRef": {
+              "type": "string",
+              "description": "服务器连接资料查询工具返回的不可逆凭据引用。"
+            },
+            "name": {
+              "type": "string",
+              "description": "服务器在 Opsark 中的显示名称。"
+            },
+            "group": {
+              "type": "string",
+              "description": "可选的服务器分组。"
+            }
+          },
+          "required": [
+            "host"
+          ]
+        },
+        "outputDescription": "返回终端内 SSH 跳转状态、目标地址和用户名占位元数据，不返回凭据组的真实值。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 2
+      },
+      {
+        "id": "user.request_input",
+        "name": "用户输入工具",
+        "description": "以结构化表单请求用户补充任务必需信息，每个参数均显示名称、用途、必填状态和输入提示。",
+        "usageInstructions": "仅在完成任务确实缺少用户信息时调用。必须作为当前计划唯一的信息收集步骤，提交后再生成后续计划。每个字段必须提供 label 和 description；敏感值必须使用 password 类型。收集用户名+密码/令牌时，两个字段必须各自提供 credential 对象，使用相同 group/kind/target 和不同 role，不得依赖 label/description 自然语言推断配对。完整凭据组会按服务器长期保存，后续任务应复用 serverCredentialGroups，不得重复索取。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "title": {
+              "type": "string",
+              "description": "表单标题，说明需要用户补充什么信息。"
+            },
+            "description": {
+              "type": "string",
+              "description": "表单整体说明，告知这些信息将用于什么操作。"
+            },
+            "fields": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8,
+              "description": "用户需要填写的参数列表。",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "key": {
+                    "type": "string",
+                    "description": "程序使用的参数名。"
+                  },
+                  "label": {
+                    "type": "string",
+                    "description": "展示给用户的参数名称。"
+                  },
+                  "description": {
+                    "type": "string",
+                    "description": "说明参数是什么、将用于什么操作。"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "text",
+                      "password",
+                      "number"
+                    ]
+                  },
+                  "placeholder": {
+                    "type": "string",
+                    "description": "不包含真实敏感值的输入示例。"
+                  },
+                  "required": {
+                    "type": "boolean",
+                    "description": "该参数是否必填。"
+                  },
+                  "credential": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "用户名/密码或令牌的显式凭据组契约。",
+                    "properties": {
+                      "group": {
+                        "type": "string",
+                        "description": "同一表单内两个凭据字段共用的组标识。"
+                      },
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "git-https",
+                          "ssh-password",
+                          "database",
+                          "service"
+                        ]
+                      },
+                      "role": {
+                        "type": "string",
+                        "enum": [
+                          "username",
+                          "secret"
+                        ]
+                      },
+                      "target": {
+                        "type": "string",
+                        "description": "认证目标主机或服务标识，不包含凭据。"
+                      }
+                    },
+                    "required": [
+                      "group",
+                      "kind",
+                      "role",
+                      "target"
+                    ]
+                  }
+                },
+                "required": [
+                  "key",
+                  "label",
+                  "description",
+                  "type",
+                  "required"
+                ]
+              }
+            }
+          },
+          "required": [
+            "title",
+            "fields"
+          ]
+        },
+        "outputDescription": "返回非敏感字段值与敏感字段占位符；凭据真实值不会写入模型上下文或普通日志。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 3
+      },
+      {
+        "id": "files.get_structure",
+        "name": "文件数据结构获取工具",
+        "description": "只读获取远端指定目录的紧凑文本目录树。",
+        "usageInstructions": "固定格式为 opsark-tool files.get_structure {...}，工具 ID 前不得添加 --。输入绝对路径即可；默认排除版本库、依赖缓存和构建产物，默认最多 4 层、600 个节点。结果截断时应缩小 rootPath 再获取，不要盲目提高上限。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "rootPath": {
+              "type": "string",
+              "description": "远端绝对目录路径"
+            },
+            "excludeDirectories": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "maxDepth": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20,
+              "default": 4
+            },
+            "maxNodes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10000,
+              "default": 600
+            },
+            "includeHidden": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "rootPath"
+          ]
+        },
+        "outputDescription": "模型仅接收一个稳定排序的 tree 文本字段；截断状态由执行器单独记录，不返回节点对象、文件内容或重复元数据。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 2
+      },
+      {
+        "id": "files.read_content",
+        "name": "文件内容读取工具",
+        "description": "有界、只读地读取远端 UTF-8 文本文件，为项目文档、声明文件和配置分析提供真实证据。",
+        "usageInstructions": "仅在已确认的绝对文件路径上使用。默认最多读取 64 KiB，最大 256 KiB；二进制文件会拒绝读取，敏感值在进入模型上下文前脱敏。目录结构不足以证明技术栈时，应使用本工具读取 README、依赖声明、锁文件或示例配置。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "需要读取的远端文件绝对路径。"
+            },
+            "maxBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 262144,
+              "default": 65536
+            }
+          },
+          "required": [
+            "path"
+          ]
+        },
+        "outputDescription": "返回脱敏后的 UTF-8 文本、文件总字节数、返回字节数和截断状态。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 1
+      },
+      {
+        "id": "software.check",
+        "name": "软件可用性检查工具",
+        "description": "在当前任务绑定终端中检查指定软件是否存在，并获取真实可执行路径和版本首行。",
+        "usageInstructions": "一次检查 1 到 20 个由项目证据或用户需求明确指出的软件；不得借此扫描整台服务器或猜测技术栈。该工具只检查，不安装、不升级、不启动服务。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "names": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 20,
+              "items": {
+                "type": "string"
+              },
+              "description": "要检查的精确命令名。"
+            },
+            "includeVersions": {
+              "type": "boolean",
+              "default": true
+            }
+          },
+          "required": [
+            "names"
+          ]
+        },
+        "outputDescription": "返回每个软件的安装状态、命令路径和版本首行。",
+        "planMode": "standalone",
+        "completionMode": "refine",
+        "version": 1
+      },
+      {
+        "id": "files.transfer_between_servers",
+        "name": "服务器间文件传输工具",
+        "description": "使用 Opsark 已保存的两台服务器凭据，在桌面后端中流式中转文件并进行 SHA-256 校验。",
+        "usageInstructions": "输入源文件、目标服务器和目标路径。工具使用受管凭据流式中转并校验，不要求源服务器持有目标凭据。是否选用该工具由当前 Skill 决定。",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "sourcePath": {
+              "type": "string",
+              "description": "当前服务器上的源文件绝对路径"
+            },
+            "targetServer": {
+              "type": "string",
+              "description": "目标服务器 ID、名称或地址"
+            },
+            "targetPath": {
+              "type": "string",
+              "description": "目标文件绝对路径，必须包含文件名"
+            },
+            "overwrite": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          "required": [
+            "sourcePath",
+            "targetServer",
+            "targetPath"
+          ]
+        },
+        "outputDescription": "返回源路径、目标路径、字节数、目标服务器 ID 和 SHA-256 校验值。",
+        "planMode": "regular",
+        "completionMode": "continue",
+        "version": 1
+      }
+    ],
+    "skillSelection": {
+      "mode": "model",
+      "multiple": true,
+      "allowEmpty": true,
+      "currentActiveSkillIds": []
+    },
+    "skillDirectory": [
+      {
+        "id": "ssh-terminal-jump",
+        "name": "终端 SSH 跳转",
+        "category": "connectivity",
+        "description": "从当前可见终端登录或跳转到另一台 SSH 服务器，并验证登录后的终端身份。",
+        "version": 4,
+        "selectionHints": [
+          "regex:(?:ssh).*(?:连接|登录|跳转)|(?:连接|登录|跳转).*(?:ssh)",
+          "regex:(?:终端|shell).*(?:跳转|登录).*(?:服务器|主机|IP)|(?:跳转|登录).*(?:服务器|主机|IP).*(?:终端|shell)"
+        ]
+      },
+      {
+        "id": "project-source-acquisition",
+        "name": "项目源码获取",
+        "category": "source-control",
+        "description": "将公开或私有 Git 仓库获取到指定目录，处理服务器级凭据复用、常见错误和最终仓库验收。",
+        "version": 12,
+        "selectionHints": [
+          "git clone",
+          "克隆代码仓库",
+          "下载或获取项目源码",
+          "拉取私有仓库",
+          "更新代码仓库",
+          "检出指定分支或提交",
+          "regex:(?:克隆|获取|下载|拉取|检出|同步|更新).*(?:仓库|代码|源码|项目)|(?:仓库|代码|源码|项目).*(?:克隆|获取|下载|拉取|检出|同步|更新)"
+        ]
+      },
+      {
+        "id": "software-installation",
+        "name": "通用软件安装",
+        "category": "environment",
+        "description": "在 Linux 服务器上安装或升级 Git、Node.js、Java/JDK、Docker 等通用软件；识别发行版、版本、权限、仓库、国内网络与镜像，并进行独立验收。",
+        "version": 1,
+        "selectionHints": [
+          "安装软件",
+          "安装 Git",
+          "安装 Node",
+          "安装 Node.js",
+          "安装 Java",
+          "安装 JDK",
+          "安装 Docker",
+          "安装 Python",
+          "安装 Go",
+          "安装 Rust",
+          "安装 Nginx",
+          "升级运行时",
+          "配置软件源",
+          "regex:(?:安装|部署|升级|配置).*(?:git|node(?:\\.js)?|npm|pnpm|yarn|java|jdk|maven|gradle|docker|docker compose|软件|运行时|工具链)",
+          "regex:(?:安装|升级|卸载)\\s*(?:软件|程序|工具|软件包|[a-z][a-z0-9+._-]*)"
+        ]
+      },
+      {
+        "id": "project-build",
+        "name": "项目依赖与构建",
+        "category": "build",
+        "description": "按项目证据分阶段完成工具链确认、依赖安装、构建和产物验收，并根据真实错误恢复。",
+        "version": 3,
+        "selectionHints": [
+          "构建项目",
+          "编译源码",
+          "安装项目依赖",
+          "生成构建产物或安装包",
+          "regex:(?:构建|编译|build|compile|package).*(?:项目|源码|代码|产物)|(?:项目|源码|代码|产物).*(?:构建|编译|build|compile|package)"
+        ]
+      },
+      {
+        "id": "database-inspection-operations",
+        "name": "数据库检查与操作",
+        "category": "data",
+        "description": "对 MySQL、MariaDB、PostgreSQL 等数据库执行库表查询、连接诊断、初始化、迁移和受控变更，以真实查询结果验收。",
+        "version": 1,
+        "selectionHints": [
+          "查看数据库",
+          "列出所有数据库",
+          "查询数据库或表",
+          "检查数据库连接",
+          "数据库初始化或迁移",
+          "regex:(?:mysql|mariadb|postgres(?:ql)?|数据库|sql).*(?:查询|查看|列出|检查|连接|初始化|迁移|创建|修改|删除)|(?:查询|查看|列出|检查|连接|初始化|迁移|创建|修改|删除).*(?:mysql|mariadb|postgres(?:ql)?|数据库|sql)"
+        ]
+      },
+      {
+        "id": "application-deployment",
+        "name": "应用部署与上线验收",
+        "category": "deployment",
+        "description": "将已有项目部署、启动或上线，并完成端到端验收。",
+        "version": 4,
+        "selectionHints": [
+          "部署项目",
+          "继续部署",
+          "上线应用",
+          "启动并验证项目",
+          "配置 Web 服务",
+          "regex:(?:部署|上线|发布|运行|启动).*(?:项目|应用|网站|服务)|(?:项目|应用|网站|服务).*(?:部署|上线|发布)"
+        ]
+      },
+      {
+        "id": "file-transfer-integrity",
+        "name": "文件传输与完整性验证",
+        "category": "transfer",
+        "description": "在服务器之间安全传输文件；目标缺少受管凭据时向用户收集 SSH 登录信息，并使用字节数和 SHA-256 证据确认完整性。",
+        "version": 5,
+        "selectionHints": [
+          "跨服务器文件传输",
+          "发送文件到服务器",
+          "复制构建产物或安装包",
+          "SHA-256 文件完整性校验",
+          "regex:(?:传输|发送|复制|拷贝|同步).*(?:文件|安装包|备份|产物)|(?:文件|安装包|备份|产物).*(?:传输|发送|复制|拷贝|同步)"
+        ]
+      }
+    ],
+    "activeSkills": [],
+    "secretVariables": [],
+    "serverCredentialGroups": []
+  },
+  "plan": [
+    {
+      "id": "ai-step-1788539568-0",
+      "kind": "observe",
+      "title": "检查 Git 可用性、目标目录状态与写入条件",
+      "description": "确认服务器上 Git 是否可用，/opt 目录是否存在且可写，以及 /opt/kaifangqian-base 是否已存在。这是获取源码前的必要环境发现步骤。",
+      "command": "git --version && ls -ld /opt && test -w /opt && echo \"WRITE_OK\" || echo \"WRITE_FAIL\"; if [ -d \"/opt/kaifangqian-base\" ]; then echo \"TARGET_EXISTS\"; else echo \"TARGET_NOT_EXISTS\"; fi",
+      "risk": "low",
+      "expected": "获得 Git 版本信息；确认 /opt 可写；明确 /opt/kaifangqian-base 目录是否已存在。",
+      "validation": "",
+      "executionScope": "isolated_exec",
+      "runtimeClass": "bounded",
+      "status": "pending",
+      "validator": {
+        "type": "file",
+        "command": "",
+        "validStates": [
+          "matched",
+          "not_found",
+          "unknown"
+        ]
+      }
+    }
+  ]
+}
+模型
+提交需求理解与规划请求
+信息
+2026/9/5 00:32:42
+log-1788539562367-jok074
+需求：拉取并部署项目https://gitee.com/kaifangqian/kaifangqian-base.git到/opt下

@@ -44,6 +44,10 @@ export function buildToolStepOutcome(input: BuildToolStepOutcomeInput): ToolStep
   const truncated = result.truncated === true;
   const output = JSON.stringify(result.data, null, 2);
   const facts = { toolId: call.toolId, truncated };
+  if (call.toolId === "context.expand" && result.data && typeof result.data === "object"
+    && "skillId" in result.data && typeof result.data.skillId === "string") {
+    Object.assign(facts, { expandedSkillId: result.data.skillId });
+  }
   const successSummary = truncated
     ? "工具已返回部分结构化证据。"
     : "工具已返回结构化证据。";

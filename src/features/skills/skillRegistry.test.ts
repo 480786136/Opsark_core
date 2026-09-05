@@ -56,8 +56,9 @@ describe("skill registry", () => {
 
     expect(skill).toMatchObject({
       id: "project-source-acquisition",
-      version: 11,
+      version: 12,
       forbiddenToolIds: ["server.resolve_connection", "server.connect"],
+      allowedToolIds: ["user.request_input"],
     });
     expect(instructions).toContain("最短的可执行计划");
     expect(instructions).toContain("GIT_HTTP_CREDENTIAL");
@@ -211,7 +212,7 @@ describe("skill registry", () => {
     })).filter((skill) => skill.id === "project-source-acquisition");
 
     expect(source.enabled).toBe(false);
-    expect(source.version).toBe(11);
+    expect(source.version).toBe(12);
     expect(source.instructions).not.toContain("旧版自由文本认证流程");
     expect(source.instructions).toContain('"kind":"git-https","role":"username"');
 
@@ -220,7 +221,7 @@ describe("skill registry", () => {
       customSkills: [],
     })).find((skill) => skill.id === "project-source-acquisition")!;
     expect(sourceFromUnversionedConfig.instructions).not.toContain("更早版本的无版本覆盖");
-    expect(sourceFromUnversionedConfig.version).toBe(11);
+    expect(sourceFromUnversionedConfig.version).toBe(12);
   });
 
   it("preserves a source override authored against the v11 contract", () => {

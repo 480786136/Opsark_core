@@ -24,6 +24,30 @@ describe("tool executor", () => {
     expect(() => parseToolCommand('opsark-tool user.request_input {"title":"凭据","fields":[{"key":"PASSWORD","label":"密码","description":"用途","type":"password","required":true,"extra":1}]}', "call-7")).toThrow("不支持字段");
   });
 
+  it.each([
+    [
+      "换行串联的多个调用",
+      'opsark-tool files.get_structure {"rootPath":"/opt/app"}\nopsark-tool files.get_structure {"rootPath":"/srv/app"}',
+    ],
+    [
+      "同一行串联的多个调用",
+      'opsark-tool files.get_structure {"rootPath":"/opt/app"} opsark-tool files.get_structure {"rootPath":"/srv/app"}',
+    ],
+    [
+      "跨行参数对象",
+      'opsark-tool files.get_structure {\n"rootPath":"/opt/app"\n}',
+    ],
+  ])("拒绝非原子的工具命令：%s", (_name, command) => {
+    expect(() => parseToolCommand(command, "call-non-atomic")).toThrow("单行原子调用");
+  });
+
+  it("拒绝在一个工具调用中拼接多个 JSON 参数对象", () => {
+    expect(() => parseToolCommand(
+      'opsark-tool files.get_structure {"rootPath":"/opt/app"} {"rootPath":"/srv/app"}',
+      "call-multiple-objects",
+    )).toThrow("单个 JSON 对象");
+  });
+
   it("拒绝把敏感凭据伪装成普通文本输入", () => {
     expect(() => parseUserInputArguments({
       title: "Gitee 凭据",
@@ -181,7 +205,7 @@ describe("tool executor", () => {
     }, resolveToolRegistry([]), { getRemoteFileStructure });
 
     expect(result.success).toBe(true);
-    expect(result.data).toEqual({ tree: "/opt/app/\n└── package.json" });
+    expect(result.data).toEqual({ tree: "/opt/app/\n└── package.json", rootPath: "/opt/app", truncated: false, warnings: [] });
     expect(getRemoteFileStructure).toHaveBeenCalledWith(expect.objectContaining({
       rootPath: "/opt/app",
       excludeDirectories: expect.arrayContaining([".git", "node_modules", "uploads"]),

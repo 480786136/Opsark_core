@@ -1,4 +1,5 @@
 import type { SkillDefinition } from "@/features/skills/types";
+import { deploymentPlanningContract } from "@/features/skills/builtins/deploymentPlanning";
 import { projectSourceAcquisitionSkill } from "@/features/skills/builtins/projectSourceAcquisition/definition";
 
 const sshTerminalJump: SkillDefinition = {
@@ -13,6 +14,7 @@ const sshTerminalJump: SkillDefinition = {
     "regex:(?:ssh).*(?:连接|登录|跳转)|(?:连接|登录|跳转).*(?:ssh)",
     "regex:(?:终端|shell).*(?:跳转|登录).*(?:服务器|主机|IP)|(?:跳转|登录).*(?:服务器|主机|IP).*(?:终端|shell)",
   ],
+  allowedToolIds: ["server.resolve_connection", "user.request_input", "server.connect"],
   instructions: `这是分阶段工作流，每次只规划当前证据允许执行的阶段，禁止猜测后续结果：
 1. 尚无目标端口连通证据时，先在当前终端执行只读网络连通检查；失败即报告阻断，不索取密码。
 2. 网络可达后，单独调用 opsark-tool server.resolve_connection，并同时检查当前上下文的 serverCredentialGroups，按目标 host/port 查询已纳管连接或当前服务器长期保存的 SSH 凭据组。模型只能看到 credentialRef、目标、用途和占位符，不得读取用户名或密码真实值。
@@ -48,6 +50,7 @@ const softwareInstallation: SkillDefinition = {
     "regex:(?:安装|部署|升级|配置).*(?:git|node(?:\\.js)?|npm|pnpm|yarn|java|jdk|maven|gradle|docker|docker compose|软件|运行时|工具链)",
     "regex:(?:安装|升级|卸载)\\s*(?:软件|程序|工具|软件包|[a-z][a-z0-9+._-]*)",
   ],
+  allowedToolIds: ["software.check", "user.request_input"],
   instructions: `这是通用服务器软件安装流程，可单独使用，也可与 project-source-acquisition、project-build 等 Skill 联合使用。只安装用户目标或已由项目证据证明必需的软件，不预设具体业务：
 1. 软件名称明确时优先调用 software.check 获取指定命令的真实路径和版本；只有工具返回缺失或版本不兼容时才进入安装。不得用全系统扫描替代精准检查，也不得因 server.basic_info 未列出某软件就直接判定缺失。缺少 OS、架构、权限证据时，本轮只能做只读环境发现；安装源可用性未知时，下一轮只做有界网络/仓库探测；证据充分后才能安装。安装主进程未真实退出前不得后置验收，30 秒模型复核不能替代真实退出状态。
 2. 明确目标：确认软件名称、用途、期望版本/版本范围、CPU 架构、系统级或用户级安装、是否允许升级现有版本，以及是否需要服务启动/开机自启。用户未指定版本时，应依据操作系统受支持版本或项目声明选择兼容版本并说明依据；不能默认安装“最新版本”，也不能顺带升级无关包。
@@ -82,6 +85,7 @@ const projectBuild: SkillDefinition = {
     "生成构建产物或安装包",
     "regex:(?:构建|编译|build|compile|package).*(?:项目|源码|代码|产物)|(?:项目|源码|代码|产物).*(?:构建|编译|build|compile|package)",
   ],
+  allowedToolIds: ["files.get_structure", "files.read_content", "software.check", "user.request_input"],
   instructions: `目标是从已确认的项目源码得到可验证的构建结果。按下面的业务阶段处理，不把多个失败边界塞进同一个 Shell 步骤：
 
 1. 项目识别：复用已有工作目录、仓库和 HEAD 证据，不重复获取源码。读取项目自己的 README、依赖声明、锁文件、工具链版本文件、构建脚本和必要的 CI 配置，确定包管理器、所需运行时、安装入口、构建入口和预期产物。关键选择尚无证据时，本轮只完成发现；不要猜技术栈、命令或产物目录。
@@ -111,6 +115,7 @@ const databaseInspectionAndOperations: SkillDefinition = {
     "数据库初始化或迁移",
     "regex:(?:mysql|mariadb|postgres(?:ql)?|数据库|sql).*(?:查询|查看|列出|检查|连接|初始化|迁移|创建|修改|删除)|(?:查询|查看|列出|检查|连接|初始化|迁移|创建|修改|删除).*(?:mysql|mariadb|postgres(?:ql)?|数据库|sql)",
   ],
+  allowedToolIds: ["user.request_input"],
   instructions: `这是数据库查询、连接诊断和受控变更的领域流程，必须以用户要求的真实数据库结果验收：
 1. 先从用户需求和已有证据确认目标引擎、主机或 socket、端口、账户、数据库名与操作类型。不得把 mysql 客户端存在当作服务可用，也不得从项目示例配置猜测生产连接参数。
 2. 认证方式必须通过真实连接结果确认。可先使用已证明可用的 socket/本地系统身份进行最小只读探测；认证失败后不得继续重试空密码或其他无证据账户。先查询当前服务器的敏感信息元数据；只有用途、目标实例和账户都一致才能复用。
@@ -138,6 +143,7 @@ const applicationDeployment: SkillDefinition = {
     "配置 Web 服务",
     "regex:(?:部署|上线|发布|运行|启动).*(?:项目|应用|网站|服务)|(?:项目|应用|网站|服务).*(?:部署|上线|发布)",
   ],
+  allowedToolIds: ["files.get_structure", "files.read_content", "software.check", "user.request_input"],
   instructions: `这是面向整体目标的应用部署流程，必须与 project-source-acquisition、software-installation、project-build 等已选 Skill 联合复用证据，不能把某个中间阶段当作部署完成：
 1. 发现阶段先用 files.get_structure 对项目目录做有界检查；随后按实际结构逐个用 files.read_content 读取 README、依赖声明、锁文件、示例配置、迁移/初始化脚本、容器编排文件、服务入口或 CI 配置。目录名、文件名或 server.basic_info 只能证明候选事实，不能证明项目一定需要 PHP、Node、Java、数据库、缓存、Nginx、Composer 或 Docker。每个 standalone 工具单独成轮，阶段证据必须在后续轮复用。
 2. 将整体目标拆为有证据依赖关系的阶段：源码就位、运行环境、项目依赖/构建、运行配置与敏感变量、数据库/缓存等外部依赖、进程或容器托管、反向代理/防火墙（仅在项目与用户授权要求时）、启动、端到端验收。每轮只规划当前证据允许的步骤，但后续规划必须继续围绕 taskGoal.rootGoal，不得被“继续部署”“重试”替换。
@@ -167,6 +173,7 @@ const fileTransferIntegrity: SkillDefinition = {
     "SHA-256 文件完整性校验",
     "regex:(?:传输|发送|复制|拷贝|同步).*(?:文件|安装包|备份|产物)|(?:文件|安装包|备份|产物).*(?:传输|发送|复制|拷贝|同步)",
   ],
+  allowedToolIds: ["server.resolve_connection", "user.request_input", "files.transfer_between_servers"],
   instructions: `这是证据驱动的文件传输与完整性验证参考流程，实际步骤仍由模型根据当前证据生成：
 1. 先确认源服务器、源文件绝对路径、目标服务器和目标位置。用户只给出目标目录时，直接使用源文件 basename 补成最终目标文件绝对路径，不得重复询问文件名；仅当任务必需信息确实缺失时，才单独调用 opsark-tool user.request_input，每个字段必须说明参数及用途。
 2. 传输前在源服务器执行单独的只读文件检查，确认源对象是存在、可读的普通文件，并获取真实绝对路径、字节数和 SHA-256。所有用户路径作为 Shell 参数时必须完整安全引用，并在命令支持时使用 -- 结束选项；普通文件判断使用 test -f 等不依赖语言环境的退出状态，不得比较 stat %F 的本地化文本。该步骤不得同时探测网络、认证或执行传输，也不得把目录、空匹配、同名文件或仅有路径文本当作已确认文件。
@@ -186,6 +193,8 @@ const fileTransferIntegrity: SkillDefinition = {
 每轮只规划当前证据允许的最少阶段；不得把源文件检查、网络探测、认证探测、传输和最终验收压进一个用条件分支吞掉退出码的 Shell 步骤。已获得的路径、字节数、哈希、网络状态、认证状态和目标资料必须复用，不得无证据重复发现或重复传输。`,
   updatedAt: "2026-08-24T00:00:00.000Z",
 };
+
+applicationDeployment.planningContract = deploymentPlanningContract(applicationDeployment.instructions);
 
 export const builtInSkillCatalog: SkillDefinition[] = [
   sshTerminalJump,

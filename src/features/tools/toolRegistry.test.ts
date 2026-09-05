@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { defaultToolCatalog } from "@/features/tools/toolCatalog";
-import { buildToolContext } from "@/features/tools/toolContext";
+import { buildPlanningToolContext, buildToolContext } from "@/features/tools/toolContext";
 import {
   createToolOverrides,
   parseToolOverrides,
@@ -44,12 +44,59 @@ describe("tool registry", () => {
   });
 
   it("exposes only enabled and model-safe fields", () => {
-    const tools = resolveToolRegistry([{ id: "secret.merge_command", enabled: false }]);
+    const tools = resolveToolRegistry([]);
     const context = buildToolContext(tools);
 
     expect(context.some((tool) => tool.id === "secret.merge_command")).toBe(false);
+    expect(context.some((tool) => tool.id === "secret.metadata")).toBe(false);
+    expect(context.some((tool) => tool.id === "server.basic_info")).toBe(false);
+    expect(context.some((tool) => tool.id === "server.realtime_metrics")).toBe(false);
+    expect(context.some((tool) => tool.id === "files.get_structure")).toBe(true);
     expect(context[0]).not.toHaveProperty("implementation");
     expect(context[0]).not.toHaveProperty("builtIn");
+  });
+
+  it("limits full tool schemas to the selected built-in Skill policy", () => {
+    const tools = resolveToolRegistry([]);
+    const softwareSkill = {
+      id: "software-installation",
+      name: "软件安装",
+      category: "environment" as const,
+      description: "安装软件",
+      version: 1,
+      enabled: true,
+      builtIn: true,
+      matchRules: [],
+      instructions: "检查后安装",
+      allowedToolIds: ["software.check", "user.request_input"],
+      updatedAt: "now",
+    };
+
+    expect(buildPlanningToolContext(tools, [softwareSkill]).map(({ id }) => id)).toEqual([
+      "user.request_input",
+      "software.check",
+    ]);
+  });
+
+  it("keeps planner-visible tools for legacy custom Skills without a declared policy", () => {
+    const tools = resolveToolRegistry([]);
+    const legacySkill = {
+      id: "skill-legacy",
+      name: "Legacy",
+      category: "other" as const,
+      description: "旧版自定义 Skill",
+      version: 1,
+      enabled: true,
+      builtIn: false,
+      matchRules: [],
+      instructions: "使用自定义工具完成任务",
+      updatedAt: "now",
+    };
+    const ids = buildPlanningToolContext(tools, [legacySkill]).map(({ id }) => id);
+
+    expect(ids).toContain("files.get_structure");
+    expect(ids).toContain("server.connect");
+    expect(ids).not.toContain("secret.merge_command");
   });
 
   it("reports empty and oversized editable fields", () => {

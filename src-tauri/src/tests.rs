@@ -55,6 +55,230 @@ fn rejects_incomplete_tool_commands_before_the_model_repair_loop_finishes() {
 }
 
 #[test]
+fn normalizes_boolean_true_validation_only_at_the_model_input_boundary() {
+    let response = r#"{"steps":[{"kind":"observe","title":"读取项目结构","description":"获取项目目录树","command":"opsark-tool files.get_structure {\"rootPath\":\"/opt/app\"}","expected":"获得项目目录树","validation":true,"risk":"low"}]}"#;
+    let steps: Vec<AiPlanStep> = parse_model_array_field(response, "steps").unwrap();
+
+    assert_eq!(steps[0].validation, "true");
+    assert!(validate_ai_plan_contract(&steps, &AiGenerationSettings::default()).is_ok());
+    assert_eq!(
+        serde_json::to_value(&steps[0]).unwrap()["validation"],
+        json!("true")
+    );
+
+    let focused_repair = r#"{"repair":{"stepIndex":1,"replacementSteps":[{"kind":"observe","title":"检查软件","description":"检查 node 是否可用","command":"opsark-tool software.check {\"names\":[\"node\"]}","expected":"获得软件状态","validation":true,"risk":"low"}]}}"#;
+    let repair: AiPlanRepairEnvelope = parse_model_json(focused_repair).unwrap();
+    assert_eq!(repair.repair.replacement_steps[0].validation, "true");
+}
+
+#[test]
+fn normalizes_empty_validation_only_for_well_formed_model_tool_steps() {
+    let mut tool_step = AiPlanStep {
+        kind: "observe".into(),
+        title: "读取项目结构".into(),
+        description: "获取项目目录树".into(),
+        command: r#"opsark-tool files.get_structure {"rootPath":"/opt/app"}"#.into(),
+        expected: "获得项目目录树".into(),
+        validation: "  ".into(),
+        risk: Some("low".into()),
+        ..AiPlanStep::default()
+    };
+    let shell_step = AiPlanStep {
+        kind: "observe".into(),
+        title: "检查目录".into(),
+        description: "检查项目目录".into(),
+        command: "test -d /opt/app".into(),
+        expected: "目录存在".into(),
+        validation: "".into(),
+        risk: Some("low".into()),
+        ..AiPlanStep::default()
+    };
+    let malformed_tool_step = AiPlanStep {
+        command: "opsark-tool files.get_structure".into(),
+        ..tool_step.clone()
+    };
+
+    assert_eq!(
+        normalize_model_tool_validations(std::slice::from_mut(&mut tool_step)),
+        1
+    );
+    assert_eq!(tool_step.validation, "true");
+    assert!(validate_ai_plan_contract(&[tool_step], &AiGenerationSettings::default()).is_ok());
+
+    let mut unaffected = vec![shell_step, malformed_tool_step.clone()];
+    assert_eq!(normalize_model_tool_validations(&mut unaffected), 0);
+    assert!(unaffected[0].validation.is_empty());
+    assert!(unaffected[1].validation.trim().is_empty());
+    assert!(
+        validate_ai_plan_contract(&[malformed_tool_step], &AiGenerationSettings::default())
+            .unwrap_err()
+            .contains("opsark-tool 协议不完整")
+    );
+}
+
+#[test]
+fn rejects_other_non_string_validation_values_at_the_model_input_boundary() {
+    for validation in ["false", "null", "0", "{}", "[]"] {
+        let response = format!(
+            r#"{{"steps":[{{"kind":"observe","title":"检查","description":"检查状态","command":"opsark-tool software.check {{\"names\":[\"node\"]}}","expected":"获得状态","validation":{validation},"risk":"low"}}]}}"#
+        );
+        let parsed = parse_model_array_field::<AiPlanStep>(&response, "steps");
+        assert!(parsed.is_err(), "validation={validation} must be rejected");
+    }
+}
+
+#[test]
+fn boolean_true_compatibility_does_not_allow_meaningless_shell_validation() {
+    let response = r#"{"steps":[{"kind":"change","title":"创建文件","description":"创建目标文件","command":"touch /tmp/opsark-result","expected":"目标文件存在","validation":true,"risk":"low"}]}"#;
+    let steps: Vec<AiPlanStep> = parse_model_array_field(response, "steps").unwrap();
+
+    assert_eq!(steps[0].validation, "true");
+    let result = validate_ai_plan_contract(&steps, &AiGenerationSettings::default())
+        .and_then(|_| convert_ai_plan_steps(steps));
+    assert!(
+        result.unwrap_err().contains("无业务意义的 validation"),
+        "ordinary Shell validation must remain strict"
+    );
+}
+
+#[test]
+fn plan_prompts_require_the_true_json_string_for_tool_validation() {
+    for prompt in [PLAN_STEP_OUTPUT_CONTRACT, GENERAL_PLAN_SYSTEM] {
+        assert!(prompt.contains(r#""validation":"true""#), "{prompt}");
+        assert!(
+            prompt.contains("禁止输出 JSON 布尔值 true")
+                || prompt.contains("不得输出 JSON 布尔值 true")
+        );
+    }
+
+    let repair = plan_repair_instruction(
+        "第 1 个模型工具步骤的 validation 必须固定为 JSON 字符串 \"true\"",
+        None,
+    );
+    assert!(repair.contains(r#""validation":"true""#));
+    assert!(repair.contains("禁止输出 JSON 布尔值 true"));
+}
+
+#[test]
+fn next_stage_complete_requires_empty_steps_and_serializes_the_public_contract() {
+    let settings = AiGenerationSettings::default();
+    let forbidden = HashSet::new();
+    let complete = AiNextStageDecision {
+        decision: " complete ".into(),
+        reason: " 已有作用域匹配的结构化证据 ".into(),
+        summary: " 整体目标已经验收 ".into(),
+        steps: Vec::new(),
+    };
+
+    let converted =
+        validate_and_convert_ai_next_stage(complete, &settings, &forbidden, None).unwrap();
+    assert_eq!(converted.decision, "complete");
+    assert!(converted.steps.is_empty());
+    let value = serde_json::to_value(converted).unwrap();
+    assert_eq!(
+        value
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>(),
+        HashSet::from([
+            "decision".to_string(),
+            "reason".to_string(),
+            "summary".to_string(),
+            "steps".to_string(),
+        ])
+    );
+
+    let invalid = AiNextStageDecision {
+        decision: "complete".into(),
+        reason: "错误地同时给出计划".into(),
+        summary: "契约不一致".into(),
+        steps: vec![AiPlanStep::default()],
+    };
+    assert!(
+        validate_and_convert_ai_next_stage(invalid, &settings, &forbidden, None)
+            .unwrap_err()
+            .contains("complete 时 steps 必须为空数组")
+    );
+}
+
+#[test]
+fn next_stage_non_complete_decisions_require_a_valid_plan() {
+    let settings = AiGenerationSettings::default();
+    for decision in ["continue", "adjust"] {
+        let empty = AiNextStageDecision {
+            decision: decision.into(),
+            reason: "目标尚未完成".into(),
+            summary: "需要下一阶段".into(),
+            steps: Vec::new(),
+        };
+        let error = validate_and_convert_ai_next_stage(empty, &settings, &HashSet::new(), None)
+            .unwrap_err();
+        assert!(error.contains("steps 至少需要 1 个元素"), "{error}");
+    }
+
+    let response = r#"{"decision":"continue","reason":"还需读取目录","summary":"进入最小发现阶段","steps":[{"kind":"observe","title":"读取项目结构","description":"获取项目目录树","command":"opsark-tool files.get_structure {\"rootPath\":\"/opt/app\"}","expected":"获得项目目录树","validation":true,"risk":"low"}]}"#;
+    let raw: AiNextStageDecision = parse_model_json(response).unwrap();
+    assert_eq!(raw.steps[0].validation, "true");
+    let converted =
+        validate_and_convert_ai_next_stage(raw, &settings, &HashSet::new(), None).unwrap();
+    assert_eq!(converted.decision, "continue");
+    assert_eq!(converted.steps.len(), 1);
+    assert_eq!(converted.steps[0].validation, "true");
+}
+
+#[test]
+fn next_stage_reuses_shell_validation_and_active_skill_tool_gates() {
+    let settings = AiGenerationSettings::default();
+    let tool_response = r#"{"decision":"adjust","reason":"需要改用 Skill 允许的凭据通道","summary":"当前工具被禁用","steps":[{"kind":"observe","title":"解析连接","description":"解析目标服务器连接","command":"opsark-tool server.resolve_connection {\"serverId\":\"server-1\"}","expected":"获得连接信息","validation":"true","risk":"low"}]}"#;
+    let raw: AiNextStageDecision = parse_model_json(tool_response).unwrap();
+    let forbidden = HashSet::from(["server.resolve_connection".to_string()]);
+    let error = validate_and_convert_ai_next_stage(raw, &settings, &forbidden, None).unwrap_err();
+    assert!(error.contains("active Skill 禁止工具"), "{error}");
+
+    let shell_response = r#"{"decision":"continue","reason":"还需创建结果文件","summary":"执行变更阶段","steps":[{"kind":"change","title":"创建文件","description":"创建结果文件","command":"touch /tmp/opsark-result","expected":"结果文件存在","validation":true,"risk":"low"}]}"#;
+    let raw: AiNextStageDecision = parse_model_json(shell_response).unwrap();
+    let error =
+        validate_and_convert_ai_next_stage(raw, &settings, &HashSet::new(), None).unwrap_err();
+    assert!(error.contains("无业务意义的 validation"), "{error}");
+}
+
+#[test]
+fn next_stage_request_has_an_explicit_evidence_gate_and_opt_in_token_limit() {
+    let unlimited = AiGenerationSettings::default();
+    let body = build_next_stage_request_body(
+        "model-a",
+        "完成整体目标",
+        r#"{"baseSnapshot":{},"activeSkills":[]}"#,
+        &unlimited,
+    );
+    assert!(body.get("max_tokens").is_none());
+    let system = body["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains(GENERAL_PLAN_SYSTEM));
+    assert!(system.contains("完成证据门禁"));
+    assert!(system.contains(
+        "计划文字、步骤标题、expected、阶段 summary、模型 review、指令和待执行步骤都不是完成证据"
+    ));
+    assert!(system.contains(r#""validation":"true""#));
+    assert!(system.contains("decision=complete 时 steps 必须严格为空数组"));
+
+    let limited = AiGenerationSettings {
+        limit_output: true,
+        max_plan_steps: 4,
+        max_output_tokens: 777,
+        max_text_chars: 160,
+        max_command_chars: 1800,
+    };
+    let body = build_next_stage_request_body("model-a", "目标", "{}", &limited);
+    assert_eq!(body["max_tokens"], json!(777));
+    assert!(body["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("steps 不超过 4 个"));
+}
+
+#[test]
 fn rejects_tools_forbidden_by_active_skills_without_blocking_shell_or_allowed_tools() {
     let context = r#"{
         "activeSkills": [
@@ -127,6 +351,39 @@ fn validates_active_skill_tool_policy_context_shape() {
     )
     .unwrap_err()
     .contains("forbiddenToolIds 必须是数组"));
+}
+
+#[test]
+fn rejects_tools_not_exposed_in_the_current_planning_context() {
+    let visible = context_visible_tool_ids(
+        r#"{"tools":[{"id":"software.check"},{"id":"user.request_input"}]}"#,
+    )
+    .unwrap()
+    .unwrap();
+    let tool_step = |tool_id: &str| AiPlanStep {
+        kind: "observe".into(),
+        title: "调用工具".into(),
+        description: "调用当前阶段工具".into(),
+        command: format!(r#"opsark-tool {tool_id} {{"names":["node"]}}"#),
+        expected: "获得结构化结果".into(),
+        validation: "true".into(),
+        risk: Some("low".into()),
+        ..AiPlanStep::default()
+    };
+
+    assert!(validate_visible_tool_policy(&[tool_step("software.check")], Some(&visible)).is_ok());
+    let error = validate_visible_tool_policy(&[tool_step("files.get_structure")], Some(&visible))
+        .unwrap_err();
+    assert!(error.contains("当前规划上下文未开放工具"), "{error}");
+    assert!(plan_repair_instruction(&error, None).contains("context.tools"));
+
+    let empty = context_visible_tool_ids(r#"{"tools":[]}"#)
+        .unwrap()
+        .unwrap();
+    assert!(validate_visible_tool_policy(&[tool_step("software.check")], Some(&empty)).is_err());
+    assert!(context_visible_tool_ids(r#"{"otherContext":true}"#)
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -355,7 +612,7 @@ fn accepts_generic_model_tools_and_rejects_non_protocol_validation() {
     assert!(
         validate_ai_plan_contract(&[invalid], &AiGenerationSettings::default())
             .unwrap_err()
-            .contains("validation 必须固定为 true")
+            .contains("validation 必须固定为 JSON 字符串 \"true\"")
     );
 }
 
@@ -1065,6 +1322,7 @@ fn loads_only_model_selected_skills_into_plan_context() {
             description: "获取代码项目".into(),
             version: 1,
             instructions: "SOURCE_WORKFLOW".into(),
+            allowed_tool_ids: Some(vec!["user.request_input".into()]),
             forbidden_tool_ids: vec!["server.resolve_connection".into()],
         },
         ModelSkillDefinition {
@@ -1073,6 +1331,7 @@ fn loads_only_model_selected_skills_into_plan_context() {
             description: "构建代码项目".into(),
             version: 1,
             instructions: "BUILD_WORKFLOW".into(),
+            allowed_tool_ids: Some(vec!["files.read_content".into()]),
             forbidden_tool_ids: Vec::new(),
         },
     ];
@@ -1155,5 +1414,7 @@ fn routes_untracked_background_repair_to_a_proven_service_manager() {
 fn build_blockers_cannot_plan_deployment_before_artifact_evidence() {
     assert!(GENERAL_PLAN_SYSTEM.contains("当前阻断发生在依赖解析、编译、打包或镜像构建阶段"));
     assert!(GENERAL_PLAN_SYSTEM.contains("构建产物未经结构化程序证据确认前"));
-    assert!(GENERAL_PLAN_SYSTEM.contains("不得生成启动、后台运行、部署、端口探测或应用健康检查步骤"));
+    assert!(
+        GENERAL_PLAN_SYSTEM.contains("不得生成启动、后台运行、部署、端口探测或应用健康检查步骤")
+    );
 }

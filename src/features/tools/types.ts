@@ -7,13 +7,20 @@ export interface ToolDefinition {
   inputSchema: Record<string, unknown>;
   outputDescription: string;
   /** Controls whether this atomic tool must be the only step in a generated plan. */
-  planMode?: "regular" | "standalone";
+  planMode?: "regular" | "standalone" | "read_batch";
   /** Tells the generic orchestrator what to do after a successful tool call. */
   completionMode?: "continue" | "refine" | "complete";
   /** Limits automatic refinement to workflows that deliberately activated a Skill. */
   refinementScope?: "always" | "active-skill";
   /** Selects the execution adapter without branching on a concrete tool id. */
   executionMode?: "local" | "terminal" | "user-input";
+  /**
+   * Controls whether the full definition is exposed to the planning model.
+   * Context-only and executor-internal capabilities must not be advertised as
+   * callable tools because doing so wastes prompt tokens and can produce plans
+   * that the dispatcher cannot execute.
+   */
+  modelExposure?: "planner" | "context" | "internal";
   enabled: boolean;
   builtIn: boolean;
   version: number;
@@ -135,9 +142,12 @@ export interface FileStructureRequest {
 
 export interface FileStructureResult {
   tree: string;
+  rootPath?: string;
+  truncated?: boolean;
+  warnings?: string[];
 }
 
-/** Backend-only scan metadata; only `tree` is exposed to the model. */
+/** Scan completeness is exposed with the tree so partial results are not mistaken for exhaustive evidence. */
 export interface FileStructureScanResult extends FileStructureResult {
   truncated: boolean;
   warnings: string[];

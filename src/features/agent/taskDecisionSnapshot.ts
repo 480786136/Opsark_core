@@ -12,6 +12,7 @@ import {
   TASK_DECISION_RECENT_PHASE_LIMIT,
 } from "@/features/agent/taskHistoryCheckpoint";
 import { taskGoal } from "@/features/agent/taskGoal";
+import { currentEvidenceSteps } from "@/features/agent/attemptState";
 import type { OpsTask, PlanStep, TaskExecutionPhase } from "@/types";
 
 const CURRENT_PLAN_STEP_LIMIT = 20;
@@ -181,6 +182,18 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep) 
       steps: selectedCurrentSteps.map((step) => compactStep(step, "current")),
     },
     recentPhases,
+    // Compact step records above carry references, not file contents. Keep the
+    // current tool results once so the next decision can actually inspect them.
+    currentToolResults: currentEvidenceSteps(task, true)
+      .filter((step) => typeof step.result?.facts.toolId === "string" && step.output)
+      .map((step) => ({
+        stepId: step.id,
+        evidenceIds: step.result?.evidenceIds,
+        toolId: step.result?.facts.toolId,
+        truncated: step.result?.facts.truncated,
+        targetContext: step.attemptContext,
+        content: redactCommandSecrets(step.output!),
+      })),
     historyCheckpoint: checkpoint ? {
       ...checkpoint,
       verifiedFacts: checkpoint.verifiedFacts.slice(-12),

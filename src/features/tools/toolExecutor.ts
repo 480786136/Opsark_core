@@ -24,6 +24,7 @@ import type {
 } from "@/features/tools/types";
 
 export interface ToolExecutionDependencies {
+  expandPlanningContext?(skillId: string): Promise<{ skillId: string }>;
   getRemoteFileStructure(request: FileStructureRequest): Promise<FileStructureScanResult>;
   readRemoteFileContent?(request: FileContentRequest): Promise<FileContentResult>;
   checkSoftware?(request: SoftwareCheckRequest): Promise<SoftwareCheckResult>;
@@ -32,6 +33,8 @@ export interface ToolExecutionDependencies {
   connectServer?(request: ServerConnectRequest): Promise<ServerConnectResult>;
   resolveServerConnection?(request: ServerConnectionLookupRequest): Promise<ServerConnectionLookupResult>;
 }
+
+const TOOL_COMMAND_ATOMICITY_ERROR = "opsark-tool 命令必须是单行原子调用：只能包含一个工具调用和一个参数对象";
 
 function parseFileContentArguments(value: Record<string, unknown>): FileContentRequest {
   const path = typeof value.path === "string" ? value.path.trim() : "";
@@ -90,9 +93,11 @@ export function parseToolCommand(
 ): ToolCall | undefined {
   const trimmed = command.trim();
   if (!/^opsark-tool(?:\s|$)/i.test(trimmed)) return undefined;
+  if (/[\r\n]/.test(command)) throw new Error(TOOL_COMMAND_ATOMICITY_ERROR);
   const match = trimmed.match(/^opsark-tool\s+([a-z0-9_.-]+)\s+([\s\S]+)$/i);
   if (!match) throw new Error("opsark-tool 命令必须包含唯一工具 ID 和参数对象");
   const argumentText = match[2].trim();
+  if (hasUnquotedToolInvocation(argumentText)) throw new Error(TOOL_COMMAND_ATOMICITY_ERROR);
   let parsed: unknown;
   if (argumentText.startsWith("{") || argumentText.startsWith("[")
     || ((argumentText.startsWith("'") && argumentText.endsWith("'"))
@@ -102,7 +107,11 @@ export function parseToolCommand(
       || (jsonText.startsWith('"') && jsonText.endsWith('"'))) {
       jsonText = jsonText.slice(1, -1);
     }
-    parsed = JSON.parse(jsonText) as unknown;
+    try {
+      parsed = JSON.parse(jsonText) as unknown;
+    } catch {
+      throw new Error("工具命令参数必须是单个 JSON 对象");
+    }
   } else {
     parsed = parseCliToolArguments(argumentText);
   }
@@ -117,6 +126,34 @@ export function parseToolCommand(
   const argumentsValue = normalizeKnownToolArguments(toolId, parsed);
   validateToolArguments(definition, argumentsValue);
   return { id: callId, toolId, arguments: argumentsValue };
+}
+
+function hasUnquotedToolInvocation(value: string) {
+  let quote = "";
+  let escaped = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === "\\") {
+        escaped = true;
+      } else if (character === quote) {
+        quote = "";
+      }
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+    if ((index === 0 || /\s/.test(value[index - 1]))
+      && value.slice(index, index + 11).toLowerCase() === "opsark-tool"
+      && (index + 11 === value.length || /\s/.test(value[index + 11]))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function validateToolArguments(tool: ToolDefinition, value: Record<string, unknown>) {
@@ -357,6 +394,12 @@ export async function executeToolCall(
   }
 
   try {
+    if (tool.implementation === "expandPlanningContext") {
+      validateToolArguments(tool, call.arguments);
+      if (!dependencies.expandPlanningContext) throw new Error("当前上下文不支持展开 Skill");
+      const data = await dependencies.expandPlanningContext(String(call.arguments.skillId));
+      return { callId: call.id, toolId: call.toolId, success: true, data };
+    }
     if (tool.implementation === "serverResolveConnection") {
       if (!dependencies.resolveServerConnection) throw new Error("当前执行环境不支持服务器连接资料查询");
       const data = await dependencies.resolveServerConnection(parseConnectionTarget(call.arguments));
@@ -373,8 +416,11 @@ export async function executeToolCall(
       return { callId: call.id, toolId: call.toolId, success: true, data };
     }
     if (tool.implementation === "getRemoteFileStructure") {
-      const data = await dependencies.getRemoteFileStructure(parseFileStructureArguments(call.arguments));
-      const modelData: FileStructureResult = { tree: data.tree };
+      const request = parseFileStructureArguments(call.arguments);
+      const data = await dependencies.getRemoteFileStructure(request);
+      const modelData: FileStructureResult = {
+        tree: data.tree, rootPath: request.rootPath, truncated: data.truncated, warnings: data.warnings,
+      };
       return { callId: call.id, toolId: call.toolId, success: true, data: modelData, truncated: data.truncated };
     }
     if (tool.implementation === "readRemoteFileContent") {

@@ -1,4 +1,4 @@
-import { buildToolContext } from "@/features/tools/toolContext";
+import { buildPlanningToolContext, buildToolContext } from "@/features/tools/toolContext";
 import {
   buildSkillDirectory,
   buildSkillContext,
@@ -18,16 +18,18 @@ import type {
 import { credentialGroupContext } from "@/features/agent/serverCredentialGroup";
 import { allTaskSteps, taskGoal } from "@/features/agent/taskGoal";
 import { buildTaskDecisionSnapshot } from "@/features/agent/taskDecisionSnapshot";
-import { compactReviewText } from "@/features/agent/longRunningReviewOutput";
+import { compactReviewText, textFingerprint } from "@/features/agent/longRunningReviewOutput";
 import type { StepReview } from "@/types";
+import { planningSkills } from "@/features/skills/skillPlanning";
+import { taskAttemptContext } from "@/features/agent/attemptState";
 
 export function trimEvidence(value: string | undefined, limit = 3200) {
   if (!value) return "";
   return value.length > limit ? `${value.slice(0, limit)}\n…（输出已截断）` : value;
 }
 
-export function extractKnownExecutionFacts(task: OpsTask, skills = resolveTaskSkills(task)) {
-  const steps = allTaskSteps(task).filter((step) => step.status === "completed");
+export function extractKnownExecutionFacts(task: OpsTask, skills = resolveTaskSkills(task), excludedIds = new Set<string>()) {
+  const steps = allTaskSteps(task).filter((step) => step.status === "completed" && !excludedIds.has(step.id));
   return {
     skillFacts: collectSkillFacts(task, skills),
     completedSteps: steps.slice(-12).map((step) => ({
@@ -187,8 +189,8 @@ export interface AdjustmentContextOptions {
   adjustmentReason?: string;
 }
 
-function boundedPlanningTools(tools: ToolDefinition[]) {
-  return buildToolContext(tools).map((tool) => ({
+function boundedPlanningTools(tools: ToolDefinition[], skills: SkillDefinition[]) {
+  return buildPlanningToolContext(tools, skills).map((tool) => ({
     ...tool,
     name: compactReviewText(tool.name, 120),
     description: compactReviewText(tool.description, 240),
@@ -198,12 +200,7 @@ function boundedPlanningTools(tools: ToolDefinition[]) {
 }
 
 function boundedPlanningSkills(skills: SkillDefinition[]) {
-  return buildSkillContext(skills).map((skill) => ({
-    ...skill,
-    name: compactReviewText(skill.name, 120),
-    description: compactReviewText(skill.description, 280),
-    instructions: compactReviewText(skill.instructions, 2_200),
-  }));
+  return buildSkillContext(skills);
 }
 
 export function buildAdjustmentContext(
@@ -211,13 +208,23 @@ export function buildAdjustmentContext(
   failedStep?: PlanStep,
   options: AdjustmentContextOptions = {},
 ) {
-  const activeSkills = input.skills ?? resolveTaskSkills(input.task);
+  const activeSkills = planningSkills(input.task, input.skills ?? resolveTaskSkills(input.task));
   const planSafetyRejection = failedStep?.result?.facts.category === "plan_safety_rejection";
   const focusedSafety = planSafetyRejection && failedStep
     ? planSafetyAdjustmentContext(input.task, failedStep)
     : undefined;
   return {
     workflowPhase: "adjust_after_failure",
+    // Keep policy content ahead of per-attempt evidence so providers can reuse
+    // the longest stable request prefix across adjustments for the same goal.
+    tools: boundedPlanningTools(input.tools, activeSkills),
+    activeSkills: boundedPlanningSkills(activeSkills),
+    instruction: planSafetyRejection
+      ? "这是执行前确定性安全门禁，不是远端执行失败。命令尚未发送到服务器。只修复 failedStep.offendingFields 列出的字段，必须保留真实失败退出码；不要改写步骤标题、风险、预期结果、其他步骤或用户授权。只返回该步骤的一个完整替代步骤，它仍会重新经过统一安全门禁。"
+      : "只根据 baseSnapshot、adjustmentTrigger 和尚未完成目标生成最少必要步骤。recentPhases 是最近两个阶段，historyCheckpoint 是更早历史的滚动摘要；不得要求重复其中已经完成的工作。计划描述和阶段总结不是成功证据，只有结构化 result/evidence 才能证明状态。失败方法必须有实质变化后才能重试。每步在独立非交互 Shell 中建立自身环境，并以 activeSkills 要求的独立验收结束。",
+    server: serverSnapshot(input.server),
+    secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),
+    serverCredentialGroups: credentialGroupContext(input.secretMetadata, input.task.serverId),
     // A deterministic safety-gate repair has its own deliberately narrow
     // payload below. Re-attaching the general task snapshot here would leak
     // unrelated commands and outputs into what must be a field-local rewrite.
@@ -237,24 +244,73 @@ export function buildAdjustmentContext(
         source: options.reviewDecision.source,
       } : undefined,
     },
-    server: serverSnapshot(input.server),
     metrics: input.metrics,
-    tools: boundedPlanningTools(input.tools),
-    activeSkills: boundedPlanningSkills(activeSkills),
     previousPlan: focusedSafety?.previousPlan,
     failedStep: focusedSafety?.failedStep,
-    instruction: planSafetyRejection
-      ? "这是执行前确定性安全门禁，不是远端执行失败。命令尚未发送到服务器。只修复 failedStep.offendingFields 列出的字段，必须保留真实失败退出码；不要改写步骤标题、风险、预期结果、其他步骤或用户授权。只返回该步骤的一个完整替代步骤，它仍会重新经过统一安全门禁。"
-      : "只根据 baseSnapshot、adjustmentTrigger 和尚未完成目标生成最少必要步骤。recentPhases 是最近两个阶段，historyCheckpoint 是更早历史的滚动摘要；不得要求重复其中已经完成的工作。计划描述和阶段总结不是成功证据，只有结构化 result/evidence 才能证明状态。失败方法必须有实质变化后才能重试。每步在独立非交互 Shell 中建立自身环境，并以 activeSkills 要求的独立验收结束。",
+  };
+}
+
+/**
+ * Identifies the policy inputs that make a cached next-stage plan valid. Live
+ * execution evidence and terminal generations are tracked separately by the
+ * adjustment incident fingerprint.
+ */
+export function nextStagePolicyFingerprint(input: WorkflowContextInput) {
+  const activeSkills = input.skills ?? resolveTaskSkills(input.task);
+  const planningTools = buildPlanningToolContext(input.tools, activeSkills);
+  return textFingerprint(JSON.stringify({
+    attemptContext: taskAttemptContext(input.task),
+    planningProjection: planningSkills(input.task, activeSkills).map(({ instructions, allowedToolIds }) => ({ instructions, allowedToolIds })),
+    rootGoal: taskGoal(input.task),
+    currentRoundId: input.task.currentRoundId,
+    permission: input.task.permission,
+    modelId: input.task.modelId,
+    executionConstraints: input.task.executionConstraints,
+    skills: activeSkills.map((skill) => ({
+      id: skill.id,
+      version: skill.version,
+      updatedAt: skill.updatedAt,
+      instructions: textFingerprint(skill.instructions),
+      planningContract: skill.planningContract,
+      allowedToolIds: skill.allowedToolIds,
+      forbiddenToolIds: skill.forbiddenToolIds,
+    })),
+    tools: planningTools,
     secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),
     serverCredentialGroups: credentialGroupContext(input.secretMetadata, input.task.serverId),
+  }));
+}
+
+/**
+ * Builds the single payload used to decide overall completion and, only when
+ * incomplete, generate the next bounded stage. Necessary Skill instructions
+ * are intentionally not character-truncated in this combined quality gate.
+ */
+export function buildNextStageContext(input: WorkflowContextInput) {
+  const activeSkills = planningSkills(input.task, input.skills ?? resolveTaskSkills(input.task));
+  const policyFingerprint = nextStagePolicyFingerprint(input);
+  return {
+    workflowPhase: "decide_after_phase",
+    tools: buildPlanningToolContext(input.tools, activeSkills),
+    activeSkills: buildSkillContext(activeSkills),
+    instruction: "先依据 baseSnapshot 的真实 result/evidence 和全部 activeSkills 验收要求判断整体目标。证据充分时返回 complete 且 steps 为空；尚未完成时在同一响应中只规划当前证据允许的最小下一阶段。不得重复已完成步骤，不得用计划描述或阶段摘要冒充成功证据。",
+    server: serverSnapshot(input.server),
+    executionConstraints: input.task.executionConstraints,
+    secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),
+    serverCredentialGroups: credentialGroupContext(input.secretMetadata, input.task.serverId),
+    policyFingerprint,
+    baseSnapshot: buildTaskDecisionSnapshot(input.task),
+    metrics: input.metrics,
   };
 }
 
 export function buildContinuationContext(input: WorkflowContextInput) {
-  const activeSkills = input.skills ?? resolveTaskSkills(input.task);
+  const activeSkills = planningSkills(input.task, input.skills ?? resolveTaskSkills(input.task));
   return {
     workflowPhase: "continue_after_discovery",
+    tools: buildPlanningToolContext(input.tools, activeSkills),
+    activeSkills: buildSkillContext(activeSkills),
+    instruction: "只使用本轮已完成发现的真实证据，生成完成用户剩余目标所需的最少变更和最终验收。不得重复发现步骤或猜测路径、工具、端口和服务名。",
     taskGoal: {
       rootGoal: taskGoal(input.task),
       currentInstruction: input.task.currentInstruction,
@@ -263,6 +319,8 @@ export function buildContinuationContext(input: WorkflowContextInput) {
     server: serverSnapshot(input.server),
     permission: input.task.permission,
     executionConstraints: input.task.executionConstraints,
+    secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),
+    serverCredentialGroups: credentialGroupContext(input.secretMetadata, input.task.serverId),
     completedDiscovery: input.task.plan.map(({ title, description, command, expected, result, evidence, output, executionScope, validationScope }) => ({
       title,
       description,
@@ -276,15 +334,10 @@ export function buildContinuationContext(input: WorkflowContextInput) {
         source,
         facts,
         scope,
-        rawOutput: trimEvidence(rawOutput),
+        rawOutput: rawOutput === output ? undefined : trimEvidence(rawOutput),
       })),
-      output: trimEvidence(output),
+      output: typeof result?.facts.toolId === "string" ? output : trimEvidence(output),
     })),
-    knownExecutionFacts: extractKnownExecutionFacts(input.task, activeSkills),
-    tools: buildToolContext(input.tools),
-    activeSkills: buildSkillContext(activeSkills),
-    instruction: "只使用本轮已完成发现的真实证据，生成完成用户剩余目标所需的最少变更和最终验收。不得重复发现步骤或猜测路径、工具、端口和服务名。",
-    secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),
-    serverCredentialGroups: credentialGroupContext(input.secretMetadata, input.task.serverId),
+    knownExecutionFacts: extractKnownExecutionFacts(input.task, activeSkills, new Set(input.task.plan.map(({ id }) => id))),
   };
 }

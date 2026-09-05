@@ -58,29 +58,32 @@ export function normalizePlanPreconditions(
     sessionContextChange: step.sessionContextChange ?? undefined,
   })));
   const toolById = new Map(tools.map((tool) => [tool.id, tool]));
+  const pendingToolCalls: Array<{ index: number; toolId: string }> = [];
   normalized.forEach((step, index) => {
     if (step.status === "pending" && /^opsark-tool(?:\s|$)/i.test(step.command.trim())) {
       try {
-        parseToolCommand(step.command, `normalize-strict-${index}`, tools);
+        const call = parseToolCommand(step.command, `normalize-strict-${index}`, tools);
+        if (call) pendingToolCalls.push({ index, toolId: call.toolId });
       } catch (error) {
         throw new Error(`第 ${index + 1} 个计划步骤的工具参数无效：${String(error)}`);
       }
     }
   });
-  const standaloneStep = normalized.find((step, index) => {
-    if (step.status !== "pending") return false;
-    try {
-      const call = parseToolCommand(step.command, `normalize-${index}`, tools);
-      return Boolean(call && toolById.get(call.toolId)?.planMode === "standalone");
-    } catch {
-      return false;
-    }
-  });
-  if (standaloneStep) {
-    normalized = [
-      ...normalized.filter((step) => step.status !== "pending"),
-      standaloneStep,
-    ];
+  const standaloneCall = pendingToolCalls.find(({ toolId }) => toolById.get(toolId)?.planMode === "standalone");
+  const pendingStepCount = normalized.filter((step) => step.status === "pending").length;
+  const readBatch = pendingToolCalls.some(({ toolId }) => toolById.get(toolId)?.planMode === "read_batch");
+  if (readBatch && pendingStepCount > 1 && (
+    pendingToolCalls.length !== pendingStepCount
+    || pendingToolCalls.some(({ toolId, index }) =>
+      toolById.get(toolId)?.planMode !== "read_batch" || normalized[index].kind !== "observe")
+  )) {
+    throw new Error("只读批次不能混入变更、Shell 或 standalone 工具；全部步骤必须为 observe 且参数已确定");
+  }
+  if (standaloneCall && pendingStepCount > 1) {
+    throw new Error(
+      `第 ${standaloneCall.index + 1} 个计划步骤调用 standalone 工具 ${standaloneCall.toolId}；`
+      + "standalone 工具必须是唯一待执行步骤，不能与其他 pending 步骤共存",
+    );
   }
   const userExplicitlyRequestedCleanup = /清理|删除|移除|卸载|清空|purge|remove|delete|uninstall/i
     .test(requirement);

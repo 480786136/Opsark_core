@@ -3,6 +3,7 @@ import {
   findUnresolvedBlockingStep,
   latestTaskRequirement,
   resolveTaskProgression,
+  selectAdjustmentSteps,
   selectContinuationSteps,
 } from "@/features/agent/taskProgression";
 import type { OpsTask, PlanStep } from "@/types";
@@ -35,6 +36,33 @@ const task = (plan: PlanStep[], overrides: Partial<OpsTask> = {}): OpsTask => ({
 });
 
 describe("taskProgression", () => {
+  it("rechecks health after an executed mutation, including a partially failed mutation", () => {
+    const health = step({ command: "curl -f http://localhost/health", kind: "observe", validation: "", status: "failed" });
+    for (const status of ["completed", "failed"] as const) {
+      const restart = step({ id: "restart", kind: "change", command: "systemctl restart app", status });
+      const candidate = { ...health, id: "retry", status: "pending" as const };
+      expect(selectAdjustmentSteps([health], [candidate])).toEqual([]);
+      expect(selectAdjustmentSteps([health, restart], [candidate])).toEqual([candidate]);
+      expect(selectContinuationSteps([{ ...health, status: "completed" }, restart], [candidate])).toEqual([candidate]);
+    }
+  });
+
+  it("invalidates attempts on target or credential changes and canonicalizes tool arguments", () => {
+    const prior = step({ command: 'opsark-tool files.get_structure {"rootPath":"/opt/app","maxDepth":4}',
+      validation: "true", status: "failed", attemptContext: "target-a:v1" });
+    const next = { ...prior, command: 'opsark-tool files.get_structure {"maxDepth":4,"rootPath":"/opt/app"}', status: "pending" as const };
+    expect(selectAdjustmentSteps([prior], [next], "target-a:v1")).toEqual([]);
+    expect(selectAdjustmentSteps([prior], [next], "target-a:v2")).toEqual([next]);
+  });
+
+  it("does not invalidate a blocker for a planned or safety-blocked mutation", () => {
+    const health = step({ command: "curl -f http://localhost/health", kind: "observe", validation: "", status: "failed" });
+    const restart = step({ id: "restart", kind: "change", command: "systemctl restart app", status: "pending" });
+    expect(selectAdjustmentSteps([health, restart], [{ ...health, status: "pending" }])).toEqual([]);
+    restart.status = "failed";
+    restart.result = { executionStatus: "blocked", observationStatus: "unknown", facts: {}, warnings: [], evidenceIds: [] };
+    expect(selectAdjustmentSteps([health, restart], [{ ...health, status: "pending" }])).toEqual([]);
+  });
   it("uses the latest user message requirement and ignores events", () => {
     const current = task([], {
       messages: [
@@ -108,6 +136,31 @@ describe("taskProgression", () => {
       step({ id: "new", command: "npm run build" }),
       step({ id: "new-copy", command: "npm run build" }),
     ]).map((item) => item.id)).toEqual(["new"]);
+  });
+
+  it("rejects an unchanged failed adjustment but permits a validation-only repair", () => {
+    const failedTool = step({
+      id: "failed-tool",
+      command: 'opsark-tool files.get_structure {"rootPath":"/opt/app"}',
+      validation: "true",
+      status: "failed",
+    });
+    const failedShellValidation = step({
+      id: "failed-shell-validation",
+      command: "test -d /opt/app",
+      validation: "test -f /wrong/path",
+      status: "failed",
+    });
+
+    expect(selectAdjustmentSteps([failedTool, failedShellValidation], [
+      step({ ...failedTool, id: "same-tool", status: "pending" }),
+      step({
+        ...failedShellValidation,
+        id: "fixed-validation",
+        validation: "test -d /opt/app",
+        status: "pending",
+      }),
+    ]).map((item) => item.id)).toEqual(["fixed-validation"]);
   });
 
   it("keeps a blocker until a successful mutating repair occurs", () => {

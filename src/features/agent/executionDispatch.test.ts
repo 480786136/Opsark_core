@@ -28,6 +28,17 @@ describe("execution dispatch", () => {
     });
   });
 
+  it("rejects a tool that was not exposed to the current planning context", () => {
+    const decision = resolveStepDispatch({
+      command: 'opsark-tool files.get_structure {"rootPath":"/opt/app"}',
+    }, [], "call-hidden", undefined, [], [], ["software.check"]);
+
+    expect(decision).toEqual({
+      kind: "invalid",
+      error: "当前规划上下文未开放工具：files.get_structure",
+    });
+  });
+
   it("returns a protocol error instead of throwing", () => {
     const decision = resolveStepDispatch({
       command: "opsark-tool files.get_structure []",

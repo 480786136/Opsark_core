@@ -1,7 +1,7 @@
 use serde::Serialize;
 use ssh2::{FileStat, Sftp};
 use std::collections::HashSet;
-use std::path::{Component, Path};
+use std::path::Path;
 
 const DEFAULT_EXCLUDES: &[&str] = &[
     ".git",
@@ -51,6 +51,66 @@ struct ScanState {
     warnings: Vec<String>,
 }
 
+fn normalize_remote_root_path(raw_path: &str) -> Result<String, String> {
+    let path = raw_path.trim();
+    if !path.starts_with('/') || path.contains('\\') || path.contains('\0') {
+        return Err("根路径必须是远端 POSIX 绝对目录路径".into());
+    }
+
+    let mut segments = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" => {}
+            "." | ".." => return Err("远端根路径不能包含 . 或 .. 路径段".into()),
+            _ => segments.push(segment),
+        }
+    }
+
+    Ok(if segments.is_empty() {
+        "/".into()
+    } else {
+        format!("/{}", segments.join("/"))
+    })
+}
+
+fn normalize_remote_exclude(raw_exclude: &str) -> Result<Option<String>, String> {
+    let normalized = raw_exclude.trim().replace('\\', "/");
+    if normalized.starts_with('/') || normalized.contains('\0') {
+        return Err(format!(
+            "排除目录必须是目录名或根目录下的相对路径：{raw_exclude}"
+        ));
+    }
+
+    let mut segments = Vec::new();
+    for segment in normalized.split('/') {
+        match segment {
+            "" => {}
+            "." | ".." => {
+                return Err(format!(
+                    "排除目录必须是目录名或根目录下的相对路径：{raw_exclude}"
+                ))
+            }
+            _ => segments.push(segment),
+        }
+    }
+
+    Ok((!segments.is_empty()).then(|| segments.join("/")))
+}
+
+fn remote_file_name(path: &Path) -> Option<String> {
+    let path = path.to_string_lossy();
+    let name = path.trim_end_matches('/').rsplit('/').next()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn join_remote_path(parent: &str, name: &str) -> String {
+    if parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{name}", parent.trim_end_matches('/'))
+    }
+}
+
 fn validate_options(
     root_path: String,
     exclude_directories: Vec<String>,
@@ -58,11 +118,7 @@ fn validate_options(
     max_nodes: usize,
     include_hidden: bool,
 ) -> Result<ScanOptions, String> {
-    let root_path = root_path.trim().trim_end_matches('/');
-    let root_path = if root_path.is_empty() { "/" } else { root_path };
-    if !Path::new(root_path).is_absolute() {
-        return Err("根路径必须是远端绝对目录路径".into());
-    }
+    let root_path = normalize_remote_root_path(&root_path)?;
     if !(1..=20).contains(&max_depth) {
         return Err("遍历深度必须在 1 到 20 之间".into());
     }
@@ -75,36 +131,15 @@ fn validate_options(
         .map(|item| item.to_string())
         .collect();
     for raw_exclude in exclude_directories {
-        let normalized_exclude = raw_exclude.trim().replace('\\', "/");
-        if normalized_exclude.starts_with('/') {
-            return Err(format!(
-                "排除目录必须是目录名或根目录下的相对路径：{raw_exclude}"
-            ));
+        if let Some(exclude) = normalize_remote_exclude(&raw_exclude)? {
+            excludes.push(exclude);
         }
-        let exclude = normalized_exclude.trim_matches('/');
-        if exclude.is_empty() {
-            continue;
-        }
-        let path = Path::new(exclude);
-        if path.is_absolute()
-            || path.components().any(|component| {
-                matches!(
-                    component,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            })
-        {
-            return Err(format!(
-                "排除目录必须是目录名或根目录下的相对路径：{raw_exclude}"
-            ));
-        }
-        excludes.push(exclude.to_string());
     }
     let mut seen = HashSet::new();
     excludes.retain(|item| seen.insert(item.clone()));
 
     Ok(ScanOptions {
-        root_path: root_path.to_string(),
+        root_path,
         excludes,
         max_depth,
         max_nodes,
@@ -133,18 +168,17 @@ fn is_excluded(relative_path: &str, name: &str, excludes: &[String]) -> bool {
 
 fn read_directory(
     sftp: &Sftp,
-    absolute_path: &Path,
+    absolute_path: &str,
     relative_parent: &str,
     depth: usize,
     options: &ScanOptions,
     state: &mut ScanState,
 ) -> Result<Vec<FileStructureNode>, String> {
     let mut entries = sftp
-        .readdir(absolute_path)
-        .map_err(|error| format!("无法读取远程目录 {}：{error}", absolute_path.display()))?;
+        .readdir(Path::new(absolute_path))
+        .map_err(|error| format!("无法读取远程目录 {absolute_path}：{error}"))?;
     entries.retain(|(path, _)| {
-        path.file_name()
-            .and_then(|name| name.to_str())
+        remote_file_name(path)
             .map(|name| name != "." && name != "..")
             .unwrap_or(false)
     });
@@ -156,25 +190,19 @@ fn read_directory(
         right_directory
             .cmp(&left_directory)
             .then_with(|| {
-                left_path
-                    .file_name()
+                remote_file_name(left_path)
                     .unwrap_or_default()
-                    .to_string_lossy()
                     .to_lowercase()
                     .cmp(
-                        &right_path
-                            .file_name()
+                        &remote_file_name(right_path)
                             .unwrap_or_default()
-                            .to_string_lossy()
                             .to_lowercase(),
                     )
             })
             .then_with(|| {
-                left_path
-                    .file_name()
+                remote_file_name(left_path)
                     .unwrap_or_default()
-                    .to_string_lossy()
-                    .cmp(&right_path.file_name().unwrap_or_default().to_string_lossy())
+                    .cmp(&remote_file_name(right_path).unwrap_or_default())
             })
     });
 
@@ -184,10 +212,7 @@ fn read_directory(
             state.truncated = true;
             break;
         }
-        let Some(name) = entry_path
-            .file_name()
-            .map(|value| value.to_string_lossy().to_string())
-        else {
+        let Some(name) = remote_file_name(&entry_path) else {
             continue;
         };
         if !options.include_hidden && name.starts_with('.') {
@@ -213,7 +238,7 @@ fn read_directory(
 
         if kind == "directory" {
             if depth < options.max_depth {
-                let child_path = absolute_path.join(&name);
+                let child_path = join_remote_path(absolute_path, &name);
                 match read_directory(sftp, &child_path, &relative_path, depth + 1, options, state) {
                     Ok(children) => node.children = Some(children),
                     Err(error) => state.warnings.push(error),
@@ -282,9 +307,8 @@ pub fn scan_sftp(
         max_nodes,
         include_hidden,
     )?;
-    let root = Path::new(&options.root_path);
     let root_stat = sftp
-        .stat(root)
+        .stat(Path::new(&options.root_path))
         .map_err(|error| format!("无法访问远程根目录 {}：{error}", options.root_path))?;
     if kind_from_stat(&root_stat) != "directory" {
         return Err(format!("远程路径不是目录：{}", options.root_path));
@@ -295,7 +319,7 @@ pub fn scan_sftp(
         truncated: false,
         warnings: Vec::new(),
     };
-    let nodes = read_directory(sftp, root, "", 1, &options, &mut state)?;
+    let nodes = read_directory(sftp, &options.root_path, "", 1, &options, &mut state)?;
     Ok(FileStructureResult {
         tree: render_tree(&options.root_path, &nodes),
         truncated: state.truncated || !state.warnings.is_empty(),
@@ -339,6 +363,9 @@ mod tests {
     #[test]
     fn rejects_unsafe_excludes_and_invalid_limits() {
         assert!(validate_options("relative".into(), vec![], 6, 2000, false).is_err());
+        assert!(validate_options("C:\\opt\\app".into(), vec![], 6, 2000, false).is_err());
+        assert!(validate_options("/opt/../app".into(), vec![], 6, 2000, false).is_err());
+        assert!(validate_options("/opt/./app".into(), vec![], 6, 2000, false).is_err());
         assert!(
             validate_options("/opt/app".into(), vec!["../etc".into()], 6, 2000, false).is_err()
         );
@@ -348,6 +375,19 @@ mod tests {
         assert!(validate_options("/opt/app".into(), vec!["/etc".into()], 6, 2000, false).is_err());
         assert!(validate_options("/opt/app".into(), vec![], 0, 2000, false).is_err());
         assert!(validate_options("/opt/app".into(), vec![], 6, 10_001, false).is_err());
+    }
+
+    #[test]
+    fn normalizes_and_joins_remote_paths_with_posix_semantics() {
+        let options = validate_options("//opt///app//".into(), vec![], 6, 2000, false).unwrap();
+
+        assert_eq!(options.root_path, "/opt/app");
+        assert_eq!(join_remote_path("/opt/app", "src"), "/opt/app/src");
+        assert_eq!(join_remote_path("/", "src"), "/src");
+        assert_eq!(
+            remote_file_name(Path::new("/opt/app/src")),
+            Some("src".into())
+        );
     }
 
     #[test]

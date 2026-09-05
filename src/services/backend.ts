@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AgentSessionContext, AgentSessionRef, AiGenerationSettings, ExecutionScope, FileEntry, Metrics, ModelDeveloperTrace, PlanStep, RequirementProcessingResult, ServerInfo, StepReview } from "@/types";
+import type { AgentSessionContext, AgentSessionRef, AiGenerationSettings, ExecutionScope, FileEntry, Metrics, ModelDeveloperTrace, NextStageDecision, PlanStep, RequirementProcessingResult, ServerInfo, StepReview } from "@/types";
 import type { ModelSkillDefinition } from "@/features/skills/types";
 import {
   normalizeLongRunningCommandOutput,
@@ -722,6 +722,41 @@ export const backend = {
       return { ...review, source: "model" };
     } catch {
       return fallback;
+    }
+  },
+
+  async decideNextStage(
+    requirement: string,
+    runtimeModel?: RuntimeModel,
+  ): Promise<NextStageDecision> {
+    const fallback: NextStageDecision = {
+      decision: runtimeModel?.apiKey ? "adjust" : "complete",
+      reason: runtimeModel?.apiKey
+        ? "下一阶段联合决策暂不可用，必须回退到原整体复核流程"
+        : "未配置远程模型，已按全部程序校验通过处理",
+      summary: runtimeModel?.apiKey
+        ? "当前阶段已经结束，联合决策未产生可执行计划。"
+        : "当前计划及其程序校验均已完成。",
+      source: "rules",
+      steps: [],
+    };
+    if (!isTauri() || !runtimeModel?.apiKey) return fallback;
+    try {
+      const decision = await invoke<Omit<NextStageDecision, "source">>("decide_ai_next_stage", {
+        apiKey: runtimeModel.apiKey,
+        endpoint: runtimeModel.endpoint,
+        model: runtimeModel.model,
+        requirement,
+        context: runtimeModel.context,
+        generationSettings: runtimeModel.generationSettings,
+      });
+      return {
+        ...decision,
+        steps: normalizePlanPreconditions(decision.steps, requirement),
+        source: "model",
+      };
+    } catch (error) {
+      throw normalizeModelInvocationError(error);
     }
   },
 

@@ -126,6 +126,11 @@ export interface StepReview {
   source: "model" | "rules";
 }
 
+/** One model decision that either completes the goal or supplies its next bounded stage. */
+export interface NextStageDecision extends StepReview {
+  steps: PlanStep[];
+}
+
 export interface ServerInfo {
   os: string;
   kernel: string;
@@ -160,6 +165,8 @@ export interface Metrics {
 
 export interface PlanStep {
   id: string;
+  /** Executor-owned target/session/credential identity at attempt start. */
+  attemptContext?: string;
   /** Missing only on legacy persisted plans; normalization upgrades it to change. */
   kind?: PlanStepKind;
   title: string;
@@ -350,6 +357,12 @@ export interface OpsTask {
   latestGoalReview?: {
     decision: StepReview;
     snapshot: Record<string, unknown>;
+    /** Plan produced by the same call that made the overall-goal decision. */
+    nextPlan?: PlanStep[];
+    /** Invalidates the cached plan when execution evidence or target state changes. */
+    continuationIncidentFingerprint?: string;
+    /** Invalidates the cached plan when goal, constraints, Skills or tools change. */
+    policyFingerprint?: string;
     createdAt: string;
   };
   /** Remaining delay before managed mode automatically requests an adjustment plan. */

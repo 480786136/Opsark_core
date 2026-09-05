@@ -1,12 +1,18 @@
 import { backend } from "@/services/backend";
+import { taskAttemptContext } from "@/features/agent/attemptState";
 import type { RuntimeModel } from "@/services/backend";
 import { createRuntimeModel } from "@/features/agent/modelRuntime";
 import {
   buildAdjustmentContext,
   buildContinuationContext,
+  buildNextStageContext,
 } from "@/features/agent/agentContext";
-import { latestTaskRequirement, selectContinuationSteps } from "@/features/agent/taskProgression";
-import { activeRoundSteps, allTaskSteps } from "@/features/agent/taskGoal";
+import {
+  latestTaskRequirement,
+  selectAdjustmentSteps,
+  selectContinuationSteps,
+} from "@/features/agent/taskProgression";
+import { activeRoundSteps } from "@/features/agent/taskGoal";
 import { buildSkillContext } from "@/features/skills/skillRegistry";
 import { compactReviewText } from "@/features/agent/longRunningReviewOutput";
 import { buildTaskDecisionSnapshot } from "@/features/agent/taskDecisionSnapshot";
@@ -16,6 +22,7 @@ import type {
   AiGenerationSettings,
   Metrics,
   ModelProfile,
+  NextStageDecision,
   OpsTask,
   PlanStep,
   SecretMetadata,
@@ -34,6 +41,10 @@ type GoalReviewer = (
   reviewContext: string,
   runtimeModel?: RuntimeModel,
 ) => Promise<import("@/types").StepReview>;
+type NextStageDecider = (
+  requirement: string,
+  runtimeModel?: RuntimeModel,
+) => Promise<NextStageDecision>;
 
 export interface PlanDiscoveryContinuationInput {
   task: OpsTask;
@@ -62,6 +73,8 @@ export interface PlanTaskAdjustmentInput {
   sharedSnapshot?: Record<string, unknown>;
   reviewDecision?: StepReview;
   adjustmentReason?: string;
+  /** An explicit user-directed retry may replay an unchanged failed attempt. */
+  allowUnchangedFailureRetry?: boolean;
 }
 
 export interface CompletionSummaryRequest {
@@ -88,6 +101,14 @@ export interface ReviewTaskGoalInput {
   model?: ModelProfile;
   apiKey?: string;
   skills?: SkillDefinition[];
+}
+
+export interface DecideTaskNextStageInput extends ReviewTaskGoalInput {
+  server?: ServerProfile;
+  metrics: Metrics;
+  tools: ToolDefinition[];
+  secretMetadata: SecretMetadata[];
+  generationSettings: AiGenerationSettings;
 }
 
 export interface FailedTaskSummaryContext {
@@ -119,7 +140,6 @@ const FAILURE_SUMMARY_STEP_LIMIT = 20;
 const FAILURE_SUMMARY_TEXT_LIMIT = 240;
 const FAILURE_SUMMARY_REASON_LIMIT = 480;
 const FAILURE_SUMMARY_REQUIREMENT_LIMIT = 1_200;
-const GOAL_REVIEW_SKILL_INSTRUCTION_LIMIT = 1_600;
 
 function sanitizeSummaryText(value: string) {
   return value
@@ -256,7 +276,7 @@ export async function reviewTaskGoal(
     name: compactReviewText(skill.name, 120),
     description: compactReviewText(skill.description, 280),
     version: skill.version,
-    instructions: compactReviewText(skill.instructions, GOAL_REVIEW_SKILL_INSTRUCTION_LIMIT),
+    instructions: skill.instructions,
   }));
   const context = {
     trigger: "overall_goal_completion",
@@ -271,6 +291,87 @@ export async function reviewTaskGoal(
   );
   const complete = decision.decision === "complete";
   return { requirement, snapshot, context, decision, complete };
+}
+
+/**
+ * Performs the overall-goal decision and next-stage planning in one model
+ * request. The former review-only path remains a fail-closed compatibility
+ * fallback while desktop versions roll forward independently.
+ */
+export async function decideTaskNextStage(
+  input: DecideTaskNextStageInput,
+  decide: NextStageDecider = backend.decideNextStage.bind(backend),
+  fallbackReview: GoalReviewer = backend.reviewGoal.bind(backend),
+) {
+  const requirement = latestTaskRequirement(input.task);
+  const context = buildNextStageContext({
+    server: input.server,
+    metrics: input.metrics,
+    task: input.task,
+    tools: input.tools,
+    secretMetadata: input.secretMetadata,
+    skills: input.skills,
+  });
+  if (!input.model) {
+    const fallback = await reviewTaskGoal(input, fallbackReview);
+    return {
+      ...fallback,
+      nextPlan: undefined,
+      policyFingerprint: context.policyFingerprint,
+      combinedError: "所选模型配置不存在，已回退整体目标复核",
+    };
+  }
+  try {
+    const decision = await decide(
+      requirement,
+      input.model.provider === "Built-in"
+        ? undefined
+        : createRuntimeModel(
+          input.model,
+          input.apiKey,
+          JSON.stringify(context),
+          input.generationSettings,
+        ),
+    );
+    if (!matchesNextStageDecision(decision.decision)) {
+      throw new Error("下一阶段联合决策返回了不支持的 decision");
+    }
+    if (decision.decision === "complete") {
+      if (decision.steps.length) throw new Error("complete 决策不得携带后续步骤");
+      return {
+        requirement,
+        snapshot: context.baseSnapshot,
+        context,
+        decision,
+        complete: true,
+        nextPlan: [] as PlanStep[],
+        policyFingerprint: context.policyFingerprint,
+      };
+    }
+    const nextPlan = selectContinuationSteps(activeRoundSteps(input.task), decision.steps, taskAttemptContext(input.task));
+    if (!nextPlan.length) throw new Error("下一阶段联合决策没有返回新的可执行步骤");
+    return {
+      requirement,
+      snapshot: context.baseSnapshot,
+      context,
+      decision,
+      complete: false,
+      nextPlan,
+      policyFingerprint: context.policyFingerprint,
+    };
+  } catch (combinedError) {
+    const fallback = await reviewTaskGoal(input, fallbackReview);
+    return {
+      ...fallback,
+      nextPlan: undefined,
+      policyFingerprint: context.policyFingerprint,
+      combinedError: String(combinedError),
+    };
+  }
+}
+
+function matchesNextStageDecision(value: string): value is NextStageDecision["decision"] {
+  return value === "complete" || value === "continue" || value === "adjust";
 }
 
 /**
@@ -295,7 +396,7 @@ export async function planDiscoveryContinuation(
       ? undefined
       : createRuntimeModel(input.model, input.apiKey, context, input.generationSettings),
   );
-  const continuation = selectContinuationSteps(allTaskSteps(input.task), candidates);
+  const continuation = selectContinuationSteps(activeRoundSteps(input.task), candidates, taskAttemptContext(input.task));
   if (!continuation.length) throw new Error("模型未返回可执行的后续步骤");
   return continuation;
 }
@@ -357,8 +458,13 @@ export async function planTaskAdjustment(
       }
     }
   }
-  const completed = allTaskSteps(input.task).filter((step) => step.status === "completed");
-  const selected = selectContinuationSteps(completed, replacement);
+  const selected = input.allowUnchangedFailureRetry
+    ? selectContinuationSteps(
+      activeRoundSteps(input.task).filter((step) => step.status === "completed"),
+      replacement,
+      taskAttemptContext(input.task),
+    )
+    : selectAdjustmentSteps(activeRoundSteps(input.task), replacement, taskAttemptContext(input.task));
   if (!selected.length) throw new Error("模型未返回新的可执行调整步骤");
   return {
     requirement,

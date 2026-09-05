@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   buildCompactFailedSummarySteps,
   buildFailedTaskSummaryContext,
+  decideTaskNextStage,
   planDiscoveryContinuation,
   planTaskAdjustment,
   reviewTaskGoal,
@@ -59,6 +60,59 @@ const generationSettings = {
 };
 
 describe("agentService", () => {
+  it("decides completion and creates the next bounded stage in one model call", async () => {
+    const decide = vi.fn().mockResolvedValue({
+      decision: "adjust",
+      reason: "HTTP 验收尚未完成",
+      summary: "进入启动与验收阶段",
+      source: "model",
+      steps: [step("start", "npm run start", "pending")],
+    });
+    const fallbackReview = vi.fn();
+
+    const result = await decideTaskNextStage({
+      task: task(),
+      model,
+      apiKey: "secret-key",
+      metrics: { cpu: 1, memory: 2, disk: 3, networkIn: 0, networkOut: 0, sampledAt: "now" },
+      tools: [],
+      secretMetadata: [],
+      generationSettings,
+      skills: [],
+    }, decide, fallbackReview);
+
+    expect(result.complete).toBe(false);
+    expect(result.nextPlan?.map(({ id }) => id)).toEqual(["start"]);
+    expect(decide).toHaveBeenCalledTimes(1);
+    expect(decide.mock.calls[0][1]?.context).toContain("decide_after_phase");
+    expect(fallbackReview).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the existing goal review when the combined endpoint is unavailable", async () => {
+    const decide = vi.fn().mockRejectedValue(new Error("unknown command"));
+    const fallbackReview = vi.fn().mockResolvedValue({
+      decision: "adjust",
+      reason: "最终验收缺失",
+      summary: "需要继续规划",
+      source: "model",
+    });
+
+    const result = await decideTaskNextStage({
+      task: task(),
+      model,
+      apiKey: "secret-key",
+      metrics: { cpu: 1, memory: 2, disk: 3, networkIn: 0, networkOut: 0, sampledAt: "now" },
+      tools: [],
+      secretMetadata: [],
+      generationSettings,
+      skills: [],
+    }, decide, fallbackReview);
+
+    expect(result.complete).toBe(false);
+    expect(result.nextPlan).toBeUndefined();
+    expect(fallbackReview).toHaveBeenCalledTimes(1);
+  });
+
   it("builds discovery context and removes repeated continuation commands", async () => {
     const generatePlan = vi.fn().mockResolvedValue([
       step("duplicate", " pwd ", "pending"),
@@ -136,6 +190,24 @@ describe("agentService", () => {
       decision: "adjust",
       summary: "continue deployment",
     });
+  });
+
+  it("rejects an unchanged failed attempt before it can be executed again", async () => {
+    const currentTask = task();
+    const failed = step("failed-tool", 'opsark-tool files.get_structure {"rootPath":"/opt/app"}', "failed");
+    failed.validation = "true";
+    currentTask.plan = [failed];
+
+    await expect(planTaskAdjustment({
+      task: currentTask,
+      failedStep: failed,
+      metrics: { cpu: 1, memory: 2, disk: 3, networkIn: 0, networkOut: 0, sampledAt: "now" },
+      tools: [],
+      secretMetadata: [],
+      model,
+      apiKey: "secret-key",
+      generationSettings,
+    }, vi.fn().mockResolvedValue([{ ...failed, id: "unchanged", status: "pending" }]))).rejects.toThrow();
   });
 
   it("安全门禁局部调整只提交命中字段并接受单步精确修复", async () => {
@@ -528,10 +600,10 @@ describe("agentService", () => {
     expect(failed.title).toBe("step-30");
     expect(failed.output.content).toContain("fatal: deployment artifact is missing");
     expect(failed.output.salientLines).toContain("fatal: deployment artifact is missing");
-    expect(context.activeSkillAcceptance[0].instructions.length).toBeLessThanOrEqual(1_600);
+    expect(context.activeSkillAcceptance[0].instructions).toBe(`final acceptance ${"long rule ".repeat(1_000)}`);
     expect(serialized).not.toContain("GOAL_REVIEW_MIDDLE_TOKEN_MUST_BE_OMITTED");
     expect(serialized).not.toContain("deploy --token secret-");
-    expect(serialized.length).toBeLessThan(30_000);
+    expect(serialized.length).toBeLessThan(40_000);
   });
 
 });

@@ -3,7 +3,9 @@ import {
   buildAgentContext,
   buildAdjustmentContext,
   buildContinuationContext,
+  buildNextStageContext,
   extractKnownExecutionFacts,
+  nextStagePolicyFingerprint,
 } from "@/features/agent/agentContext";
 import type { OpsTask, ServerProfile } from "@/types";
 import { resolveToolRegistry } from "@/features/tools/toolRegistry";
@@ -238,6 +240,49 @@ describe("agent context", () => {
     expect(adjustment.tools).toEqual(expect.arrayContaining([expect.objectContaining({ id: "files.get_structure" })]));
     expect(continuation.completedDiscovery[0].output).toContain("ok");
     expect(JSON.stringify({ adjustment, continuation })).not.toContain("secret-value");
+    expect(JSON.stringify(adjustment).indexOf('"tools"'))
+      .toBeLessThan(JSON.stringify(adjustment).indexOf('"baseSnapshot"'));
+    expect(JSON.stringify(continuation).indexOf('"tools"'))
+      .toBeLessThan(JSON.stringify(continuation).indexOf('"completedDiscovery"'));
+  });
+
+  it("builds one next-stage context with only the active Skill tool policy", () => {
+    const current = createTask();
+    current.activeSkillIds = ["software-installation"];
+    const skills = resolveSkillRegistry({ overrides: [], customSkills: [] })
+      .filter((skill) => skill.id === "software-installation");
+    const input = {
+      server: createServer(),
+      metrics: { cpu: 1, memory: 2, disk: 3, networkIn: 4, networkOut: 5, sampledAt: "now" },
+      task: current,
+      tools: resolveToolRegistry([]),
+      secretMetadata: [],
+      skills,
+    };
+    const context = buildNextStageContext(input);
+
+    expect(context.workflowPhase).toBe("decide_after_phase");
+    expect(context.tools.map(({ id }) => id)).toEqual(["user.request_input", "software.check"]);
+    expect(context.activeSkills[0].instructions).toContain("软件名称明确");
+    expect(context.policyFingerprint).toBe(nextStagePolicyFingerprint(input));
+    expect(JSON.stringify(context)).not.toContain("secret.merge_command");
+    expect(JSON.stringify(context).indexOf('"tools"'))
+      .toBeLessThan(JSON.stringify(context).indexOf('"baseSnapshot"'));
+
+    const changedPermission = structuredClone(current);
+    changedPermission.permission = "managed";
+    expect(nextStagePolicyFingerprint({ ...input, task: changedPermission }))
+      .not.toBe(context.policyFingerprint);
+
+    const changedTools = structuredClone(input.tools);
+    changedTools.find(({ id }) => id === "software.check")!.description += "（已更新）";
+    expect(nextStagePolicyFingerprint({ ...input, tools: changedTools }))
+      .not.toBe(context.policyFingerprint);
+
+    expect(nextStagePolicyFingerprint({
+      ...input,
+      secretMetadata: [{ key: "NPM_TOKEN", description: "依赖令牌", scope: "server", serverId: "server-1" }],
+    })).not.toBe(context.policyFingerprint);
   });
 });
 

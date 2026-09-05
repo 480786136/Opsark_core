@@ -15,10 +15,14 @@ describe("file structure tool", () => {
     expect(request.excludeDirectories.filter((item) => item === "uploads")).toHaveLength(1);
     expect(request.maxDepth).toBe(4);
     expect(request.maxNodes).toBe(600);
+    expect(normalizeFileStructureRequest({ rootPath: "//opt///app//" }).rootPath).toBe("/opt/app");
   });
 
   it("rejects unsafe paths and out-of-range limits", () => {
     expect(() => normalizeFileStructureRequest({ rootPath: "opt/app" })).toThrow("绝对目录");
+    expect(() => normalizeFileStructureRequest({ rootPath: "C:\\opt\\app" })).toThrow("POSIX");
+    expect(() => normalizeFileStructureRequest({ rootPath: "/opt/../app" })).toThrow("路径段");
+    expect(() => normalizeFileStructureRequest({ rootPath: "/opt/./app" })).toThrow("路径段");
     expect(() => normalizeFileStructureRequest({ rootPath: "/opt/app", excludeDirectories: ["../etc"] })).toThrow("排除目录");
     expect(() => normalizeFileStructureRequest({ rootPath: "/opt/app", excludeDirectories: ["..\\etc"] })).toThrow("排除目录");
     expect(() => normalizeFileStructureRequest({ rootPath: "/opt/app", maxDepth: 21 })).toThrow("遍历深度");
