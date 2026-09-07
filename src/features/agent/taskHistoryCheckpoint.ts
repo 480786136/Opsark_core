@@ -13,7 +13,10 @@ import type {
 } from "@/types";
 
 const CHECKPOINT_FACT_LIMIT = 12;
+<<<<<<< HEAD
 const CHECKPOINT_ISSUE_LIMIT = 8;
+=======
+>>>>>>> origin/master
 const CHECKPOINT_PHASE_SUMMARY_LIMIT = 4;
 const RECENT_DETAILED_PHASE_COUNT = 2;
 
@@ -98,6 +101,7 @@ function mergePhase(
   let unresolvedIssues = [...checkpoint.unresolvedIssues];
   for (const step of phase.plan) {
     const commandFingerprint = textFingerprint(step.command);
+<<<<<<< HEAD
     if (!isExceptional(step)) {
       if (step.status === "completed") {
         unresolvedIssues = unresolvedIssues.filter((item) => item.commandFingerprint !== commandFingerprint);
@@ -106,6 +110,21 @@ function mergePhase(
     }
     const existing = unresolvedIssues.find((item) => item.commandFingerprint === commandFingerprint);
     unresolvedIssues = unresolvedIssues.filter((item) => item.commandFingerprint !== commandFingerprint);
+=======
+    const sameIssue = (item: TaskHistoryCheckpoint["unresolvedIssues"][number]) =>
+      item.commandFingerprint === commandFingerprint && Boolean(step.attemptContext)
+      && item.attemptContext === step.attemptContext;
+    if (!isExceptional(step)) {
+      if (step.status === "completed" && step.result?.executionStatus === "success"
+        && step.result.observationStatus === "matched"
+        && step.evidence?.some(item => step.result?.evidenceIds.includes(item.id))) {
+        unresolvedIssues = unresolvedIssues.filter((item) => !sameIssue(item));
+      }
+      continue;
+    }
+    const existing = unresolvedIssues.find(sameIssue);
+    unresolvedIssues = unresolvedIssues.filter((item) => !sameIssue(item) && item.stepId !== step.id);
+>>>>>>> origin/master
     unresolvedIssues.push({
       stepId: step.id,
       title: compactReviewText(step.title, 180),
@@ -117,6 +136,10 @@ function mergePhase(
           : undefined,
       status: step.status,
       commandFingerprint,
+<<<<<<< HEAD
+=======
+      attemptContext: step.attemptContext,
+>>>>>>> origin/master
       attemptCount: (existing?.attemptCount ?? 0) + 1,
     });
   }
@@ -141,7 +164,11 @@ function mergePhase(
     sourceStepCount: checkpoint.sourceStepCount + phase.plan.length,
     statusCounts,
     verifiedFacts: verifiedFacts.slice(-CHECKPOINT_FACT_LIMIT),
+<<<<<<< HEAD
     unresolvedIssues: unresolvedIssues.slice(-CHECKPOINT_ISSUE_LIMIT),
+=======
+    unresolvedIssues,
+>>>>>>> origin/master
     phaseSummaries,
     throughPhaseId: phase.id,
     sourceHistoryFingerprint,

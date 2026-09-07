@@ -104,12 +104,57 @@ describe("review service", () => {
       source: "model",
     }));
 
+<<<<<<< HEAD
     expect(result.modelDecision.decision).toBe("complete");
+=======
+    expect(result.modelDecision?.decision).toBe("complete");
+>>>>>>> origin/master
     expect(result.finalDecision).toMatchObject({ decision: "adjust", source: "rules" });
     expect(result.mutatingStep).toBe(true);
     expect(result.recoveryStepFound).toBe(true);
   });
 
+<<<<<<< HEAD
+=======
+  it("sends a failed change directly to adjustment when no remaining step can recover it", async () => {
+    const task = createTask();
+    const failed = createStep("build", "npm install && npm run build", "failed");
+    failed.kind = "change";
+    failed.result = {
+      executionStatus: "failed", observationStatus: "unknown", exitCode: 1,
+      facts: { category: "command_failed", commandCompleted: false },
+      warnings: [], evidenceIds: ["main"], failureReason: "Cannot find module autoprefixer",
+    };
+    failed.output = "npm install succeeded\nCannot find module autoprefixer";
+    task.plan = [failed, createStep("验收", "test -d dist", "pending")];
+    const reviewer = vi.fn();
+    const result = await reviewExecutionFailure({
+      task, step: failed, failureReason: failed.result.failureReason!, model,
+    }, reviewer);
+
+    expect(reviewer).not.toHaveBeenCalled();
+    expect(result.modelDecision).toBeUndefined();
+    expect(result.finalDecision).toMatchObject({ decision: "adjust", source: "rules" });
+    expect(JSON.stringify(result.context)).toContain("Cannot find module autoprefixer");
+    expect(failed.status).toBe("failed");
+    expect(task.plan[1].status).toBe("pending");
+  });
+
+  it("still asks the model to interpret a failed read-only diagnostic", async () => {
+    const task = createTask();
+    const failed = createStep("检查服务", "systemctl is-active app", "failed");
+    failed.kind = "observe";
+    task.plan = [failed];
+    const reviewer = vi.fn().mockResolvedValue({
+      decision: "complete", reason: "The query confirmed the service is inactive",
+      summary: "inactive", source: "model",
+    });
+    const result = await reviewExecutionFailure({ task, step: failed, failureReason: "inactive", model }, reviewer);
+    expect(reviewer).toHaveBeenCalledOnce();
+    expect(result.finalDecision.source).toBe("model");
+  });
+
+>>>>>>> origin/master
   it("lets deterministic postcondition blockers override a model continue decision", async () => {
     const task = createTask();
     const deploy = createStep("deploy", "systemctl restart app", "validating");

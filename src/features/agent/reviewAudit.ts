@@ -57,7 +57,11 @@ export function buildPeriodicReviewAudit(input: PeriodicReviewAuditInput): Audit
 
 export interface CommandFailureReviewAuditInput extends AuditScope {
   context: Record<string, unknown>;
+<<<<<<< HEAD
   modelDecision: StepReview;
+=======
+  modelDecision?: StepReview;
+>>>>>>> origin/master
   finalDecision: StepReview;
   diagnosticStep: boolean;
   mutatingStep: boolean;
@@ -68,12 +72,24 @@ export function buildCommandFailureReviewAudit(
   input: CommandFailureReviewAuditInput,
 ): AuditEventDraft {
   return {
+<<<<<<< HEAD
     category: "model",
     level: input.finalDecision.decision === "adjust" ? "warning" : "info",
     title: `${input.stepTitle} · 主命令失败异常复核`,
     detail: detail({
       input: input.context,
       modelDecision: input.modelDecision,
+=======
+    category: input.modelDecision ? "model" : "system",
+    level: input.finalDecision.decision === "adjust" ? "warning" : "info",
+    title: input.modelDecision
+      ? `${input.stepTitle} · 主命令失败异常复核`
+      : `${input.stepTitle} · 执行失败直接进入调整`,
+    detail: detail({
+      input: input.context,
+      modelDecision: input.modelDecision,
+      modelReviewSkipped: !input.modelDecision,
+>>>>>>> origin/master
       diagnosticStep: input.diagnosticStep,
       mutatingStep: input.mutatingStep,
       recoveryStepFound: input.recoveryStepFound,

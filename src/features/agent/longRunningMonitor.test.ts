@@ -343,7 +343,11 @@ describe("longRunningMonitor", () => {
     expect(onHeartbeat).not.toHaveBeenCalled();
   });
 
+<<<<<<< HEAD
   it("progressive 任务有远程 CPU/I/O 活动时不会因文本沉默接受模型停止建议", async () => {
+=======
+  it("samples active builds locally, reviews periodically, and escalates new errors without waiting", async () => {
+>>>>>>> origin/master
     let currentTime = Date.parse("2026-08-14T00:00:00.000Z");
     const timers = new Map<number, () => void>();
     const scheduler: LongRunningMonitorScheduler = {
@@ -362,23 +366,71 @@ describe("longRunningMonitor", () => {
     } satisfies OpsTask;
     const cancelExecution = vi.fn();
     const onAudit = vi.fn();
+<<<<<<< HEAD
     const controller = startLongRunningMonitor({
       task, step, requirement: "构建项目", validation: step.validation, executionId: "exec-progress", secretValues: {},
       getStreamedOutput: () => "", isCancelled: () => false, onHeartbeat: vi.fn(), onEvent: vi.fn(),
       onAudit, onError: vi.fn(), cancelExecution, scheduler,
       sampleRuntimeProgress: vi.fn().mockResolvedValue({ active: true, processCount: 3, cpuPercent: 42, ioBytes: 8192 }),
       reviewStep: vi.fn().mockResolvedValue(review("adjust", "model")),
+=======
+    let output = "";
+    const reviewStep = vi.fn().mockResolvedValue(review("continue", "model"));
+    const controller = startLongRunningMonitor({
+      task, step, requirement: "构建项目", validation: step.validation, executionId: "exec-progress", secretValues: {},
+      getStreamedOutput: () => output, isCancelled: () => false, onHeartbeat: vi.fn(), onEvent: vi.fn(),
+      onAudit, onError: vi.fn(), cancelExecution, scheduler,
+      sampleRuntimeProgress: vi.fn().mockResolvedValue({ active: true, processCount: 3, cpuPercent: 42, ioBytes: 8192 }),
+      reviewStep,
+>>>>>>> origin/master
     });
 
     currentTime += 30_000;
     timers.get(1)?.();
+<<<<<<< HEAD
     await vi.waitFor(() => expect(onAudit).toHaveBeenCalledOnce());
     expect(onAudit.mock.calls[0][0].acceptedDecision).toBe(false);
+=======
+    await vi.waitFor(() => expect(controller.getState().skippedModelReviewCount).toBe(1));
+    expect(reviewStep).not.toHaveBeenCalled();
+    currentTime += 90_000;
+    timers.get(1)?.();
+    await vi.waitFor(() => expect(onAudit).toHaveBeenCalledOnce());
+    output = "Error: build dependency missing";
+    currentTime += 30_000;
+    timers.get(1)?.();
+    await vi.waitFor(() => expect(reviewStep).toHaveBeenCalledTimes(2));
+    expect(JSON.parse(reviewStep.mock.calls[1][1]).terminalOutput.content).toContain("dependency missing");
+>>>>>>> origin/master
     expect(cancelExecution).not.toHaveBeenCalled();
     expect(controller.getState().runtimeProgress).toMatchObject({ active: true, processCount: 3 });
     controller.stop();
   });
 
+<<<<<<< HEAD
+=======
+  it("does not defer model review merely because idle child processes still exist", async () => {
+    let now = 0;
+    let tick: () => void = () => {};
+    const step = { id: "idle", title: "build", description: "build", command: "npm run build",
+      validation: "test -d dist", expected: "artifact", risk: "low", status: "running" } satisfies PlanStep;
+    const task = { id: "task", serverId: "server", title: "build", status: "running", permission: "safe",
+      modelId: "model", messages: [], plan: [step], createdAt: "now", updatedAt: "now" } satisfies OpsTask;
+    const reviewer = vi.fn().mockResolvedValue(review("continue", "model"));
+    const monitor = startLongRunningMonitor({ task, step, requirement: "build", validation: step.validation,
+      executionId: "exec", secretValues: {}, getStreamedOutput: () => "", isCancelled: () => false,
+      onHeartbeat: vi.fn(), onEvent: vi.fn(), onAudit: vi.fn(), onError: vi.fn(), reviewStep: reviewer,
+      sampleRuntimeProgress: async () => ({ active: true, processCount: 5, cpuPercent: 0, ioBytes: 10 }),
+      scheduler: { now: () => now, setInterval: cb => { tick = cb; return 1; }, clearInterval: vi.fn() },
+    });
+    now = 30_000;
+    tick();
+    await vi.waitFor(() => expect(reviewer).toHaveBeenCalledOnce());
+    expect(monitor.getState().skippedModelReviewCount).toBe(0);
+    monitor.stop();
+  });
+
+>>>>>>> origin/master
   it("progressive executionId 的进程组消失时确定性停止等待", async () => {
     let currentTime = Date.parse("2026-08-14T00:00:00.000Z");
     const timers = new Map<number, () => void>();

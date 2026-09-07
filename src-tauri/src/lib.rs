@@ -7,9 +7,17 @@ mod command_guard;
 mod credential;
 mod file_tree;
 mod json_contract;
+<<<<<<< HEAD
 mod knowledge;
 mod metrics;
 mod model;
+=======
+mod metrics;
+mod model;
+mod prompt_layers;
+mod task_logs;
+mod evidence_store;
+>>>>>>> origin/master
 mod sftp;
 mod sftp_transfer;
 mod ssh;
@@ -141,7 +149,11 @@ const NEXT_STAGE_OUTPUT_CONTRACT: &str = r#"输出必须严格为 {"decision":"c
 decision=complete 时 steps 必须严格为空数组。decision=continue 或 adjust 时 steps 必须至少有 1 个元素。
 每个步骤必须严格包含：{"kind":"observe|change","title":"非空字符串","description":"非空字符串","command":"非空字符串","expected":"非空字符串","validation":"字符串","risk":"low|medium|high"}。可选字段只允许 executionScope、validationScope、runtimeClass 和 sessionContextChange；其枚举、作用域、独立校验、长任务和进程跟踪要求与 GENERAL_PLAN_SYSTEM 相同。
 observe 的 validation 必须为空字符串；change 的 validation 必须是非空、独立、只读的后置条件。工具命令必须严格写成 opsark-tool <toolId> <JSON参数对象> 并符合 context.tools 的 inputSchema。当 command 以 opsark-tool 开头时，validation 必须固定为 JSON 字符串 "true"，即输出 "validation":"true"；禁止输出 JSON 布尔值 true。context.activeSkills 禁止的工具不得出现在 steps 中。工具上下文中 planMode=standalone 的工具必须是 steps 中唯一的步骤。
+<<<<<<< HEAD
 planMode=read_batch 允许参数已经确定的纯 observe 工具批次；不能混入 Shell、变更或 standalone，也不能预设前一步工具输出。整批结束后再判断下一阶段。
+=======
+planMode=read_batch 允许参数已经确定的纯 observe 工具批次；不能混入 Shell、变更或 standalone，也不能预设前一步工具输出。整批结束后再判断下一阶段。planMode、completionMode、executionMode 是工具目录元数据，由编排器读取，禁止复制到 steps 的对象字段中；步骤只能使用输出协议声明的字段。
+>>>>>>> origin/master
 command 和 validation 中的换行及反斜杠必须按标准 JSON 规则转义。返回前必须同时自检决策分支、所有计划字段和完整 JSON 结构。"#;
 const REQUIREMENT_CLASSIFICATION_CONTRACT: &str = r#"本阶段只做需求分类、任务关系判断、终端上下文判断、执行约束提取和 Skill 选择，禁止输出 steps、command、validation 或执行计划。context.taskGoal.rootGoal 是当前任务长期绑定的整体目标，currentInstruction 只是上一轮指令。必须判断本次输入与整体目标的关系：new_goal=独立的新执行目标；continue=继续/重试原目标；supplement=为原目标补充条件；side_question=临时咨询且不改变原目标；replace_goal=用户明确放弃原目标并替换；cancel_goal=明确取消原目标。不得仅因用户提出另一个问题就隐式覆盖原目标；新执行目标使用 new_goal，只有明确“改为/不要原目标/替换为”才用 replace_goal。必须先判断回答或计划是否依赖用户之前的终端输入/输出：如依赖且 terminalContext.content 未提供或范围不够，返回 terminal_context，terminalContextLines 必须大于当前 includedLines，且不超过 totalLines 和 400；不依赖则不得请求终端内容。对 execute，constraints.changePolicy 是本轮权威的只读/变更边界：查询现状、列表、检查和定位故障必须为 read_only；用户明确要求安装、修改、构建、部署、传输或其他环境变更时为 requested_changes_only；只有用户明确允许为达成目标执行必要的附加变更时才为 allow_necessary_changes。execute 不得返回 unspecified。environmentPolicy、failurePolicy、prohibitedActions、requiredConditions 和 userDirectives 只能来自用户明确表达，不得猜测或自行增加。context.skillDirectory 中的名称、description 和 selectionHints 用于语义选择；category 只用于管理和导航，不得触发 Skill。只选择直接适用于整体目标、本轮显式子目标或已有证据证明必需阶段的 Skill，允许复合需求选择多个 Skill；不得因为目录中存在相近领域或关键词局部相似而强行匹配。零匹配是正常且合法的结果，此时 selectedSkillIds=[]，后续使用通用流程。selectedSkillIds 是本轮完整集合，continue/supplement 也必须移除不再适用或上轮误选的 Skill，程序不会自动并集。咨询类必须严格输出：{"intent":"answer","relation":"side_question|cancel_goal","answer":"非空回答","constraints":null,"terminalContextLines":0,"selectedSkillIds":[]}。执行类必须严格输出：{"intent":"execute","relation":"new_goal|continue|supplement|replace_goal","answer":"","constraints":{"changePolicy":"read_only|requested_changes_only|allow_necessary_changes","environmentPolicy":"unspecified|preserve|allow_isolated_changes|allow_host_changes","failurePolicy":"unspecified|strict|best_effort","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},"terminalContextLines":0,"selectedSkillIds":[]}。需要更多终端内容时必须严格输出：{"intent":"terminal_context","relation":null,"answer":"","constraints":null,"terminalContextLines":80,"selectedSkillIds":[]}。顶层只允许 intent、relation、answer、constraints、terminalContextLines、selectedSkillIds 六个字段。"#;
 const SECRET_PLACEHOLDER_RULE: &str = "敏感变量规则：${secret.NAME} 是 Opsark 的执行时传输占位符，不是要保留在远端文件里的字面量。必须原样写成 ${secret.NAME}，绝对不得在美元符号前添加反斜杠。程序会在 SSH 执行前注入真实值，并在输出、日志和模型上下文中脱敏。模型看到的 •••••••• 只表示真实值已被脱敏：它既不是远端文件的实际内容，也不能证明具体密码正确或错误，更不能据此声称占位符未解析。选择变量时名称和说明必须与目标凭据语义一致；若现有变量无法区分目标账户或用途，应使用新的、用途明确的变量名，由界面向用户索取，不能静默借用含义模糊的旧值。写入远端配置后应使用不泄露秘密的功能性后置条件校验；校验命令中仍可使用同一占位符供程序注入。不得要求远端保留 Opsark 占位符，也不得因脱敏标记判定泄露、写入失败或密码错误。除非用户明确禁止持久化密码，不得自行增加该限制。";
@@ -182,6 +194,10 @@ const GENERAL_SUMMARY_SYSTEM: &str = "你是通用运维结果总结器。仅根
 const GENERAL_REVIEW_SYSTEM: &str = "你是运维执行复核员。根据用户目标、trigger、executionConstraints、当前步骤或 baseSnapshot 的结构化结果、关键错误和剩余步骤，判断 continue、adjust 或 complete。priorVerifiedFacts 只用于避免重复，不能代替当前状态证据。不得把失败改写为成功，不得虚构证据、命令或授权。证据作用域必须与 expected 一致。存在确定恢复路径时 continue；已阻断、证据不足或作用域不匹配时 adjust；只有目标被真实且作用域匹配的证据充分证明时 complete。安全拦截、审批、执行结果和程序门禁不可被覆盖。只返回包含 decision、reason、summary 的 JSON。";
 const LONG_RUNNING_REVIEW_SYSTEM: &str = "你是长任务运行状态复核员。输入只包含压缩后的用户目标、当前步骤、下一步骤提示、跨轮关键证据、进度状态和本轮新增终端输出。只判断当前命令应 continue 还是 adjust：语义输出或可验证进度仍在变化时返回 continue；仅旋转图标、时间戳或重复行变化不算进展。连续无进展、出现认证或交互等待、明确错误、达到等待上限时返回 adjust。continue 仅表示继续等待当前命令，不能进入下一步；主命令未返回真实退出且 periodicObservation.passed=false 时不得 complete。terminalOutput.omittedCharacters 仅表示旧输出被压缩，不代表失败；salientEvidence 是前轮已保留的关键错误、警告或里程碑，不得忽略。不得虚构输出、退出码、命令或授权。只返回 decision、reason、summary 三个字段的简短 JSON，reason 和 summary 各不超过 60 个字。";
 const STRUCTURED_OUTPUT_ATTEMPTS: usize = 2;
+<<<<<<< HEAD
+=======
+const REQUIREMENT_RELATION_RULE: &str = "关系自检：句式是提问不等于 side_question。例如新任务‘现在有哪些 Java 服务在运行’需要查询真实服务器，应返回 intent=execute、relation=new_goal、changePolicy=read_only、answer=空字符串、selectedSkillIds=[]。只有无需读取真实环境的咨询才使用 answer + side_question；已有整体目标时依据实际关系选择 continue/supplement/new_goal，不得自动替换原目标。";
+>>>>>>> origin/master
 const PLAN_GENERATION_ATTEMPTS: usize = 3;
 
 fn deserialize_model_validation<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -370,6 +386,11 @@ struct RequirementProcessingResult {
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelDeveloperTrace {
+<<<<<<< HEAD
+=======
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    normalizations: Vec<String>,
+>>>>>>> origin/master
     attempts: Vec<ModelAttemptTrace>,
 }
 
@@ -399,7 +420,11 @@ fn record_model_attempt(
         stage: stage.to_string(),
         attempt,
         duration_ms: started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+<<<<<<< HEAD
         request,
+=======
+        request: prompt_layers::prepare_request(&request).0,
+>>>>>>> origin/master
         response,
         error,
     });
@@ -420,6 +445,25 @@ fn developer_model_log_path(app: &AppHandle) -> Option<PathBuf> {
         .map(|directory| directory.join("developer-model-calls.jsonl"))
 }
 
+<<<<<<< HEAD
+=======
+#[tauri::command]
+fn append_task_log(app: AppHandle, stream: String, event: Value, context: Value) -> Result<(), String> {
+    let root = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    task_logs::append(&root, &stream, event, &context)
+}
+
+#[tauri::command]
+fn save_task_evidence(app: AppHandle, task_id: String, record: Value) -> Result<String, String> {
+    evidence_store::save(&app.path().app_data_dir().map_err(|e| e.to_string())?, &task_id, &record)
+}
+
+#[tauri::command]
+fn read_task_evidence(app: AppHandle, task_id: String, evidence_id: String, offset: usize, limit: usize) -> Result<Value, String> {
+    evidence_store::read(&app.path().app_data_dir().map_err(|e| e.to_string())?, &task_id, &evidence_id, offset, limit)
+}
+
+>>>>>>> origin/master
 fn context_with_selected_skills(
     context: &str,
     skill_definitions: &[ModelSkillDefinition],
@@ -445,6 +489,13 @@ fn context_with_selected_skills(
         })
         .collect::<Result<Vec<_>, _>>()?;
     object.remove("skillDirectory");
+<<<<<<< HEAD
+=======
+    if let Some(Value::Array(evidence)) = object.get_mut("skillEvidence") {
+        evidence.retain(|item| item.get("skillId").and_then(Value::as_str)
+            .is_some_and(|id| selected_skill_ids.iter().any(|selected| selected == id)));
+    }
+>>>>>>> origin/master
     if let Some(Value::Array(tools)) = object.get_mut("tools") {
         // A missing allow-list means a legacy/custom Skill whose capabilities
         // are unknown. Keep the planner-visible catalog in that case so prompt
@@ -465,7 +516,11 @@ fn context_with_selected_skills(
                     let forbidden = selected
                         .iter()
                         .any(|skill| skill.forbidden_tool_ids.iter().any(|item| item == id));
+<<<<<<< HEAD
                     !forbidden && (!restrict_to_allow_lists || allowed_tool_ids.contains(id))
+=======
+                    !forbidden && (!restrict_to_allow_lists || allowed_tool_ids.contains(id) || id == "evidence.read")
+>>>>>>> origin/master
                 })
                 .unwrap_or(true)
         });
@@ -556,6 +611,81 @@ fn normalize_execution_constraints(
     }
 }
 
+<<<<<<< HEAD
+=======
+fn classification_contract_error(decision: &AiRequirementDecision, skill_selection_error: Option<String>) -> Option<String> {
+        let relation = decision.relation.as_deref();
+        match decision.intent.as_str() {
+            "answer"
+                if !decision.answer.trim().is_empty()
+                    && decision.constraints.is_null()
+                    && decision.terminal_context_lines == 0
+                    && decision.selected_skill_ids.is_empty()
+                    && matches!(relation, Some("side_question" | "cancel_goal")) =>
+            {
+                None
+            }
+            "answer" => {
+                Some("咨询类响应的 answer 必须是非空字符串且 selectedSkillIds 必须为空".to_string())
+            }
+            "execute"
+                if decision.answer.trim().is_empty()
+                    && execute_constraints_match_contract(&decision.constraints)
+                    && decision.terminal_context_lines == 0
+                    && matches!(
+                        relation,
+                        Some("new_goal" | "continue" | "supplement" | "replace_goal")
+                    )
+                    && skill_selection_error.is_none() =>
+            {
+                None
+            }
+            "execute" => Some(skill_selection_error.unwrap_or_else(|| {
+                if !decision.answer.trim().is_empty() {
+                    "执行类响应的 answer 必须为空字符串".to_string()
+                } else if !execute_constraints_match_contract(&decision.constraints) {
+                    "执行类响应的 constraints 必须包含合法字段且 changePolicy 不得为 unspecified".to_string()
+                } else if decision.terminal_context_lines != 0 {
+                    "执行类响应的 terminalContextLines 必须为 0".to_string()
+                } else {
+                    "execute.relation 必须为 new_goal、continue、supplement 或 replace_goal；side_question 只适用于 answer。读取真实环境也属于 execute；首次查询用 new_goal，已有目标按实际关系选择，不能因句式是提问就使用 side_question。保留已正确的 answer 和 constraints。".to_string()
+                }
+            })),
+            "terminal_context"
+                if decision.answer.trim().is_empty()
+                    && decision.constraints.is_null()
+                    && decision.relation.is_none()
+                    && decision.selected_skill_ids.is_empty()
+                    && (1..=400).contains(&decision.terminal_context_lines) =>
+            {
+                None
+            }
+            "terminal_context" => Some("终端上下文请求必须给出 1 到 400 行".to_string()),
+            _ => Some("需求分类 intent 只能是 answer、execute 或 terminal_context".to_string()),
+        }
+}
+
+/// A fresh read-only request cannot be a side question to a nonexistent goal.
+/// Never infer a new relation when any prior task context is present or unknown.
+fn normalize_initial_readonly_relation(decision: &mut AiRequirementDecision, context: &str) -> bool {
+    if decision.intent != "execute" || decision.relation.as_deref() != Some("side_question")
+        || !decision.answer.trim().is_empty() || decision.terminal_context_lines != 0
+        || !execute_constraints_match_contract(&decision.constraints)
+        || decision.constraints["changePolicy"] != "read_only" {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(context) else { return false; };
+    let absent = |key: &str| value.get(key).is_none_or(Value::is_null);
+    let empty_array = |pointer: &str| value.pointer(pointer).and_then(Value::as_array).is_some_and(Vec::is_empty);
+    if !value.is_object() || !absent("taskGoal") || !absent("previousExecution")
+        || !empty_array("/conversationHistory") || !empty_array("/knownExecutionFacts/completedSteps") {
+        return false;
+    }
+    decision.relation = Some("new_goal".into());
+    true
+}
+
+>>>>>>> origin/master
 fn execute_constraints_match_contract(value: &Value) -> bool {
     let Ok(constraints) = serde_json::from_value::<ExecutionConstraints>(value.clone()) else {
         return false;
@@ -1113,6 +1243,10 @@ fn build_next_stage_request_body(
 ) -> Value {
     let limit_rule = next_stage_limit_rule(settings);
     let mut body = json!({
+<<<<<<< HEAD
+=======
+        "_opsarkContext": context,
+>>>>>>> origin/master
         "model": model,
         "messages": [
             {
@@ -2306,6 +2440,10 @@ async fn generate_ai_plan_with_trace(
             PLAN_STEP_OUTPUT_CONTRACT
         };
         let mut body = json!({
+<<<<<<< HEAD
+=======
+            "_opsarkContext": context,
+>>>>>>> origin/master
             "model": model,
             "messages": [
                 {"role": "system", "content": format!("{system}\n{deployment_rules}\n{response_contract}\n{limit_rule}\n{SECRET_PLACEHOLDER_RULE}\n{STRICT_JSON_OUTPUT_RULE}")},
@@ -2623,9 +2761,16 @@ async fn process_ai_requirement(
             )
         };
         let body = json!({
+<<<<<<< HEAD
             "model": model,
             "messages": [
                 {"role": "system", "content": format!("{system}\n{SECRET_PLACEHOLDER_RULE}\n{REQUIREMENT_CLASSIFICATION_CONTRACT}\n{STRICT_JSON_OUTPUT_RULE}")},
+=======
+            "_opsarkContext": classification_context,
+            "model": model,
+            "messages": [
+                {"role": "system", "content": format!("{system}\n{SECRET_PLACEHOLDER_RULE}\n{REQUIREMENT_CLASSIFICATION_CONTRACT}\n{REQUIREMENT_RELATION_RULE}\n{STRICT_JSON_OUTPUT_RULE}")},
+>>>>>>> origin/master
                 {"role": "user", "content": format!("服务器上下文：\n{classification_context}\n\n用户输入：\n{requirement}\n\n严格按系统消息中的分类契约返回。{correction}")}
             ],
             "thinking": {"type": "disabled"},
@@ -2661,7 +2806,11 @@ async fn process_ai_requirement(
         let parsed = message_content(&payload, "模型响应缺少需求理解结果").and_then(|content| {
             parse_model_json(content).map_err(|error| format!("需求理解结构解析失败：{error}"))
         });
+<<<<<<< HEAD
         let decision: AiRequirementDecision = match parsed {
+=======
+        let mut decision: AiRequirementDecision = match parsed {
+>>>>>>> origin/master
             Ok(decision) => decision,
             Err(error) => {
                 last_error = error;
@@ -2695,6 +2844,7 @@ async fn process_ai_requirement(
                 .find(|id| !available_skill_ids.contains(id.as_str()))
                 .map(|id| format!("selectedSkillIds 包含未启用或不存在的 Skill：{id}"))
         };
+<<<<<<< HEAD
         let relation = decision.relation.as_deref();
         let contract_error = match decision.intent.as_str() {
             "answer"
@@ -2736,6 +2886,12 @@ async fn process_ai_requirement(
             "terminal_context" => Some("终端上下文请求必须给出 1 到 400 行".to_string()),
             _ => Some("需求分类 intent 只能是 answer、execute 或 terminal_context".to_string()),
         };
+=======
+        if skill_selection_error.is_none() && normalize_initial_readonly_relation(&mut decision, &context) {
+            developer_trace.normalizations.push("首次只读执行且无历史目标：relation 从 side_question 规范为 new_goal；原始模型响应保留。".into());
+        }
+        let contract_error = classification_contract_error(&decision, skill_selection_error);
+>>>>>>> origin/master
         if let Some(error) = contract_error {
             last_error = error;
             record_model_attempt(
@@ -2868,6 +3024,10 @@ async fn generate_ai_summary(
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
     let system = GENERAL_SUMMARY_SYSTEM;
     let body = json!({
+<<<<<<< HEAD
+=======
+        "_opsarkContext": execution_context,
+>>>>>>> origin/master
         "model": model,
         "messages": [
             {"role": "system", "content": format!("{system}\n{SECRET_PLACEHOLDER_RULE}")},
@@ -2929,6 +3089,10 @@ async fn review_ai_step(
             )
         };
         let body = json!({
+<<<<<<< HEAD
+=======
+            "_opsarkContext": review_context,
+>>>>>>> origin/master
             "model": model,
             "messages": [
                 {"role": "system", "content": format!("{system}\n{REVIEW_SECRET_PLACEHOLDER_RULE}\n{STRICT_JSON_OUTPUT_RULE}")},
@@ -2981,7 +3145,13 @@ pub fn run() {
         .manage(SftpTransferManager::default())
         .manage(ExecutionManager::default())
         .invoke_handler(tauri::generate_handler![
+<<<<<<< HEAD
             knowledge::knowledge_request,
+=======
+            append_task_log,
+            save_task_evidence,
+            read_task_evidence,
+>>>>>>> origin/master
             get_realtime_metrics,
             probe_ssh_server,
             execute_ssh_command,

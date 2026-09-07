@@ -88,18 +88,45 @@ export async function reviewExecutionFailure(
     input.step,
     remainingSteps,
   );
+<<<<<<< HEAD
   const modelDecision = await reviewStep(
     requirement,
     JSON.stringify(context),
     remainingSteps.length > 0,
     createRuntimeModel(input.model, input.apiKey, ""),
   );
+=======
+>>>>>>> origin/master
   const mutatingStep = isMutatingStepCommand(input.step.command);
   const diagnosticStep = isReadOnlyDiagnosticStep(input.step) && !mutatingStep;
   const recoveryStepFound = remainingPlanCanRecoverExecutionFailure(
     input.failureCategory,
     remainingSteps,
   );
+<<<<<<< HEAD
+=======
+  // Every possible review outcome is already constrained to adjustment here.
+  // Send the failure evidence directly to the adjustment planner once instead
+  // of asking a model to choose a branch that the local gate must override.
+  if (!diagnosticStep && !recoveryStepFound) {
+    const finalDecision: StepReview = {
+      decision: "adjust",
+      reason: `${input.failureReason}；剩余计划没有能够处理该失败原因的明确恢复步骤。`,
+      summary: "执行失败证据已保留，下一次规划将直接分析原因并生成恢复步骤。",
+      source: "rules",
+    };
+    return {
+      requirement, context, modelDecision: undefined, finalDecision,
+      remainingSteps, diagnosticStep, mutatingStep, recoveryStepFound,
+    };
+  }
+  const modelDecision = await reviewStep(
+    requirement,
+    JSON.stringify(context),
+    remainingSteps.length > 0,
+    createRuntimeModel(input.model, input.apiKey, ""),
+  );
+>>>>>>> origin/master
   let finalDecision = modelDecision;
   if (modelDecision.source !== "model") {
     finalDecision = {

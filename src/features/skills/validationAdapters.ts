@@ -312,7 +312,20 @@ export const validationAdapters: ValidationAdapter[] = [
     type: "process",
     matches: (step) => /\bps\s|\bpgrep\b|\bpidof\b|进程/i.test(stepText(step)),
     validStates: ["matched", "not_found", "unknown"], expectedExitCodes: [1],
+<<<<<<< HEAD
     parse(lines, emptyResult) {
+=======
+    parse(lines, emptyResult, step) {
+      const inspectedCommand = step.command.trim().replace(/\s+/g, " ");
+      const selfMatches = lines.filter(line => /\b(?:bash|sh|dash|zsh)\s+-[a-z]*c[a-z]*\s/.test(line)
+        && (line.includes("/tmp/opsark-exec-") || (inspectedCommand.length > 12
+          && line.replace(/\s+/g, " ").includes(inspectedCommand))));
+      if (selfMatches.length) {
+        return { facts: { selfInspectionMatches: selfMatches.length,
+          processEvidenceAmbiguous: true,
+          reason: "进程输出包含本次检查自身的 Shell 包装进程；须按真实可执行文件身份重新检查，不能据此断定目标进程存在或不存在。" }, status: "unknown" };
+      }
+>>>>>>> origin/master
       const pids = new Set<number>();
       lines.forEach((line) => { const value = line.match(/^\S+\s+(\d+)\s+/)?.[1] ?? line.match(/^(\d+)(?:\s|$)/)?.[1]; if (value) pids.add(Number(value)); });
       return { facts: { processFound: found(lines, emptyResult), processCount: found(lines, emptyResult) ? Math.max(pids.size, 1) : 0, pids: [...pids] }, status: found(lines, emptyResult) ? "matched" : "not_found" };

@@ -164,18 +164,30 @@ export const defaultToolCatalog: ToolDefinition[] = [
               key: { type: "string", description: "程序使用的参数名。" },
               label: { type: "string", description: "展示给用户的参数名称。" },
               description: { type: "string", description: "说明参数是什么、将用于什么操作。" },
+<<<<<<< HEAD
               type: { type: "string", enum: ["text", "password", "number"] },
+=======
+              type: { type: "string", enum: ["text", "password", "number"], description: "存在 credential 时，username 和 secret 两种角色都必须使用 password，表示保密输入和存储。" },
+>>>>>>> origin/master
               placeholder: { type: "string", description: "不包含真实敏感值的输入示例。" },
               required: { type: "boolean", description: "该参数是否必填。" },
               credential: {
                 type: "object",
                 additionalProperties: false,
+<<<<<<< HEAD
                 description: "用户名/密码或令牌的显式凭据组契约。",
+=======
+                description: "一次表单至多一个完整凭据组，恰好 username 与 secret 各一项；两项 type=password、required=true，共用 group/kind/target。目标未知时先用普通表单确认目标，再收集凭据。",
+>>>>>>> origin/master
                 properties: {
                   group: { type: "string", description: "同一表单内两个凭据字段共用的组标识。" },
                   kind: { type: "string", enum: ["git-https", "ssh-password", "database", "service"] },
                   role: { type: "string", enum: ["username", "secret"] },
+<<<<<<< HEAD
                   target: { type: "string", description: "认证目标主机或服务标识，不包含凭据。" },
+=======
+                  target: { type: "string", description: "已确认的真实认证目标（数据库应含实例端口），不含凭据。不得使用 mysql_target 等占位标识或尚未填写的字段名。" },
+>>>>>>> origin/master
                 },
                 required: ["group", "kind", "role", "target"],
               },
@@ -193,7 +205,11 @@ export const defaultToolCatalog: ToolDefinition[] = [
     executionMode: "user-input",
     enabled: true,
     builtIn: true,
+<<<<<<< HEAD
     version: 3,
+=======
+    version: 4,
+>>>>>>> origin/master
     updatedAt: CATALOG_UPDATED_AT,
   },
   {
@@ -212,6 +228,22 @@ export const defaultToolCatalog: ToolDefinition[] = [
     enabled: true, builtIn: true, version: 1, updatedAt: CATALOG_UPDATED_AT,
   },
   {
+<<<<<<< HEAD
+=======
+    id: "evidence.read", implementation: "readEvidence", name: "读取历史证据",
+    description: "按当前任务的证据引用分页取回已保存原文。",
+    usageInstructions: "传入上下文中的 evidenceId。offset 按 Unicode 字符计数，后续页使用 nextOffset；按需读取相关页。仅能读取当前任务，返回历史采集内容，不证明远端当前状态；保留 capturedPartial。",
+    inputSchema: { type: "object", additionalProperties: false, required: ["evidenceId"], properties: {
+      evidenceId: { type: "string", pattern: "^[a-f0-9]{64}$" },
+      offset: { type: "integer", minimum: 0, default: 0 },
+      limit: { type: "integer", minimum: 1, maximum: 12000, default: 6000 },
+    } },
+    outputDescription: "text、metadata、totalCharacters、nextOffset；nextOffset 为空表示已保存内容读完。",
+    planMode: "read_batch", completionMode: "refine", executionMode: "local",
+    enabled: true, builtIn: true, version: 1, updatedAt: CATALOG_UPDATED_AT,
+  },
+  {
+>>>>>>> origin/master
     id: "files.get_structure",
     implementation: "getRemoteFileStructure",
     name: "文件数据结构获取工具",
@@ -244,7 +276,11 @@ export const defaultToolCatalog: ToolDefinition[] = [
     implementation: "readRemoteFileContent",
     name: "文件内容读取工具",
     description: "有界、只读地读取远端 UTF-8 文本文件，为项目文档、声明文件和配置分析提供真实证据。",
+<<<<<<< HEAD
     usageInstructions: "仅在已确认的绝对文件路径上使用。默认最多读取 64 KiB，最大 256 KiB；二进制文件会拒绝读取，敏感值在进入模型上下文前脱敏。目录结构不足以证明技术栈时，应使用本工具读取 README、依赖声明、锁文件或示例配置。",
+=======
+    usageInstructions: "仅读取已确认绝对路径、与当前决策有关的文本。多个已知路径可作为独立 observe 步骤放入同一 read_batch 计划；整批完成后分析，任一步失败停止剩余步骤。路径依赖前项输出时另起阶段。默认 64 KiB，最大 256 KiB；二进制拒绝，敏感值脱敏。优先 README、依赖声明或示例配置，不默认读取完整锁文件。",
+>>>>>>> origin/master
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -261,7 +297,11 @@ export const defaultToolCatalog: ToolDefinition[] = [
     executionMode: "local",
     enabled: true,
     builtIn: true,
+<<<<<<< HEAD
     version: 1,
+=======
+    version: 2,
+>>>>>>> origin/master
     updatedAt: CATALOG_UPDATED_AT,
   },
   {

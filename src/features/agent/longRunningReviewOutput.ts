@@ -67,6 +67,22 @@ function isCriticalLine(line: string) {
   return CRITICAL_LINE.test(line) || NAMED_ERROR_LINE.test(line);
 }
 
+<<<<<<< HEAD
+=======
+/**
+ * Returns whether a terminal fragment contains a newly observable failure.
+ * Progress bars, timestamps and spinner updates are intentionally ignored so
+ * callers can keep monitoring locally without asking the model to repeat the
+ * same advisory review.
+ */
+export function hasCriticalLongRunningEvidence(output: string) {
+  return sanitizeTerminalOutput(output)
+    .split("\n")
+    .map(normalizeSemanticLine)
+    .some((line) => line.length > 0 && isCriticalLine(line));
+}
+
+>>>>>>> origin/master
 function normalizeSemanticLine(line: string) {
   return line
     .replace(SPINNER_CHARACTERS, "")

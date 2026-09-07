@@ -1,5 +1,9 @@
 import type { ExecutionEvidence, PlanStep, StepResult, StepReview } from "@/types";
 import type { ToolCall, ToolResult } from "@/features/tools/types";
+<<<<<<< HEAD
+=======
+import { buildToolEvidenceFacts } from "@/features/tools/toolEvidence";
+>>>>>>> origin/master
 
 export interface ToolStepOutcome {
   status: "completed" | "failed";
@@ -41,9 +45,20 @@ export function buildToolStepOutcome(input: BuildToolStepOutcomeInput): ToolStep
     };
   }
 
+<<<<<<< HEAD
   const truncated = result.truncated === true;
   const output = JSON.stringify(result.data, null, 2);
   const facts = { toolId: call.toolId, truncated };
+=======
+  const truncated = result.truncated === true || (result.data !== null && typeof result.data === "object"
+    && "truncated" in result.data && result.data.truncated === true);
+  const output = JSON.stringify(result.data, null, 2);
+  const facts: Record<string, unknown> = {
+    toolId: call.toolId,
+    truncated,
+    ...buildToolEvidenceFacts(call, result),
+  };
+>>>>>>> origin/master
   if (call.toolId === "context.expand" && result.data && typeof result.data === "object"
     && "skillId" in result.data && typeof result.data.skillId === "string") {
     Object.assign(facts, { expandedSkillId: result.data.skillId });

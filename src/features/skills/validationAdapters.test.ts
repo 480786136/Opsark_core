@@ -2,9 +2,30 @@ import { describe, expect, it } from "vitest";
 import {
   analyzeSkillCommandFailure,
   analyzeSkillOutputSignals,
+<<<<<<< HEAD
 } from "@/features/skills/validationAdapters";
 
 describe("validation output signals", () => {
+=======
+  parseSkillObservation,
+} from "@/features/skills/validationAdapters";
+import type { PlanStep } from "@/types";
+
+describe("validation output signals", () => {
+  it("does not certify the inspection shell itself as the target process", () => {
+    const command = "ps -eo pid,args | awk '/java/ {print $0}'";
+    const step = { command } as PlanStep;
+    const result = parseSkillObservation("process", [
+      "2577500 bash -c pid_file='/tmp/opsark-exec-test.pid'; setsid sh -lc 'ps -eo pid,args'",
+      `2577554 sh -lc ${command}`,
+    ], false, step);
+    expect(result.status).toBe("unknown");
+    expect(result.facts.processFound).toBeUndefined();
+    expect(parseSkillObservation("process", ["42 /usr/bin/java -jar orders.jar"], false, step))
+      .toMatchObject({ status: "matched", facts: { pids: [42] } });
+    expect(parseSkillObservation("process", [], true, step).status).toBe("not_found");
+  });
+>>>>>>> origin/master
   it("captures Vite environment and chunk-size advisories", () => {
     const result = analyzeSkillOutputSignals([
       "NODE_ENV=production is not supported in the .env file.",

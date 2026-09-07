@@ -10,10 +10,23 @@ export function taskAttemptContext(task: OpsTask) {
 }
 
 export function mayHaveChangedState(step: PlanStep) {
+<<<<<<< HEAD
   return step.kind === "change" && ["completed", "failed"].includes(step.status)
     && step.result?.executionStatus !== "blocked"
     && step.result?.facts.category !== "plan_safety_rejection"
     && step.result?.facts.commandCompleted !== false;
+=======
+  // commandCompleted describes success, not whether the shell ran. Failed
+  // compound commands may already have installed packages or changed files.
+  const dispatched = step.result?.facts.commandDispatched === true
+    || step.result?.exitCode !== undefined
+    || step.evidence?.some((item) => item.source === "main"
+      && (typeof item.facts.exitCode === "number" || item.facts.stoppedByPeriodicReview === true));
+  return step.kind === "change" && ["completed", "failed"].includes(step.status)
+    && step.result?.executionStatus !== "blocked"
+    && step.result?.facts.category !== "plan_safety_rejection"
+    && (dispatched || step.result?.facts.commandCompleted !== false);
+>>>>>>> origin/master
 }
 
 /** Conservatively invalidate target-wide observations after a possible mutation. */

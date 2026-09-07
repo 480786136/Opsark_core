@@ -3,7 +3,10 @@ import { ref } from "vue";
 import { Save, Shield, SlidersHorizontal } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import { useOpsStore } from "@/stores/ops";
+<<<<<<< HEAD
 import KnowledgeSettings from "@/features/knowledge/KnowledgeSettings.vue";
+=======
+>>>>>>> origin/master
 
 const store = useOpsStore();
 const { t } = useI18n();
@@ -24,7 +27,10 @@ function saveSettings() {
       </button>
     </header>
     <div class="settings-layout">
+<<<<<<< HEAD
       <KnowledgeSettings />
+=======
+>>>>>>> origin/master
       <section class="settings-card">
         <div class="settings-title"><SlidersHorizontal :size="18" /><div><h2>{{ t("settings.limitsTitle") }}</h2><p>{{ t("settings.limitsSubtitle") }}</p></div></div>
         <div class="generation-limit-head">

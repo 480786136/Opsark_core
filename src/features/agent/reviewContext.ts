@@ -12,6 +12,10 @@ import {
   reviewPlanSummary,
 } from "@/features/agent/reviewPayload";
 import type { OpsTask, PlanStep } from "@/types";
+<<<<<<< HEAD
+=======
+import { modelLogContext } from "./modelLogContext";
+>>>>>>> origin/master
 
 const REVIEW_HISTORY_STEP_LIMIT = 6;
 const REVIEW_REMAINING_STEP_LIMIT = 6;
@@ -42,7 +46,11 @@ export interface LongRunningProgressStatus {
 }
 
 function taskSnapshot(task: OpsTask) {
+<<<<<<< HEAD
   return { title: task.title, permission: task.permission, status: task.status };
+=======
+  return { _log: modelLogContext(task), title: task.title, permission: task.permission, status: task.status };
+>>>>>>> origin/master
 }
 
 function planSnapshot(step: PlanStep) {
@@ -126,6 +134,10 @@ export function buildLongRunningReviewContext(input: {
   const nextStep = input.task.plan.find((step) => step !== input.step && step.status === "pending");
   return {
     trigger: "periodic_long_running",
+<<<<<<< HEAD
+=======
+    _log: modelLogContext(input.task, input.step),
+>>>>>>> origin/master
     reviewPolicy: {
       periodicLongRunningReview: true,
       decisionContinueMeansWait: true,

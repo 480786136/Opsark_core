@@ -1,7 +1,10 @@
 node_modules/
 dist/
 src-tauri/target/
+<<<<<<< HEAD
 src-tauri/target-knowledge/
+=======
+>>>>>>> origin/master
 .DS_Store
 *.log
 .idea/

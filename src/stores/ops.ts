@@ -1,4 +1,10 @@
 import { defineStore } from "pinia";
+<<<<<<< HEAD
+=======
+import { modelLogContext } from "@/features/agent/modelLogContext";
+import { restoreConversationLinks } from "@/features/agent/conversationHistory";
+import { archiveToolEvidence } from "@/features/agent/evidenceArchive";
+>>>>>>> origin/master
 import { backend, buildExecutionSummary, isTauri, ModelInvocationError, normalizePlanPreconditions } from "@/services/backend";
 import {
   classifyStepResult,
@@ -456,7 +462,11 @@ function migrateFinishedSideQuestionDisplay(task: OpsTask) {
 }
 
 function initialTasks() {
+<<<<<<< HEAD
   return readSaved<OpsTask[]>("opsark.tasks", []).map((task) => {
+=======
+  const tasks = readSaved<OpsTask[]>("opsark.tasks", []).map((task) => {
+>>>>>>> origin/master
     task.permission = normalizePermissionLevel(task.permission);
     task.adjustmentInProgress = false;
     if (task.adjustmentIncident) {
@@ -509,6 +519,10 @@ function initialTasks() {
     });
     return task;
   });
+<<<<<<< HEAD
+=======
+  return restoreConversationLinks(tasks, readSaved<AuditEvent[]>("opsark.logs", []));
+>>>>>>> origin/master
 }
 
 function initialLogs() {
@@ -971,6 +985,15 @@ export const useOpsStore = defineStore("ops", {
           taskTitle: event.taskTitle ?? task?.title,
         }, uid("log"), now()),
       );
+<<<<<<< HEAD
+=======
+      const entry = this.logs[0];
+      const knownLogSecrets = { ...this.serverPasswords, ...this.modelApiKeys, ...this.secretValues };
+      const safeEntry = Object.fromEntries(Object.entries(entry).map(([key, value]) =>
+        [key, typeof value === "string" ? redactExecutionOutput(value, knownLogSecrets) : value]));
+      void backend.appendTaskLog?.("events", safeEntry, task ? modelLogContext(task) : { taskId: event.taskId, serverId })
+        ?.catch(() => console.warn("任务操作日志写入失败，界面日志仍保留"));
+>>>>>>> origin/master
       this.persist();
     },
 
@@ -996,6 +1019,11 @@ export const useOpsStore = defineStore("ops", {
           taskTitle: event.taskTitle ?? task?.title,
         }, uid("devlog"), now(), knownSecrets),
       );
+<<<<<<< HEAD
+=======
+      void backend.appendTaskLog?.("developer-events", this.developerLogs[0], task ? modelLogContext(task) : { taskId: event.taskId, serverId })
+        ?.catch(() => console.warn("开发者任务日志写入失败，界面日志仍保留"));
+>>>>>>> origin/master
       this.persist();
     },
 
@@ -1101,6 +1129,14 @@ export const useOpsStore = defineStore("ops", {
       if (!connection) throw new Error("请先连接真实服务器");
       const startedAt = performance.now();
       const result = await executeRegisteredToolCall(call, this.tools, {
+<<<<<<< HEAD
+=======
+        readEvidence: async (evidenceId, offset, limit) => {
+          const current = this.tasks.find(candidate => candidate.id === taskId);
+          if (!current) throw new Error("缺少证据所属任务");
+          return backend.readTaskEvidence(current.id, evidenceId, offset, limit);
+        },
+>>>>>>> origin/master
         resolveServerConnection: async (
           request: ServerConnectionLookupRequest,
         ): Promise<ServerConnectionLookupResult> => {
@@ -1612,6 +1648,10 @@ export const useOpsStore = defineStore("ops", {
               ? availableTerminalLines.slice(-requestedTerminalLines)
               : [];
           context = JSON.stringify(buildAgentContext({
+<<<<<<< HEAD
+=======
+            task,
+>>>>>>> origin/master
             server,
             metrics: contextMetrics,
             permission,
@@ -1800,6 +1840,10 @@ export const useOpsStore = defineStore("ops", {
             restoreWorkflowState(sourceTask, workflowSnapshot);
           }
           task = this.createTask(serverId, permission, modelId);
+<<<<<<< HEAD
+=======
+          task.conversationId = sourceTask.conversationId ?? sourceTask.id;
+>>>>>>> origin/master
           transitionTask(task, "planning");
           task.rootGoal = content;
           task.currentInstruction = content;
@@ -2253,7 +2297,11 @@ export const useOpsStore = defineStore("ops", {
           this.addLog({
             category: "model",
             level: "warning",
+<<<<<<< HEAD
             title: "调整计划格式异常，任务保持可恢复",
+=======
+            title: "调整计划生成失败，任务保持可恢复",
+>>>>>>> origin/master
             detail: task.pauseReason,
             serverId: task.serverId,
             taskId,
@@ -2815,6 +2863,15 @@ export const useOpsStore = defineStore("ops", {
       });
       task.currentExecutionId = undefined;
       if (lifecycle.cancelled || task.cancelRequested) return;
+<<<<<<< HEAD
+=======
+      if (isTauri() && this.tools.some(tool => tool.id === "evidence.read" && tool.enabled)
+        && !resolveTaskSkills(task, this.skills).some(skill => skill.forbiddenToolIds?.includes("evidence.read"))) {
+        await archiveToolEvidence(task, step, backend.saveTaskEvidence,
+          text => redactExecutionOutput(text, serverSecretValues(this.secretValues, executionServerId(task))));
+      }
+      if (task.cancelRequested) return;
+>>>>>>> origin/master
       transitionTask(task, lifecycle.taskStatus);
       task.pauseReason = lifecycle.pauseReason;
       this.pushMessage(task, {
@@ -3243,6 +3300,21 @@ export const useOpsStore = defineStore("ops", {
         const monitorDecision = monitorState.decision;
         const monitorValidationPassed = monitorState.validationPassed;
         const monitorRound = monitorState.reviewRound;
+<<<<<<< HEAD
+=======
+        if (monitorState.skippedModelReviewCount > 0) {
+          this.addLog({
+            category: "system", level: "info", title: `${step.title} · 长任务模型调用统计`,
+            detail: JSON.stringify({
+              samplingRound: monitorRound,
+              modelReviewCount: monitorState.modelReviewCount,
+              skippedModelReviewCount: monitorState.skippedModelReviewCount,
+              reason: "CPU/I/O 有活动且无新错误时继续本地监控，周期性保留模型复核",
+            }),
+            serverId: targetServerId, taskId,
+          });
+        }
+>>>>>>> origin/master
         if (task.cancelRequested) {
           await rollbackShellStartup("任务已取消");
           return;

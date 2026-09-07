@@ -12,7 +12,13 @@ import {
   TASK_DECISION_RECENT_PHASE_LIMIT,
 } from "@/features/agent/taskHistoryCheckpoint";
 import { taskGoal } from "@/features/agent/taskGoal";
+<<<<<<< HEAD
 import { currentEvidenceSteps } from "@/features/agent/attemptState";
+=======
+import { modelLogContext } from "./modelLogContext";
+import { currentEvidenceSteps } from "@/features/agent/attemptState";
+import { modelToolOutput } from "@/features/agent/executionContextEvidence";
+>>>>>>> origin/master
 import type { OpsTask, PlanStep, TaskExecutionPhase } from "@/types";
 
 const CURRENT_PLAN_STEP_LIMIT = 20;
@@ -128,7 +134,11 @@ function phaseSnapshot(phase: TaskExecutionPhase) {
   };
 }
 
+<<<<<<< HEAD
 export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep) {
+=======
+export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, allowArchive = false) {
+>>>>>>> origin/master
   const checkpoint = task.historyCheckpoint ?? initializeTaskHistoryCheckpoint(task);
   const incidentStep = failedStep ?? [...task.plan].reverse().find(isExceptional);
   const selectedCurrentPlan = selectBoundedSteps(task.plan, CURRENT_PLAN_STEP_LIMIT);
@@ -192,12 +202,20 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep) 
         toolId: step.result?.facts.toolId,
         truncated: step.result?.facts.truncated,
         targetContext: step.attemptContext,
+<<<<<<< HEAD
         content: redactCommandSecrets(step.output!),
+=======
+        content: modelToolOutput(step, redactCommandSecrets(step.output!), allowArchive),
+>>>>>>> origin/master
       })),
     historyCheckpoint: checkpoint ? {
       ...checkpoint,
       verifiedFacts: checkpoint.verifiedFacts.slice(-12),
+<<<<<<< HEAD
       unresolvedIssues: checkpoint.unresolvedIssues.slice(-8),
+=======
+      unresolvedIssues: checkpoint.unresolvedIssues,
+>>>>>>> origin/master
       phaseSummaries: checkpoint.phaseSummaries.slice(-4),
     } : undefined,
     omittedHistory: checkpoint ? {
@@ -210,6 +228,10 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep) 
   };
   return {
     ...body,
+<<<<<<< HEAD
+=======
+    _log: modelLogContext(task, failedStep),
+>>>>>>> origin/master
     snapshotFingerprint: textFingerprint(JSON.stringify(body)),
   };
 }

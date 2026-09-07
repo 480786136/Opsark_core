@@ -28,10 +28,17 @@ import { useOpsStore } from "@/stores/ops";
 import type { ObservationStatus, OpsTask, PlanStep, TaskPlanHistory } from "@/types";
 import AgentExecutionPhase from "@/components/AgentExecutionPhase.vue";
 import ModelSettingsModal from "@/components/ModelSettingsModal.vue";
+<<<<<<< HEAD
 import TaskKnowledgeUpload from "@/features/knowledge/TaskKnowledgeUpload.vue";
 import { isAdjustmentProgressMessage, isPlanProgressMessage } from "@/features/agent/taskMessages";
 import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
 import { useWorkspaceLinkStore } from "@/features/workspace/workspaceLinkStore";
+=======
+import { isAdjustmentProgressMessage, isPlanProgressMessage } from "@/features/agent/taskMessages";
+import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
+import { useWorkspaceLinkStore } from "@/features/workspace/workspaceLinkStore";
+import { conversationHistoryRounds } from "@/features/agent/conversationHistory";
+>>>>>>> origin/master
 
 const props = defineProps<{ serverId: string }>();
 const store = useOpsStore();
@@ -62,6 +69,10 @@ const timeline = ref<HTMLElement>();
 
 const serverTasks = computed(() => store.tasks.filter((task) => task.serverId === props.serverId));
 const task = computed(() => serverTasks.value.find((item) => item.id === workspaceState.activeTaskId));
+<<<<<<< HEAD
+=======
+const conversationRounds = computed(() => task.value ? conversationHistoryRounds(serverTasks.value, task.value) : []);
+>>>>>>> origin/master
 const pendingApproval = computed(() => task.value?.plan.find((step) => step.status === "awaiting_approval"));
 const failedStep = computed(() => task.value?.plan.find((step) => step.status === "failed"));
 const adjustmentLabel = computed(() =>
@@ -406,7 +417,10 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
       </button>
     </header>
 
+<<<<<<< HEAD
     <TaskKnowledgeUpload v-if="task" :task="task" />
+=======
+>>>>>>> origin/master
     <div v-if="!automationEnabled" class="agent-welcome">
       <div class="agent-welcome-ambient" aria-hidden="true"><i></i><i></i><i></i></div>
       <div class="agent-orb">
@@ -465,7 +479,11 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
         </div>
 
         <template v-else>
+<<<<<<< HEAD
           <template v-for="round in task.planHistory ?? []" :key="round.id">
+=======
+          <template v-for="round in conversationRounds" :key="round.id">
+>>>>>>> origin/master
             <div class="task-message user message user-aligned">
               <div class="message-body">
                 <div class="message-meta">

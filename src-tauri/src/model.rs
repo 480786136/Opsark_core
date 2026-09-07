@@ -1,5 +1,6 @@
 use reqwest::StatusCode;
 use serde_json::{json, Value};
+<<<<<<< HEAD
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -22,6 +23,22 @@ fn append_model_log(path: Option<&Path>, event: Value) {
         file.write_all(b"\n").map_err(|error| error.to_string())?;
         file.flush().map_err(|error| error.to_string())
     })();
+=======
+
+use std::path::Path;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const MODEL_RESPONSE_ATTEMPTS: usize = 3;
+
+fn append_model_log(path: Option<&Path>, event: Value, context: &Value) {
+    let Some(path) = path else { return };
+    let result = crate::task_logs::append(
+        path.parent().unwrap_or(Path::new(".")),
+        "model-calls",
+        event,
+        context,
+    );
+>>>>>>> origin/master
     if let Err(error) = result {
         eprintln!("开发者模型日志写入失败：{error}");
     }
@@ -82,10 +99,21 @@ pub(crate) async fn post_model_request(
     timeout_seconds: u64,
     developer_log_path: Option<&Path>,
 ) -> Result<Value, String> {
+<<<<<<< HEAD
     let mut last_retryable_error = String::new();
 
     for attempt in 1..=MODEL_RESPONSE_ATTEMPTS {
         let call_id = format!("model-{}-{attempt}", unix_millis());
+=======
+    let (prepared_body, mut log_context) = crate::prompt_layers::prepare_request(body);
+    log_context["requestId"] = json!(crate::task_logs::call_id());
+    let body = &prepared_body;
+    let mut last_retryable_error = String::new();
+
+    for attempt in 1..=MODEL_RESPONSE_ATTEMPTS {
+        let started_at = Instant::now();
+        let call_id = crate::task_logs::call_id();
+>>>>>>> origin/master
         append_model_log(
             developer_log_path,
             json!({
@@ -97,7 +125,13 @@ pub(crate) async fn post_model_request(
                 "url": safe_model_url(url),
                 "timeoutSeconds": timeout_seconds,
                 "request": body,
+<<<<<<< HEAD
             }),
+=======
+                "contextMetrics": crate::prompt_layers::request_metrics(body),
+            }),
+            &log_context,
+>>>>>>> origin/master
         );
         // 每轮使用新连接，避免重用被上游代理截断的 HTTP 连接。
         // 最后一轮回退到 HTTP/1.1 + identity，兼容有问题的 HTTP/2/压缩网关。
@@ -129,6 +163,10 @@ pub(crate) async fn post_model_request(
                         "attempt": attempt,
                         "error": &last_retryable_error,
                     }),
+<<<<<<< HEAD
+=======
+                    &log_context,
+>>>>>>> origin/master
                 );
                 if attempt < MODEL_RESPONSE_ATTEMPTS {
                     wait_before_model_retry(attempt).await;
@@ -172,6 +210,10 @@ pub(crate) async fn post_model_request(
                         "contentLength": content_length,
                         "error": &last_retryable_error,
                     }),
+<<<<<<< HEAD
+=======
+                    &log_context,
+>>>>>>> origin/master
                 );
                 if attempt < MODEL_RESPONSE_ATTEMPTS {
                     wait_before_model_retry(attempt).await;
@@ -202,6 +244,10 @@ pub(crate) async fn post_model_request(
                         "responseText": String::from_utf8_lossy(&response_bytes),
                         "error": &last_retryable_error,
                     }),
+<<<<<<< HEAD
+=======
+                    &log_context,
+>>>>>>> origin/master
                 );
                 if attempt < MODEL_RESPONSE_ATTEMPTS {
                     wait_before_model_retry(attempt).await;
@@ -215,6 +261,10 @@ pub(crate) async fn post_model_request(
             developer_log_path,
             json!({
                 "event": "response_received",
+<<<<<<< HEAD
+=======
+                "durationMs": started_at.elapsed().as_millis() as u64,
+>>>>>>> origin/master
                 "callId": &call_id,
                 "timestampMs": unix_millis(),
                 "requestName": request_name,
@@ -225,6 +275,10 @@ pub(crate) async fn post_model_request(
                 "contentLength": content_length,
                 "response": &payload,
             }),
+<<<<<<< HEAD
+=======
+            &log_context,
+>>>>>>> origin/master
         );
 
         if status.is_success() {

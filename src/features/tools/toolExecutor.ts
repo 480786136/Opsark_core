@@ -24,6 +24,10 @@ import type {
 } from "@/features/tools/types";
 
 export interface ToolExecutionDependencies {
+<<<<<<< HEAD
+=======
+  readEvidence?(evidenceId: string, offset: number, limit: number): Promise<Record<string, unknown>>;
+>>>>>>> origin/master
   expandPlanningContext?(skillId: string): Promise<{ skillId: string }>;
   getRemoteFileStructure(request: FileStructureRequest): Promise<FileStructureScanResult>;
   readRemoteFileContent?(request: FileContentRequest): Promise<FileContentResult>;
@@ -204,7 +208,21 @@ function validateSchemaValue(schema: Record<string, unknown>, value: unknown, pa
 /** Validates built-in atomic tool contracts before a plan reaches execution. */
 function normalizeKnownToolArguments(toolId: string, value: Record<string, unknown>) {
   if (toolId === "server.connect") return { ...parseServerConnectArguments(value) };
+<<<<<<< HEAD
   if (toolId === "user.request_input") return { ...parseUserInputArguments(value) };
+=======
+  if (toolId === "user.request_input") {
+    // A declared credential username must use protected input/storage. This
+    // local promotion changes neither the account nor its target or purpose.
+    // Validate the complete credential pair afterwards; never infer metadata.
+    const fields = Array.isArray(value.fields) ? value.fields.map(field => {
+      if (isRecord(field) && field.type === "text" && isRecord(field.credential)
+        && field.credential.role === "username") return { ...field, type: "password" };
+      return field;
+    }) : value.fields;
+    return { ...parseUserInputArguments({ ...value, fields }) };
+  }
+>>>>>>> origin/master
   return value;
 }
 
@@ -400,6 +418,15 @@ export async function executeToolCall(
       const data = await dependencies.expandPlanningContext(String(call.arguments.skillId));
       return { callId: call.id, toolId: call.toolId, success: true, data };
     }
+<<<<<<< HEAD
+=======
+    if (tool.implementation === "readEvidence") {
+      validateToolArguments(tool, call.arguments);
+      if (!dependencies.readEvidence) throw new Error("当前任务不能读取存档证据");
+      const data = await dependencies.readEvidence(String(call.arguments.evidenceId), Number(call.arguments.offset ?? 0), Number(call.arguments.limit ?? 6000));
+      return { callId: call.id, toolId: call.toolId, success: true, data };
+    }
+>>>>>>> origin/master
     if (tool.implementation === "serverResolveConnection") {
       if (!dependencies.resolveServerConnection) throw new Error("当前执行环境不支持服务器连接资料查询");
       const data = await dependencies.resolveServerConnection(parseConnectionTarget(call.arguments));

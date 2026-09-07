@@ -4150,13 +4150,24 @@ describe("智能任务状态机", () => {
     expect(task.pauseReason).toContain("命令执行未成功");
     expect(task.summary).toBeUndefined();
     expect(task.messages.some((message) => message.kind === "summary")).toBe(false);
+<<<<<<< HEAD
     expect(backend.reviewStep).toHaveBeenCalledTimes(1);
     const reviewContext = JSON.parse(vi.mocked(backend.reviewStep).mock.calls[0][1]);
     expect(vi.mocked(backend.reviewStep).mock.calls[0][0]).toBe(task.title);
+=======
+    expect(backend.reviewStep).not.toHaveBeenCalled();
+    const event = store.logs.find(log => log.taskId === task.id && log.title.includes("执行失败直接进入调整"));
+    expect(event?.category).toBe("system");
+    const reviewContext = JSON.parse(event!.detail).input;
+>>>>>>> origin/master
     expect(reviewContext).not.toHaveProperty("userRequirement");
     expect(reviewContext).not.toHaveProperty("fullPlan");
     expect(reviewContext.planSummary.totalSteps).toBe(1);
     expect(reviewContext.currentStep.result.executionStatus).toBe("failed");
+<<<<<<< HEAD
+=======
+    expect(task.plan[0].review).toMatchObject({ decision: "adjust", source: "rules" });
+>>>>>>> origin/master
   });
 
   it("主命令失败后模型会结合用户约束和剩余恢复步骤决定继续", async () => {

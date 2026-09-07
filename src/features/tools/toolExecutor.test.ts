@@ -3,6 +3,36 @@ import { executeToolCall, parseToolCommand, parseUserInputArguments } from "@/fe
 import { resolveToolRegistry } from "@/features/tools/toolRegistry";
 
 describe("tool executor", () => {
+<<<<<<< HEAD
+=======
+  it("locally protects an explicitly declared credential username without changing its binding", () => {
+    const fields = [
+      { key: "mysql_user", label: "用户名", description: "数据库账户", type: "text", required: true,
+        credential: { group: "db", kind: "database", role: "username", target: "db.internal:3306" } },
+      { key: "MYSQL_PASSWORD", label: "密码", description: "数据库密码", type: "password", required: true,
+        credential: { group: "db", kind: "database", role: "secret", target: "db.internal:3306" } },
+    ];
+    const command = () => `opsark-tool user.request_input ${JSON.stringify({ title: "数据库凭据", fields })}`;
+    const call = parseToolCommand(command(), "local-repair")!;
+    expect(call.arguments.fields).toEqual([{ ...fields[0], type: "password" }, fields[1]]);
+    expect(fields[0].type).toBe("text");
+    fields[1].credential.target = "other.internal:3306";
+    expect(() => parseToolCommand(command(), "mismatch")).toThrow("必须完全一致");
+    fields[1].credential.target = "db.internal:3306";
+    fields[0].required = false;
+    expect(() => parseToolCommand(command(), "optional-credential")).toThrow("必填");
+  });
+  it("reads task-scoped evidence pages and rejects task overrides", async () => {
+    const evidenceId = "a".repeat(64);
+    const readEvidence = vi.fn().mockResolvedValue({ text: "history", historical: true, nextOffset: null });
+    const call = parseToolCommand(`opsark-tool evidence.read ${JSON.stringify({ evidenceId, offset: 12, limit: 20 })}`, "read")!;
+    const result = await executeToolCall(call, resolveToolRegistry([]), { readEvidence, getRemoteFileStructure: vi.fn() });
+    expect(readEvidence).toHaveBeenCalledWith(evidenceId, 12, 20);
+    expect(result).toMatchObject({ success: true, data: { historical: true } });
+    expect(() => parseToolCommand(`opsark-tool evidence.read ${JSON.stringify({ evidenceId, taskId: "other-task" })}`, "read")).toThrow();
+    expect(() => parseToolCommand(`opsark-tool evidence.read ${JSON.stringify({ evidenceId, limit: 12001 })}`, "read")).toThrow();
+  });
+>>>>>>> origin/master
   it("parses the model-facing tool command protocol", () => {
     expect(parseToolCommand(
       'opsark-tool files.get_structure {"rootPath":"/opt/app","maxDepth":4}',

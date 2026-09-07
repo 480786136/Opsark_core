@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import { compileSkillInstructions } from "@/features/skills/instructionBuilder";
 import { projectSourceAcquisitionContract } from "@/features/skills/builtins/projectSourceAcquisition/workflow";
 import type { SkillDefinition } from "@/features/skills/types";
@@ -42,3 +43,7 @@ export const projectSourceAcquisitionSkill: SkillDefinition = {
   },
   updatedAt: "2026-08-25T12:00:00.000Z",
 };
+=======
+﻿import { loadSkillDefinition } from "@/features/skills/skillFileLoader";
+export const projectSourceAcquisitionSkill = loadSkillDefinition("project-source-acquisition");
+>>>>>>> origin/master

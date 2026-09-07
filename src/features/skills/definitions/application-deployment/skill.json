@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "id": "application-deployment",
+  "name": "应用部署与上线验收",
+  "category": "deployment",
+  "description": "将已有项目部署、启动或上线，并完成端到端验收。",
+  "version": 6,
+  "enabled": true,
+  "builtIn": true,
+  "matchRules": [
+    "部署项目",
+    "继续部署",
+    "上线应用",
+    "启动并验证项目",
+    "配置 Web 服务",
+    "regex:(?:部署|上线|发布|运行|启动).*(?:项目|应用|网站|服务)|(?:项目|应用|网站|服务).*(?:部署|上线|发布)"
+  ],
+  "allowedToolIds": [
+    "files.get_structure",
+    "files.read_content",
+    "software.check",
+    "user.request_input"
+  ],
+  "updatedAt": "2026-09-06T00:00:00.000Z",
+  "instructions": "instructions.md",
+  "planningContract": {
+    "evidenceAdapters": [
+      "project_manifest"
+    ],
+    "afterMutation": "full",
+    "globalInstructions": "global.md",
+    "acceptanceInstructions": "acceptance.md",
+    "stages": [
+      {
+        "id": "discover",
+        "title": "项目发现",
+        "requiresTools": [],
+        "allowedToolIds": [
+          "files.get_structure",
+          "files.read_content",
+          "user.request_input"
+        ],
+        "exitRequirements": [
+          {
+            "kind": "project_manifest",
+            "toolIds": [
+              "files.read_content"
+            ],
+            "complete": true
+          }
+        ],
+        "producesEvidence": [
+          "经内容解析的项目声明及其文件路径"
+        ],
+        "exitEvidence": "完整且可解析的项目声明；普通文档、目录名与文件名不能满足",
+        "instructions": "stages/discover.md"
+      },
+      {
+        "id": "prepare",
+        "title": "环境准备与部署",
+        "requiresTools": [
+          "files.read_content"
+        ],
+        "allowedToolIds": [
+          "files.get_structure",
+          "files.read_content",
+          "software.check",
+          "user.request_input"
+        ],
+        "requiresEvidence": [
+          {
+            "kind": "project_manifest",
+            "toolIds": [
+              "files.read_content"
+            ],
+            "complete": true
+          }
+        ],
+        "producesEvidence": [
+          "实际软件状态、部署配置与独立验收结果"
+        ],
+        "exitEvidence": "项目声明证明的软件需求及最终部署验收证据",
+        "instructions": "stages/prepare.md"
+      }
+    ],
+    "sourceFingerprint": "fnv1a:1798:6b287078"
+  }
+}

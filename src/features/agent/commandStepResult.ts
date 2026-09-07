@@ -55,6 +55,10 @@ export function buildPeriodicReviewFailure(
       exitCode: input.exitCode,
       facts: {
         commandCompleted: false,
+<<<<<<< HEAD
+=======
+        commandDispatched: true,
+>>>>>>> origin/master
         stoppedByPeriodicReview: true,
         reviewRound: input.reviewRound,
       },
@@ -83,7 +87,11 @@ export function buildCommandFailure(input: CommandFailureInput): CommandFailureO
       executionStatus: "failed",
       observationStatus: "unknown",
       exitCode: input.exitCode,
+<<<<<<< HEAD
       facts: { commandCompleted: false, ...failure.facts },
+=======
+      facts: { commandCompleted: false, ...failure.facts, commandDispatched: true },
+>>>>>>> origin/master
       warnings: [],
       evidenceIds: evidence.map((item) => item.id),
       failureReason: failure.reason,

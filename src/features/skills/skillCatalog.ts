@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import type { SkillDefinition } from "@/features/skills/types";
 import { deploymentPlanningContract } from "@/features/skills/builtins/deploymentPlanning";
 import { projectSourceAcquisitionSkill } from "@/features/skills/builtins/projectSourceAcquisition/definition";
@@ -205,3 +206,7 @@ export const builtInSkillCatalog: SkillDefinition[] = [
   applicationDeployment,
   fileTransferIntegrity,
 ];
+=======
+﻿import { loadBuiltInSkills } from "./skillFileLoader";
+export const builtInSkillCatalog = loadBuiltInSkills();
+>>>>>>> origin/master
