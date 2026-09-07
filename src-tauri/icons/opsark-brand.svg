@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Opsark">
+  <path
+    d="M396 274.7c0 91.7-64.2 137.5-140.4 164.1a18.3 18.3 0 0 1-12.3-.2C166.8 412.2 102.7 366.3 102.7 274.7V146.3A18.3 18.3 0 0 1 121 128c36.7 0 82.5-22 114.4-49.9a21.5 21.5 0 0 1 27.9 0C295.4 106.2 341 128 377.7 128a18.3 18.3 0 0 1 18.3 18.3z"
+    fill="none"
+    stroke="#d9f763"
+    stroke-width="34"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path
+    d="m194.3 256 36.7 36.7 73.3-73.4"
+    fill="none"
+    stroke="#d9f763"
+    stroke-width="34"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>
