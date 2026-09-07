@@ -2,6 +2,7 @@ import { buildPlanningToolContext, buildToolContext } from "@/features/tools/too
 import {
   buildSkillDirectory,
   buildSkillContext,
+  buildSkillEvidenceContext,
   collectSkillFacts,
   resolveTaskSkills,
 } from "@/features/skills/skillRegistry";
@@ -21,7 +22,9 @@ import { buildTaskDecisionSnapshot } from "@/features/agent/taskDecisionSnapshot
 import { compactReviewText, textFingerprint } from "@/features/agent/longRunningReviewOutput";
 import type { StepReview } from "@/types";
 import { planningSkills } from "@/features/skills/skillPlanning";
+import { modelLogContext } from "./modelLogContext";
 import { taskAttemptContext } from "@/features/agent/attemptState";
+import { executionContextEvidence, EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION } from "@/features/agent/executionContextEvidence";
 
 export function trimEvidence(value: string | undefined, limit = 3200) {
   if (!value) return "";
@@ -33,21 +36,16 @@ export function extractKnownExecutionFacts(task: OpsTask, skills = resolveTaskSk
   return {
     skillFacts: collectSkillFacts(task, skills),
     completedSteps: steps.slice(-12).map((step) => ({
+      stepId: step.id,
       title: step.title,
       command: step.command,
       result: step.result,
-      output: trimEvidence(step.output),
+      ...executionContextEvidence(step, trimEvidence),
+      targetContext: step.attemptContext,
       executionScope: step.executionScope,
       validationScope: step.validationScope,
-      evidence: step.evidence?.map(({ type, source, facts, rawOutput, scope }) => ({
-        type,
-        source,
-        facts,
-        scope,
-        rawOutput: trimEvidence(rawOutput),
-      })),
     })),
-    instruction: "这些事实来自同一任务的已完成执行证据。后续步骤必须优先复用，不得在无新证据时猜测或重复已完成工作。",
+    instruction: `这些记录来自同一任务的已完成执行证据；目标、凭据或资源变化后，历史观察不能证明当前状态。后续步骤必须优先复用仍适用的证据。${EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION}`,
   };
 }
 
@@ -123,6 +121,7 @@ function secretVariableContext(secretMetadata: SecretMetadata[], serverId: strin
 }
 
 export interface AgentContextInput {
+  task?: OpsTask;
   server?: ServerProfile;
   metrics: Metrics;
   permission: PermissionLevel;
@@ -151,6 +150,8 @@ export interface AgentContextInput {
 
 export function buildAgentContext(input: AgentContextInput) {
   return {
+    _log: input.task ? modelLogContext(input.task) : undefined,
+    skillEvidence: input.task ? buildSkillEvidenceContext(planningSkills(input.task, input.skillDirectory ?? input.skills ?? [])) : undefined,
     server: serverSnapshot(input.server),
     metrics: input.metrics,
     permission: input.permission,
@@ -215,6 +216,8 @@ export function buildAdjustmentContext(
     : undefined;
   return {
     workflowPhase: "adjust_after_failure",
+    _log: modelLogContext(input.task, failedStep),
+    skillEvidence: buildSkillEvidenceContext(activeSkills),
     // Keep policy content ahead of per-attempt evidence so providers can reuse
     // the longest stable request prefix across adjustments for the same goal.
     tools: boundedPlanningTools(input.tools, activeSkills),
@@ -230,7 +233,8 @@ export function buildAdjustmentContext(
     // unrelated commands and outputs into what must be a field-local rewrite.
     baseSnapshot: planSafetyRejection
       ? undefined
-      : options.sharedSnapshot ?? buildTaskDecisionSnapshot(input.task, failedStep),
+      : options.sharedSnapshot ?? buildTaskDecisionSnapshot(input.task, failedStep,
+        buildPlanningToolContext(input.tools, activeSkills).some(tool => tool.id === "evidence.read")),
     adjustmentTrigger: {
       reason: options.adjustmentReason
         ? compactReviewText(options.adjustmentReason, 800)
@@ -291,6 +295,8 @@ export function buildNextStageContext(input: WorkflowContextInput) {
   const policyFingerprint = nextStagePolicyFingerprint(input);
   return {
     workflowPhase: "decide_after_phase",
+    _log: modelLogContext(input.task),
+    skillEvidence: buildSkillEvidenceContext(activeSkills),
     tools: buildPlanningToolContext(input.tools, activeSkills),
     activeSkills: buildSkillContext(activeSkills),
     instruction: "先依据 baseSnapshot 的真实 result/evidence 和全部 activeSkills 验收要求判断整体目标。证据充分时返回 complete 且 steps 为空；尚未完成时在同一响应中只规划当前证据允许的最小下一阶段。不得重复已完成步骤，不得用计划描述或阶段摘要冒充成功证据。",
@@ -299,7 +305,8 @@ export function buildNextStageContext(input: WorkflowContextInput) {
     secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),
     serverCredentialGroups: credentialGroupContext(input.secretMetadata, input.task.serverId),
     policyFingerprint,
-    baseSnapshot: buildTaskDecisionSnapshot(input.task),
+    baseSnapshot: buildTaskDecisionSnapshot(input.task, undefined,
+      buildPlanningToolContext(input.tools, activeSkills).some(tool => tool.id === "evidence.read")),
     metrics: input.metrics,
   };
 }
@@ -308,9 +315,11 @@ export function buildContinuationContext(input: WorkflowContextInput) {
   const activeSkills = planningSkills(input.task, input.skills ?? resolveTaskSkills(input.task));
   return {
     workflowPhase: "continue_after_discovery",
+    _log: modelLogContext(input.task),
+    skillEvidence: buildSkillEvidenceContext(activeSkills),
     tools: buildPlanningToolContext(input.tools, activeSkills),
     activeSkills: buildSkillContext(activeSkills),
-    instruction: "只使用本轮已完成发现的真实证据，生成完成用户剩余目标所需的最少变更和最终验收。不得重复发现步骤或猜测路径、工具、端口和服务名。",
+    instruction: `只使用本轮已完成发现的真实证据，生成完成用户剩余目标所需的最少变更和最终验收。不得重复发现步骤或猜测路径、工具、端口和服务名。${EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION}`,
     taskGoal: {
       rootGoal: taskGoal(input.task),
       currentInstruction: input.task.currentInstruction,
@@ -321,22 +330,19 @@ export function buildContinuationContext(input: WorkflowContextInput) {
     executionConstraints: input.task.executionConstraints,
     secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),
     serverCredentialGroups: credentialGroupContext(input.secretMetadata, input.task.serverId),
-    completedDiscovery: input.task.plan.map(({ title, description, command, expected, result, evidence, output, executionScope, validationScope }) => ({
-      title,
-      description,
-      command,
-      expected,
-      result,
-      executionScope,
-      validationScope,
-      evidence: evidence?.map(({ type, source, facts, rawOutput, scope }) => ({
-        type,
-        source,
-        facts,
-        scope,
-        rawOutput: rawOutput === output ? undefined : trimEvidence(rawOutput),
-      })),
-      output: typeof result?.facts.toolId === "string" ? output : trimEvidence(output),
+    completedDiscovery: input.task.plan.map((step) => ({
+      stepId: step.id,
+      title: step.title,
+      description: step.description,
+      command: step.command,
+      expected: step.expected,
+      result: step.result,
+      executionScope: step.executionScope,
+      validationScope: step.validationScope,
+      targetContext: step.attemptContext,
+      ...executionContextEvidence(step, typeof step.result?.facts.toolId === "string"
+        ? (value) => value : trimEvidence,
+        buildPlanningToolContext(input.tools, activeSkills).some(tool => tool.id === "evidence.read")),
     })),
     knownExecutionFacts: extractKnownExecutionFacts(input.task, activeSkills, new Set(input.task.plan.map(({ id }) => id))),
   };

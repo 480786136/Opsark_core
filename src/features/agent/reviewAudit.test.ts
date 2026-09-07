@@ -94,6 +94,16 @@ describe("review audit", () => {
     ]);
   });
 
+  it("does not record a skipped failure review as a model call", () => {
+    const event = buildCommandFailureReviewAudit({
+      ...scope, context: {}, finalDecision: ruleAdjust,
+      diagnosticStep: false, mutatingStep: true, recoveryStepFound: false,
+    });
+    expect(event.category).toBe("system");
+    expect(JSON.parse(event.detail)).toMatchObject({ modelReviewSkipped: true });
+    expect(JSON.parse(event.detail).modelDecision).toBeUndefined();
+  });
+
   it("emits one deterministic event when model review is unnecessary", () => {
     const events = buildEvidenceReviewAudits({
       ...scope,

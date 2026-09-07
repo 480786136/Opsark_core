@@ -107,6 +107,7 @@ export interface ExecutionEvidence {
   rawOutput: string;
   collectedAt: string;
   scope?: ExecutionScopeEvidence;
+  archive?: { evidenceId: string; fingerprint: string; characters: number; capturedPartial: boolean };
 }
 
 export interface StepResult {
@@ -259,6 +260,7 @@ export interface TaskHistoryIssue {
   status: PlanStep["status"];
   commandFingerprint: string;
   attemptCount: number;
+  attemptContext?: string;
 }
 
 export interface TaskHistoryPhaseSummary {
@@ -332,6 +334,8 @@ export type ManagedStopReason =
   | "cancelled";
 
 export interface OpsTask {
+  /** UI conversation identity; never merges task goals or execution evidence. */
+  conversationId?: string;
   id: string;
   serverId: string;
   /** Explicit server used by Agent execution after a server.connect tool step. */
@@ -464,6 +468,7 @@ export interface RequirementProcessingResult {
 }
 
 export interface ModelDeveloperTrace {
+  normalizations?: string[];
   attempts: ModelAttemptTrace[];
 }
 

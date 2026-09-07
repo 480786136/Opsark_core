@@ -8,6 +8,8 @@ import {
 } from "@/features/agent/taskProgression";
 import type { OpsTask, PlanStep } from "@/types";
 import type { ToolDefinition } from "@/features/tools/types";
+import { buildCommandFailure } from "@/features/agent/commandStepResult";
+import { currentEvidenceSteps, taskAttemptContext } from "@/features/agent/attemptState";
 
 const step = (overrides: Partial<PlanStep> = {}): PlanStep => ({
   id: overrides.id ?? "step-1",
@@ -36,6 +38,28 @@ const task = (plan: PlanStep[], overrides: Partial<OpsTask> = {}): OpsTask => ({
 });
 
 describe("taskProgression", () => {
+  it("invalidates observations after a real failed compound change while preventing its blind retry", () => {
+    const current = task([]);
+    const context = taskAttemptContext(current);
+    const read = step({ id: "read", kind: "observe", command: "cat package-lock.json", attemptContext: context,
+      result: { executionStatus: "success", observationStatus: "matched", facts: {}, warnings: [], evidenceIds: [] } });
+    const failure = buildCommandFailure({ output: "installed packages\nBuild failed", exitCode: 1,
+      evidenceId: "main", collectedAt: "2026-09-05T00:00:00Z" });
+    const build = step({ id: "build", kind: "change", command: "npm install && npm run build",
+      status: "failed", attemptContext: context, result: failure.result, evidence: failure.evidence });
+    current.plan = [read, build];
+    expect(currentEvidenceSteps(current)).toEqual([]);
+    const candidate = { ...read, id: "recheck", status: "pending" as const };
+    expect(selectAdjustmentSteps(current.plan, [candidate], context)).toEqual([candidate]);
+    expect(selectAdjustmentSteps(current.plan, [{ ...build, id: "repeat", status: "pending" }], context)).toEqual([]);
+    // Persisted logs created before commandDispatched existed retain exit evidence.
+    delete build.result!.facts.commandDispatched;
+    expect(currentEvidenceSteps(current)).toEqual([]);
+    build.result!.exitCode = undefined;
+    build.evidence = [];
+    build.result!.facts.category = "tool_command_parse";
+    expect(currentEvidenceSteps(current)).toEqual([read]);
+  });
   it("rechecks health after an executed mutation, including a partially failed mutation", () => {
     const health = step({ command: "curl -f http://localhost/health", kind: "observe", validation: "", status: "failed" });
     for (const status of ["completed", "failed"] as const) {

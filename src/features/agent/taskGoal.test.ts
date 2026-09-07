@@ -47,6 +47,28 @@ function task(): OpsTask {
 }
 
 describe("task goal lifecycle", () => {
+  it("retains all unresolved issues and never resolves a different target by command text", () => {
+    const current = task();
+    const closeRound = (date: string) => {
+      const snapshot = capturePreviousRound(current, date)!;
+      snapshot.history.id = date;
+      commitPreviousRound(current, snapshot);
+    };
+    current.plan = Array.from({ length: 10 }, (_, index) => ({ ...step(`failure-${index}`, "failed"),
+      attemptContext: "server-a", command: `check-${index}` }));
+    closeRound("2026-01-03");
+    expect(current.historyCheckpoint?.unresolvedIssues).toHaveLength(10);
+    current.plan = [{ ...step("recheck"), command: "check-0", attemptContext: "server-b",
+      result: { executionStatus: "success", observationStatus: "matched", facts: {}, warnings: [], evidenceIds: ["proof"] },
+      evidence: [{ id: "proof", type: "command-output", source: "main", facts: {}, rawOutput: "ok", collectedAt: "now" }],
+    }];
+    closeRound("2026-01-04");
+    expect(current.historyCheckpoint?.unresolvedIssues).toHaveLength(10);
+    current.plan[0].attemptContext = "server-a";
+    closeRound("2026-01-05");
+    expect(current.historyCheckpoint?.unresolvedIssues).toHaveLength(9);
+    expect(buildTaskDecisionSnapshot(current).historyCheckpoint?.unresolvedIssues).toHaveLength(9);
+  });
   it("keeps the root goal instead of replacing it with retry text", () => {
     expect(taskGoal(task())).toBe("帮我部署 office 项目");
   });

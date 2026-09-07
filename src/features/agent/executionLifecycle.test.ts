@@ -73,6 +73,8 @@ describe("execution lifecycle", () => {
         consecutiveContinueRounds: 0,
         salientEvidence: [],
         runtimeIdleReviewRounds: 0,
+        modelReviewCount: 1,
+        skippedModelReviewCount: 0,
       }),
     }));
 
@@ -116,6 +118,8 @@ describe("execution lifecycle", () => {
         consecutiveContinueRounds: 0,
         salientEvidence: [],
         runtimeIdleReviewRounds: 0,
+        modelReviewCount: 0,
+        skippedModelReviewCount: 0,
       }),
     }))).rejects.toThrow("connection closed");
 

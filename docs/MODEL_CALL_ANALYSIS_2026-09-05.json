@@ -1,0 +1,131 @@
+﻿{
+  "date": "2026-09-05",
+  "dateZone": "UTC",
+  "invalidLines": 0,
+  "totals": {
+    "requests": 109,
+    "responsesWithUsage": 108,
+    "errors": 1,
+    "promptTokens": 923202,
+    "completionTokens": 23858,
+    "totalTokens": 947060,
+    "cachedInputTokens": 82816,
+    "requestCharacters": 2711499
+  },
+  "groups": {
+    "需求理解": {
+      "requests": 1,
+      "responsesWithUsage": 1,
+      "errors": 0,
+      "promptTokens": 2473,
+      "completionTokens": 68,
+      "totalTokens": 2541,
+      "cachedInputTokens": 0,
+      "requestCharacters": 6787
+    },
+    "计划生成": {
+      "requests": 37,
+      "responsesWithUsage": 36,
+      "errors": 1,
+      "promptTokens": 554274,
+      "completionTokens": 11441,
+      "totalTokens": 565715,
+      "cachedInputTokens": 82816,
+      "requestCharacters": 1611103
+    },
+    "阶段联合决策": {
+      "requests": 19,
+      "responsesWithUsage": 19,
+      "errors": 0,
+      "promptTokens": 268510,
+      "completionTokens": 8081,
+      "totalTokens": 276591,
+      "cachedInputTokens": 0,
+      "requestCharacters": 797849
+    },
+    "结果复核": {
+      "requests": 52,
+      "responsesWithUsage": 52,
+      "errors": 0,
+      "promptTokens": 97945,
+      "completionTokens": 4268,
+      "totalTokens": 102213,
+      "cachedInputTokens": 0,
+      "requestCharacters": 295760
+    }
+  },
+  "reviewTypes": {
+    "commandFailure": 11,
+    "longRunning": 35,
+    "other": 6
+  },
+  "repeatedRequestBodies": 0,
+  "repairRequests": 2,
+  "repeatedEvidenceCharacters": 64634,
+  "note": "Characters are serialized UTF-16 lengths, not tokens. Usage excludes requests whose provider returned no usage. Repeated bodies across requests are not automatically unnecessary.",
+  "errors": [
+    {
+      "callId": "model-1788579881054-1",
+      "status": 403,
+      "code": "AllocationQuota.FreeTierOnly",
+      "timestamp": "2026-09-05T03:44:41.054Z"
+    }
+  ],
+  "largest": [
+    {
+      "callId": "model-1788579081730-1",
+      "requestName": "计划生成",
+      "promptTokens": 38071,
+      "contextFields": {
+        "knownExecutionFacts": 79480,
+        "activeSkills": 5336,
+        "tools": 3557,
+        "completedDiscovery": 1713
+      }
+    },
+    {
+      "callId": "model-1788578005115-1",
+      "requestName": "计划生成",
+      "promptTokens": 21191,
+      "contextFields": {
+        "baseSnapshot": 38918,
+        "activeSkills": 5289,
+        "tools": 4108,
+        "instruction": 230
+      }
+    },
+    {
+      "callId": "model-1788577994181-1",
+      "requestName": "计划生成",
+      "promptTokens": 21158,
+      "contextFields": {
+        "baseSnapshot": 38918,
+        "activeSkills": 5289,
+        "tools": 4108,
+        "instruction": 230
+      }
+    },
+    {
+      "callId": "model-1788577967643-1",
+      "requestName": "计划生成",
+      "promptTokens": 20714,
+      "contextFields": {
+        "baseSnapshot": 37217,
+        "activeSkills": 5289,
+        "tools": 4108,
+        "adjustmentTrigger": 342
+      }
+    },
+    {
+      "callId": "model-1788577947351-1",
+      "requestName": "计划生成",
+      "promptTokens": 20606,
+      "contextFields": {
+        "knownExecutionFacts": 30571,
+        "activeSkills": 5612,
+        "completedDiscovery": 4393,
+        "tools": 4108
+      }
+    }
+  ]
+}

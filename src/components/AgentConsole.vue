@@ -31,6 +31,7 @@ import ModelSettingsModal from "@/components/ModelSettingsModal.vue";
 import { isAdjustmentProgressMessage, isPlanProgressMessage } from "@/features/agent/taskMessages";
 import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
 import { useWorkspaceLinkStore } from "@/features/workspace/workspaceLinkStore";
+import { conversationHistoryRounds } from "@/features/agent/conversationHistory";
 
 const props = defineProps<{ serverId: string }>();
 const store = useOpsStore();
@@ -61,6 +62,7 @@ const timeline = ref<HTMLElement>();
 
 const serverTasks = computed(() => store.tasks.filter((task) => task.serverId === props.serverId));
 const task = computed(() => serverTasks.value.find((item) => item.id === workspaceState.activeTaskId));
+const conversationRounds = computed(() => task.value ? conversationHistoryRounds(serverTasks.value, task.value) : []);
 const pendingApproval = computed(() => task.value?.plan.find((step) => step.status === "awaiting_approval"));
 const failedStep = computed(() => task.value?.plan.find((step) => step.status === "failed"));
 const adjustmentLabel = computed(() =>
@@ -463,7 +465,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
         </div>
 
         <template v-else>
-          <template v-for="round in task.planHistory ?? []" :key="round.id">
+          <template v-for="round in conversationRounds" :key="round.id">
             <div class="task-message user message user-aligned">
               <div class="message-body">
                 <div class="message-meta">

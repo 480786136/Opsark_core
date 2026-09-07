@@ -2,6 +2,7 @@ import { backend } from "@/services/backend";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import type { RuntimeModel } from "@/services/backend";
 import { createRuntimeModel } from "@/features/agent/modelRuntime";
+import { modelLogContext } from "./modelLogContext";
 import {
   buildAdjustmentContext,
   buildContinuationContext,
@@ -481,7 +482,7 @@ export async function summarizeTaskExecution(
 ) {
   const requirement = latestTaskRequirement(input.task);
   const steps = activeRoundSteps(input.task);
-  const model = createRuntimeModel(input.model, input.apiKey, "");
+  const model = createRuntimeModel(input.model, input.apiKey, "", undefined, modelLogContext(input.task));
   if (model) {
     input.onModelRequest?.({
       requirement,
@@ -505,7 +506,7 @@ export async function summarizeFailedTask(
 ) {
   const requirement = latestTaskRequirement(input.task);
   const steps = activeRoundSteps(input.task);
-  const model = createRuntimeModel(input.model, input.apiKey, "");
+  const model = createRuntimeModel(input.model, input.apiKey, "", undefined, modelLogContext(input.task));
   const failureContext = buildFailedTaskSummaryContext(input.task, input.reason);
   const modelGoal = sanitizeSummaryText(requirement).slice(0, FAILURE_SUMMARY_REQUIREMENT_LIMIT);
   const modelRequirement = [

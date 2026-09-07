@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "ssh-terminal-jump",
+  "name": "终端 SSH 跳转",
+  "category": "connectivity",
+  "description": "从当前可见终端登录或跳转到另一台 SSH 服务器，并验证登录后的终端身份。",
+  "version": 4,
+  "enabled": true,
+  "builtIn": true,
+  "matchRules": [
+    "regex:(?:ssh).*(?:连接|登录|跳转)|(?:连接|登录|跳转).*(?:ssh)",
+    "regex:(?:终端|shell).*(?:跳转|登录).*(?:服务器|主机|IP)|(?:跳转|登录).*(?:服务器|主机|IP).*(?:终端|shell)"
+  ],
+  "allowedToolIds": [
+    "server.resolve_connection",
+    "user.request_input",
+    "server.connect"
+  ],
+  "updatedAt": "2026-08-24T00:00:00.000Z",
+  "instructions": "instructions.md"
+}

@@ -63,6 +63,9 @@ export function normalizePlanPreconditions(
     if (step.status === "pending" && /^opsark-tool(?:\s|$)/i.test(step.command.trim())) {
       try {
         const call = parseToolCommand(step.command, `normalize-strict-${index}`, tools);
+        if (call?.toolId === "user.request_input") {
+          step.command = `opsark-tool ${call.toolId} ${JSON.stringify(call.arguments)}`;
+        }
         if (call) pendingToolCalls.push({ index, toolId: call.toolId });
       } catch (error) {
         throw new Error(`第 ${index + 1} 个计划步骤的工具参数无效：${String(error)}`);

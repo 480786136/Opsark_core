@@ -149,11 +149,14 @@ export function compactReviewEvidence(
   return {
     totalItems: evidence.length,
     omittedItems: Math.max(0, evidence.length - selected.length),
-    items: selected.map(({ type, source, facts, rawOutput, scope }) => {
+    items: selected.map(({ id, type, source, facts, rawOutput, scope, collectedAt, archive }) => {
       const outputLimit = source === "main"
         ? options.mainOutputLimit ?? rawOutputLimit
         : options.validationOutputLimit ?? rawOutputLimit;
       return {
+        id,
+        collectedAt,
+        archive,
         type,
         source,
         facts: fitStructuredValue(facts, factsLimit),

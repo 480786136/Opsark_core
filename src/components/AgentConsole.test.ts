@@ -27,6 +27,32 @@ describe("AgentConsole 服务器工作区隔离", () => {
     host.remove();
   });
 
+  it("在当前任务中连续展示同一会话的 Java 与 MySQL 记录", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    const java = ops.createTask("server-a", "safe", "model-deepseek");
+    java.createdAt = "2026-09-06T01:00:00Z";
+    java.status = "completed";
+    java.messages = [{ id: "java-question", role: "user", kind: "message", content: "现在有哪些java服务在运行", createdAt: java.createdAt }];
+    java.summary = "Java 服务：orders.jar";
+    const mysql = ops.createTask("server-a", "safe", "model-deepseek");
+    mysql.conversationId = java.id;
+    mysql.createdAt = "2026-09-06T02:00:00Z";
+    mysql.messages = [{ id: "mysql-question", role: "user", kind: "message", content: "现在mysql数据库有哪些库", createdAt: mysql.createdAt }];
+    useAgentWorkspaceStore(pinia).updateServer("server-a", { activeTaskId: mysql.id, automationEnabled: true });
+    const app = createApp(AgentConsole, { serverId: "server-a" });
+    app.use(pinia);
+    app.use(i18n);
+    app.mount(host);
+    await nextTick();
+    expect(host.textContent).toContain("现在有哪些java服务在运行");
+    expect(host.textContent).toContain("orders.jar");
+    expect(host.textContent).toContain("现在mysql数据库有哪些库");
+    expect(mysql.plan).toHaveLength(0);
+    app.unmount();
+  });
+
   it("分别恢复每台服务器的活动任务和输入草稿", async () => {
     const pinia = createPinia();
     const ops = useOpsStore(pinia);

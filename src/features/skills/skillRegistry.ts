@@ -239,6 +239,11 @@ export function buildSkillContext(skills: SkillDefinition[]): ModelSkillDefiniti
   }));
 }
 
+export function buildSkillEvidenceContext(skills: SkillDefinition[]) {
+  return skills.filter(skill => skill.planningEvidence)
+    .map(skill => ({ skillId: skill.id, ...skill.planningEvidence! }));
+}
+
 export function collectSkillFacts(task: OpsTask, skills = resolveTaskSkills(task)) {
   return Object.fromEntries(skills.flatMap((skill) => {
     const facts = collectRuntimeSkillFacts(skill.id, task);

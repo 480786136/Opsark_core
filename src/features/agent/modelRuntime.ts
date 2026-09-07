@@ -7,6 +7,7 @@ export function createRuntimeModel(
   apiKey: string | undefined,
   context: string,
   generationSettings?: AiGenerationSettings,
+  logContext?: Record<string, unknown>,
 ): RuntimeModel | undefined {
   if (!model || !apiKey) return undefined;
   return {
@@ -15,6 +16,7 @@ export function createRuntimeModel(
     model: model.model,
     context,
     generationSettings,
+    ...(logContext ? { logContext } : {}),
   };
 }
 

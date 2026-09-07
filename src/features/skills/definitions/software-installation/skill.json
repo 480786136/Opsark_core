@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "software-installation",
+  "name": "通用软件安装",
+  "category": "environment",
+  "description": "在 Linux 服务器上安装或升级 Git、Node.js、Java/JDK、Docker 等通用软件；识别发行版、版本、权限、仓库、国内网络与镜像，并进行独立验收。",
+  "version": 1,
+  "enabled": true,
+  "builtIn": true,
+  "matchRules": [
+    "安装软件",
+    "安装 Git",
+    "安装 Node",
+    "安装 Node.js",
+    "安装 Java",
+    "安装 JDK",
+    "安装 Docker",
+    "安装 Python",
+    "安装 Go",
+    "安装 Rust",
+    "安装 Nginx",
+    "升级运行时",
+    "配置软件源",
+    "regex:(?:安装|部署|升级|配置).*(?:git|node(?:\\.js)?|npm|pnpm|yarn|java|jdk|maven|gradle|docker|docker compose|软件|运行时|工具链)",
+    "regex:(?:安装|升级|卸载)\\s*(?:软件|程序|工具|软件包|[a-z][a-z0-9+._-]*)"
+  ],
+  "allowedToolIds": [
+    "software.check",
+    "user.request_input"
+  ],
+  "updatedAt": "2026-08-21T00:00:00.000Z",
+  "instructions": "instructions.md"
+}

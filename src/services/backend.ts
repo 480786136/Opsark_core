@@ -27,6 +27,7 @@ export interface RuntimeConnection {
 }
 
 export interface RuntimeModel {
+  logContext?: Record<string, unknown>;
   apiKey: string;
   endpoint: string;
   model: string;
@@ -175,7 +176,7 @@ export function buildPlanNormalizationRepair(error: unknown, steps: PlanStep[]):
     expected: credentialType ? "password" : undefined,
     validationError,
     previousModelOutput: steps,
-    instruction: "只修复上述结构或工具参数错误；保持业务目的、步骤范围、风险和用户授权不变，不增加无关步骤。",
+    instruction: "只修复上述结构或工具参数错误；保持业务目的、步骤范围、风险和用户授权不变，不增加无关步骤。工具参数修复必须逐字保留每个步骤的 kind、title、description、risk、expected、validation 及步骤数量；只修改报错步骤 command 内的错误参数，不要润色描述或重写计划。",
   };
 }
 
@@ -204,6 +205,16 @@ function assertPlanRepairScope(repair: PlanNormalizationRepair, repaired: PlanSt
 }
 
 export const backend = {
+  async appendTaskLog(stream: "events" | "developer-events", event: unknown, context: unknown) {
+    if (isTauri()) await invoke("append_task_log", { stream, event, context });
+  },
+  async saveTaskEvidence(taskId: string, record: Record<string, unknown>) {
+    if (!isTauri()) throw new Error("证据持久化需要桌面存储");
+    return invoke<string>("save_task_evidence", { taskId, record });
+  },
+  async readTaskEvidence(taskId: string, evidenceId: string, offset: number, limit: number) {
+    return invoke<Record<string, unknown>>("read_task_evidence", { taskId, evidenceId, offset, limit });
+  },
   async saveCredential(kind: CredentialKind, id: string, value: string) {
     if (!isTauri()) return;
     await invoke("save_credential", { kind, id, value });
@@ -647,8 +658,9 @@ export const backend = {
           endpoint: runtimeModel.endpoint,
           model: runtimeModel.model,
           requirement,
-          executionContext: JSON.stringify(
-            steps.map(({ title, command, expected, status, output, result, evidence }) => ({
+          executionContext: JSON.stringify({
+            _log: runtimeModel.logContext,
+            steps: steps.map(({ title, command, expected, status, output, result, evidence }) => ({
               title,
               command,
               expected,
@@ -657,7 +669,7 @@ export const backend = {
               result,
               evidence: evidence?.map(({ type, source, facts, scope }) => ({ type, source, facts, scope })),
             })),
-          ),
+          }),
         });
       } catch {
         return fallback;

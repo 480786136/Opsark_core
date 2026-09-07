@@ -1,11 +1,6 @@
 import { describe, expect, it } from "vitest";
-import {
-  GIT_HTTPS_CREDENTIAL_GROUP,
-  gitHttpsCredentialFields,
-} from "@/features/skills/builtins/projectSourceAcquisition/authentication";
 import { projectSourceAcquisitionSkill } from "@/features/skills/builtins/projectSourceAcquisition/definition";
-import { projectSourceAcquisitionContract } from "@/features/skills/builtins/projectSourceAcquisition/workflow";
-import { compileSkillInstructions } from "@/features/skills/instructionBuilder";
+import { loadSkillDefinition } from "@/features/skills/skillFileLoader";
 import { validateSkillDefinition } from "@/features/skills/skillValidation";
 
 const EXPECTED_STAGE_IDS = [
@@ -29,13 +24,16 @@ describe("project-source-acquisition v12", () => {
   });
 
   it("keeps stages unique and in evidence-driven execution order", () => {
-    const stageIds = projectSourceAcquisitionContract.stages.map(({ id }) => id);
+    const stageIds = [...projectSourceAcquisitionSkill.instructions.matchAll(/^\d+\. \[([\w-]+)\]/gm)].map(match => match[1]);
 
     expect(stageIds).toEqual(EXPECTED_STAGE_IDS);
     expect(new Set(stageIds).size).toBe(stageIds.length);
   });
 
   it("declares one explicit Git HTTPS credential group with complementary roles", () => {
+    const request = projectSourceAcquisitionSkill.instructions.match(/opsark-tool user.request_input (\{[^\n]+\})/)![1];
+    const gitHttpsCredentialFields = JSON.parse(request).fields as Array<{ key: string; type: string; credential: unknown }>;
+    const GIT_HTTPS_CREDENTIAL_GROUP = "git_https_repository";
     expect(gitHttpsCredentialFields.map((field) => ({
       key: field.key,
       type: field.type,
@@ -65,8 +63,8 @@ describe("project-source-acquisition v12", () => {
   });
 
   it("keeps only the decisions, validation outcome and error routes needed by the model", () => {
-    const first = compileSkillInstructions(projectSourceAcquisitionContract);
-    const second = compileSkillInstructions(projectSourceAcquisitionContract);
+    const first = loadSkillDefinition("project-source-acquisition").instructions;
+    const second = loadSkillDefinition("project-source-acquisition").instructions;
 
     expect(first).toBe(second);
     expect(projectSourceAcquisitionSkill.instructions).toBe(first);

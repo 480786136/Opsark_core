@@ -1418,3 +1418,53 @@ fn build_blockers_cannot_plan_deployment_before_artifact_evidence() {
         GENERAL_PLAN_SYSTEM.contains("不得生成启动、后台运行、部署、端口探测或应用健康检查步骤")
     );
 }
+
+#[test]
+fn initial_readonly_classification_repairs_only_a_proven_fresh_task() {
+    let response = json!({"intent":"execute","relation":"side_question","answer":"",
+        "constraints":{"changePolicy":"read_only","environmentPolicy":"unspecified","failurePolicy":"unspecified",
+            "prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},
+        "terminalContextLines":0,"selectedSkillIds":[]});
+    let fresh = json!({"conversationHistory":[],"knownExecutionFacts":{"completedSteps":[]}});
+    let mut decision: AiRequirementDecision = serde_json::from_value(response.clone()).unwrap();
+    let error = classification_contract_error(&decision, None).unwrap();
+    assert!(error.contains("execute.relation"));
+    assert!(!error.contains("constraints 必须"));
+    assert!(normalize_initial_readonly_relation(&mut decision, &fresh.to_string()));
+    assert_eq!(decision.relation.as_deref(), Some("new_goal"));
+    assert_eq!(decision.constraints, response["constraints"]);
+    assert!(classification_contract_error(&decision, None).is_none());
+
+    for context in [json!({}), json!({"conversationHistory":[]}),
+        json!({"conversationHistory":[{"role":"user","content":"prior"}],"knownExecutionFacts":{"completedSteps":[]}}),
+        json!({"conversationHistory":[],"knownExecutionFacts":{"completedSteps":[{"id":"old"}]}}),
+        json!({"taskGoal":{"rootGoal":"deploy"},"conversationHistory":[],"knownExecutionFacts":{"completedSteps":[]}}),
+        json!({"previousExecution":{},"conversationHistory":[],"knownExecutionFacts":{"completedSteps":[]}})] {
+        let mut decision: AiRequirementDecision = serde_json::from_value(response.clone()).unwrap();
+        assert!(!normalize_initial_readonly_relation(&mut decision, &context.to_string()));
+        assert_eq!(decision.relation.as_deref(), Some("side_question"));
+    }
+    for policy in ["unspecified", "requested_changes_only", "allow_necessary_changes"] {
+        let mut decision: AiRequirementDecision = serde_json::from_value(response.clone()).unwrap();
+        decision.constraints["changePolicy"] = json!(policy);
+        assert!(!normalize_initial_readonly_relation(&mut decision, &fresh.to_string()));
+    }
+}
+
+#[test]
+fn classification_feedback_identifies_the_invalid_field() {
+    let response = json!({"intent":"execute","relation":"new_goal","answer":"",
+        "constraints":{"changePolicy":"read_only","environmentPolicy":"unspecified","failurePolicy":"unspecified",
+            "prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},
+        "terminalContextLines":0,"selectedSkillIds":[]});
+    let mut answer: AiRequirementDecision = serde_json::from_value(response.clone()).unwrap();
+    answer.answer = "explanation".into();
+    assert!(classification_contract_error(&answer, None).unwrap().contains("answer"));
+    let mut lines: AiRequirementDecision = serde_json::from_value(response.clone()).unwrap();
+    lines.terminal_context_lines = 10;
+    assert!(classification_contract_error(&lines, None).unwrap().contains("terminalContextLines"));
+    let mut constraints: AiRequirementDecision = serde_json::from_value(response).unwrap();
+    constraints.constraints["changePolicy"] = json!("unspecified");
+    assert!(classification_contract_error(&constraints, None).unwrap().contains("constraints"));
+    assert_eq!(classification_contract_error(&constraints, Some("unknown Skill".into())).as_deref(), Some("unknown Skill"));
+}

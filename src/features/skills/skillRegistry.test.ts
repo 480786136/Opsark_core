@@ -42,9 +42,9 @@ describe("skill registry", () => {
     const [skill] = suggestSkillsByRules("构建项目");
     const instructions = buildSkillContext([skill])[0].instructions;
 
-    expect(skill).toMatchObject({ id: "project-build", version: 3 });
+    expect(skill).toMatchObject({ id: "project-build", version: 5 });
     expect(instructions).toContain("不把多个失败边界塞进同一个 Shell 步骤");
-    expect(instructions).toContain("不得把依赖安装与构建写成 npm install && npm run build");
+    expect(instructions).toContain("安装与构建必须是不同步骤");
     expect(instructions).toContain("不得把全部 stdout/stderr 只重定向到文件");
     expect(instructions).toContain("定期复核停止或终端中断只表示没有取得真实退出结果");
     expect(instructions).toContain("按网络/DNS/TLS、认证、运行时版本");
@@ -130,7 +130,7 @@ describe("skill registry", () => {
       .find((skill) => skill.id === "application-deployment")!;
 
     expect(deployment).toMatchObject({
-      version: 4,
+      version: 6,
       category: "deployment",
     });
     expect(deployment.description).not.toContain("前后端");
@@ -252,7 +252,7 @@ describe("skill registry", () => {
       customSkills: [],
     })).find((skill) => skill.id === "project-build")!;
 
-    expect(build).toMatchObject({ version: 3, enabled: false });
+    expect(build).toMatchObject({ version: 5, enabled: false });
     expect(build.instructions).not.toContain("旧版将依赖安装和构建合并执行");
     expect(build.instructions).toContain("依赖安装：作为独立步骤执行");
   });

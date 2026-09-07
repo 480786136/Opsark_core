@@ -150,7 +150,7 @@ describe("agent context", () => {
     expect(facts.completedSteps[0]).toMatchObject({
       title: "读取 README",
       output: "requires PHP 8.2",
-      evidence: [expect.objectContaining({ rawOutput: "requires PHP 8.2" })],
+      evidence: [expect.objectContaining({ rawOutputRef: "output" })],
     });
   });
 
@@ -262,7 +262,7 @@ describe("agent context", () => {
     const context = buildNextStageContext(input);
 
     expect(context.workflowPhase).toBe("decide_after_phase");
-    expect(context.tools.map(({ id }) => id)).toEqual(["user.request_input", "software.check"]);
+    expect(context.tools.map(({ id }) => id)).toEqual(["user.request_input", "evidence.read", "software.check"]);
     expect(context.activeSkills[0].instructions).toContain("软件名称明确");
     expect(context.policyFingerprint).toBe(nextStagePolicyFingerprint(input));
     expect(JSON.stringify(context)).not.toContain("secret.merge_command");
