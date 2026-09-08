@@ -1,9 +1,5 @@
 import { describe, expect, it } from "vitest";
-<<<<<<< HEAD
-import { buildPlanNormalizationRepair } from "@/services/backend";
-=======
 import { buildPlanNormalizationRepair, normalizePlanPreconditions } from "@/services/backend";
->>>>>>> origin/master
 import type { PlanStep } from "@/types";
 
 const malformedStep: PlanStep = {
@@ -19,8 +15,6 @@ const malformedStep: PlanStep = {
 };
 
 describe("plan normalization repair feedback", () => {
-<<<<<<< HEAD
-=======
   it("normalizes the logged database username mismatch before a model repair is needed", () => {
     const fields = [
       { key: "mysql_user", label: "数据库用户名", description: "目标实例账户", type: "text", required: true,
@@ -36,7 +30,6 @@ describe("plan normalization repair feedback", () => {
     expect(normalized.kind).toBe(original.kind);
     expect(original.command).toContain('"type":"text"');
   });
->>>>>>> origin/master
   it("returns a field-local credential type error with the prior model output", () => {
     const repair = buildPlanNormalizationRepair(
       new Error("第 1 个计划步骤的工具参数无效：凭据参数 username 必须使用 password 类型"),

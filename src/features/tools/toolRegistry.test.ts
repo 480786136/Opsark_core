@@ -74,10 +74,7 @@ describe("tool registry", () => {
 
     expect(buildPlanningToolContext(tools, [softwareSkill]).map(({ id }) => id)).toEqual([
       "user.request_input",
-<<<<<<< HEAD
-=======
       "evidence.read",
->>>>>>> origin/master
       "software.check",
     ]);
   });

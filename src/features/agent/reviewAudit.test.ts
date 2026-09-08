@@ -94,8 +94,6 @@ describe("review audit", () => {
     ]);
   });
 
-<<<<<<< HEAD
-=======
   it("does not record a skipped failure review as a model call", () => {
     const event = buildCommandFailureReviewAudit({
       ...scope, context: {}, finalDecision: ruleAdjust,
@@ -106,7 +104,6 @@ describe("review audit", () => {
     expect(JSON.parse(event.detail).modelDecision).toBeUndefined();
   });
 
->>>>>>> origin/master
   it("emits one deterministic event when model review is unnecessary", () => {
     const events = buildEvidenceReviewAudits({
       ...scope,

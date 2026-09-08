@@ -28,7 +28,14 @@ const VOLATILE_EVIDENCE_KEYS = /^(?:id|evidenceIds|executionId|reviewRound|elaps
 const TERMINAL_RECOVERY_PATTERN = /(?:\bpty\b|\bshell\b.*(?:busy|occupied|release|reconnect)|terminal.*(?:busy|occupied|release|reconnect)|绑定终端|终端.*(?:未就绪|未释放|被占用|断开|重连|超时)|命令结束标记|执行通道.*(?:断开|异常)|connection closed|channel closed|socket closed)/i;
 
 export function isTerminalTransportFailure(error: unknown) {
-  return TERMINAL_RECOVERY_PATTERN.test(String(error));
+  return isSshConnectionSetupFailure(error)
+    || /^(?:Error: )?(?:SSH (?:用户名或密码不正确|身份认证失败)|AgentSession .*generation|AgentSession generation|无法创建 SSH 命令通道|无法执行远程命令|读取远程(?:标准|错误)输出失败)/i.test(String(error))
+    || TERMINAL_RECOVERY_PATTERN.test(String(error));
+}
+
+/** These executor errors occur before channel.exec; retrying cannot replay a command. */
+export function isSshConnectionSetupFailure(error: unknown) {
+  return /^(?:Error: )?SSH (?:网络连接失败|握手失败|会话创建失败)[：:]/.test(String(error));
 }
 
 function canonicalize(value: unknown): unknown {

@@ -1,34 +1,13 @@
-<<<<<<< HEAD
-import { describe, expect, it } from "vitest";
-=======
 ﻿import { describe, expect, it } from "vitest";
->>>>>>> origin/master
 import { builtInSkillCatalog } from "@/features/skills/skillCatalog";
 import { planningSkills } from "@/features/skills/skillPlanning";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { buildAdjustmentContext } from "@/features/agent/agentContext";
-<<<<<<< HEAD
-=======
 import { buildToolStepOutcome } from "@/features/agent/toolStepResult";
->>>>>>> origin/master
 import type { OpsTask, PlanStep } from "@/types";
 
 const task = (): OpsTask => ({ id: "task", title: "deploy", serverId: "server", modelId: "model",
   status: "running", permission: "safe", messages: [], plan: [], createdAt: "now", updatedAt: "now" });
-<<<<<<< HEAD
-const skill = () => structuredClone(builtInSkillCatalog.find(({ id }) => id === "application-deployment")!);
-function read(current: OpsTask, facts = {}): PlanStep {
-  return { id: "read", title: "read", description: "read", command: "read", kind: "observe",
-    validation: "", expected: "read", risk: "low", status: "completed", attemptContext: taskAttemptContext(current),
-    result: { executionStatus: "success", observationStatus: "matched", facts: { toolId: "files.read_content", ...facts }, warnings: [], evidenceIds: ["e"] } };
-}
-
-describe("evidence-driven Skill projection", () => {
-  it("retains acceptance and global boundaries, opening software tools only after content evidence", () => {
-    const current = task();
-    const definition = skill();
-    const initial = planningSkills(current, [definition])[0];
-=======
 const skill = (id = "application-deployment") => structuredClone(builtInSkillCatalog.find(item => item.id === id)!);
 function read(current: OpsTask, path = "/app/package.json", content = '{"scripts":{"build":"vite build"}}', truncated = false): PlanStep {
   const call = { id: `call-${path}`, toolId: "files.read_content", arguments: { path } };
@@ -78,7 +57,6 @@ describe("evidence-driven Skill projection", () => {
     const definition = skill();
     const initial = planningSkills(current, [definition])[0];
     expect(initial.instructions.length).toBeLessThan(definition.instructions.length);
->>>>>>> origin/master
     expect(initial.allowedToolIds).not.toContain("software.check");
     expect(initial.allowedToolIds).toContain("context.expand");
     expect(initial.instructions).toContain(definition.planningContract!.acceptanceInstructions);
@@ -89,14 +67,6 @@ describe("evidence-driven Skill projection", () => {
     expect(planningSkills(current, [definition])[0].allowedToolIds).not.toContain("software.check");
   });
 
-<<<<<<< HEAD
-  it("does not use truncated results, model prose or another target as stage evidence", () => {
-    const current = task();
-    current.plan = [read(current, { truncated: true })];
-    expect(planningSkills(current, [skill()])[0].allowedToolIds).not.toContain("software.check");
-    current.plan[0] = { ...read(current), attemptContext: "another-server" };
-    expect(planningSkills(current, [skill()])[0].allowedToolIds).not.toContain("software.check");
-=======
   it.each([
     ["/app/README.md", '{"scripts":{"build":"vite build"}}', false],
     ["/app/package.json", "{}", false],
@@ -161,7 +131,6 @@ describe("evidence-driven Skill projection", () => {
     change.result!.facts.commandDispatched = true;
     current.plan = [read(current), change];
     expect(planningSkills(current, [definition])[0]).toEqual(definition);
->>>>>>> origin/master
   });
 
   it("falls back to full policies for failure, explicit expansion, and edited instructions", () => {
@@ -169,13 +138,9 @@ describe("evidence-driven Skill projection", () => {
     const definition = skill();
     current.plan = [{ ...read(current), status: "failed" }];
     expect(planningSkills(current, [definition])[0]).toEqual(definition);
-<<<<<<< HEAD
-    current.plan = [read(current, { toolId: "context.expand", expandedSkillId: definition.id })];
-=======
     const expanded = read(current);
     expanded.result!.facts = { toolId: "context.expand", expandedSkillId: definition.id };
     current.plan = [expanded];
->>>>>>> origin/master
     expect(planningSkills(current, [definition])[0]).toEqual(definition);
     current.plan = [];
     definition.instructions += "\n自定义末尾验收";
@@ -183,20 +148,13 @@ describe("evidence-driven Skill projection", () => {
     const context = buildAdjustmentContext({ task: current, skills: [definition], tools: [], secretMetadata: [],
       metrics: { cpu: 0, memory: 0, disk: 0, networkIn: 0, networkOut: 0, sampledAt: "now" } });
     expect(context.activeSkills[0].instructions).toBe(definition.instructions);
-<<<<<<< HEAD
-=======
     delete definition.planningContract;
     expect(planningSkills(current, [definition])[0]).toEqual(definition);
->>>>>>> origin/master
   });
 
   it("shrinks only the initial source request and restores authentication after real execution", () => {
     const current = task();
-<<<<<<< HEAD
-    const source = builtInSkillCatalog.find(({ id }) => id === "project-source-acquisition")!;
-=======
     const source = skill("project-source-acquisition");
->>>>>>> origin/master
     const initial = planningSkills(current, [source])[0];
     expect(initial.instructions.length).toBeLessThan(source.instructions.length);
     expect(initial.instructions).toContain("origin");

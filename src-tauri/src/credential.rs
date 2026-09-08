@@ -1,11 +1,7 @@
 const KEYCHAIN_SERVICE: &str = "com.opsark.desktop";
 
 pub(crate) fn credential_account(kind: &str, id: &str) -> Result<String, String> {
-<<<<<<< HEAD
     if !matches!(kind, "server" | "model" | "secret" | "knowledge") {
-=======
-    if !matches!(kind, "server" | "model" | "secret") {
->>>>>>> origin/master
         return Err("不支持的凭据类型".into());
     }
     if id.trim().is_empty() || id.len() > 160 {
@@ -66,10 +62,10 @@ mod tests {
             "secret:TOKEN"
         );
         assert!(credential_account("other", "id").is_err());
-<<<<<<< HEAD
-        assert_eq!(credential_account("knowledge", "primary").unwrap(), "knowledge:primary");
-=======
->>>>>>> origin/master
+        assert_eq!(
+            credential_account("knowledge", "primary").unwrap(),
+            "knowledge:primary"
+        );
         assert!(credential_account("server", " ").is_err());
     }
 }

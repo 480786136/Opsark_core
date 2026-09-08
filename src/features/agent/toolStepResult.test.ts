@@ -12,12 +12,8 @@ describe("tool step result", () => {
   it("builds complete structured evidence for a successful call", () => {
     const outcome = buildToolStepOutcome({
       call,
-<<<<<<< HEAD
-      result: { callId: call.id, toolId: call.toolId, success: true, data: { totalNodes: 3 } },
-=======
       result: { callId: call.id, toolId: call.toolId, success: true,
         data: { rootPath: "/opt/app", tree: "/opt/app/\n└── README.md", warnings: [], truncated: false } },
->>>>>>> origin/master
       completedAt: "2026-08-14T01:00:00.000Z",
       evidenceId: "evidence-1",
     });
@@ -27,9 +23,6 @@ describe("tool step result", () => {
     expect(outcome.result.evidenceIds).toEqual(["evidence-1"]);
     expect(outcome.evidence?.[0]).toMatchObject({
       id: "evidence-1",
-<<<<<<< HEAD
-      facts: { toolId: call.toolId, truncated: false },
-=======
       facts: {
         toolId: call.toolId,
         truncated: false,
@@ -37,13 +30,10 @@ describe("tool step result", () => {
         evidenceScope: "/opt/app",
         evidenceComplete: true,
       },
->>>>>>> origin/master
     });
     expect(outcome.review?.decision).toBe("continue");
   });
 
-<<<<<<< HEAD
-=======
   it("does not promote a successful malformed response into a complete product", () => {
     const outcome = buildToolStepOutcome({
       call,
@@ -71,7 +61,6 @@ describe("tool step result", () => {
     expect(outcome.result.facts).toMatchObject({ truncated: true, evidenceComplete: false, evidenceKind: "directory_structure" });
   });
 
->>>>>>> origin/master
   it("marks truncated output as warning evidence", () => {
     const outcome = buildToolStepOutcome({
       call,

@@ -5,6 +5,24 @@ import { useAgentTerminalStore } from "./agentTerminalStore";
 describe("agent terminal store", () => {
   beforeEach(() => setActivePinia(createPinia()));
 
+  it("同步故障代次并释放 busy，不伪造退出码或接受旧会话事件", () => {
+    const store = useAgentTerminalStore();
+    store.registerSession({
+      id: "agent-1", serverId: "server-1", taskId: "task-1", generation: 1, state: "ready",
+      context: { environment: {}, sourceFiles: [], shell: "bash", revision: 0 }, createdAt: "now",
+    });
+    store.begin("task-1", "validation", "test -d /opt/repo/.git", "isolated_exec", true);
+    store.invalidateSession("task-1", "agent-1", 2);
+    expect(store.sessionsByTask["task-1"]).toMatchObject({ state: "recovering", generation: 2 });
+    expect(store.entriesByTask["task-1"][0].exitCode).toBeUndefined();
+    store.invalidateSession("task-1", "agent-1", 1);
+    store.invalidateSession("task-1", "other-session", 3);
+    expect(store.sessionsByTask["task-1"].generation).toBe(2);
+    store.close("task-1");
+    store.invalidateSession("task-1", "agent-1", 3);
+    expect(store.sessionsByTask["task-1"].state).toBe("closed");
+  });
+
   it("keeps Agent sessions outside user terminal pane state", () => {
     const store = useAgentTerminalStore();
     store.registerSession({

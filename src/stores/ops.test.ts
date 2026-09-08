@@ -19,6 +19,7 @@ import {
   isMutatingStepCommand,
 } from "@/services/validation";
 import { useTerminalSessionStore } from "@/features/terminal/terminalSessionStore";
+import { useAgentTerminalStore } from "@/features/terminal/agentTerminalStore";
 
 const plan: PlanStep[] = [
   {
@@ -54,7 +55,10 @@ const plan: PlanStep[] = [
 ];
 
 describe("智能任务状态机", () => {
-  afterEach(() => vi.useRealTimers());
+  afterEach(() => {
+    vi.useRealTimers();
+    Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+  });
 
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -167,6 +171,107 @@ describe("智能任务状态机", () => {
       taskId: task.id,
       taskTitle: "检查 Web 服务",
     });
+  });
+
+  function setupAgentClone() {
+    vi.useFakeTimers();
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
+    task.status = "running";
+    task.plan = [{
+      ...structuredClone(plan[0]), id: "clone", kind: "change", risk: "medium",
+      title: "克隆仓库", command: "git clone https://example.invalid/repo.git /opt/repo",
+      validation: "git -C /opt/repo rev-parse --verify HEAD",
+      validator: { type: "exit_code", expectedExitCode: 0 },
+    }];
+    store.serverPasswords[task.serverId] = "test-password";
+    vi.spyOn(backend, "analyzePlanStepSafety").mockImplementation(async (command, validation) => ({
+      safe: true, normalizedCommand: command, normalizedValidation: validation, repairedFields: [], issues: [],
+    }));
+    let generation = 0;
+    vi.spyOn(backend, "createAgentTerminal").mockImplementation(async () => ({
+      id: "agent-1", serverId: task.serverId, taskId: task.id, generation: ++generation, state: "ready",
+      context: { environment: {}, sourceFiles: [], shell: "bash", revision: 0 }, createdAt: task.createdAt,
+    }));
+    vi.spyOn(store, "advanceTask").mockResolvedValue(undefined);
+    return { store, task, terminals: useAgentTerminalStore() };
+  }
+
+  it("Agent 克隆完成后 SSH 握手失败只重试校验，成功后正常推进且不调用模型", async () => {
+    const { store, task, terminals } = setupAgentClone();
+    let validationAttempts = 0;
+    const execute = vi.spyOn(backend, "executeAgentCommand").mockImplementation(async (input) => {
+      if (input.command === task.plan[0].validation && validationAttempts++ === 0) {
+        input.onSessionInvalidated?.(2);
+        throw "SSH 握手失败：[Session(-8)] Unable to exchange encryption keys";
+      }
+      return {
+        output: input.command === task.plan[0].command ? "Cloning into '/opt/repo'...\n[exit: 0]" : "abc123\n[exit: 0]",
+        success: true, simulated: false, exitCode: 0, emptyResult: false,
+        sessionId: input.session.id, generation: input.session.generation, scope: input.scope,
+      };
+    });
+    const running = store.runStep(task.id, "clone");
+    await vi.advanceTimersByTimeAsync(3_000);
+    await running;
+    expect(execute.mock.calls.map(([input]) => input.command)).toEqual([
+      task.plan[0].command, task.plan[0].validation, task.plan[0].validation,
+    ]);
+    expect(execute.mock.calls.map(([input]) => input.session.generation)).toEqual([1, 1, 2]);
+    expect(task.plan[0].status).toBe("completed");
+    expect(task.plan[0].output).toContain("Cloning into");
+    expect(terminals.sessionsByTask[task.id]).toMatchObject({ state: "ready", generation: 2 });
+    expect(backend.reviewStep).not.toHaveBeenCalled();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(store.advanceTask).toHaveBeenCalledOnce();
+  });
+
+  it("持续校验握手失败后释放 busy、有限等待并停止倒计时与模型重拟", async () => {
+    const { store, task, terminals } = setupAgentClone();
+    const execute = vi.spyOn(backend, "executeAgentCommand").mockImplementation(async (input) => {
+      if (input.command === task.plan[0].command) return {
+        output: "Cloning into '/opt/repo'...\n[exit: 0]", success: true, simulated: false,
+        exitCode: 0, emptyResult: false, sessionId: input.session.id, generation: input.session.generation, scope: input.scope,
+      };
+      input.onSessionInvalidated?.(input.session.generation + 1);
+      throw "SSH 握手失败：[Session(-8)] Unable to exchange encryption keys";
+    });
+    const running = store.runStep(task.id, "clone");
+    await vi.advanceTimersByTimeAsync(3_000);
+    await running;
+    expect(execute).toHaveBeenCalledTimes(4);
+    expect(task.plan[0].result?.facts).toMatchObject({ commandCompleted: true, validationCompleted: false });
+    expect(task.plan[0].output).toContain("Cloning into");
+    expect(terminals.sessionsByTask[task.id].state).toBe("recovering");
+    expect(task.managedAdjustmentPhase).toBe("waiting_transport");
+    await store.queueManagedAdjustment(task.id);
+    await store.queueManagedAdjustment(task.id);
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(task.managedAdjustmentPhase).toBe("manual_required");
+    expect(task.autoAdjustmentSeconds).toBeUndefined();
+    expect(task.messages.filter(({ content }) => content.includes("倒计时结束"))).toHaveLength(0);
+    expect(backend.reviewStep).not.toHaveBeenCalled();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+  });
+
+  it("恢复识别 Agent ready，且无发送前证据时不重放主命令", async () => {
+    const { store, task, terminals } = setupAgentClone();
+    await store.ensureTaskAgentSession(task.id);
+    task.status = "needs_adjustment";
+    task.plan[0].status = "failed";
+    task.plan[0].result = {
+      executionStatus: "failed", observationStatus: "unknown", evidenceIds: [], warnings: [],
+      facts: { category: "terminal_transport", commandCompleted: false },
+    };
+    const resume = vi.spyOn(store, "resumeTransportAdjustment");
+    await store.requestAdjustment(task.id, true);
+    expect(resume).toHaveBeenCalledOnce();
+    expect(terminals.sessionsByTask[task.id].state).toBe("ready");
+    expect(task.managedAdjustmentPhase).toBe("manual_required");
+    expect(task.plan[0].status).toBe("failed");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
   });
 
   it("记录完整且脱敏的需求处理开发者日志", async () => {
@@ -4150,24 +4255,15 @@ describe("智能任务状态机", () => {
     expect(task.pauseReason).toContain("命令执行未成功");
     expect(task.summary).toBeUndefined();
     expect(task.messages.some((message) => message.kind === "summary")).toBe(false);
-<<<<<<< HEAD
-    expect(backend.reviewStep).toHaveBeenCalledTimes(1);
-    const reviewContext = JSON.parse(vi.mocked(backend.reviewStep).mock.calls[0][1]);
-    expect(vi.mocked(backend.reviewStep).mock.calls[0][0]).toBe(task.title);
-=======
     expect(backend.reviewStep).not.toHaveBeenCalled();
     const event = store.logs.find(log => log.taskId === task.id && log.title.includes("执行失败直接进入调整"));
     expect(event?.category).toBe("system");
     const reviewContext = JSON.parse(event!.detail).input;
->>>>>>> origin/master
     expect(reviewContext).not.toHaveProperty("userRequirement");
     expect(reviewContext).not.toHaveProperty("fullPlan");
     expect(reviewContext.planSummary.totalSteps).toBe(1);
     expect(reviewContext.currentStep.result.executionStatus).toBe("failed");
-<<<<<<< HEAD
-=======
     expect(task.plan[0].review).toMatchObject({ decision: "adjust", source: "rules" });
->>>>>>> origin/master
   });
 
   it("主命令失败后模型会结合用户约束和剩余恢复步骤决定继续", async () => {

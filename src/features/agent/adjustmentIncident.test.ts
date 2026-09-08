@@ -3,6 +3,8 @@ import {
   buildAdjustmentBlockerSnapshot,
   isSameAdjustmentIncident,
   openAdjustmentIncident,
+  isTerminalTransportFailure,
+  isSshConnectionSetupFailure,
 } from "./adjustmentIncident";
 import type { OpsTask, PlanStep } from "@/types";
 
@@ -55,6 +57,16 @@ const target = {
 };
 
 describe("adjustment incident fingerprint", () => {
+  it("识别执行器 SSH 建连错误，但不把业务日志或未知退出当成安全重放证据", () => {
+    const error = "SSH 握手失败：[Session(-8)] Unable to exchange encryption keys";
+    expect(isTerminalTransportFailure(error)).toBe(true);
+    expect(isSshConnectionSetupFailure(new Error(error))).toBe(true);
+    expect(isSshConnectionSetupFailure("SSH 网络连接失败：connection reset")).toBe(true);
+    expect(isTerminalTransportFailure("SSH 用户名或密码不正确")).toBe(true);
+    expect(isSshConnectionSetupFailure("SSH 用户名或密码不正确")).toBe(false);
+    expect(isSshConnectionSetupFailure("channel closed")).toBe(false);
+    expect(isSshConnectionSetupFailure(`application log: ${error}`)).toBe(false);
+  });
   it("不使用可变的展示文案作为阻塞身份", () => {
     const task = taskWith(failedStep());
     task.pauseReason = "已等待 30 秒";

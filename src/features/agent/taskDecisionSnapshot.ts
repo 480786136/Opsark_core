@@ -12,13 +12,10 @@ import {
   TASK_DECISION_RECENT_PHASE_LIMIT,
 } from "@/features/agent/taskHistoryCheckpoint";
 import { taskGoal } from "@/features/agent/taskGoal";
-<<<<<<< HEAD
-import { currentEvidenceSteps } from "@/features/agent/attemptState";
-=======
 import { modelLogContext } from "./modelLogContext";
 import { currentEvidenceSteps } from "@/features/agent/attemptState";
-import { modelToolOutput } from "@/features/agent/executionContextEvidence";
->>>>>>> origin/master
+import { decisionOutputProjector, DECISION_EVIDENCE_INSTRUCTION } from "./decisionEvidence";
+import { workflowProgress } from "./workflowProgress";
 import type { OpsTask, PlanStep, TaskExecutionPhase } from "@/types";
 
 const CURRENT_PLAN_STEP_LIMIT = 20;
@@ -61,7 +58,7 @@ function selectBoundedSteps(steps: PlanStep[], limit: number) {
   return steps.filter(({ id }) => ids.has(id)).slice(-limit);
 }
 
-function compactStep(step: PlanStep, detail: "current" | "recent") {
+function compactStep(step: PlanStep, detail: "current" | "recent", project: ReturnType<typeof decisionOutputProjector>) {
   const exceptional = isExceptional(step);
   const needsCommand = exceptional
     || ["pending", "awaiting_approval", "awaiting_input", "running"].includes(step.status);
@@ -77,9 +74,10 @@ function compactStep(step: PlanStep, detail: "current" | "recent") {
       : undefined,
     commandFingerprint: textFingerprint(step.command),
     result: compactReviewResult(step.result, exceptional ? 1_500 : 800),
-    output: exceptional
-      ? compactReviewOutput(step.output, detail === "current" ? 1_500 : 700, 600)
-      : reviewOutputMetadata(step.output),
+    output: typeof step.result?.facts.toolId === "string" && detail === "current"
+      ? { ...reviewOutputMetadata(step.output), contentRef: "currentToolResults", stepId: step.id }
+      : project(step.output, step.evidence, detail === "current" ? 2_048 : 1_024),
+    targetContext: step.attemptContext,
     executionScope: step.executionScope,
     validationScope: step.validationScope,
     evidence: compactReviewEvidence(step.evidence, {
@@ -117,7 +115,7 @@ function currentIncident(step: PlanStep | undefined) {
   };
 }
 
-function phaseSnapshot(phase: TaskExecutionPhase) {
+function phaseSnapshot(phase: TaskExecutionPhase, project: ReturnType<typeof decisionOutputProjector>) {
   const selected = selectBoundedSteps(phase.plan, RECENT_PHASE_STEP_LIMIT);
   return {
     phaseId: phase.id,
@@ -129,26 +127,42 @@ function phaseSnapshot(phase: TaskExecutionPhase) {
       includedSteps: selected.length,
       omittedSteps: Math.max(0, phase.plan.length - selected.length),
     },
-    steps: selected.map((step) => compactStep(step, "recent")),
+    steps: selected.map((step) => compactStep(step, "recent", project)),
     completedAt: phase.completedAt,
   };
 }
 
-<<<<<<< HEAD
-export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep) {
-=======
 export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, allowArchive = false) {
->>>>>>> origin/master
   const checkpoint = task.historyCheckpoint ?? initializeTaskHistoryCheckpoint(task);
   const incidentStep = failedStep ?? [...task.plan].reverse().find(isExceptional);
   const selectedCurrentPlan = selectBoundedSteps(task.plan, CURRENT_PLAN_STEP_LIMIT);
   const selectedCurrentSteps = selectedCurrentPlan
     .filter(({ id }) => id !== incidentStep?.id);
+  const project = decisionOutputProjector(allowArchive);
+  // Spend the shared output budget on current evidence before older summaries.
+  const currentSteps = [...selectedCurrentSteps].reverse().map((step) => compactStep(step, "current", project)).reverse();
+  const currentToolResults = currentEvidenceSteps(task, true)
+    .filter((step) => typeof step.result?.facts.toolId === "string" && step.output)
+    .slice(-12).map((step) => ({
+      stepId: step.id, evidenceIds: step.result?.evidenceIds, toolId: step.result?.facts.toolId,
+      truncated: step.result?.facts.truncated, targetContext: step.attemptContext,
+      content: project(step.output, step.evidence),
+    }));
   const recentPhases = (task.phaseHistory ?? [])
     .filter((phase) => phase.roundId === task.currentRoundId)
     .slice(-TASK_DECISION_RECENT_PHASE_LIMIT)
-    .map(phaseSnapshot);
+    .map(phase => phaseSnapshot(phase, project));
   const rootGoal = taskGoal(task);
+  const progression = workflowProgress(task);
+  // Re-read the locally retained ledger before asking the server again. This
+  // uses a separate bounded window, never a model-authored success summary.
+  const recoveryProject = decisionOutputProjector(allowArchive, 12_000);
+  const recoveredEvidence = progression.rereadEvidence
+    ? [...(task.phaseHistory ?? []).filter(phase => phase.roundId === task.currentRoundId).flatMap(phase => phase.plan), ...task.plan]
+      .filter(step => step.result && step.output).slice(-3).reverse().map(step => ({
+        stepId: step.id, targetContext: step.attemptContext,
+        output: recoveryProject(step.output, step.evidence, 6_000),
+      })) : undefined;
   const recentDetailedSteps = recentPhases.reduce((total, phase) => total + phase.planSummary.totalSteps, 0);
   const currentProgress = reviewPlanSummary(task.plan);
   const statusCounts = { ...(checkpoint?.statusCounts ?? {}) };
@@ -177,6 +191,8 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
       relation: task.lastRequirementRelation,
     },
     executionConstraints: task.executionConstraints,
+    workflowProgress: progression,
+    recoveredEvidence,
     progress: {
       ...progress,
       totalRounds: task.planHistory?.length ?? 0,
@@ -189,33 +205,22 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
       includedSteps: selectedCurrentPlan.length,
       incidentIncludedSeparately: Boolean(incidentStep && selectedCurrentPlan.some(({ id }) => id === incidentStep.id)),
       omittedSteps: Math.max(0, task.plan.length - selectedCurrentPlan.length),
-      steps: selectedCurrentSteps.map((step) => compactStep(step, "current")),
+      steps: currentSteps,
     },
     recentPhases,
     // Compact step records above carry references, not file contents. Keep the
     // current tool results once so the next decision can actually inspect them.
-    currentToolResults: currentEvidenceSteps(task, true)
-      .filter((step) => typeof step.result?.facts.toolId === "string" && step.output)
-      .map((step) => ({
-        stepId: step.id,
-        evidenceIds: step.result?.evidenceIds,
-        toolId: step.result?.facts.toolId,
-        truncated: step.result?.facts.truncated,
-        targetContext: step.attemptContext,
-<<<<<<< HEAD
-        content: redactCommandSecrets(step.output!),
-=======
-        content: modelToolOutput(step, redactCommandSecrets(step.output!), allowArchive),
->>>>>>> origin/master
-      })),
+    currentToolResults,
     historyCheckpoint: checkpoint ? {
       ...checkpoint,
-      verifiedFacts: checkpoint.verifiedFacts.slice(-12),
-<<<<<<< HEAD
-      unresolvedIssues: checkpoint.unresolvedIssues.slice(-8),
-=======
+      verifiedFacts: checkpoint.verifiedFacts.slice(-12).map(fact => {
+        const original = [...(task.planHistory ?? []).flatMap(round => round.plan),
+          ...(task.phaseHistory ?? []).flatMap(phase => phase.plan), ...task.plan]
+          .find(step => step.id === fact.stepId);
+        return { ...fact, targetContext: original?.attemptContext ?? fact.targetContext,
+          output: original ? project(original.output, original.evidence, 800) : fact.output };
+      }),
       unresolvedIssues: checkpoint.unresolvedIssues,
->>>>>>> origin/master
       phaseSummaries: checkpoint.phaseSummaries.slice(-4),
     } : undefined,
     omittedHistory: checkpoint ? {
@@ -224,14 +229,11 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
       compactedSteps: checkpoint.sourceStepCount,
       fingerprint: checkpoint.sourceHistoryFingerprint,
     } : undefined,
-    instruction: "recentPhases 是最近两个执行阶段的有界详情；historyCheckpoint 是更早历史的结构化滚动摘要。只有 result/evidence 支持的内容属于已验证事实，计划描述和阶段总结不等于执行成功。",
+    instruction: `recentPhases 是最近两个执行阶段；historyCheckpoint 是更早历史，必须核对目标与时效。只有 result/evidence 支持的内容属于已验证事实，计划描述和阶段总结不等于执行成功。${DECISION_EVIDENCE_INSTRUCTION}`,
   };
   return {
     ...body,
-<<<<<<< HEAD
-=======
     _log: modelLogContext(task, failedStep),
->>>>>>> origin/master
     snapshotFingerprint: textFingerprint(JSON.stringify(body)),
   };
 }

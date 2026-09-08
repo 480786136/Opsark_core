@@ -1,4 +1,5 @@
 import { compactReviewText, textFingerprint } from "@/features/agent/longRunningReviewOutput";
+import { decisionOutput } from "./decisionEvidence";
 import {
   compactReviewEvidence,
   compactReviewResult,
@@ -13,10 +14,6 @@ import type {
 } from "@/types";
 
 const CHECKPOINT_FACT_LIMIT = 12;
-<<<<<<< HEAD
-const CHECKPOINT_ISSUE_LIMIT = 8;
-=======
->>>>>>> origin/master
 const CHECKPOINT_PHASE_SUMMARY_LIMIT = 4;
 const RECENT_DETAILED_PHASE_COUNT = 2;
 
@@ -82,6 +79,8 @@ function mergePhase(
     const fact = {
       stepId: step.id,
       title: compactReviewText(step.title, 180),
+      targetContext: step.attemptContext,
+      output: decisionOutput(step.output, step.evidence, 800),
       result: compactReviewResult(step.result, 900) as Record<string, unknown> | undefined,
       evidence: compactReviewEvidence(step.evidence, {
         maxItems: 3,
@@ -101,16 +100,6 @@ function mergePhase(
   let unresolvedIssues = [...checkpoint.unresolvedIssues];
   for (const step of phase.plan) {
     const commandFingerprint = textFingerprint(step.command);
-<<<<<<< HEAD
-    if (!isExceptional(step)) {
-      if (step.status === "completed") {
-        unresolvedIssues = unresolvedIssues.filter((item) => item.commandFingerprint !== commandFingerprint);
-      }
-      continue;
-    }
-    const existing = unresolvedIssues.find((item) => item.commandFingerprint === commandFingerprint);
-    unresolvedIssues = unresolvedIssues.filter((item) => item.commandFingerprint !== commandFingerprint);
-=======
     const sameIssue = (item: TaskHistoryCheckpoint["unresolvedIssues"][number]) =>
       item.commandFingerprint === commandFingerprint && Boolean(step.attemptContext)
       && item.attemptContext === step.attemptContext;
@@ -124,7 +113,6 @@ function mergePhase(
     }
     const existing = unresolvedIssues.find(sameIssue);
     unresolvedIssues = unresolvedIssues.filter((item) => !sameIssue(item) && item.stepId !== step.id);
->>>>>>> origin/master
     unresolvedIssues.push({
       stepId: step.id,
       title: compactReviewText(step.title, 180),
@@ -136,10 +124,7 @@ function mergePhase(
           : undefined,
       status: step.status,
       commandFingerprint,
-<<<<<<< HEAD
-=======
       attemptContext: step.attemptContext,
->>>>>>> origin/master
       attemptCount: (existing?.attemptCount ?? 0) + 1,
     });
   }
@@ -164,11 +149,7 @@ function mergePhase(
     sourceStepCount: checkpoint.sourceStepCount + phase.plan.length,
     statusCounts,
     verifiedFacts: verifiedFacts.slice(-CHECKPOINT_FACT_LIMIT),
-<<<<<<< HEAD
-    unresolvedIssues: unresolvedIssues.slice(-CHECKPOINT_ISSUE_LIMIT),
-=======
     unresolvedIssues,
->>>>>>> origin/master
     phaseSummaries,
     throughPhaseId: phase.id,
     sourceHistoryFingerprint,

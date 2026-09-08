@@ -8,11 +8,8 @@ import {
 } from "@/features/agent/taskProgression";
 import type { OpsTask, PlanStep } from "@/types";
 import type { ToolDefinition } from "@/features/tools/types";
-<<<<<<< HEAD
-=======
 import { buildCommandFailure } from "@/features/agent/commandStepResult";
 import { currentEvidenceSteps, taskAttemptContext } from "@/features/agent/attemptState";
->>>>>>> origin/master
 
 const step = (overrides: Partial<PlanStep> = {}): PlanStep => ({
   id: overrides.id ?? "step-1",
@@ -41,8 +38,6 @@ const task = (plan: PlanStep[], overrides: Partial<OpsTask> = {}): OpsTask => ({
 });
 
 describe("taskProgression", () => {
-<<<<<<< HEAD
-=======
   it("invalidates observations after a real failed compound change while preventing its blind retry", () => {
     const current = task([]);
     const context = taskAttemptContext(current);
@@ -65,7 +60,6 @@ describe("taskProgression", () => {
     build.result!.facts.category = "tool_command_parse";
     expect(currentEvidenceSteps(current)).toEqual([read]);
   });
->>>>>>> origin/master
   it("rechecks health after an executed mutation, including a partially failed mutation", () => {
     const health = step({ command: "curl -f http://localhost/health", kind: "observe", validation: "", status: "failed" });
     for (const status of ["completed", "failed"] as const) {

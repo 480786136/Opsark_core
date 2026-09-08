@@ -6,6 +6,7 @@ import { createPinia } from "pinia";
 import { i18n } from "@/features/preferences/i18n";
 import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
 import { useOpsStore } from "@/stores/ops";
+import { buildAdjustmentBlockerSnapshot, openAdjustmentIncident } from "@/features/agent/adjustmentIncident";
 
 vi.mock("@/components/ModelSettingsModal.vue", () => ({
   default: defineComponent(() => () => h("div")),
@@ -27,8 +28,6 @@ describe("AgentConsole 服务器工作区隔离", () => {
     host.remove();
   });
 
-<<<<<<< HEAD
-=======
   it("在当前任务中连续展示同一会话的 Java 与 MySQL 记录", async () => {
     const pinia = createPinia();
     const ops = useOpsStore(pinia);
@@ -55,7 +54,38 @@ describe("AgentConsole 服务器工作区隔离", () => {
     app.unmount();
   });
 
->>>>>>> origin/master
+  it("通道故障优先显示恢复等待，超时后停止转圈并显示检查恢复入口", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    const task = ops.createTask("server-a", "managed", "model-deepseek");
+    task.status = "needs_adjustment";
+    task.managedAdjustmentPhase = "generating";
+    task.plan = [{
+      id: "clone", title: "克隆仓库", description: "获取源码", command: "git clone https://example.invalid/repo.git /opt/repo",
+      expected: "仓库可用", validation: "test -d /opt/repo/.git", risk: "medium", status: "failed",
+    }];
+    task.autoAdjustmentSeconds = 3;
+    task.adjustmentIncident = openAdjustmentIncident(
+      buildAdjustmentBlockerSnapshot(task, undefined, { terminalBusy: true }), true, task.createdAt,
+    );
+    useAgentWorkspaceStore(pinia).updateServer("server-a", { activeTaskId: task.id, automationEnabled: true });
+    const app = createApp(AgentConsole, { serverId: "server-a" });
+    app.use(pinia);
+    app.use(i18n);
+    app.mount(host);
+    await nextTick();
+    expect(host.textContent).toContain("正在等待终端恢复");
+    expect(host.textContent).not.toContain("正在生成调整方案");
+    task.managedAdjustmentPhase = "manual_required";
+    task.managedStopReason = "transport_recovery";
+    task.autoAdjustmentSeconds = undefined;
+    await nextTick();
+    expect(host.textContent).toContain("检查终端恢复");
+    expect(host.textContent).not.toContain("正在等待终端恢复");
+    app.unmount();
+  });
+
   it("分别恢复每台服务器的活动任务和输入草稿", async () => {
     const pinia = createPinia();
     const ops = useOpsStore(pinia);

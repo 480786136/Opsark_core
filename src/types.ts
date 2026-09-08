@@ -107,10 +107,7 @@ export interface ExecutionEvidence {
   rawOutput: string;
   collectedAt: string;
   scope?: ExecutionScopeEvidence;
-<<<<<<< HEAD
-=======
   archive?: { evidenceId: string; fingerprint: string; characters: number; capturedPartial: boolean };
->>>>>>> origin/master
 }
 
 export interface StepResult {
@@ -248,6 +245,8 @@ export interface TaskExecutionPhase {
 }
 
 export interface TaskHistoryVerifiedFact {
+  targetContext?: string;
+  output?: Record<string, unknown>;
   stepId: string;
   title: string;
   result?: Record<string, unknown>;
@@ -263,10 +262,7 @@ export interface TaskHistoryIssue {
   status: PlanStep["status"];
   commandFingerprint: string;
   attemptCount: number;
-<<<<<<< HEAD
-=======
   attemptContext?: string;
->>>>>>> origin/master
 }
 
 export interface TaskHistoryPhaseSummary {
@@ -332,6 +328,8 @@ export type ManagedAdjustmentPhase =
   | "manual_required";
 
 export type ManagedStopReason =
+  | "workflow_error"
+  | "no_progress"
   | "model_generation_failed"
   | "transport_recovery"
   | "retry_exhausted"
@@ -340,11 +338,10 @@ export type ManagedStopReason =
   | "cancelled";
 
 export interface OpsTask {
-<<<<<<< HEAD
-=======
+  /** Invalidates async results when a user cancels or starts another request. */
+  workflowEpoch?: number;
   /** UI conversation identity; never merges task goals or execution evidence. */
   conversationId?: string;
->>>>>>> origin/master
   id: string;
   serverId: string;
   /** Explicit server used by Agent execution after a server.connect tool step. */
@@ -477,10 +474,7 @@ export interface RequirementProcessingResult {
 }
 
 export interface ModelDeveloperTrace {
-<<<<<<< HEAD
-=======
   normalizations?: string[];
->>>>>>> origin/master
   attempts: ModelAttemptTrace[];
 }
 

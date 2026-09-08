@@ -86,6 +86,10 @@ export function failInteractiveCredentialResolution(
 /** Records an unexpected orchestration failure without discarding existing evidence. */
 export function failUnexpectedStep(step: PlanStep, error: unknown): StepFailureOutcome {
   const detail = String(error);
+  if (["completed", "skipped"].includes(step.status)) {
+    const pauseReason = `后续流程异常：${detail}。步骤“${step.title}”的既有状态与证据保持有效。`;
+    return { pauseReason, eventMessage: pauseReason };
+  }
   const pauseReason = `步骤“${step.title}”执行异常：${detail}。任务已暂停，可生成调整计划后继续。`;
   transitionStep(step, "failed");
   step.progressMessage = "步骤执行异常";

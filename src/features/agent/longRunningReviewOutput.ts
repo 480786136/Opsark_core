@@ -67,8 +67,6 @@ function isCriticalLine(line: string) {
   return CRITICAL_LINE.test(line) || NAMED_ERROR_LINE.test(line);
 }
 
-<<<<<<< HEAD
-=======
 /**
  * Returns whether a terminal fragment contains a newly observable failure.
  * Progress bars, timestamps and spinner updates are intentionally ignored so
@@ -82,7 +80,6 @@ export function hasCriticalLongRunningEvidence(output: string) {
     .some((line) => line.length > 0 && isCriticalLine(line));
 }
 
->>>>>>> origin/master
 function normalizeSemanticLine(line: string) {
   return line
     .replace(SPINNER_CHARACTERS, "")

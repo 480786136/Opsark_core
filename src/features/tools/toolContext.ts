@@ -51,10 +51,7 @@ export function selectPlanningTools(
     ? new Set(skills.flatMap((skill) => skill.allowedToolIds ?? []))
     : undefined;
   if (skills.some((skill) => skill.planningContract)) allowed?.add("context.expand");
-<<<<<<< HEAD
-=======
   allowed?.add("evidence.read");
->>>>>>> origin/master
   return tools.filter((tool) => (
     tool.enabled
     && (tool.modelExposure ?? "planner") === "planner"

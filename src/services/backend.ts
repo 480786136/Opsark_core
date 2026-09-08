@@ -16,6 +16,7 @@ import {
   analyzePlanStepSafety as analyzePlanStepSafetyLocally,
 } from "@/features/agent/planSafety";
 import type { PlanStepSafetyAnalysis } from "@/features/agent/planSafety";
+import { isTerminalTransportFailure } from "@/features/agent/adjustmentIncident";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -27,10 +28,7 @@ export interface RuntimeConnection {
 }
 
 export interface RuntimeModel {
-<<<<<<< HEAD
-=======
   logContext?: Record<string, unknown>;
->>>>>>> origin/master
   apiKey: string;
   endpoint: string;
   model: string;
@@ -140,11 +138,7 @@ export interface AgentRuntimeProgress {
   ioBytes: number;
 }
 
-<<<<<<< HEAD
 export type CredentialKind = "server" | "model" | "secret" | "knowledge";
-=======
-export type CredentialKind = "server" | "model" | "secret";
->>>>>>> origin/master
 
 export {
   buildExecutionSummary,
@@ -183,11 +177,7 @@ export function buildPlanNormalizationRepair(error: unknown, steps: PlanStep[]):
     expected: credentialType ? "password" : undefined,
     validationError,
     previousModelOutput: steps,
-<<<<<<< HEAD
-    instruction: "只修复上述结构或工具参数错误；保持业务目的、步骤范围、风险和用户授权不变，不增加无关步骤。",
-=======
     instruction: "只修复上述结构或工具参数错误；保持业务目的、步骤范围、风险和用户授权不变，不增加无关步骤。工具参数修复必须逐字保留每个步骤的 kind、title、description、risk、expected、validation 及步骤数量；只修改报错步骤 command 内的错误参数，不要润色描述或重写计划。",
->>>>>>> origin/master
   };
 }
 
@@ -216,8 +206,6 @@ function assertPlanRepairScope(repair: PlanNormalizationRepair, repaired: PlanSt
 }
 
 export const backend = {
-<<<<<<< HEAD
-=======
   async appendTaskLog(stream: "events" | "developer-events", event: unknown, context: unknown) {
     if (isTauri()) await invoke("append_task_log", { stream, event, context });
   },
@@ -228,7 +216,6 @@ export const backend = {
   async readTaskEvidence(taskId: string, evidenceId: string, offset: number, limit: number) {
     return invoke<Record<string, unknown>>("read_task_evidence", { taskId, evidenceId, offset, limit });
   },
->>>>>>> origin/master
   async saveCredential(kind: CredentialKind, id: string, value: string) {
     if (!isTauri()) return;
     await invoke("save_credential", { kind, id, value });
@@ -283,11 +270,19 @@ export const backend = {
     approvedHighRisk: boolean;
     promptCredential?: AgentPromptCredential;
     onProgress?(event: AgentTerminalOutputEvent): void;
+    onSessionInvalidated?(generation?: number): void;
   }): Promise<AgentCommandResult> {
     if (!isTauri()) return requireDesktopRuntime("Agent 沙箱命令执行");
     let unlisten: (() => void) | undefined;
-    if (input.onProgress) {
+    if (input.onProgress || input.onSessionInvalidated) {
       unlisten = await listen<AgentTerminalOutputEvent>("agent-terminal-output", (event) => {
+        if (event.payload.sessionId === input.session.id
+          && event.payload.executionId === input.executionId
+          && event.payload.stream === "error"
+          && event.payload.generation > input.session.generation) {
+          input.onSessionInvalidated?.(event.payload.generation);
+          return;
+        }
         if (
           event.payload.sessionId === input.session.id
           && event.payload.generation === input.session.generation
@@ -306,6 +301,9 @@ export const backend = {
         approvedHighRisk: input.approvedHighRisk,
         promptCredential: input.promptCredential,
       });
+    } catch (error) {
+      if (isTerminalTransportFailure(error)) input.onSessionInvalidated?.();
+      throw error;
     } finally {
       unlisten?.();
     }
@@ -672,14 +670,9 @@ export const backend = {
           endpoint: runtimeModel.endpoint,
           model: runtimeModel.model,
           requirement,
-<<<<<<< HEAD
-          executionContext: JSON.stringify(
-            steps.map(({ title, command, expected, status, output, result, evidence }) => ({
-=======
           executionContext: JSON.stringify({
             _log: runtimeModel.logContext,
             steps: steps.map(({ title, command, expected, status, output, result, evidence }) => ({
->>>>>>> origin/master
               title,
               command,
               expected,
@@ -688,11 +681,7 @@ export const backend = {
               result,
               evidence: evidence?.map(({ type, source, facts, scope }) => ({ type, source, facts, scope })),
             })),
-<<<<<<< HEAD
-          ),
-=======
           }),
->>>>>>> origin/master
         });
       } catch {
         return fallback;

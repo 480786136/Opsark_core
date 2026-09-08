@@ -104,18 +104,12 @@ describe("review service", () => {
       source: "model",
     }));
 
-<<<<<<< HEAD
-    expect(result.modelDecision.decision).toBe("complete");
-=======
     expect(result.modelDecision?.decision).toBe("complete");
->>>>>>> origin/master
     expect(result.finalDecision).toMatchObject({ decision: "adjust", source: "rules" });
     expect(result.mutatingStep).toBe(true);
     expect(result.recoveryStepFound).toBe(true);
   });
 
-<<<<<<< HEAD
-=======
   it("sends a failed change directly to adjustment when no remaining step can recover it", async () => {
     const task = createTask();
     const failed = createStep("build", "npm install && npm run build", "failed");
@@ -154,7 +148,6 @@ describe("review service", () => {
     expect(result.finalDecision.source).toBe("model");
   });
 
->>>>>>> origin/master
   it("lets deterministic postcondition blockers override a model continue decision", async () => {
     const task = createTask();
     const deploy = createStep("deploy", "systemctl restart app", "validating");

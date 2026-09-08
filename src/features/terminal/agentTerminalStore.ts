@@ -108,6 +108,15 @@ export const useAgentTerminalStore = defineStore("agentTerminals", {
       const session = this.sessionsByTask[taskId];
       if (session) session.state = "ready";
     },
+    invalidateSession(taskId: string, sessionId: string, generation?: number) {
+      const session = this.sessionsByTask[taskId];
+      if (!session || session.id !== sessionId || session.state === "closed"
+        || (generation !== undefined && generation < session.generation)) return;
+      if (generation !== undefined) session.generation = generation;
+      // The command slot was released, but remote connectivity is not verified.
+      // Do not invent an exit code for the interrupted execution.
+      session.state = "recovering";
+    },
     system(taskId: string, text: string) {
       this.append(taskId, { kind: "system", text });
     },

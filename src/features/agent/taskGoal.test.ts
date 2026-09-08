@@ -47,8 +47,6 @@ function task(): OpsTask {
 }
 
 describe("task goal lifecycle", () => {
-<<<<<<< HEAD
-=======
   it("retains all unresolved issues and never resolves a different target by command text", () => {
     const current = task();
     const closeRound = (date: string) => {
@@ -71,7 +69,6 @@ describe("task goal lifecycle", () => {
     expect(current.historyCheckpoint?.unresolvedIssues).toHaveLength(9);
     expect(buildTaskDecisionSnapshot(current).historyCheckpoint?.unresolvedIssues).toHaveLength(9);
   });
->>>>>>> origin/master
   it("keeps the root goal instead of replacing it with retry text", () => {
     expect(taskGoal(task())).toBe("帮我部署 office 项目");
   });

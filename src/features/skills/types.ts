@@ -16,8 +16,6 @@ export const SKILL_CATEGORY_IDS = [
 
 export type SkillCategory = typeof SKILL_CATEGORY_IDS[number];
 
-<<<<<<< HEAD
-=======
 export interface SkillEvidenceRequirement {
   kind: string;
   toolIds?: string[];
@@ -39,7 +37,6 @@ export interface SkillPlanningEvidence {
   facts: Record<string, unknown>;
 }
 
->>>>>>> origin/master
 export interface SkillDefinition {
   id: string;
   name: string;
@@ -51,14 +48,11 @@ export interface SkillDefinition {
   /** Optional semantic-selection hints. Plain text and regex forms are both shown to the model as hints. */
   matchRules: string[];
   instructions: string;
-<<<<<<< HEAD
-=======
   /** Dynamic phase evidence; excluded from the stable model Skill definition. */
   planningEvidence?: {
     stageId: string;
     observed: Array<Pick<SkillPlanningEvidence, "evidenceId" | "kind" | "scope" | "facts">>;
   };
->>>>>>> origin/master
   /** Trusted optional projection; a prose override invalidates this contract. */
   planningContract?: {
     sourceInstructions: string;
@@ -66,13 +60,10 @@ export interface SkillDefinition {
     acceptanceInstructions: string;
     /** Only shrink the first discovery request; resume full rules after execution. */
     initialOnly?: boolean;
-<<<<<<< HEAD
-=======
     /** Conservatively restore all rules after executed changes invalidate observations. */
     afterMutation?: "full";
     /** Trusted, local domain parsers; these names cannot be supplied by a model tool call. */
     evidenceAdapters?: Array<"project_manifest">;
->>>>>>> origin/master
     stages: Array<{
       id: string;
       title: string;
@@ -80,15 +71,12 @@ export interface SkillDefinition {
       allowedToolIds: string[];
       /** Only executor-recorded successful tool results satisfy these conditions. */
       requiresTools: string[];
-<<<<<<< HEAD
-=======
       /** Deterministic evidence products required before this stage is exposed. */
       requiresEvidence?: SkillEvidenceRequirement[];
       /** Machine-checkable exit products; exitEvidence remains explanatory text. */
       exitRequirements?: SkillEvidenceRequirement[];
       /** Human-readable products this stage must leave for the next stage. */
       producesEvidence?: string[];
->>>>>>> origin/master
       exitEvidence: string;
     }>;
   };

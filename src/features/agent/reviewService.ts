@@ -88,23 +88,12 @@ export async function reviewExecutionFailure(
     input.step,
     remainingSteps,
   );
-<<<<<<< HEAD
-  const modelDecision = await reviewStep(
-    requirement,
-    JSON.stringify(context),
-    remainingSteps.length > 0,
-    createRuntimeModel(input.model, input.apiKey, ""),
-  );
-=======
->>>>>>> origin/master
   const mutatingStep = isMutatingStepCommand(input.step.command);
   const diagnosticStep = isReadOnlyDiagnosticStep(input.step) && !mutatingStep;
   const recoveryStepFound = remainingPlanCanRecoverExecutionFailure(
     input.failureCategory,
     remainingSteps,
   );
-<<<<<<< HEAD
-=======
   // Every possible review outcome is already constrained to adjustment here.
   // Send the failure evidence directly to the adjustment planner once instead
   // of asking a model to choose a branch that the local gate must override.
@@ -126,7 +115,6 @@ export async function reviewExecutionFailure(
     remainingSteps.length > 0,
     createRuntimeModel(input.model, input.apiKey, ""),
   );
->>>>>>> origin/master
   let finalDecision = modelDecision;
   if (modelDecision.source !== "model") {
     finalDecision = {

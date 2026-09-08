@@ -4,7 +4,7 @@
 
 ## 使用步骤
 
-1. 启动平级 `Opsark_knowledge` API 与 Worker，以及 `Opsark_admin` 管理后台。后台创建知识库，再签发该库的客户端知识 Key，赋予 `knowledge:read`、`records:write`、`records:read`。不能使用模型 Key 或内部服务 Token。
+1. 启动平级 `Opsark_knowledge` API 与 Worker，在知识自身管理页面（默认 http://127.0.0.1:8002）登录并创建知识库，再签发该库的客户端知识 Key，赋予 `knowledge:read`、`records:write`、`records:read`。不需要启动 Admin，不能使用模型 Key 或内部服务 Token。独立管理升级方法见 [开发版说明](../../Opsark_admin/docs/独立系统开发版使用与验收.md)。
 2. 在 core 桌面版设置页的“知识服务与记录上传”填写 base URL，例如 `http://127.0.0.1:8002/api/v1`，填写 Key，点击“保存并测试连接”。
 3. 选择返回的目标知识库，打开“启用任务记录上传”，点击“保存知识设置”。这一卡片单独保存，不依赖页面原有的保存按钮。
 4. 工作区选择任务，点击“上传任务记录”。检查脱敏后的 JSON 和目标；默认不含命令，可按需勾选脱敏命令。确认内容可上传后再提交。

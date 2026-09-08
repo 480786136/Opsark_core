@@ -2,11 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
   analyzeSkillCommandFailure,
   analyzeSkillOutputSignals,
-<<<<<<< HEAD
-} from "@/features/skills/validationAdapters";
-
-describe("validation output signals", () => {
-=======
   parseSkillObservation,
 } from "@/features/skills/validationAdapters";
 import type { PlanStep } from "@/types";
@@ -25,7 +20,6 @@ describe("validation output signals", () => {
       .toMatchObject({ status: "matched", facts: { pids: [42] } });
     expect(parseSkillObservation("process", [], true, step).status).toBe("not_found");
   });
->>>>>>> origin/master
   it("captures Vite environment and chunk-size advisories", () => {
     const result = analyzeSkillOutputSignals([
       "NODE_ENV=production is not supported in the .env file.",

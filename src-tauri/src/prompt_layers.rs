@@ -117,8 +117,14 @@ mod tests {
         let (first, _) = prepare_request(&body("old", "read"));
         let (second, _) = prepare_request(&body("new evidence", "read"));
         let metrics = request_metrics(&first);
-        assert_eq!(metrics["stablePrefixFingerprint"], request_metrics(&second)["stablePrefixFingerprint"]);
-        assert_ne!(metrics["requestBytes"], request_metrics(&second)["requestBytes"]);
+        assert_eq!(
+            metrics["stablePrefixFingerprint"],
+            request_metrics(&second)["stablePrefixFingerprint"]
+        );
+        assert_ne!(
+            metrics["requestBytes"],
+            request_metrics(&second)["requestBytes"]
+        );
         assert_eq!(metrics["exactTokens"], false);
         assert_eq!(metrics["sections"].as_array().unwrap().len(), 3);
     }

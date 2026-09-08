@@ -763,6 +763,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn fresh_login_shell_detects_bash_profile_precedence_over_profile() {
         let unique = std::time::SystemTime::now()

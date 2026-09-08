@@ -37,6 +37,63 @@ function createTask(step: PlanStep): OpsTask {
 const noop = () => undefined;
 
 describe("execution lifecycle", () => {
+  const handshakeError = new Error("SSH 握手失败：[Session(-8)] Unable to exchange encryption keys");
+  function transportValidationInput(overrides = {}) {
+    return {
+      step: createStep({ command: "git clone https://example.invalid/repo.git /opt/repo" }),
+      validation: "git -C /opt/repo rev-parse --verify HEAD",
+      initialExecutionId: "validation-1",
+      createRetryExecutionId: vi.fn(() => "validation-retry"),
+      secretValues: {}, isCancelled: () => false,
+      onExecutionChange: vi.fn(), onProgress: noop, onRetry: vi.fn(),
+      onTransportRetry: vi.fn(async () => undefined),
+      waitBeforeRetry: vi.fn(async (_ms: number) => undefined),
+      ...overrides,
+    };
+  }
+
+  it("握手失败后只重试原校验，并清理每次执行标识", async () => {
+    const input = transportValidationInput();
+    const execute = vi.fn().mockRejectedValueOnce(handshakeError)
+      .mockResolvedValueOnce({ passed: true, exitCode: 0, output: "HEAD", detail: "ok" });
+    const result = await runValidationLifecycle(input, execute);
+    expect(result.validation.passed).toBe(true);
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(execute.mock.calls.map(([call]) => call.step.validation)).toEqual([input.validation, input.validation]);
+    expect(input.onTransportRetry).toHaveBeenCalledExactlyOnceWith(1);
+    expect(input.onRetry).not.toHaveBeenCalled();
+    expect(input.onExecutionChange.mock.calls.flat()).toEqual(["validation-1", undefined, "validation-retry", undefined]);
+  });
+
+  it("持续握手失败最多重试两次，保留原异常", async () => {
+    const input = transportValidationInput();
+    const execute = vi.fn().mockRejectedValue(handshakeError);
+    await expect(runValidationLifecycle(input, execute)).rejects.toBe(handshakeError);
+    expect(execute).toHaveBeenCalledTimes(3);
+    expect(input.onTransportRetry).toHaveBeenCalledTimes(2);
+    expect(input.waitBeforeRetry.mock.calls.flat()).toEqual([500, 1500]);
+    expect(input.onExecutionChange).toHaveBeenLastCalledWith(undefined);
+  });
+
+  it.each(["channel closed", "SSH 用户名或密码不正确", "绑定终端未返回命令结束标记"])("不重试已发送或非瞬态错误：%s", async (error) => {
+    const input = transportValidationInput();
+    const execute = vi.fn().mockRejectedValue(error);
+    await expect(runValidationLifecycle(input, execute)).rejects.toBe(error);
+    expect(execute).toHaveBeenCalledOnce();
+    expect(input.onTransportRetry).not.toHaveBeenCalled();
+  });
+
+  it("退避期间取消任务后不重连或再发送校验", async () => {
+    let cancelled = false;
+    const input = transportValidationInput({
+      isCancelled: () => cancelled,
+      waitBeforeRetry: async () => { cancelled = true; },
+    });
+    const execute = vi.fn().mockRejectedValue(handshakeError);
+    await expect(runValidationLifecycle(input, execute)).rejects.toBe(handshakeError);
+    expect(execute).toHaveBeenCalledOnce();
+    expect(input.onTransportRetry).not.toHaveBeenCalled();
+  });
   it("stops monitoring, clears the execution ID and accepts verified completion", async () => {
     const step = createStep();
     const executionChanges: Array<string | undefined> = [];
@@ -73,11 +130,8 @@ describe("execution lifecycle", () => {
         consecutiveContinueRounds: 0,
         salientEvidence: [],
         runtimeIdleReviewRounds: 0,
-<<<<<<< HEAD
-=======
         modelReviewCount: 1,
         skippedModelReviewCount: 0,
->>>>>>> origin/master
       }),
     }));
 
@@ -121,11 +175,8 @@ describe("execution lifecycle", () => {
         consecutiveContinueRounds: 0,
         salientEvidence: [],
         runtimeIdleReviewRounds: 0,
-<<<<<<< HEAD
-=======
         modelReviewCount: 0,
         skippedModelReviewCount: 0,
->>>>>>> origin/master
       }),
     }))).rejects.toThrow("connection closed");
 

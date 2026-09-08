@@ -10,18 +10,12 @@ import {
   LONG_RUNNING_GOAL_CONTEXT_LIMIT,
   mergeLongRunningSalientEvidence,
   semanticLongRunningOutputFingerprint,
-<<<<<<< HEAD
-=======
   hasCriticalLongRunningEvidence,
->>>>>>> origin/master
 } from "@/features/agent/longRunningReviewOutput";
 import type { OpsTask, PlanStep, StepReview } from "@/types";
 
 export const LONG_RUNNING_REVIEW_INTERVAL_MS = 30_000;
-<<<<<<< HEAD
-=======
 export const PROGRESSIVE_ADVISORY_INTERVAL_MS = 120_000;
->>>>>>> origin/master
 export const BOUNDED_COMMAND_HARD_LIMIT_SECONDS = 90;
 export const STALLED_REVIEW_NOTICE_ROUNDS = 2;
 export const PROGRESSIVE_MAX_STALLED_REVIEW_ROUNDS = 4;
@@ -43,11 +37,8 @@ export interface LongRunningMonitorState {
   salientEvidence: string[];
   runtimeProgress?: AgentRuntimeProgress;
   runtimeIdleReviewRounds: number;
-<<<<<<< HEAD
-=======
   modelReviewCount: number;
   skippedModelReviewCount: number;
->>>>>>> origin/master
 }
 
 export interface LongRunningReviewAudit {
@@ -141,11 +132,7 @@ export function acceptsLongRunningDecision(review: StepReview, validationPassed:
 }
 
 /**
-<<<<<<< HEAD
- * Starts a heartbeat and a 30-second advisory model review without running the
-=======
  * Starts a heartbeat and 30-second runtime sampling without running the
->>>>>>> origin/master
  * postcondition concurrently. A finite command must first return its real exit
  * marker; only then may formal validation start. This prevents downloads and
  * installers from being mistaken for completed work based on partial output.
@@ -165,11 +152,8 @@ export function startLongRunningMonitor(
     consecutiveContinueRounds: 0,
     salientEvidence: mergeLongRunningSalientEvidence([], input.getStreamedOutput()),
     runtimeIdleReviewRounds: 0,
-<<<<<<< HEAD
-=======
     modelReviewCount: 0,
     skippedModelReviewCount: 0,
->>>>>>> origin/master
   };
   let stopped = false;
   let lastNoticeAt = 0;
@@ -183,11 +167,8 @@ export function startLongRunningMonitor(
     ? new Date(input.step.startedAt).getTime()
     : scheduler.now();
   const startedAt = Number.isFinite(parsedStartedAt) ? parsedStartedAt : scheduler.now();
-<<<<<<< HEAD
-=======
   let lastModelReviewAt = startedAt;
   let lastModelReviewedOutput = "";
->>>>>>> origin/master
 
   const elapsedSeconds = () => Math.max(
     0,
@@ -303,8 +284,6 @@ export function startLongRunningMonitor(
           return;
         }
       }
-<<<<<<< HEAD
-=======
       const newOutput = currentOutput.startsWith(lastModelReviewedOutput)
         ? currentOutput.slice(lastModelReviewedOutput.length) : currentOutput;
       const measuredProgress = state.workload === "progressive"
@@ -317,7 +296,6 @@ export function startLongRunningMonitor(
         state.skippedModelReviewCount += 1;
         return;
       }
->>>>>>> origin/master
       const progress: LongRunningProgressStatus = {
         workload: state.workload,
         outputFingerprint: state.outputFingerprint,
@@ -359,11 +337,8 @@ export function startLongRunningMonitor(
         salientEvidence: state.salientEvidence,
       });
       const reviewStep = input.reviewStep ?? backend.reviewStep.bind(backend);
-<<<<<<< HEAD
-=======
       state.modelReviewCount += 1;
       lastModelReviewAt = scheduler.now();
->>>>>>> origin/master
       const modelDecision = await reviewStep(
         compactReviewText(input.requirement, LONG_RUNNING_GOAL_CONTEXT_LIMIT),
         JSON.stringify(context),
@@ -372,10 +347,7 @@ export function startLongRunningMonitor(
       );
       if (stopped || input.isCancelled() || interruptionRequested) return;
       outputReviewCursor = nextOutputReviewCursor;
-<<<<<<< HEAD
-=======
       lastModelReviewedOutput = currentOutput;
->>>>>>> origin/master
       const runtimeShowsProgress = state.workload === "progressive"
         && runtimeProgress?.active === true
         && (runtimeProgress.cpuPercent >= 0.1 || runtimeProgress.processCount > 1 || runtimeIoChanged);

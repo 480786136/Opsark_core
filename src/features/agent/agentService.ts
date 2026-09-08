@@ -1,11 +1,10 @@
 import { backend } from "@/services/backend";
 import { taskAttemptContext } from "@/features/agent/attemptState";
+import { workflowLifetime, StaleWorkflowError } from "./workflowLifetime";
+import { DECISION_EVIDENCE_INSTRUCTION } from "./decisionEvidence";
 import type { RuntimeModel } from "@/services/backend";
 import { createRuntimeModel } from "@/features/agent/modelRuntime";
-<<<<<<< HEAD
-=======
 import { modelLogContext } from "./modelLogContext";
->>>>>>> origin/master
 import {
   buildAdjustmentContext,
   buildContinuationContext,
@@ -101,6 +100,7 @@ export interface SummarizeFailedTaskInput {
 }
 
 export interface ReviewTaskGoalInput {
+  isCancelled?(): boolean;
   task: OpsTask;
   model?: ModelProfile;
   apiKey?: string;
@@ -273,6 +273,8 @@ export async function reviewTaskGoal(
   input: ReviewTaskGoalInput,
   review: GoalReviewer = backend.reviewGoal.bind(backend),
 ) {
+  const lifetime = workflowLifetime(input.task);
+  if (!lifetime.current() || input.isCancelled?.()) throw new StaleWorkflowError();
   const requirement = latestTaskRequirement(input.task);
   const snapshot = buildTaskDecisionSnapshot(input.task);
   const activeSkills = buildSkillContext(input.skills ?? []).map((skill) => ({
@@ -286,7 +288,7 @@ export async function reviewTaskGoal(
     trigger: "overall_goal_completion",
     baseSnapshot: snapshot,
     activeSkillAcceptance: activeSkills,
-    instruction: "用外层用户目标、baseSnapshot 的结构化结果和 activeSkillAcceptance 判断整体目标。输出元数据和阶段总结不等于成功证据；缺少最终验收证据时必须 adjust。若返回 adjust，reason 和 summary 必须明确指出尚未完成的目标，供调整计划直接复用。",
+    instruction: `用外层用户目标、baseSnapshot 的真实输出与结构化结果和 activeSkillAcceptance 判断整体目标。阶段总结不等于成功证据；缺少最终验收证据时必须 adjust。若返回 adjust，reason 和 summary 必须指出未满足条件，区分未采集与上下文省略。${DECISION_EVIDENCE_INSTRUCTION}`,
   };
   const decision = await review(
     requirement,
@@ -294,6 +296,7 @@ export async function reviewTaskGoal(
     createRuntimeModel(input.model, input.apiKey, ""),
   );
   const complete = decision.decision === "complete";
+  if (!lifetime.current() || input.isCancelled?.()) throw new StaleWorkflowError();
   return { requirement, snapshot, context, decision, complete };
 }
 
@@ -307,6 +310,11 @@ export async function decideTaskNextStage(
   decide: NextStageDecider = backend.decideNextStage.bind(backend),
   fallbackReview: GoalReviewer = backend.reviewGoal.bind(backend),
 ) {
+  const lifetime = workflowLifetime(input.task);
+  const assertCurrent = () => {
+    if (!lifetime.current() || input.isCancelled?.()) throw new StaleWorkflowError();
+  };
+  assertCurrent();
   const requirement = latestTaskRequirement(input.task);
   const context = buildNextStageContext({
     server: input.server,
@@ -337,6 +345,7 @@ export async function decideTaskNextStage(
           input.generationSettings,
         ),
     );
+    assertCurrent();
     if (!matchesNextStageDecision(decision.decision)) {
       throw new Error("下一阶段联合决策返回了不支持的 decision");
     }
@@ -364,6 +373,7 @@ export async function decideTaskNextStage(
       policyFingerprint: context.policyFingerprint,
     };
   } catch (combinedError) {
+    assertCurrent();
     const fallback = await reviewTaskGoal(input, fallbackReview);
     return {
       ...fallback,
@@ -386,6 +396,7 @@ export async function planDiscoveryContinuation(
   input: PlanDiscoveryContinuationInput,
   generatePlan: PlanGenerator = backend.generatePlan.bind(backend),
 ) {
+  const lifetime = workflowLifetime(input.task);
   const context = JSON.stringify(buildContinuationContext({
     server: input.server,
     metrics: input.metrics,
@@ -400,6 +411,7 @@ export async function planDiscoveryContinuation(
       ? undefined
       : createRuntimeModel(input.model, input.apiKey, context, input.generationSettings),
   );
+  lifetime.assertCurrent();
   const continuation = selectContinuationSteps(activeRoundSteps(input.task), candidates, taskAttemptContext(input.task));
   if (!continuation.length) throw new Error("模型未返回可执行的后续步骤");
   return continuation;
@@ -414,6 +426,7 @@ export async function planTaskAdjustment(
   input: PlanTaskAdjustmentInput,
   generatePlan: PlanGenerator = backend.generatePlan.bind(backend),
 ) {
+  const lifetime = workflowLifetime(input.task);
   const requirement = latestTaskRequirement(input.task);
   const context = buildAdjustmentContext({
     server: input.server,
@@ -446,6 +459,7 @@ export async function planTaskAdjustment(
       ? undefined
       : createRuntimeModel(input.model, input.apiKey, JSON.stringify(context), input.generationSettings),
   );
+  lifetime.assertCurrent();
   if (safetyFields.length && input.failedStep) {
     if (replacement.length !== 1) {
       throw new Error("安全门禁局部调整只能返回一个替代步骤");
@@ -485,11 +499,7 @@ export async function summarizeTaskExecution(
 ) {
   const requirement = latestTaskRequirement(input.task);
   const steps = activeRoundSteps(input.task);
-<<<<<<< HEAD
-  const model = createRuntimeModel(input.model, input.apiKey, "");
-=======
   const model = createRuntimeModel(input.model, input.apiKey, "", undefined, modelLogContext(input.task));
->>>>>>> origin/master
   if (model) {
     input.onModelRequest?.({
       requirement,
@@ -513,11 +523,7 @@ export async function summarizeFailedTask(
 ) {
   const requirement = latestTaskRequirement(input.task);
   const steps = activeRoundSteps(input.task);
-<<<<<<< HEAD
-  const model = createRuntimeModel(input.model, input.apiKey, "");
-=======
   const model = createRuntimeModel(input.model, input.apiKey, "", undefined, modelLogContext(input.task));
->>>>>>> origin/master
   const failureContext = buildFailedTaskSummaryContext(input.task, input.reason);
   const modelGoal = sanitizeSummaryText(requirement).slice(0, FAILURE_SUMMARY_REQUIREMENT_LIMIT);
   const modelRequirement = [

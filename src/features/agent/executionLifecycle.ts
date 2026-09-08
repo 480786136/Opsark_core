@@ -24,6 +24,7 @@ import {
   createTerminalOutputAccumulator,
 } from "@/utils/terminal";
 import type { OpsTask, PlanStep } from "@/types";
+import { isSshConnectionSetupFailure } from "@/features/agent/adjustmentIncident";
 
 type CommandExecutor = (input: ExecuteStepCommandInput) => Promise<ExecutionCommandResult>;
 type ValidationExecutor = (input: ExecuteStepValidationInput) => Promise<StepValidationResult>;
@@ -134,6 +135,7 @@ export interface RunValidationLifecycleInput {
   onExecutionChange(executionId?: string): void;
   onProgress(safeChunk: string): void;
   onRetry(firstOutput: string, maxRetries: number): void;
+  onTransportRetry?(attempt: number): Promise<void>;
   waitBeforeRetry?(delayMs: number): Promise<void>;
 }
 
@@ -163,7 +165,10 @@ export async function runValidationLifecycle(
   input: RunValidationLifecycleInput,
   executeValidation: ValidationExecutor = executeStepValidation,
 ): Promise<ValidationLifecycleResult> {
-  const run = async (executionId: string) => {
+  let transportRetries = 0;
+  let attemptCount = 0;
+  const runOnce = async (executionId: string) => {
+    attemptCount += 1;
     input.onExecutionChange(executionId);
     try {
       return await executeValidation({
@@ -178,10 +183,28 @@ export async function runValidationLifecycle(
     }
   };
 
+  const run = async (executionId: string): Promise<StepValidationResult> => {
+    for (;;) {
+      try {
+        return await runOnce(executionId);
+      } catch (error) {
+        // A missing exit after dispatch is ambiguous. Only reconnect/retry when
+        // SSH setup failed before this validation could have reached the server.
+        if (!input.onTransportRetry || !isSshConnectionSetupFailure(error)
+          || transportRetries >= 2 || input.isCancelled()) throw error;
+        transportRetries += 1;
+        await (input.waitBeforeRetry ?? defaultValidationWait)(transportRetries === 1 ? 500 : 1_500);
+        if (input.isCancelled()) throw error;
+        await input.onTransportRetry(transportRetries);
+        if (input.isCancelled()) throw error;
+        executionId = input.createRetryExecutionId();
+      }
+    }
+  };
+
   let validation = await run(input.initialExecutionId);
-  let attemptCount = 1;
   if (input.isCancelled() || !validationMayStillStabilize(validation)) {
-    return { validation, retried: false, firstFailedOutput: "", attemptCount };
+    return { validation, retried: attemptCount > 1, firstFailedOutput: "", attemptCount };
   }
 
   const firstFailedOutput = validation.output ?? "";
@@ -191,7 +214,6 @@ export async function runValidationLifecycle(
     await waitBeforeRetry(delayMs);
     if (input.isCancelled()) break;
     validation = await run(input.createRetryExecutionId());
-    attemptCount += 1;
     if (validation.passed || !validationMayStillStabilize(validation)) break;
   }
   return { validation, retried: attemptCount > 1, firstFailedOutput, attemptCount };

@@ -3,8 +3,6 @@ import { executeToolCall, parseToolCommand, parseUserInputArguments } from "@/fe
 import { resolveToolRegistry } from "@/features/tools/toolRegistry";
 
 describe("tool executor", () => {
-<<<<<<< HEAD
-=======
   it("locally protects an explicitly declared credential username without changing its binding", () => {
     const fields = [
       { key: "mysql_user", label: "用户名", description: "数据库账户", type: "text", required: true,
@@ -32,7 +30,6 @@ describe("tool executor", () => {
     expect(() => parseToolCommand(`opsark-tool evidence.read ${JSON.stringify({ evidenceId, taskId: "other-task" })}`, "read")).toThrow();
     expect(() => parseToolCommand(`opsark-tool evidence.read ${JSON.stringify({ evidenceId, limit: 12001 })}`, "read")).toThrow();
   });
->>>>>>> origin/master
   it("parses the model-facing tool command protocol", () => {
     expect(parseToolCommand(
       'opsark-tool files.get_structure {"rootPath":"/opt/app","maxDepth":4}',
