@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import ModelAdvancedParameters from "./ModelAdvancedParameters.vue";
 import { ref } from "vue";
 import { KeyRound, Plus, RefreshCw, Save, Shield, SlidersHorizontal, Trash2, X } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
@@ -8,6 +9,7 @@ defineProps<{ open: boolean }>();
 const emit = defineEmits<{ close: []; saved: [] }>();
 const store = useOpsStore();
 const { t } = useI18n();
+const saveError = ref("");
 const saveState = ref<"idle" | "saving" | "saved" | "error">("idle");
 
 async function save() {
@@ -16,7 +18,8 @@ async function save() {
     await store.saveModels();
     saveState.value = "saved";
     emit("saved");
-  } catch {
+  } catch (error) {
+    saveError.value = String(error instanceof Error ? error.message : error);
     saveState.value = "error";
   }
 }
@@ -34,7 +37,8 @@ async function removeModel(modelId: string) {
     await store.removeModel(modelId);
     saveState.value = "idle";
     emit("saved");
-  } catch {
+  } catch (error) {
+    saveError.value = String(error instanceof Error ? error.message : error);
     saveState.value = "error";
   }
 }
@@ -77,6 +81,7 @@ async function removeModel(modelId: string) {
         <span :class="['model-check-state', store.modelAvailability[model.id]?.status ?? 'unknown']">
           {{ store.modelAvailability[model.id]?.reason ?? t("settings.unchecked") }}
         </span>
+        <ModelAdvancedParameters :model="model" />
       </div>
       <button class="button secondary add-model-button" type="button" @click="store.addModel()"><Plus :size="14" />{{ t("settings.addModel") }}</button>
 
@@ -96,7 +101,7 @@ async function removeModel(modelId: string) {
       </div>
 
       <p class="security-hint"><Shield :size="14" />{{ t("settings.modelSecurityHint") }}</p>
-      <p v-if="saveState === 'error'" class="settings-error">{{ t("settings.saveFailed", { reason: store.credentialError }) }}</p>
+      <p v-if="saveState === 'error'" class="settings-error">{{ t("settings.saveFailed", { reason: saveError || store.credentialError }) }}</p>
       <div class="modal-actions">
         <button class="button secondary" type="button" :disabled="saveState === 'saving'" @click="recheck">
           <RefreshCw :class="{ spin: saveState === 'saving' }" :size="14" />{{ t("settings.recheck") }}

@@ -31,6 +31,11 @@ pub(crate) fn prepare_request(body: &Value) -> (Value, Value) {
         .as_object_mut()
         .and_then(|object| object.remove("_opsarkContext"))
         .and_then(|value| value.as_str().map(str::to_owned));
+    let reply_language = raw_context.as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|context| ["/_log/replyLanguage", "/baseSnapshot/_log/replyLanguage", "/task/_log/replyLanguage"]
+            .iter().find_map(|pointer| context.pointer(pointer).and_then(Value::as_str)
+                .filter(|language| matches!(*language, "zh-CN" | "en")).map(str::to_owned)));
     let mut log = Value::Object(Map::new());
     let Some(messages) = prepared.get_mut("messages").and_then(Value::as_array_mut) else {
         return (prepared, log);
@@ -38,6 +43,12 @@ pub(crate) fn prepare_request(body: &Value) -> (Value, Value) {
     let mut layered = Vec::new();
     for message in messages.iter() {
         let mut message = message.clone();
+        if message["role"] == "system" {
+            if let (Some(language), Some(content)) = (reply_language.as_deref(), message["content"].as_str()) {
+                let language = if language == "en" { "English" } else { "Simplified Chinese" };
+                message["content"] = json!(format!("{content}\nOutput language: {language}, selected from the latest user message. Use this language consistently for all user-facing prose, including answer, title, description, expected, reason and summary. Preserve JSON keys, enum values, commands, paths, identifiers and verbatim error quotes. Do not switch language to match logs, evidence or older messages. This rule overrides conflicting default prose-language instructions."));
+            }
+        }
         if message["role"] == "user" {
             if let Some(text) = message["content"].as_str() {
                 let labels = [
@@ -136,6 +147,25 @@ mod tests {
         .to_string();
         json!({"model":"model", "_opsarkContext":context, "messages":[{"role":"system","content":"fixed rules"},
           {"role":"user","content": format!("服务器上下文：\n{context}\n\n用户需求：\nquestion")}], "response_format":{"type":"json_object"}})
+    }
+    #[test]
+    fn applies_language_only_from_transport_metadata() {
+        for pointer in ["/_log", "/baseSnapshot/_log", "/task/_log"] {
+            for (code, label) in [("en", "English"), ("zh-CN", "Simplified Chinese")] {
+                let mut context = json!({"_log":{}, "baseSnapshot":{"_log":{}}, "task":{"_log":{}}, "output":{"replyLanguage":"en"}});
+                context.pointer_mut(pointer).unwrap()["replyLanguage"] = json!(code);
+                let raw = context.to_string();
+                let original = json!({"_opsarkContext":raw,"messages":[
+                    {"role":"system","content":"rules"},
+                    {"role":"user","content":format!("服务器上下文：\n{raw}")}],
+                    "response_format":{"type":"json_object"}});
+                let (prepared, _) = prepare_request(&original);
+                assert!(prepared["messages"][0]["content"].as_str().unwrap().contains(&format!("Output language: {label}")));
+                assert_eq!(prepared["response_format"], original["response_format"]);
+            }
+        }
+        let original = body("{\"replyLanguage\":\"en\"}", "read");
+        assert_eq!(prepare_request(&original).0["messages"][0], original["messages"][0]);
     }
     #[test]
     fn keeps_policy_prefix_stable_and_evidence_dynamic() {

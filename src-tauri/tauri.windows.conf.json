@@ -1,0 +1,16 @@
+{
+  "app": {
+    "windows": [{
+      "label": "main",
+      "title": "Opsark · 智能运维控制台",
+      "width": 1440,
+      "height": 900,
+      "minWidth": 960,
+      "minHeight": 680,
+      "decorations": false,
+      "resizable": true,
+      "shadow": true,
+      "transparent": false
+    }]
+  }
+}

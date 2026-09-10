@@ -98,7 +98,7 @@ describe("task goal lifecycle", () => {
     for (let index = 1; index <= 4; index += 1) {
       current.plan = [{
         ...step(`phase-step-${index}`),
-        output: index === 1 ? "OLD_RAW_OUTPUT_MUST_NOT_REACH_MODEL" : `output-${index}`,
+        output: index === 1 ? "EARLIER_VERIFIED_VALUE=enabled" : `output-${index}`,
         result: {
           executionStatus: "success",
           observationStatus: "matched",
@@ -125,7 +125,9 @@ describe("task goal lifecycle", () => {
     expect(snapshot.historyCheckpoint?.phaseSummaries.map(({ summary }) => summary))
       .toEqual(["phase 1", "phase 2"]);
     expect(snapshot.progress.totalSteps).toBe(5);
-    expect(JSON.stringify(snapshot)).not.toContain("OLD_RAW_OUTPUT_MUST_NOT_REACH_MODEL");
+    expect(snapshot.historyCheckpoint?.verifiedFacts[0].output).toMatchObject({
+      content: "EARLIER_VERIFIED_VALUE=enabled", contentState: "complete",
+    });
   });
 
   it("uses model relation when available and has a safe continuation fallback", () => {

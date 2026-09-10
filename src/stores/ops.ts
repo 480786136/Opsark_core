@@ -1,3 +1,4 @@
+import { validateRequestParameters } from "@/features/agent/modelParameters";
 import { defineStore } from "pinia";
 import { modelLogContext } from "@/features/agent/modelLogContext";
 import { restoreConversationLinks } from "@/features/agent/conversationHistory";
@@ -201,8 +202,8 @@ const executionServerId = (task: Pick<OpsTask, "serverId" | "executionTargetServ
 );
 let persistTimer: number | undefined;
 let credentialHydration: Promise<void> | undefined;
-const adjustingTaskIds = new Set<string>();
-const managedAdjustmentSchedulers = new Map<string, { requested: boolean }>();
+const adjustingTaskIds = new Map<string, ReturnType<typeof workflowLifetime>>();
+const managedAdjustmentSchedulers = new Map<string, { requested: boolean; current(): boolean }>();
 const recoveringAdjustmentTaskIds = new Set<string>();
 const resumingTransportTaskIds = new Set<string>();
 const secretValueId = (serverId: string, key: string) => `${serverId}::${key}`;
@@ -1325,11 +1326,13 @@ export const useOpsStore = defineStore("ops", {
       const targetServerId = task ? executionServerId(task) : undefined;
       const connection = targetServerId ? this.getRuntimeConnection(targetServerId) : undefined;
       if (!task || !connection || !isTauri() || !agentSandboxTerminalV1Enabled()) return undefined;
+      const epoch = task.workflowEpoch;
       const session = await backend.createAgentTerminal(targetServerId!, task.id, {
         host: connection.host,
         port: connection.port,
         username: connection.username,
       });
+      if (task.workflowEpoch !== epoch || executionServerId(task) !== targetServerId) return undefined;
       task.agentSessionId = session.id;
       task.agentSessionGeneration = session.generation;
       useAgentTerminalStore().registerSession(session);
@@ -1675,6 +1678,7 @@ export const useOpsStore = defineStore("ops", {
               apiKey: apiKey ?? "",
               endpoint: model.endpoint,
               model: model.model,
+              requestParameters: model.requestParameters,
               context,
               generationSettings: this.aiGenerationSettings,
             }, skillDefinitions);
@@ -1972,7 +1976,7 @@ export const useOpsStore = defineStore("ops", {
           await this.approvePlan(task.id, true);
         }
       } catch (error) {
-        if (task.cancelRequested) return;
+        if (task.cancelRequested || sourceTask.workflowEpoch !== submissionEpoch) return;
         transitionTask(task, "planning_failed");
         task.summary = undefined;
         const message = error instanceof Error ? error.message : String(error);
@@ -2175,13 +2179,13 @@ export const useOpsStore = defineStore("ops", {
     },
 
     async beginAdjustment(taskId: string, automatic = false, expectedFingerprint?: string) {
-      if (adjustingTaskIds.has(taskId)) return;
+      if (adjustingTaskIds.get(taskId)?.current()) return;
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || !["needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)) return;
       if (expectedFingerprint && task.adjustmentIncident?.fingerprint !== expectedFingerprint) return;
       const lifetime = workflowLifetime(task);
       if (automatic && this.stopAutomaticLoop(task)) return;
-      adjustingTaskIds.add(taskId);
+      adjustingTaskIds.set(taskId, lifetime);
       task.adjustmentInProgress = true;
       if (task.permission === "managed") {
         task.managedAdjustmentPhase = "generating";
@@ -2333,7 +2337,7 @@ export const useOpsStore = defineStore("ops", {
         this.persist();
       } finally {
         if (lifetime.current()) task.adjustmentInProgress = false;
-        adjustingTaskIds.delete(taskId);
+        if (adjustingTaskIds.get(taskId) === lifetime) adjustingTaskIds.delete(taskId);
         this.persist();
       }
     },
@@ -2343,7 +2347,7 @@ export const useOpsStore = defineStore("ops", {
     },
 
     async requestAdjustment(taskId: string, automatic = false) {
-      if (adjustingTaskIds.has(taskId)) return;
+      if (adjustingTaskIds.get(taskId)?.current()) return;
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || !["needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)) return;
       const failed = [...task.plan].reverse().find((step) => step.status === "failed");
@@ -2447,17 +2451,19 @@ export const useOpsStore = defineStore("ops", {
         return;
       }
       const activeScheduler = managedAdjustmentSchedulers.get(taskId);
-      if (activeScheduler) {
+      if (activeScheduler?.current()) {
         // Nested approve/advance calls may discover another continuation while
         // the prior adjustment promise is still unwinding. Record the request
         // instead of silently dropping it behind the old countdown lock.
         activeScheduler.requested = true;
         return;
       }
-      const scheduler = { requested: true };
+      const lifetime = workflowLifetime(task);
+      const scheduler = { requested: true, current: lifetime.current };
       managedAdjustmentSchedulers.set(taskId, scheduler);
       try {
         while (scheduler.requested) {
+          if (!lifetime.current()) break;
           scheduler.requested = false;
           const current = this.tasks.find((item) => item.id === taskId);
           if (!current || current.permission !== "managed"
@@ -2474,12 +2480,14 @@ export const useOpsStore = defineStore("ops", {
           current.managedAdjustmentPhase = "countdown";
           current.managedStopReason = undefined;
           for (let remaining = seconds; remaining > 0; remaining -= 1) {
+            if (!lifetime.current()) break;
             if (!["needs_adjustment", "awaiting_continuation"].includes(current.status)
               || current.cancelRequested) break;
             current.autoAdjustmentSeconds = remaining;
             this.persist();
             await wait(1_000);
           }
+          if (!lifetime.current()) break;
           if (!["needs_adjustment", "awaiting_continuation"].includes(current.status)
             || current.cancelRequested) continue;
           if (current.managedStopReason === "transport_recovery") break;
@@ -2503,7 +2511,7 @@ export const useOpsStore = defineStore("ops", {
         }
       } finally {
         const current = this.tasks.find((item) => item.id === taskId);
-        if (current) {
+        if (current && (lifetime.current() || current.cancelRequested && managedAdjustmentSchedulers.get(taskId) === scheduler)) {
           current.autoAdjustmentSeconds = undefined;
           if (current.cancelRequested) {
             current.managedAdjustmentPhase = "manual_required";
@@ -2516,7 +2524,7 @@ export const useOpsStore = defineStore("ops", {
             current.managedStopReason = "model_generation_failed";
           }
         }
-        managedAdjustmentSchedulers.delete(taskId);
+        if (managedAdjustmentSchedulers.get(taskId) === scheduler) managedAdjustmentSchedulers.delete(taskId);
         this.persist();
       }
     },
@@ -2669,7 +2677,7 @@ export const useOpsStore = defineStore("ops", {
             apiKey,
             generationSettings: this.aiGenerationSettings,
             skills: resolveTaskSkills(task, this.skills),
-            isCancelled: () => task.cancelRequested === true,
+            isCancelled: () => !lifetime.current(),
             onStart: () => {
               this.pushMessage(task, {
                 role: "system",
@@ -2775,7 +2783,7 @@ export const useOpsStore = defineStore("ops", {
           apiKey,
           serverId: targetServerId,
           taskId,
-          isCancelled: () => task.cancelRequested === true,
+          isCancelled: () => !lifetime.current(),
         });
         completionPipeline.audits.forEach((event) => this.addLog(event));
         if (completionPipeline.cancelled || !lifetime.current()) return;
@@ -2807,9 +2815,9 @@ export const useOpsStore = defineStore("ops", {
           apiKey,
           serverId: targetServerId,
           taskId,
-          isCancelled: () => task.cancelRequested === true,
+          isCancelled: () => !lifetime.current(),
         });
-        if (reviewPipeline.cancelled || task.cancelRequested) return;
+        if (reviewPipeline.cancelled || !lifetime.current()) return;
         reviewPipeline.audits.forEach((event) => this.addLog(event));
         const coordination = reviewPipeline.coordination;
         transitionTask(task, coordination.taskStatus);
@@ -3162,7 +3170,7 @@ export const useOpsStore = defineStore("ops", {
       let executionPhase: "command" | "validation" = "command";
       let agentSession: import("@/types").AgentSessionRef | undefined = agentTerminals.sessionsByTask[task.id];
       const invalidateAgentSession = (generation?: number) => {
-        if (!agentSession) return;
+        if (!agentSession || !lifetime.current()) return;
         agentTerminals.invalidateSession(task.id, agentSession.id, generation);
         task.agentSessionGeneration = agentTerminals.sessionsByTask[task.id]?.generation;
       };
@@ -3171,6 +3179,7 @@ export const useOpsStore = defineStore("ops", {
         if (useAgentSandbox && prepared.connection) {
           agentSession = await this.ensureTaskAgentSession(task.id);
         }
+        if (!lifetime.current()) return;
         const executionId = uid("exec");
         const startupTransaction = buildShellStartupTransaction(step, executionId);
         let startupRollbackAttempted = false;
@@ -3201,7 +3210,7 @@ export const useOpsStore = defineStore("ops", {
                   approvedHighRisk,
                   onSessionInvalidated: invalidateAgentSession,
                   onProgress: (event) => {
-                    if (!event.data || (event.stream !== "stdout" && event.stream !== "stderr")) return;
+                    if (!lifetime.current() || !event.data || (event.stream !== "stdout" && event.stream !== "stderr")) return;
                     const safeChunk = redactExecutionOutput(event.data, scopedSecrets);
                     if (!safeChunk) return;
                     frameworkStreamed = true;
@@ -3216,6 +3225,7 @@ export const useOpsStore = defineStore("ops", {
                   executionId: frameworkExecutionId,
                   secretValues: scopedSecrets,
                   onProgress: (safeChunk) => {
+                  if (!lifetime.current()) return;
                     frameworkStreamed = true;
                     agentTerminals.output(task.id, frameworkExecutionId, safeChunk);
                     appendTerminalStream(this.terminalLines, safeChunk);
@@ -3293,19 +3303,22 @@ export const useOpsStore = defineStore("ops", {
           connection: prepared.connection,
           runtimeModel: prepared.runtimeModel,
           secretValues: scopedSecrets,
-          isCancelled: () => task.cancelRequested === true,
+          isCancelled: () => !lifetime.current(),
           onExecutionChange: (activeExecutionId) => {
-            task.currentExecutionId = activeExecutionId;
+            if (lifetime.current()) task.currentExecutionId = activeExecutionId;
           },
           onProgress: (safeChunk, streamedOutput) => {
+            if (!lifetime.current()) return;
             step.output = `$ ${step.command}\n${streamedOutput}`;
             appendTerminalStream(this.terminalLines, safeChunk);
           },
           onHeartbeat: (elapsedSeconds, progressMessage) => {
+            if (!lifetime.current()) return;
             step.elapsedSeconds = elapsedSeconds;
             step.progressMessage = progressMessage;
           },
           onEvent: (role, content) => {
+            if (!lifetime.current()) return;
             this.pushMessage(task, { role, kind: "event", content });
             this.persist();
           },
@@ -3357,7 +3370,7 @@ export const useOpsStore = defineStore("ops", {
             promptCredential: interactivePromptCredential,
             onSessionInvalidated: invalidateAgentSession,
             onProgress: (event) => {
-              if (!event.data || (event.stream !== "stdout" && event.stream !== "stderr")) return;
+              if (!lifetime.current() || !event.data || (event.stream !== "stdout" && event.stream !== "stderr")) return;
               const safeChunk = redactExecutionOutput(event.data, scopedSecrets);
               if (!safeChunk) return;
               agentTerminals.output(task.id, input.executionId, safeChunk);
@@ -3389,7 +3402,7 @@ export const useOpsStore = defineStore("ops", {
             serverId: targetServerId, taskId,
           });
         }
-        if (task.cancelRequested) {
+        if (!lifetime.current()) {
           await rollbackShellStartup("任务已取消");
           return;
         }
@@ -3444,7 +3457,7 @@ export const useOpsStore = defineStore("ops", {
           return;
         }
         if (!result.success) {
-          if (result.exitCode === 130 || task.cancelRequested) return;
+          if (result.exitCode === 130 || !lifetime.current()) return;
           const failure = applyCommandFailure(step, {
             output: safeOutput,
             exitCode: result.exitCode,
@@ -3473,9 +3486,9 @@ export const useOpsStore = defineStore("ops", {
             apiKey,
             serverId: targetServerId,
             taskId,
-            isCancelled: () => task.cancelRequested === true,
+            isCancelled: () => !lifetime.current(),
           });
-          if (reviewPipeline.cancelled || task.cancelRequested) return;
+          if (reviewPipeline.cancelled || !lifetime.current()) return;
           reviewPipeline.audits.forEach((event) => this.addLog(event));
           const coordination = reviewPipeline.coordination;
           transitionTask(task, coordination.taskStatus);
@@ -3537,11 +3550,12 @@ export const useOpsStore = defineStore("ops", {
                 createRetryExecutionId: () => uid("validation-retry"),
                 connection: prepared.connection,
                 secretValues: serverSecretValues(this.secretValues, targetServerId),
-                isCancelled: () => task.cancelRequested === true,
+                isCancelled: () => !lifetime.current(),
                 onExecutionChange: (activeExecutionId) => {
-                  task.currentExecutionId = activeExecutionId;
+                  if (lifetime.current()) task.currentExecutionId = activeExecutionId;
                 },
                 onProgress: (safeChunk) => {
+                  if (!lifetime.current()) return;
                   validationStreamed = true;
                   appendTerminalStream(this.terminalLines, safeChunk);
                 },
@@ -3555,7 +3569,7 @@ export const useOpsStore = defineStore("ops", {
                   agentTerminals.system(task.id, "Agent 状态稳定复核");
                 },
                 onTransportRetry: useAgentSandbox ? async (attempt) => {
-                  if (task.cancelRequested) return;
+                  if (!lifetime.current()) return;
                   this.pushMessage(task, {
                     role: "system", kind: "event",
                     content: `后置校验 SSH 建连失败，正在重连并重试校验（${attempt}/2）；主命令结果已保留。`,
@@ -3586,7 +3600,7 @@ export const useOpsStore = defineStore("ops", {
                     promptCredential: validationPromptCredential,
                     onSessionInvalidated: invalidateAgentSession,
                     onProgress: (event) => {
-                      if (!event.data || (event.stream !== "stdout" && event.stream !== "stderr")) return;
+                      if (!lifetime.current() || !event.data || (event.stream !== "stdout" && event.stream !== "stderr")) return;
                       const safeChunk = redactExecutionOutput(event.data, scopedSecrets);
                       if (!safeChunk) return;
                       agentTerminals.output(task.id, input.executionId, safeChunk);
@@ -3608,7 +3622,7 @@ export const useOpsStore = defineStore("ops", {
                 }
                 : undefined);
             })();
-        if (task.cancelRequested) {
+        if (!lifetime.current()) {
           await rollbackShellStartup("任务在验收期间已取消");
           return;
         }
@@ -3686,9 +3700,9 @@ export const useOpsStore = defineStore("ops", {
           blockingFacts: classified.result.facts,
           serverId: targetServerId,
           taskId,
-          isCancelled: () => task.cancelRequested === true,
+          isCancelled: () => !lifetime.current(),
         });
-        if (reviewPipeline.cancelled || task.cancelRequested) return;
+        if (reviewPipeline.cancelled || !lifetime.current()) return;
         reviewPipeline.audits.forEach((event) => this.addLog(event));
         const coordination = reviewPipeline.coordination;
         transitionTask(task, coordination.taskStatus);
@@ -3712,7 +3726,7 @@ export const useOpsStore = defineStore("ops", {
         if (rollbackShellStartupOnFailure) {
           await rollbackShellStartupOnFailure("执行或验收通道异常");
         }
-        if (task.cancelRequested) return;
+        if (!lifetime.current()) return;
         if (executionPhase === "validation") {
           const failure = failValidationProtocol(step, error);
           if (isTerminalTransportFailure(error)) {
@@ -3749,9 +3763,9 @@ export const useOpsStore = defineStore("ops", {
               blockingFacts: step.result?.facts ?? {},
               serverId: targetServerId,
               taskId,
-              isCancelled: () => task.cancelRequested === true,
+              isCancelled: () => !lifetime.current(),
             });
-            if (reviewPipeline.cancelled || task.cancelRequested) return;
+            if (reviewPipeline.cancelled || !lifetime.current()) return;
             reviewPipeline.audits.forEach((event) => this.addLog(event));
             const coordination = reviewPipeline.coordination;
             transitionTask(task, coordination.taskStatus);
@@ -4198,6 +4212,7 @@ export const useOpsStore = defineStore("ops", {
     },
 
     async saveModels() {
+      for (const model of this.models) validateRequestParameters(model.requestParameters);
       this.aiGenerationSettings = normalizeAiGenerationSettings(this.aiGenerationSettings);
       this.models = this.models.filter((model) => model.provider !== "Built-in" && model.id !== "model-local");
       const credentials = this.models.map(async (model) => {
@@ -4244,6 +4259,7 @@ export const useOpsStore = defineStore("ops", {
             apiKey,
             endpoint: model.endpoint,
             model: model.model,
+            requestParameters: model.requestParameters,
           });
           this.modelAvailability[model.id] = {
             status: result.available ? "available" : "unavailable",

@@ -25,6 +25,7 @@ import { planningSkills } from "@/features/skills/skillPlanning";
 import { modelLogContext } from "./modelLogContext";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { executionContextEvidence, EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION } from "@/features/agent/executionContextEvidence";
+import { DECISION_EVIDENCE_INSTRUCTION } from "./decisionEvidence";
 
 export function trimEvidence(value: string | undefined, limit = 3200) {
   if (!value) return "";
@@ -299,7 +300,7 @@ export function buildNextStageContext(input: WorkflowContextInput) {
     skillEvidence: buildSkillEvidenceContext(activeSkills),
     tools: buildPlanningToolContext(input.tools, activeSkills),
     activeSkills: buildSkillContext(activeSkills),
-    instruction: "先依据 baseSnapshot 的真实 result/evidence 和全部 activeSkills 验收要求判断整体目标。证据充分时返回 complete 且 steps 为空；尚未完成时在同一响应中只规划当前证据允许的最小下一阶段。不得重复已完成步骤，不得用计划描述或阶段摘要冒充成功证据。",
+    instruction: `先依据 baseSnapshot 的真实输出、result/evidence 和全部 activeSkills 验收要求判断整体目标。证据充分时返回 complete 且 steps 为空；尚未完成时明确未满足条件和缺少的事实，只规划最小下一阶段。recoveredEvidence 是从已有执行记录补读的原文，应先检查，再决定是否需要执行新命令。不得重复已完成步骤，不得用计划描述或阶段摘要冒充成功证据。${DECISION_EVIDENCE_INSTRUCTION}`,
     server: serverSnapshot(input.server),
     executionConstraints: input.task.executionConstraints,
     secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),

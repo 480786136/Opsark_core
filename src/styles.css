@@ -1,3 +1,5 @@
+@import "./features/workspace/legacyWorkspaceTabs.css";
+
 @font-face {
   font-family: "DM Mono";
   src: local("SFMono-Regular"), local("Menlo"), local("Consolas"), local("Liberation Mono");
@@ -165,7 +167,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .security-hint { display: flex; align-items: flex-start; gap: 7px; margin: 5px 0 0; color: #68717d; font-size: 9px; line-height: 1.55; }
 .security-hint svg { flex: 0 0 auto; color: var(--accent); }
 
-.workspace { position: relative; width: 100%; height: 100%; display: grid; grid-template-rows: 48px minmax(0, 1fr) 34px; background: var(--bg); }
+.workspace { position: relative; width: 100%; height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr) 34px; background: var(--bg); }
 .workspace-header { display: flex; align-items: center; padding: 0 12px; gap: 9px; border-bottom: 1px solid var(--border); background: var(--chrome); }
 .back-button, .refresh-button { border: 0; background: transparent; cursor: pointer; color: var(--muted); }
 .back-button { width: 28px; height: 28px; display: grid; place-items: center; }
@@ -1446,7 +1448,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   .server-card { min-height: 176px; }
   .modal-actions { flex-wrap: wrap; }
   .modal-actions .button { flex: 1 1 120px; }
-  .workspace { height: 100%; grid-template-rows: 46px minmax(0, 1fr) 30px; }
+  .workspace { height: 100%; grid-template-rows: auto minmax(0, 1fr) 30px; }
   .workspace-header { min-width: 0; }
   .workspace-server-tab-add { flex: 0 0 32px; }
   .workspace-server-tab-add > button { width: 32px; }
@@ -1526,7 +1528,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 }
 
 @media (max-height: 520px) {
-  .workspace { grid-template-rows: 42px minmax(0, 1fr) 24px; }
+  .workspace { grid-template-rows: auto minmax(0, 1fr) 24px; }
   .workspace-header { padding-inline: 6px; }
   .workspace-server-window-tab > button:first-child { height: 40px; }
   .metrics-bar { font-size: 7px; }

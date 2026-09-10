@@ -437,7 +437,19 @@ export interface SubmittedSecretBinding {
   submittedAt: string;
 }
 
+export interface ModelRequestParameters {
+  temperature?: number;
+  top_p?: number;
+  max_tokens?: number;
+  max_completion_tokens?: number;
+  frequency_penalty?: number;
+  presence_penalty?: number;
+  reasoning_effort?: "low" | "medium" | "high";
+  thinking?: "default" | "enabled" | "disabled";
+}
+
 export interface ModelProfile {
+  requestParameters?: ModelRequestParameters;
   id: string;
   name: string;
   provider: string;

@@ -11,6 +11,7 @@ export function createRuntimeModel(
 ): RuntimeModel | undefined {
   if (!model || !apiKey) return undefined;
   return {
+    requestParameters: model.requestParameters,
     apiKey,
     endpoint: model.endpoint,
     model: model.model,

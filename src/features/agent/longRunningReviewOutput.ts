@@ -32,13 +32,16 @@ export function textFingerprint(value: string) {
 }
 
 export function compactReviewText(value: string | undefined, limit: number) {
+  limit = Math.max(0, Math.floor(limit));
+  if (!limit) return "";
   const text = (value ?? "").trim();
   if (text.length <= limit) return text;
   const marker = `\n…[已压缩，原始 ${text.length} 字符，指纹 ${textFingerprint(text)}]…\n`;
+  if (limit <= marker.length) return text.slice(0, limit);
   const available = Math.max(0, limit - marker.length);
   const headLength = Math.ceil(available * 0.4);
   const tailLength = Math.max(0, available - headLength);
-  return `${text.slice(0, headLength)}${marker}${text.slice(-tailLength)}`;
+  return `${text.slice(0, headLength)}${marker}${tailLength ? text.slice(-tailLength) : ""}`;
 }
 
 function compactLongLine(line: string) {

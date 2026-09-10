@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { ChevronLeft, KeyRound, Plus, RefreshCw, Server, Wifi, X } from "lucide-vue-next";
+import { KeyRound, RefreshCw, Server, Wifi, X } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import AgentConsole from "@/components/AgentConsole.vue";
 import FileExplorer from "@/components/FileExplorer.vue";
 import MetricsBar from "@/components/MetricsBar.vue";
 import TerminalWorkspace from "@/features/terminal/TerminalWorkspace.vue";
+import WorkspaceNavigation from "@/features/workspace/WorkspaceNavigation.vue";
 import WorkspaceToolbar from "@/features/workspace/WorkspaceToolbar.vue";
 import {
   resizeWorkspaceColumns,
@@ -29,13 +30,19 @@ const files = useFileWorkspaceStore();
 const windowTabs = useServerWorkspaceTabsStore();
 layout.hydrate();
 const { t } = useI18n();
-const serverId = computed(() => String(route.params.id));
+// KeepAlive views still observe the global route while hidden. Retain the last
+// server so switching to Local cannot unmount its terminal/Agent subtree.
+const serverId = ref(typeof route.params.id === "string" ? route.params.id : "");
+watch(() => route.path, () => {
+  if (route.path.startsWith("/server/") && typeof route.params.id === "string") {
+    serverId.value = route.params.id;
+  }
+});
 const server = computed(() => store.servers.find((item) => item.id === serverId.value));
 const openedServers = computed(() => windowTabs.openServerIds
   .map((id) => store.servers.find((item) => item.id === id))
   .filter((item): item is NonNullable<typeof item> => Boolean(item)));
 const connecting = ref(false);
-const serverMenuOpen = ref(false);
 const password = ref("");
 const isLive = computed(() => store.connectedServerIds.includes(serverId.value));
 const editorEntry = ref<FileEntry>();
@@ -56,7 +63,7 @@ const workspaceGridClass = computed(() => ({
 }));
 
 function startMetricsTimer() {
-  if (interval !== undefined) return;
+  if (interval !== undefined || !server.value) return;
   interval = window.setInterval(() => void store.refreshMetrics(serverId.value), 10000);
 }
 
@@ -73,6 +80,7 @@ onActivated(() => {
 onDeactivated(() => {
   viewActive.value = false;
   stopMetricsTimer();
+  stopResize?.();
 });
 onBeforeUnmount(() => {
   stopMetricsTimer();
@@ -133,26 +141,12 @@ function refreshFileDirectory() {
   void files.loadDirectory(server.value.id, connection, currentPath);
 }
 
-function switchServer(nextServerId: string) {
-  serverMenuOpen.value = false;
-  windowTabs.open(nextServerId);
-  if (nextServerId !== serverId.value) void router.push(`/server/${nextServerId}`);
-}
-
-function closeServerWindow(serverWindowId: string) {
-  const nextServerId = windowTabs.close(serverWindowId);
-  if (serverWindowId !== serverId.value) return;
-  if (nextServerId) void router.replace(`/server/${nextServerId}`);
-  else void router.push("/");
-}
-
 watch(serverId, async (nextServerId) => {
+  if (!nextServerId || !store.servers.some(server => server.id === nextServerId)) return;
   const activationVersion = serverActivationVersion + 1;
   serverActivationVersion = activationVersion;
-  serverMenuOpen.value = false;
   connecting.value = false;
   editorEntry.value = undefined;
-  windowTabs.hydrate(store.servers.map(({ id }) => id), nextServerId);
   const connected = await store.ensureServerConnected(nextServerId);
   if (activationVersion !== serverActivationVersion || nextServerId !== serverId.value) return;
   connecting.value = !connected;
@@ -163,47 +157,14 @@ watch(serverId, async (nextServerId) => {
 
 <template>
   <div v-if="server" class="workspace">
-    <header class="workspace-header">
-      <button class="back-button" @click="router.push('/')"><ChevronLeft :size="18" /></button>
-      <nav class="workspace-server-tabs" :aria-label="t('workspace.serverWindows')">
-        <div
-          v-for="option in openedServers"
-          :key="option.id"
-          :class="['workspace-server-window-tab', { active: option.id === server.id }]"
-        >
-          <button type="button" :title="`${option.username}@${option.host}`" @click="switchServer(option.id)">
-            <span :class="['workspace-server-status', option.status]" />
-            <span>{{ option.name }}</span>
-          </button>
-          <button type="button" class="workspace-server-window-close" :title="t('workspace.closeServerWindow')" @click.stop="closeServerWindow(option.id)"><X :size="11" /></button>
-        </div>
-      </nav>
-      <div class="workspace-server-tab-add">
-        <button type="button" :title="t('workspace.openServerWindow')" :aria-expanded="serverMenuOpen" @click="serverMenuOpen = !serverMenuOpen"><Plus :size="14" /></button>
-        <Transition name="layout-menu">
-          <section v-if="serverMenuOpen" class="workspace-server-menu" @keydown.esc="serverMenuOpen = false">
-            <header>{{ t("workspace.openServerWindow") }}</header>
-            <button
-              v-for="option in store.servers"
-              :key="option.id"
-              type="button"
-              :class="{ active: option.id === server.id }"
-              @click="switchServer(option.id)"
-            >
-              <span :class="['workspace-server-status', option.status]" />
-              <span><strong>{{ option.name }}</strong><small>{{ option.username }}@{{ option.host }}</small></span>
-              <span v-if="windowTabs.openServerIds.includes(option.id)" class="workspace-server-open-mark">{{ t("workspace.opened") }}</span>
-            </button>
-          </section>
-        </Transition>
-      </div>
+    <WorkspaceNavigation>
       <div :class="['workspace-env', { live: isLive, preparing: !isLive }]"><Wifi :size="13" />{{ isLive ? t("workspace.liveSession") : t("workspace.preparingSession") }}</div>
       <WorkspaceToolbar />
       <button class="refresh-button" :disabled="store.isCollecting" @click="refreshOrConnect">
         <RefreshCw v-if="isLive" :class="{ spin: store.isCollecting }" :size="15" />
         <KeyRound v-else :size="14" />{{ isLive ? t("workspace.refreshEnvironment") : t("workspace.connectServer") }}
       </button>
-    </header>
+    </WorkspaceNavigation>
     <div ref="workspaceGrid" :class="['workspace-grid', workspaceGridClass]" :style="workspaceGridStyle">
       <FileExplorer :key="`files-${server.id}`" :server-id="server.id" @edit="editorEntry = $event" />
       <button

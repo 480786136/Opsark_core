@@ -74,7 +74,8 @@ pub(crate) async fn post_model_request(
     timeout_seconds: u64,
     developer_log_path: Option<&Path>,
 ) -> Result<Value, String> {
-    let (prepared_body, mut log_context) = crate::prompt_layers::prepare_request(body);
+    let configured_body = crate::model_parameters::prepare(body)?;
+    let (prepared_body, mut log_context) = crate::prompt_layers::prepare_request(&configured_body);
     log_context["requestId"] = json!(crate::task_logs::call_id());
     let body = &prepared_body;
     let mut last_retryable_error = String::new();

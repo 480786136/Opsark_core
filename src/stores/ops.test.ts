@@ -173,6 +173,107 @@ describe("智能任务状态机", () => {
     });
   });
 
+  function completedObservationTask() {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
+    task.status = "running";
+    task.plan = [{ ...structuredClone(plan[0]), kind: "observe", status: "completed", output: "STATE=ready",
+      result: { executionStatus: "success", observationStatus: "matched", exitCode: 0,
+        facts: { found: true, lineCount: 1 }, warnings: [], evidenceIds: ["proof"] },
+      evidence: [{ id: "proof", type: "command-output", source: "main", rawOutput: "STATE=ready", facts: {}, collectedAt: "now" }],
+    }];
+    return { store, task };
+  }
+
+  it("目标判断等待期间终止任务，迟到结果不会恢复任务或把已完成步骤标为失败", async () => {
+    const { store, task } = completedObservationTask();
+    let resolveDecision;
+    vi.mocked(backend.decideNextStage).mockImplementationOnce(() => new Promise(resolve => { resolveDecision = resolve; }));
+    const running = store.advanceTask(task.id);
+    await vi.waitFor(() => expect(resolveDecision).toBeTypeOf("function"));
+    await store.terminateTask(task.id);
+    resolveDecision({ decision: "continue", steps: structuredClone(plan), reason: "next", summary: "next", source: "model" });
+    await running;
+    expect(task.status).toBe("cancelled");
+    expect(task.plan[0].status).toBe("completed");
+    expect(task.plan[0].output).toBe("STATE=ready");
+    expect(backend.reviewGoal).not.toHaveBeenCalled();
+    expect(task.messages.some(message => message.content.includes("非法步骤状态迁移"))).toBe(false);
+    expect(task.latestGoalReview).toBeUndefined();
+  });
+
+  it("取消后同一任务进入新轮次，旧模型结果不能覆盖新计划", async () => {
+    const { store, task } = completedObservationTask();
+    let resolveDecision;
+    vi.mocked(backend.decideNextStage).mockImplementationOnce(() => new Promise(resolve => { resolveDecision = resolve; }));
+    const running = store.advanceTask(task.id);
+    await vi.waitFor(() => expect(resolveDecision).toBeTypeOf("function"));
+    task.workflowEpoch = (task.workflowEpoch ?? 0) + 1;
+    task.currentRoundId = "new-round";
+    task.cancelRequested = false;
+    task.status = "running";
+    task.plan = [{ ...structuredClone(plan[0]), id: "new-step" }];
+    resolveDecision({ decision: "complete", steps: [], reason: "done", summary: "done", source: "model" });
+    await running;
+    expect(task.status).toBe("running");
+    expect(task.plan.map(step => step.id)).toEqual(["new-step"]);
+    expect(task.summary).toBeUndefined();
+    expect(backend.reviewGoal).not.toHaveBeenCalled();
+  });
+
+  it("后续规划服务异常只暂停编排，保留已完成步骤的状态与证据", async () => {
+    const { store, task } = completedObservationTask();
+    const before = JSON.parse(JSON.stringify(task.plan[0]));
+    vi.mocked(backend.decideNextStage).mockRejectedValueOnce(new Error("planner unavailable"));
+    vi.mocked(backend.reviewGoal).mockRejectedValueOnce(new Error("review unavailable"));
+    await expect(store.advanceTask(task.id)).resolves.toBeUndefined();
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.plan[0]).toEqual(before);
+    expect(task.managedStopReason).toBe("workflow_error");
+    await store.queueManagedAdjustment(task.id);
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+  });
+
+  it("通用无进展保护跨命令写法生效，自动暂停后仍允许明确人工调整", async () => {
+    const { store, task } = completedObservationTask();
+    const original = JSON.parse(JSON.stringify(task.plan[0]));
+    task.status = "awaiting_continuation";
+    task.phaseHistory = [0, 1].map(index => ({
+      id: `phase-${index}`, roundId: task.currentRoundId, reason: "adjustment", requirement: "query state",
+      plan: [{ ...original, id: `old-${index}`, title: `query-${index}`, command: `query-state-${index}` }],
+      createdAt: "now", completedAt: "now",
+    }));
+    await store.queueManagedAdjustment(task.id);
+    await store.requestAdjustment(task.id, true);
+    expect(task.managedStopReason).toBe("no_progress");
+    expect(task.managedAdjustmentPhase).toBe("manual_required");
+    expect(task.autoAdjustmentSeconds).toBeUndefined();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    const begin = vi.spyOn(store, "beginAdjustment").mockResolvedValue(undefined);
+    await store.requestAdjustment(task.id, false);
+    expect(begin).toHaveBeenCalledOnce();
+    expect(task.plan[0].status).toBe("completed");
+  });
+
+  it("旧轮次倒计时不会触发新轮次的调整，也不会清理新调度器", async () => {
+    vi.useFakeTimers();
+    const { store, task } = completedObservationTask();
+    task.status = "awaiting_continuation";
+    const request = vi.spyOn(store, "requestAdjustment").mockImplementation(async () => { task.status = "running"; });
+    const oldCountdown = store.queueManagedAdjustment(task.id, 2);
+    await vi.advanceTimersByTimeAsync(500);
+    task.workflowEpoch = (task.workflowEpoch ?? 0) + 1;
+    task.currentRoundId = "replacement-round";
+    const newCountdown = store.queueManagedAdjustment(task.id, 4);
+    await vi.advanceTimersByTimeAsync(2000);
+    await oldCountdown;
+    expect(request).not.toHaveBeenCalled();
+    expect(task.autoAdjustmentSeconds).toBeGreaterThan(0);
+    await vi.advanceTimersByTimeAsync(3000);
+    await newCountdown;
+    expect(request).toHaveBeenCalledOnce();
+  });
+
   function setupAgentClone() {
     vi.useFakeTimers();
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
@@ -272,6 +373,24 @@ describe("智能任务状态机", () => {
     expect(task.plan[0].status).toBe("failed");
     expect(backend.executeCommand).not.toHaveBeenCalled();
     expect(backend.generatePlan).not.toHaveBeenCalled();
+  });
+
+  it("旧需求规划延迟失败不会覆盖新轮次状态", async () => {
+    const store = useOpsStore();
+    let rejectRequest;
+    vi.mocked(backend.processRequirement).mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectRequest = reject; }));
+    const pending = store.submitRequirement("srv-production-01", "检查服务", "safe", "model-deepseek");
+    await vi.waitFor(() => expect(rejectRequest).toBeTypeOf("function"));
+    const task = store.activeTask!;
+    task.workflowEpoch = (task.workflowEpoch ?? 0) + 1;
+    task.currentRoundId = "replacement-round";
+    task.status = "awaiting_plan_approval";
+    task.plan = [{ ...structuredClone(plan[0]), id: "replacement-step" }];
+    rejectRequest(new Error("old request failed"));
+    await pending;
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(task.plan[0].id).toBe("replacement-step");
+    expect(task.pauseReason).toBeUndefined();
   });
 
   it("记录完整且脱敏的需求处理开发者日志", async () => {

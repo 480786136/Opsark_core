@@ -536,7 +536,7 @@ describe("agentService", () => {
     expect(review.mock.calls[0][1]).not.toContain("dependencies");
   });
 
-  it("bounds the overall-goal ledger and keeps only exceptional output content", async () => {
+  it("bounds the overall-goal ledger while retaining short successful evidence and failure details", async () => {
     const currentTask = task();
     const noisyFailure = [
       "build started",
@@ -596,7 +596,7 @@ describe("agentService", () => {
       incidentIncludedSeparately: true,
     });
     expect(successful.output).toHaveProperty("totalCharacters");
-    expect(successful.output).not.toHaveProperty("content");
+    expect(successful.output).toMatchObject({ content: "successful raw output 0", contentState: "complete" });
     expect(failed.title).toBe("step-30");
     expect(failed.output.content).toContain("fatal: deployment artifact is missing");
     expect(failed.output.salientLines).toContain("fatal: deployment artifact is missing");

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { onBeforeUnmount, onDeactivated, onMounted, ref } from "vue";
 import { Bot, Check, Columns3, FolderTree, SquareTerminal } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import {
@@ -12,6 +12,7 @@ const { t } = useI18n();
 const layout = useWorkspaceLayoutStore();
 const root = ref<HTMLElement>();
 const menuOpen = ref(false);
+onDeactivated(() => { menuOpen.value = false; });
 
 const presetOptions: Array<{ id: WorkspaceLayoutPreset; labelKey: string }> = [
   { id: "shell", labelKey: "workspace.layoutShell" },

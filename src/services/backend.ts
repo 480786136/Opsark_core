@@ -1,3 +1,4 @@
+import { parameterContext, validateRequestParameters } from "@/features/agent/modelParameters";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { AgentSessionContext, AgentSessionRef, AiGenerationSettings, ExecutionScope, FileEntry, Metrics, ModelDeveloperTrace, NextStageDecision, PlanStep, RequirementProcessingResult, ServerInfo, StepReview } from "@/types";
@@ -28,6 +29,7 @@ export interface RuntimeConnection {
 }
 
 export interface RuntimeModel {
+  requestParameters?: import("@/types").ModelRequestParameters;
   logContext?: Record<string, unknown>;
   apiKey: string;
   endpoint: string;
@@ -562,7 +564,7 @@ export const backend = {
           endpoint: runtimeModel.endpoint,
           model: runtimeModel.model,
           requirement,
-          context: runtimeModel.context,
+          context: parameterContext(runtimeModel.context, runtimeModel.requestParameters),
           generationSettings: runtimeModel.generationSettings,
         });
       } catch (error) {
@@ -578,7 +580,7 @@ export const backend = {
             endpoint: runtimeModel.endpoint,
             model: runtimeModel.model,
             requirement: `${requirement}\n\n上次计划未通过本地协议校验。请依据 context.planGenerationRepair 只修复格式并重新返回完整计划。`,
-            context: contextWithPlanRepair(runtimeModel.context, repair),
+            context: parameterContext(contextWithPlanRepair(runtimeModel.context, repair), runtimeModel.requestParameters),
             generationSettings: runtimeModel.generationSettings,
           });
           assertPlanRepairScope(repair, repaired);
@@ -618,7 +620,7 @@ export const backend = {
           endpoint: runtimeModel.endpoint,
           model: runtimeModel.model,
           requirement,
-          context: runtimeModel.context,
+          context: parameterContext(runtimeModel.context, runtimeModel.requestParameters),
           skillDefinitions,
           generationSettings: runtimeModel.generationSettings,
         });
@@ -635,7 +637,7 @@ export const backend = {
             endpoint: runtimeModel.endpoint,
             model: runtimeModel.model,
             requirement: `${requirement}\n\n上次执行计划未通过本地协议校验。保持已判定的用户意图和任务关系，仅依据 context.planGenerationRepair 修复计划格式。`,
-            context: contextWithPlanRepair(runtimeModel.context, repair),
+            context: parameterContext(contextWithPlanRepair(runtimeModel.context, repair), runtimeModel.requestParameters),
             skillDefinitions,
             generationSettings: runtimeModel.generationSettings,
           });
@@ -655,6 +657,7 @@ export const backend = {
     if (!runtimeModel.model.trim()) return { available: false, reason: "未配置模型名称" };
     if (!isTauri()) return { available: false, reason: "需要在 Opsark 桌面端验证真实模型连接" };
     return invoke("check_ai_model", {
+      requestParameters: validateRequestParameters(runtimeModel.requestParameters),
       apiKey: runtimeModel.apiKey,
       endpoint: runtimeModel.endpoint,
       model: runtimeModel.model,
@@ -672,6 +675,7 @@ export const backend = {
           requirement,
           executionContext: JSON.stringify({
             _log: runtimeModel.logContext,
+            _requestParameters: validateRequestParameters(runtimeModel.requestParameters),
             steps: steps.map(({ title, command, expected, status, output, result, evidence }) => ({
               title,
               command,
@@ -711,7 +715,7 @@ export const backend = {
         endpoint: runtimeModel.endpoint,
         model: runtimeModel.model,
         requirement,
-        reviewContext,
+        reviewContext: parameterContext(reviewContext, runtimeModel.requestParameters),
       });
       return { ...review, source: "model" };
     } catch {
@@ -741,7 +745,7 @@ export const backend = {
         endpoint: runtimeModel.endpoint,
         model: runtimeModel.model,
         requirement,
-        reviewContext,
+        reviewContext: parameterContext(reviewContext, runtimeModel.requestParameters),
       });
       return { ...review, source: "model" };
     } catch {
@@ -771,7 +775,7 @@ export const backend = {
         endpoint: runtimeModel.endpoint,
         model: runtimeModel.model,
         requirement,
-        context: runtimeModel.context,
+        context: parameterContext(runtimeModel.context, runtimeModel.requestParameters),
         generationSettings: runtimeModel.generationSettings,
       });
       return {

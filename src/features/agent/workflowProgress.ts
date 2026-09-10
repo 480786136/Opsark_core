@@ -15,9 +15,15 @@ function factsWithoutStatistics(value: unknown): unknown {
 
 /** Evidence identity excludes the plan's wording and executor bookkeeping. */
 export function observationIdentity(step: PlanStep) {
+  let target: unknown = step.attemptContext;
+  try {
+    const context: unknown = JSON.parse(step.attemptContext ?? "null");
+    if (Array.isArray(context)) target = [context[0], context[4]];
+  } catch { /* Legacy opaque target identities remain distinct. */ }
   const output = (step.output ?? step.evidence?.map(item => item.rawOutput).join("\n") ?? "")
     .replace(/\[exit:\s*-?\d+\]/g, "").trim().replace(/\r\n/g, "\n");
   return textFingerprint(JSON.stringify({
+    target,
     output,
     result: factsWithoutStatistics(step.result?.facts ?? {}),
     status: step.result?.observationStatus,
@@ -41,6 +47,7 @@ export function workflowProgress(task: OpsTask) {
     completedPhases += 1;
     const changed = steps.some(step => step.kind === "change" && step.status === "completed"
       && step.result?.executionStatus === "success");
+    if (changed) seen.clear();
     let added = false;
     for (const step of steps) {
       if (!step.result || !step.output && !step.evidence?.length) continue;

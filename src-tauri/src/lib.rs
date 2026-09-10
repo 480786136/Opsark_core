@@ -8,6 +8,8 @@ mod credential;
 mod evidence_store;
 mod file_tree;
 mod json_contract;
+mod local_terminal;
+mod model_parameters;
 mod knowledge;
 mod metrics;
 mod model;
@@ -2964,7 +2966,15 @@ async fn check_ai_model(
     api_key: String,
     endpoint: String,
     model: String,
+    request_parameters: Option<Value>,
 ) -> Result<ModelCheckResult, String> {
+    if let Some(parameters) = request_parameters.filter(|value| value.as_object().is_some_and(|object| !object.is_empty())) {
+        let mut body = json!({"model":model,"messages":[{"role":"user","content":"Reply OK."}],"max_tokens":16});
+        model_parameters::apply(&mut body, &parameters)?;
+        let payload = post_model_request(&format!("{}/chat/completions", endpoint.trim_end_matches('/')), &api_key, &body, "模型参数测试", 60, None).await?;
+        message_content(&payload, "模型测试没有返回文本")?;
+        return Ok(ModelCheckResult { available: true, reason: "模型生成测试通过，接口已接受请求参数（实际效果以服务端实现为准）".into() });
+    }
     let availability = check_model_availability(&api_key, &endpoint, &model).await?;
     Ok(ModelCheckResult {
         available: availability.available,
@@ -3095,10 +3105,15 @@ async fn review_ai_step(
 pub fn run() {
     tauri::Builder::default()
         .manage(TerminalManager::default())
+        .manage(local_terminal::LocalTerminalManager::default())
         .manage(AgentTerminalManager::default())
         .manage(SftpTransferManager::default())
         .manage(ExecutionManager::default())
         .invoke_handler(tauri::generate_handler![
+            local_terminal::open_local_terminal,
+            local_terminal::write_local_terminal,
+            local_terminal::resize_local_terminal,
+            local_terminal::close_local_terminal,
             append_task_log,
             save_task_evidence,
             read_task_evidence,

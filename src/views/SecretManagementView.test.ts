@@ -39,7 +39,7 @@ describe("SecretManagementView", () => {
       serverId: "server-b",
     }];
     const workspaceTabs = useServerWorkspaceTabsStore(pinia);
-    workspaceTabs.activeServerId = "server-b";
+    workspaceTabs.open("server-b");
 
     const app = createApp(SecretManagementView);
     app.use(pinia).use(i18n).mount(host);
@@ -95,22 +95,22 @@ describe("SecretManagementView", () => {
       { id: "server-b", name: "Beta", host: "10.0.0.2", port: 22, username: "root", group: "test", status: "online", environment: [], info: { os: "Linux", kernel: "6", cpu: "CPU", cores: 1, memoryGb: 1, diskGb: 1, uptime: "1h" }, createdAt },
     ];
     const workspaceTabs = useServerWorkspaceTabsStore(pinia);
-    workspaceTabs.activeServerId = "server-a";
+    workspaceTabs.open("server-a");
     const app = createApp(SecretManagementView);
     app.use(pinia).use(i18n).mount(host);
     await nextTick();
     const select = host.querySelector<HTMLSelectElement>(".secret-server-picker select")!;
 
-    workspaceTabs.activeServerId = "server-b";
+    workspaceTabs.open("server-b");
     await nextTick();
     expect(select.value).toBe("server-b");
 
     select.value = "server-a";
     select.dispatchEvent(new Event("change", { bubbles: true }));
     await nextTick();
-    workspaceTabs.activeServerId = "server-a";
+    workspaceTabs.open("server-a");
     await nextTick();
-    workspaceTabs.activeServerId = "server-b";
+    workspaceTabs.open("server-b");
     await nextTick();
 
     expect(select.value).toBe("server-a");

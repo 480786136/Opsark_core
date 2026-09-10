@@ -4,7 +4,6 @@ import {
   compactReviewOutput,
   compactReviewPlanStep,
   compactReviewResult,
-  reviewOutputMetadata,
   reviewPlanSummary,
 } from "@/features/agent/reviewPayload";
 import {
@@ -74,9 +73,7 @@ function compactStep(step: PlanStep, detail: "current" | "recent", project: Retu
       : undefined,
     commandFingerprint: textFingerprint(step.command),
     result: compactReviewResult(step.result, exceptional ? 1_500 : 800),
-    output: typeof step.result?.facts.toolId === "string" && detail === "current"
-      ? { ...reviewOutputMetadata(step.output), contentRef: "currentToolResults", stepId: step.id }
-      : project(step.output, step.evidence, detail === "current" ? 2_048 : 1_024),
+    output: project(step.output, step.evidence, detail === "current" ? 2_048 : 1_024),
     targetContext: step.attemptContext,
     executionScope: step.executionScope,
     validationScope: step.validationScope,
@@ -146,7 +143,9 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
     .slice(-12).map((step) => ({
       stepId: step.id, evidenceIds: step.result?.evidenceIds, toolId: step.result?.facts.toolId,
       truncated: step.result?.facts.truncated, targetContext: step.attemptContext,
-      content: project(step.output, step.evidence),
+      content: currentSteps.some(item => item.stepId === step.id)
+        ? { contentRef: "currentPlan.steps.output", stepId: step.id }
+        : project(step.output, step.evidence),
     }));
   const recentPhases = (task.phaseHistory ?? [])
     .filter((phase) => phase.roundId === task.currentRoundId)
