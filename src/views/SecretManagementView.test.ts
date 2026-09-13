@@ -46,7 +46,7 @@ describe("SecretManagementView", () => {
     await nextTick();
 
     expect(host.querySelector<HTMLSelectElement>(".secret-server-picker select")?.value).toBe("server-b");
-    expect(host.querySelector<HTMLInputElement>(".secret-editor-row input")?.value).toBe("GIT_HTTP_CREDENTIAL");
+    expect(host.querySelector(".secret-row-copy strong")?.textContent).toBe("GIT_HTTP_CREDENTIAL");
     expect(host.textContent).toContain("Beta · 10.0.0.2 · 1");
     expect(host.querySelector(".secret-empty-state")).toBeNull();
 
@@ -79,7 +79,7 @@ describe("SecretManagementView", () => {
     app.use(pinia).use(i18n).mount(host);
     await nextTick();
 
-    expect(host.querySelectorAll(".secret-editor-row")).toHaveLength(2);
+    expect(host.querySelectorAll(".secret-list-row")).toHaveLength(2);
     expect(host.textContent).toContain("Alpha · 10.0.0.1 · 2");
     expect(host.textContent).toContain("Gitee HTTPS 凭据 · gitee.com · 用户名字段");
     expect(host.textContent).toContain("Gitee HTTPS 凭据 · gitee.com · 密码/令牌字段");

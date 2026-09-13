@@ -1125,12 +1125,12 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 /* 智能需求处理：统一主题、强化信息层级与状态动效 */
 .agent-panel { container: agent / inline-size; background: linear-gradient(180deg, color-mix(in srgb, var(--panel) 96%, var(--accent) 4%), var(--panel)); }
 .agent-header { height: 48px; padding: 0 14px; background: color-mix(in srgb, var(--raised) 96%, var(--accent) 4%); box-shadow: 0 1px 0 var(--border-soft); }
-.agent-title { gap: 8px; }
+.agent-title { flex: 1 1 0; gap: 8px; margin-right: 12px; }
 .agent-title-icon { width: 28px; height: 28px; flex: 0 0 28px; display: grid; place-items: center; border: 1px solid var(--accent-border); border-radius: 8px; color: var(--accent); background: var(--accent-soft); }
-.agent-title-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.agent-title-copy { min-width: 0; flex: 1 1 0; display: flex; flex-direction: column; gap: 2px; }
 .agent-title-copy strong { font-size: 10px; }
-.agent-title-copy small { max-width: 180px; overflow: hidden; color: var(--dim); font-size: 7.5px; text-overflow: ellipsis; white-space: nowrap; }
-.beta { border-color: var(--accent-border); background: var(--accent-soft); }
+.agent-title-copy small { overflow: hidden; color: var(--dim); font-size: 7.5px; text-overflow: ellipsis; white-space: nowrap; }
+.beta { flex-shrink: 0; border-color: var(--accent-border); background: var(--accent-soft); }
 .agent-activity { display: inline-flex; align-items: center; gap: 5px; color: var(--accent); font-size: 7.5px; white-space: nowrap; }
 .agent-activity i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 45%, transparent); animation: agent-status-pulse 1.8s ease-out infinite; }
 .task-menu-trigger { width: auto; min-width: 94px; max-width: 150px; min-height: 34px; flex: 0 0 auto; padding: 3px 7px; border: 1px solid transparent; border-radius: 7px; color: var(--muted); }
@@ -1166,6 +1166,17 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 .task-strip .new-task { min-height: 34px; margin-top: 6px; border-top: 0; border: 1px dashed var(--accent-border); color: var(--accent); background: var(--accent-soft); }
 .task-strip .new-task:hover { background: color-mix(in srgb, var(--accent) 17%, transparent); }
 .task-strip-empty { padding: 24px 10px; color: var(--dim); font-size: 8px; text-align: center; }
+.task-strip-head { gap: 10px; min-height: 44px; }
+.task-strip-heading { flex: 1; }
+.task-strip-head .icon-button { width: 26px; height: 26px; flex: none; }
+.task-strip-heading small { font-size: 9px; }
+.task-strip-list { flex: 1; }
+.task-menu-search { display: flex; align-items: center; gap: 8px; margin: 9px 3px 5px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 5px; background: var(--panel); color: var(--muted); }
+.task-menu-search input { width: 100%; min-width: 0; border: 0; background: transparent; color: var(--text); font-size: 11px; }
+.task-strip .task-select strong { display: block; white-space: nowrap; text-overflow: ellipsis; font-size: 11px; }
+.task-strip .task-select > span:last-child { min-width: 0; }
+.task-strip small { font-size: 9px; }
+.task-strip .task-delete { flex: 0 0 30px; }
 
 /* 智能运维开启页：环境扫描、能力点亮与启动反馈 */
 .agent-welcome { position: relative; isolation: isolate; width: min(100%, 360px); max-width: 360px; padding: 34px 28px; }
@@ -1277,7 +1288,6 @@ button:disabled { opacity: .48; cursor: not-allowed; }
 
 @container agent (max-width: 520px) {
   .agent-header { padding-inline: 10px; }
-  .agent-title-copy small { max-width: 120px; }
   .agent-activity { max-width: 92px; overflow: hidden; text-overflow: ellipsis; }
   .agent-timeline { padding: 18px 10px 24px; }
   .task-message { gap: 8px; }
@@ -1312,7 +1322,7 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   .agent-header { gap: 6px; }
   .agent-title { gap: 6px; overflow: hidden; }
   .agent-title-icon { width: 26px; height: 26px; flex-basis: 26px; }
-  .agent-title-copy small, .beta, .agent-activity { display: none; }
+  .beta, .agent-activity { display: none; }
   .task-menu-trigger { min-width: 78px; max-width: 92px; padding-inline: 5px; }
   .task-menu-trigger-icon { width: 22px; height: 22px; flex-basis: 22px; }
   .task-menu-trigger-copy { display: flex; }
@@ -1595,6 +1605,20 @@ button:disabled { opacity: .48; cursor: not-allowed; }
   }
 }
 
+/* Panel switches remain authoritative at every viewport width. */
+.workspace-grid.hide-files > .file-panel,
+.workspace-grid.hide-terminal > .terminal-workspace-stack,
+.workspace-grid.hide-agent > .agent-workspace-stack { display: none !important; }
+.workspace-panels-empty { grid-column: 1 / -1; margin: auto; padding: 24px; color: var(--muted); font-size: 13px; text-align: center; }
+@media (max-width: 760px) {
+  .workspace-layout-controls { display: flex; }
+  .workspace-layout-button { display: none; }
+}
+@media (min-width: 761px) {
+  .workspace-grid:not(.hide-files) > .file-panel { display: flex !important; }
+  .workspace-grid:not(.hide-terminal) > .terminal-workspace-stack { display: block !important; }
+  .workspace-grid:not(.hide-agent) > .agent-workspace-stack { display: flex !important; }
+}
 .current-plan-card > .plan-card-head {
   min-height: 39px;
   padding: 6px 10px;

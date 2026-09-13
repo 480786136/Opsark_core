@@ -210,6 +210,7 @@ fn generate_live_deepseek_plan() {
         "只读检查服务器磁盘空间".into(),
         r#"{"os":"CentOS 7","diskUsage":"82%","permission":"safe"}"#.into(),
         None,
+        90,
         &mut developer_trace,
         None,
     ))

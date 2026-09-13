@@ -11,7 +11,7 @@ afterEach(() => { app?.unmount(); document.body.innerHTML = ""; });
 async function mount() {
   const pinia = createPinia(); setActivePinia(pinia);
   const store = useOpsStore();
-  store.models = [{ id: "one", name: "Example", model: "model", provider: "Compatible", endpoint: "https://example.test/v1", enabled: true, hasApiKey: true }];
+  store.models = [{ id: "one", name: "Example", model: "model", provider: "Compatible", endpoint: "https://example.test/v1", enabled: true, hasApiKey: true, timeoutSeconds: 180 }];
   store.modelApiKeys.one = "secret";
   const host = document.createElement("div"); document.body.append(host);
   app = createApp(ModelManagementView).use(pinia).use(createI18n({ legacy: false, locale: "en", missingWarn: false, fallbackWarn: false, messages: { en: {} } }));
@@ -43,4 +43,16 @@ it("opening and cancelling a new model does not persist an empty record", async 
   expect(store.models).toHaveLength(1);
   document.querySelector('[role="dialog"]')!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await nextTick();
   expect(store.models).toHaveLength(1);
+});
+it("keeps the editor open on backdrop clicks and saves the per-model timeout", async () => {
+  const store = await mount();
+  vi.spyOn(store, "saveModels").mockResolvedValue();
+  document.querySelector<HTMLButtonElement>(".model-card")!.click(); await nextTick();
+  document.querySelector<HTMLElement>(".drawer-overlay")!.click(); await nextTick();
+  expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+  const timeout = document.querySelector<HTMLInputElement>('input[type="number"]')!;
+  timeout.value = "360"; timeout.dispatchEvent(new Event("input")); await nextTick();
+  document.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+  await nextTick(); await nextTick();
+  expect(store.models[0].timeoutSeconds).toBe(360);
 });

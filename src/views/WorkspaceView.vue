@@ -52,7 +52,9 @@ let interval: number | undefined;
 let stopResize: (() => void) | undefined;
 let serverActivationVersion = 0;
 
+const allPanelsVisible = computed(() => Object.values(layout.visiblePanels).every(Boolean));
 const workspaceGridStyle = computed<Record<string, string>>(() => ({
+  gridTemplateColumns: (["files", "terminal", "agent"] as const).filter(panel => layout.visiblePanels[panel]).map(panel => `minmax(0, ${layout.columns[panel]}fr)`).join(allPanelsVisible.value ? " 5px " : " "),
   "--files-column": `${layout.columns.files}fr`,
   "--terminal-column": `${layout.columns.terminal}fr`,
   "--agent-column": `${layout.columns.agent}fr`,
@@ -60,6 +62,9 @@ const workspaceGridStyle = computed<Record<string, string>>(() => ({
 const workspaceGridClass = computed(() => ({
   [`focus-${layout.focusPanel}`]: Boolean(layout.focusPanel),
   "has-focus": Boolean(layout.focusPanel),
+  "hide-files": !layout.visiblePanels.files,
+  "hide-terminal": !layout.visiblePanels.terminal,
+  "hide-agent": !layout.visiblePanels.agent,
 }));
 
 function startMetricsTimer() {
@@ -168,6 +173,7 @@ watch(serverId, async (nextServerId) => {
     <div ref="workspaceGrid" :class="['workspace-grid', workspaceGridClass]" :style="workspaceGridStyle">
       <FileExplorer :key="`files-${server.id}`" :server-id="server.id" @edit="editorEntry = $event" />
       <button
+        v-if="allPanelsVisible"
         class="workspace-resizer"
         type="button"
         role="separator"
@@ -184,10 +190,12 @@ watch(serverId, async (nextServerId) => {
           v-show="option.id === server.id"
           :key="`terminal-${option.id}`"
           :server-id="option.id"
+          :active="viewActive && option.id === server.id"
           :workspace-active="viewActive && option.id === server.id"
         />
       </section>
       <button
+        v-if="allPanelsVisible"
         class="workspace-resizer"
         type="button"
         role="separator"
@@ -206,6 +214,7 @@ watch(serverId, async (nextServerId) => {
           :server-id="option.id"
         />
       </section>
+      <p v-if="!Object.values(layout.visiblePanels).some(Boolean)" class="workspace-panels-empty">点击顶部文件、终端或 AI 图标显示对应区域</p>
     </div>
     <MetricsBar />
     <div v-if="editorEntry" class="workspace-editor-backdrop">

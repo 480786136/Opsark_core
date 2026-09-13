@@ -22,6 +22,8 @@ import {
   Sparkles,
   TerminalSquare,
   Trash2,
+  X,
+  Search,
 } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import { useOpsStore } from "@/stores/ops";
@@ -34,7 +36,7 @@ import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
 import { useWorkspaceLinkStore } from "@/features/workspace/workspaceLinkStore";
 import { conversationHistoryRounds } from "@/features/agent/conversationHistory";
 
-const props = defineProps<{ serverId: string }>();
+const props = defineProps<{ serverId: string; active?: boolean }>();
 const store = useOpsStore();
 const agentWorkspaces = useAgentWorkspaceStore();
 const workspaceLinks = useWorkspaceLinkStore();
@@ -42,6 +44,10 @@ const { t, locale } = useI18n();
 const taskMenuTrigger = ref<HTMLElement>();
 const taskMenu = ref<HTMLElement>();
 const workspaceState = agentWorkspaces.ensureServer(props.serverId);
+watch(() => props.active, (active) => {
+  if (active !== false) agentWorkspaces.updateServer(props.serverId, { activeTaskId: "", showTasks: false });
+}, { immediate: true });
+const taskQuery = ref("");
 const persistedField = <K extends keyof typeof workspaceState>(key: K) => computed({
   get: () => workspaceState[key],
   set: (value: typeof workspaceState[K]) => agentWorkspaces.updateServer(props.serverId, { [key]: value }),
@@ -60,9 +66,11 @@ const terminalReference = ref("");
 const secretInput = ref("");
 const userInputValues = ref<Record<string, string>>({});
 const timeline = ref<HTMLElement>();
+const pendingFreshRequirement = ref("");
 
 const serverTasks = computed(() => store.tasks.filter((task) => task.serverId === props.serverId));
 const task = computed(() => serverTasks.value.find((item) => item.id === workspaceState.activeTaskId));
+const filteredTasks = computed(() => serverTasks.value.filter(item => item.title.toLowerCase().includes(taskQuery.value.toLowerCase())));
 const conversationRounds = computed(() => task.value ? conversationHistoryRounds(serverTasks.value, task.value) : []);
 const pendingApproval = computed(() => task.value?.plan.find((step) => step.status === "awaiting_approval"));
 const failedStep = computed(() => task.value?.plan.find((step) => step.status === "failed"));
@@ -156,7 +164,7 @@ const currentConversationMessages = computed(() => {
     !isPlanProgressMessage(message.content) || index === latestPlanProgressIndex
   ));
 });
-const currentPhases = computed(() => (task.value?.phaseHistory ?? [])
+const currentPhases = computed(() => pendingFreshRequirement.value ? [] : (task.value?.phaseHistory ?? [])
   .filter((phase) => phase.roundId === task.value?.currentRoundId));
 const currentRecords = computed(() => {
   if (!task.value) return [];
@@ -206,21 +214,37 @@ async function submit() {
   if (!value || !automationEnabled.value || isBusy.value || !modelId.value || !store.connectedServerIds.includes(props.serverId)) return;
   showTasks.value = false;
   let selectedTask = task.value;
+  let contextTaskId = "";
   if (!selectedTask) {
     selectedTask = store.createTask(props.serverId, permission.value, modelId.value);
     agentWorkspaces.updateServer(props.serverId, { activeTaskId: selectedTask.id });
   }
+  const startsAfterFinishedTask = ["completed", "failed", "cancelled"].includes(selectedTask.status);
+  if (startsAfterFinishedTask) {
+    pendingFreshRequirement.value = value;
+    contextTaskId = selectedTask.id;
+    const previousTask = selectedTask;
+    selectedTask = store.createTask(props.serverId, permission.value, modelId.value);
+    selectedTask.title = value;
+    selectedTask.conversationId = previousTask.conversationId ?? previousTask.id;
+    agentWorkspaces.updateServer(props.serverId, { activeTaskId: selectedTask.id });
+  }
   input.value = "";
-  await store.submitRequirement(
-    props.serverId,
-    value,
-    permission.value,
-    modelId.value,
-    terminalReference.value,
-    selectedTask.id,
-  );
-  if (store.activeTaskId && store.activeTaskId !== workspaceState.activeTaskId) {
-    agentWorkspaces.updateServer(props.serverId, { activeTaskId: store.activeTaskId });
+  try {
+    await store.submitRequirement(
+      props.serverId,
+      value,
+      permission.value,
+      modelId.value,
+      terminalReference.value,
+      selectedTask.id,
+      contextTaskId,
+    );
+    if (store.activeTaskId && store.activeTaskId !== workspaceState.activeTaskId) {
+      agentWorkspaces.updateServer(props.serverId, { activeTaskId: store.activeTaskId });
+    }
+  } finally {
+    pendingFreshRequirement.value = "";
   }
   terminalReference.value = "";
 }
@@ -365,8 +389,7 @@ async function deleteTaskItem(item: OpsTask) {
   if (!taskCanBeDeleted(item)) {
     await store.terminateTask(item.id);
   }
-  store.deleteTask(item.id);
-  agentWorkspaces.reconcileTasks(props.serverId, serverTasks.value.map(({ id }) => id));
+  if (store.deleteTask(item.id)) startNewTask();
 }
 
 function selectTaskItem(taskId: string) {
@@ -376,6 +399,9 @@ function selectTaskItem(taskId: string) {
 
 function startNewTask() {
   agentWorkspaces.updateServer(props.serverId, { activeTaskId: "", showTasks: false });
+  input.value = "";
+  terminalReference.value = "";
+  taskQuery.value = "";
 }
 
 function closeTaskMenuOnOutsidePointer(event: PointerEvent) {
@@ -397,7 +423,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
     <header class="agent-header">
       <div class="agent-title">
         <span class="agent-title-icon"><Bot :size="17" /></span>
-        <span class="agent-title-copy"><strong>{{ t("agent.title") }}</strong><small v-if="task">{{ task.title }}</small></span>
+        <span class="agent-title-copy"><strong>{{ t("agent.title") }}</strong><small v-if="pendingFreshRequirement" :title="pendingFreshRequirement">正在识别新需求：{{ pendingFreshRequirement }}</small><small v-else-if="task" :title="task.title">{{ task.title }}</small></span>
         <span class="beta">CORE</span>
         <span v-if="isBusy" class="agent-activity"><i></i>{{ statusText(task?.status) }}</span>
       </div>
@@ -408,7 +434,6 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
       </button>
     </header>
 
-    <TaskKnowledgeUpload v-if="task" :task="task" />
     <div v-if="!automationEnabled" class="agent-welcome">
       <div class="agent-welcome-ambient" aria-hidden="true"><i></i><i></i><i></i></div>
       <div class="agent-orb">
@@ -430,15 +455,17 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
 
     <template v-else>
       <Transition name="task-pop">
-      <div v-if="showTasks" ref="taskMenu" class="task-strip">
+      <div v-if="showTasks" ref="taskMenu" class="task-strip" @keydown.esc.stop="showTasks = false">
         <header class="task-strip-head">
           <span class="task-strip-heading"><History :size="14" /><span><strong>{{ t("agent.taskListTitle") }}</strong><small>{{ t("agent.taskListHint") }}</small></span></span>
           <strong>{{ serverTasks.length }}</strong>
+          <button class="icon-button" type="button" aria-label="关闭任务列表" @click="showTasks = false"><X :size="14"/></button>
         </header>
+        <label class="task-menu-search"><Search :size="14"/><input v-model="taskQuery" aria-label="搜索任务" placeholder="搜索任务"/></label>
         <div class="task-strip-list">
         <TransitionGroup name="task-list">
-        <div v-for="item in serverTasks" :key="item.id" :class="['task-strip-item', item.status, { active: item.id === task?.id }]">
-          <button class="task-select" @click="selectTaskItem(item.id)">
+        <div v-for="item in filteredTasks" :key="item.id" :class="['task-strip-item', item.status, { active: item.id === task?.id }]">
+          <button class="task-select" :title="item.title" @click="selectTaskItem(item.id)">
             <span :class="['task-status-mini', item.status]"></span>
             <span><strong>{{ item.title }}</strong><small>{{ t("agent.rounds", { count: (item.planHistory?.length ?? 0) + (item.messages.some((message) => message.role === 'user' && message.kind === 'message') ? 1 : 0), status: statusText(item.status) }) }}</small></span>
           </button>
@@ -452,12 +479,14 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
         </div>
         </TransitionGroup>
         <div v-if="!serverTasks.length" class="task-strip-empty">{{ t("agent.emptyTitle") }}</div>
+        <div v-else-if="!filteredTasks.length" class="task-strip-empty">没有匹配的任务</div>
         </div>
         <button class="new-task" @click="startNewTask"><MessageSquarePlus :size="14" />{{ t("agent.newTask") }}</button>
       </div>
       </Transition>
 
       <div ref="timeline" class="agent-timeline">
+        <TaskKnowledgeUpload v-if="task && !pendingFreshRequirement" :key="task.id" :task="task" />
         <div v-if="!task" class="empty-agent">
           <div class="mini-orb"><Bot :size="22" /></div>
           <h3>{{ t("agent.emptyTitle") }}</h3>
@@ -595,7 +624,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
             :index="phaseIndex + 1"
           />
 
-          <div v-if="task.plan.length" :class="['plan-card', 'current-plan-card', `task-card-${task.status}`]">
+          <div v-if="task.plan.length && !pendingFreshRequirement" :class="['plan-card', 'current-plan-card', `task-card-${task.status}`]">
             <div class="plan-card-head">
               <span class="plan-title-block">
                 <span class="plan-title-line">

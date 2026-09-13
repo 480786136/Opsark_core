@@ -8,7 +8,8 @@ import {
   type WorkspacePanel,
 } from "./workspaceLayoutStore";
 
-const { t } = useI18n();
+const { t, locale } = useI18n();
+const panelLabel = (panel: WorkspacePanel) => locale.value.startsWith("zh") ? ({ files: "文件", terminal: "终端", agent: "AI 助手" })[panel] : ({ files: "Files", terminal: "Terminal", agent: "AI assistant" })[panel];
 const layout = useWorkspaceLayoutStore();
 const root = ref<HTMLElement>();
 const menuOpen = ref(false);
@@ -32,7 +33,7 @@ function applyPreset(preset: WorkspaceLayoutPreset) {
 }
 
 function toggleFocus(panel: WorkspacePanel) {
-  layout.toggleFocus(panel);
+  layout.togglePanel(panel);
   menuOpen.value = false;
 }
 
@@ -60,11 +61,11 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeFromOutsi
       <button
         v-for="item in focusOptions"
         :key="item.id"
-        :class="{ active: layout.focusPanel === item.id }"
+        :class="{ active: layout.visiblePanels[item.id] }"
         type="button"
-        :title="t(item.labelKey)"
-        :aria-label="t(item.labelKey)"
-        :aria-pressed="layout.focusPanel === item.id"
+        :title="panelLabel(item.id)"
+        :aria-label="panelLabel(item.id)"
+        :aria-pressed="layout.visiblePanels[item.id]"
         @click="toggleFocus(item.id)"
       >
         <component :is="item.icon" :size="14" />
@@ -82,17 +83,6 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeFromOutsi
         >
           <span>{{ t(option.labelKey) }}</span>
           <Check v-if="layout.preset === option.id" :size="13" />
-        </button>
-        <strong class="workspace-layout-menu-section">{{ t("workspace.focusMode") }}</strong>
-        <button
-          v-for="item in focusOptions"
-          :key="`focus-${item.id}`"
-          type="button"
-          :class="{ active: layout.focusPanel === item.id }"
-          @click="toggleFocus(item.id)"
-        >
-          <span>{{ t(item.labelKey) }}</span>
-          <Check v-if="layout.focusPanel === item.id" :size="13" />
         </button>
       </div>
     </Transition>

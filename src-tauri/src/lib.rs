@@ -47,6 +47,16 @@ use file_tree::{scan_sftp, FileStructureResult};
 use json_contract::{parse_model_array_field, parse_model_json};
 use metrics::{get_realtime_metrics, get_ssh_metrics};
 use model::{check_model_availability, message_content, post_model_request};
+
+const DEFAULT_MODEL_TIMEOUT_SECONDS: u64 = 90;
+const MIN_MODEL_TIMEOUT_SECONDS: u64 = 10;
+const MAX_MODEL_TIMEOUT_SECONDS: u64 = 900;
+
+fn normalize_model_timeout(timeout_seconds: Option<u64>) -> u64 {
+    timeout_seconds
+        .unwrap_or(DEFAULT_MODEL_TIMEOUT_SECONDS)
+        .clamp(MIN_MODEL_TIMEOUT_SECONDS, MAX_MODEL_TIMEOUT_SECONDS)
+}
 use sftp::{
     create_sftp_directory, delete_sftp_entry, list_sftp_directory, read_local_file_for_upload,
     read_sftp_file, read_sftp_file_prefix, rename_sftp_entry, write_sftp_file,
@@ -2387,6 +2397,7 @@ async fn generate_ai_plan(
     requirement: String,
     context: String,
     generation_settings: Option<AiGenerationSettings>,
+    timeout_seconds: Option<u64>,
 ) -> Result<Vec<PlanStep>, String> {
     let mut developer_trace = ModelDeveloperTrace::default();
     let developer_log_path = developer_model_log_path(&app);
@@ -2397,6 +2408,7 @@ async fn generate_ai_plan(
         requirement,
         context,
         generation_settings,
+        normalize_model_timeout(timeout_seconds),
         &mut developer_trace,
         developer_log_path.as_deref(),
     )
@@ -2411,6 +2423,7 @@ async fn generate_ai_plan_with_trace(
     requirement: String,
     context: String,
     generation_settings: Option<AiGenerationSettings>,
+    timeout_seconds: u64,
     developer_trace: &mut ModelDeveloperTrace,
     developer_log_path: Option<&Path>,
 ) -> Result<Vec<PlanStep>, String> {
@@ -2472,7 +2485,7 @@ async fn generate_ai_plan_with_trace(
         let request_snapshot = body.clone();
         let started_at = Instant::now();
         let payload =
-            match post_model_request(&url, &api_key, &body, "计划生成", 60, developer_log_path)
+            match post_model_request(&url, &api_key, &body, "计划生成", timeout_seconds, developer_log_path)
                 .await
             {
                 Ok(payload) => payload,
@@ -2644,7 +2657,9 @@ async fn decide_ai_next_stage(
     requirement: String,
     context: String,
     generation_settings: Option<AiGenerationSettings>,
+    timeout_seconds: Option<u64>,
 ) -> Result<AiNextStageResult, String> {
+    let timeout_seconds = normalize_model_timeout(timeout_seconds);
     let generation_settings = generation_settings.unwrap_or_default();
     let mut developer_trace = ModelDeveloperTrace::default();
     let forbidden_tool_ids = active_skill_forbidden_tool_ids(&context)
@@ -2661,7 +2676,7 @@ async fn decide_ai_next_stage(
         &api_key,
         &body,
         "阶段联合决策",
-        60,
+        timeout_seconds,
         developer_log_path.as_deref(),
     )
     .await
@@ -2757,7 +2772,9 @@ async fn process_ai_requirement(
     context: String,
     skill_definitions: Vec<ModelSkillDefinition>,
     generation_settings: Option<AiGenerationSettings>,
+    timeout_seconds: Option<u64>,
 ) -> Result<RequirementProcessingResult, String> {
+    let timeout_seconds = normalize_model_timeout(timeout_seconds);
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
     let system = GENERAL_REQUIREMENT_SYSTEM;
     let mut last_error = "模型未返回需求理解结果".to_string();
@@ -2792,7 +2809,7 @@ async fn process_ai_requirement(
             &api_key,
             &body,
             "需求理解",
-            45,
+            timeout_seconds,
             developer_log_path.as_deref(),
         )
         .await
@@ -2937,6 +2954,7 @@ async fn process_ai_requirement(
         requirement,
         plan_context,
         generation_settings,
+        timeout_seconds,
         &mut developer_trace,
         developer_log_path.as_deref(),
     )
@@ -2967,11 +2985,13 @@ async fn check_ai_model(
     endpoint: String,
     model: String,
     request_parameters: Option<Value>,
+    timeout_seconds: Option<u64>,
 ) -> Result<ModelCheckResult, String> {
+    let timeout_seconds = normalize_model_timeout(timeout_seconds);
     if let Some(parameters) = request_parameters.filter(|value| value.as_object().is_some_and(|object| !object.is_empty())) {
         let mut body = json!({"model":model,"messages":[{"role":"user","content":"Reply OK."}],"max_tokens":16});
         model_parameters::apply(&mut body, &parameters)?;
-        let payload = post_model_request(&format!("{}/chat/completions", endpoint.trim_end_matches('/')), &api_key, &body, "模型参数测试", 60, None).await?;
+        let payload = post_model_request(&format!("{}/chat/completions", endpoint.trim_end_matches('/')), &api_key, &body, "模型参数测试", timeout_seconds, None).await?;
         message_content(&payload, "模型测试没有返回文本")?;
         return Ok(ModelCheckResult { available: true, reason: "模型生成测试通过，接口已接受请求参数（实际效果以服务端实现为准）".into() });
     }
@@ -2990,7 +3010,9 @@ async fn generate_ai_summary(
     model: String,
     requirement: String,
     execution_context: String,
+    timeout_seconds: Option<u64>,
 ) -> Result<String, String> {
+    let timeout_seconds = normalize_model_timeout(timeout_seconds);
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
     let system = GENERAL_SUMMARY_SYSTEM;
     let body = json!({
@@ -3009,7 +3031,7 @@ async fn generate_ai_summary(
         &api_key,
         &body,
         "模型总结",
-        30,
+        timeout_seconds,
         developer_log_path.as_deref(),
     )
     .await?;
@@ -3037,7 +3059,9 @@ async fn review_ai_step(
     model: String,
     requirement: String,
     review_context: String,
+    timeout_seconds: Option<u64>,
 ) -> Result<AiStepReview, String> {
+    let timeout_seconds = normalize_model_timeout(timeout_seconds);
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
     let periodic_long_running = is_periodic_long_running_review(&review_context);
     let system = if periodic_long_running {
@@ -3072,7 +3096,7 @@ async fn review_ai_step(
             &api_key,
             &body,
             "结果复核",
-            25,
+            timeout_seconds,
             developer_log_path.as_deref(),
         )
         .await?;

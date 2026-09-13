@@ -51,6 +51,33 @@ describe("AgentConsole 服务器工作区隔离", () => {
     expect(host.textContent).toContain("orders.jar");
     expect(host.textContent).toContain("现在mysql数据库有哪些库");
     expect(mysql.plan).toHaveLength(0);
+    const upload = host.querySelector<HTMLButtonElement>(".agent-timeline .task-knowledge-upload button");
+    expect(upload).not.toBeNull();
+    expect(host.querySelector(".agent-panel > .task-knowledge-upload")).toBeNull();
+    upload!.click();
+    await nextTick();
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain("请先在设置");
+    app.unmount();
+  });
+
+  it("长任务标题在标题栏和任务列表中保留全文与悬停提示", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    const task = ops.createTask("server-a", "safe", "model-deepseek");
+    task.title = "拉取https://gitee.com/qiwen-cloud/qiwen-file.git到/opt下并验收仓库";
+    useAgentWorkspaceStore(pinia).updateServer("server-a", { activeTaskId: task.id, automationEnabled: true });
+    const app = createApp(AgentConsole, { serverId: "server-a" }).use(pinia).use(i18n);
+    app.mount(host);
+    await nextTick();
+    const title = host.querySelector<HTMLElement>(".agent-title-copy small");
+    expect(title?.textContent).toBe(task.title);
+    expect(title?.title).toBe(task.title);
+    host.querySelector<HTMLButtonElement>(".task-menu-trigger")!.click();
+    await nextTick();
+    const select = host.querySelector<HTMLButtonElement>(".task-select");
+    expect(select?.title).toBe(task.title);
+    expect(select?.querySelector("strong")?.textContent).toBe(task.title);
     app.unmount();
   });
 

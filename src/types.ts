@@ -450,6 +450,8 @@ export interface ModelRequestParameters {
 
 export interface ModelProfile {
   requestParameters?: ModelRequestParameters;
+  /** End-to-end deadline for each model request. It is not sent in the JSON body. */
+  timeoutSeconds?: number;
   id: string;
   name: string;
   provider: string;

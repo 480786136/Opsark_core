@@ -50,4 +50,20 @@ describe("workspaceLayoutStore", () => {
     expect(layout.columns).toEqual(workspaceLayoutPresets.shell);
     expect(layout.preset).toBe("shell");
   });
+
+  it("独立切换面板并恢复显示组合，比例预设不改变开关", () => {
+    const layout = useWorkspaceLayoutStore();
+    layout.togglePanel("files");
+    layout.togglePanel("agent");
+    layout.applyPreset("balanced");
+    expect(layout.visiblePanels).toEqual({ files: false, terminal: true, agent: false });
+    setActivePinia(createPinia());
+    const restored = useWorkspaceLayoutStore();
+    restored.hydrate();
+    expect(restored.visiblePanels).toEqual(layout.visiblePanels);
+    restored.togglePanel("terminal");
+    expect(Object.values(restored.visiblePanels).some(Boolean)).toBe(false);
+    restored.togglePanel("files");
+    expect(restored.visiblePanels.files).toBe(true);
+  });
 });

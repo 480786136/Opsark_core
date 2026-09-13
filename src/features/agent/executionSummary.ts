@@ -1,5 +1,9 @@
 import type { PlanStep } from "@/types";
 
+export function completionSummaryContradictsGoal(summary: string) {
+  return /(?:本轮任务未完成|整体目标[^\n]{0,80}(?:尚未|未由).{0,30}完成)/.test(summary);
+}
+
 function resultLines(step: PlanStep) {
   const mainOutput = (step.output ?? "").split("\n--- 独立校验 ---")[0];
   return mainOutput
@@ -55,4 +59,15 @@ export function buildExecutionSummary(requirement: string, steps: PlanStep[]) {
   return finalResult.length
     ? `本轮处理完成，共执行 ${completed.length} 个步骤，程序证据均有效。最终结果：${finalResult.join("；")}。`
     : `本轮处理完成，共执行 ${completed.length} 个步骤，程序证据均有效。`;
+}
+
+/** Completion is called only after the separate whole-goal evidence gate passed. */
+export function buildGoalCompletedSummary(requirement: string, steps: PlanStep[]) {
+  const completed = steps.filter((step) => step.status === "completed" && step.result?.executionStatus === "success");
+  const recovered = steps.filter((step) => step.status === "failed").length;
+  const finalResult = completed.length ? resultLines(completed[completed.length - 1]).slice(-3) : [];
+  return [
+    `整体目标“${requirement}”已通过最终证据门禁。共确认 ${completed.length} 个成功步骤${recovered ? `，${recovered} 个早期失败已被后续恢复与成功证据覆盖` : ""}。`,
+    finalResult.length ? `最终结果：${finalResult.join("；")}。` : "",
+  ].filter(Boolean).join("\n");
 }

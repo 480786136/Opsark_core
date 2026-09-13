@@ -16,6 +16,7 @@ import {
   selectContinuationSteps,
 } from "@/features/agent/taskProgression";
 import { activeRoundSteps } from "@/features/agent/taskGoal";
+import { buildGoalCompletedSummary, completionSummaryContradictsGoal } from "@/features/agent/executionSummary";
 import { buildSkillContext } from "@/features/skills/skillRegistry";
 import { compactReviewText } from "@/features/agent/longRunningReviewOutput";
 import { buildTaskDecisionSnapshot } from "@/features/agent/taskDecisionSnapshot";
@@ -512,7 +513,10 @@ export async function summarizeTaskExecution(
       })),
     });
   }
-  const summary = await generateSummary(requirement, steps, model);
+  const generated = await generateSummary(requirement, steps, model);
+  const summary = completionSummaryContradictsGoal(generated)
+    ? buildGoalCompletedSummary(requirement, steps)
+    : generated;
   return { summary, requirement, usedModel: model !== undefined };
 }
 

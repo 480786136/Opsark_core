@@ -274,6 +274,86 @@ describe("智能任务状态机", () => {
     expect(request).toHaveBeenCalledOnce();
   });
 
+  it("新任务标题完整保存需求，持久化后仍保留长 URL 和目标目录", async () => {
+    const store = useOpsStore();
+    const requirement = "拉取 https://gitee.com/qiwen-cloud/qiwen-file.git 到 /opt/qiwen-file 并验证仓库完整性";
+
+    await store.submitRequirement("srv-production-01", requirement, "safe", "model-deepseek");
+    store.persist(true);
+
+    expect(store.activeTask?.title).toBe(requirement);
+    expect(JSON.parse(localStorage.getItem("opsark.tasks")!)[0].title).toBe(requirement);
+  });
+
+  it("已完成任务的后续输入在新记录中分类，不覆盖原计划与状态", async () => {
+    const store = useOpsStore();
+    const finished = store.createTask("srv-production-01", "safe", "model-deepseek");
+    finished.title = "拉取项目";
+    finished.rootGoal = "拉取项目";
+    finished.status = "completed";
+    finished.plan = [{ ...structuredClone(plan[0]), status: "completed" }];
+    store.pushMessage(finished, { role: "user", kind: "message", content: "拉取项目" });
+    const originalPlan = JSON.parse(JSON.stringify(finished.plan));
+    const next = store.createTask("srv-production-01", "safe", "model-deepseek");
+    next.title = "所以已经拉取成功了吗";
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({
+      intent: "answer", relation: "side_question", answer: "已拉取并通过校验。", plan: [],
+    });
+
+    await store.submitRequirement(
+      "srv-production-01", "所以已经拉取成功了吗", "safe", "model-deepseek", "", next.id, finished.id,
+    );
+
+    expect(finished.status).toBe("completed");
+    expect(finished.title).toBe("拉取项目");
+    expect(finished.plan).toEqual(originalPlan);
+    expect(next.status).toBe("completed");
+    expect(next.plan).toEqual([]);
+    expect(next.messages.some((message) => message.content === "已拉取并通过校验。")).toBe(true);
+  });
+
+  it.each(["new_goal", "replace_goal"] as const)("%s 创建独立任务时保留完整标题", async (relation) => {
+    const store = useOpsStore();
+    const original = store.createTask("srv-production-01", "safe", "model-deepseek");
+    original.rootGoal = "检查 Web 服务";
+    original.title = "我的服务检查";
+    original.status = "completed";
+    const requirement = "拉取 https://gitee.com/qiwen-cloud/qiwen-file.git 到 /opt/qiwen-file 并验证仓库完整性";
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({
+      intent: "execute",
+      relation,
+      plan: structuredClone(plan),
+    });
+
+    await store.submitRequirement("srv-production-01", requirement, "safe", "model-deepseek", "", original.id);
+
+    expect(store.activeTask?.id).not.toBe(original.id);
+    expect(store.activeTask?.title).toBe(requirement);
+    expect(original.title).toBe("我的服务检查");
+  });
+
+  it.each([true, false])("启动时恢复旧自动截短标题并保留自定义标题（已保存整体目标：%s）", (hasRootGoal) => {
+    const store = useOpsStore();
+    const requirement = "拉取 https://gitee.com/qiwen-cloud/qiwen-file.git 到 /opt/qiwen-file 并验证仓库完整性";
+    const legacy = store.createTask("srv-production-01", "safe", "model-deepseek");
+    if (hasRootGoal) legacy.rootGoal = requirement;
+    store.pushMessage(legacy, { role: "user", kind: "message", content: requirement });
+    localStorage.setItem("opsark.tasks", JSON.stringify([
+      { ...legacy, id: "legacy-truncated", title: requirement.slice(0, 22) },
+      { ...legacy, id: "custom-title", title: "我的仓库部署任务" },
+      { ...legacy, id: "short-custom-prefix", title: requirement.slice(0, 21) },
+    ]));
+    setActivePinia(createPinia());
+
+    const restored = useOpsStore();
+
+    expect(restored.tasks.find(({ id }) => id === "legacy-truncated")?.title).toBe(requirement);
+    expect(restored.tasks.find(({ id }) => id === "custom-title")?.title).toBe("我的仓库部署任务");
+    expect(restored.tasks.find(({ id }) => id === "short-custom-prefix")?.title).toBe(requirement.slice(0, 21));
+    restored.persist(true);
+    expect(JSON.parse(localStorage.getItem("opsark.tasks")!)[0].title).toBe(requirement);
+  });
+
   function setupAgentClone() {
     vi.useFakeTimers();
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
@@ -2294,7 +2374,7 @@ describe("智能任务状态机", () => {
     expect(store.activeTask?.status).toBe("awaiting_plan_approval");
   });
 
-  it("删除任务会清理本地记录并自动选择同服务器下一条任务", () => {
+  it("删除任务会清理本地记录并回到新任务", () => {
     const store = useOpsStore();
     const retained = store.createTask("srv-production-01", "safe", "model-deepseek");
     retained.title = "保留任务";
@@ -2313,7 +2393,7 @@ describe("智能任务状态机", () => {
     expect(store.deleteTask(removed.id)).toBe(true);
 
     expect(store.tasks.map((item) => item.id)).toEqual([retained.id]);
-    expect(store.activeTaskId).toBe(retained.id);
+    expect(store.activeTaskId).toBeNull();
     expect(store.pendingSecret).toBeNull();
     expect(JSON.parse(localStorage.getItem("opsark.tasks") ?? "[]")).toHaveLength(1);
   });

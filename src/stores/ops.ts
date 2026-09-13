@@ -92,6 +92,7 @@ import {
   taskGoal,
 } from "@/features/agent/taskGoal";
 import { initializeTaskHistoryCheckpoint } from "@/features/agent/taskHistoryCheckpoint";
+import { buildGoalCompletedSummary, completionSummaryContradictsGoal } from "@/features/agent/executionSummary";
 import { isPlanProgressMessage } from "@/features/agent/taskMessages";
 import {
   decideTaskNextStage,
@@ -395,7 +396,7 @@ function initialServers() {
   }));
 }
 
-function initialModels() {
+function initialModels(): ModelProfile[] {
   const saved = readSaved<ModelProfile[]>("opsark.models", defaultModels)
     .filter((model) => model.provider !== "Built-in" && model.id !== "model-local")
     .filter((model) => !(
@@ -404,7 +405,7 @@ function initialModels() {
       && model.model === "deepseek-v4-flash"
       && model.hasApiKey !== true
     ));
-  return saved.length ? saved : defaultModels.map((model) => ({ ...model }));
+  return (saved.length ? saved : defaultModels).map((model) => ({ timeoutSeconds: 90, ...model }));
 }
 
 function initialSecretMetadata() {
@@ -500,18 +501,32 @@ function initialTasks() {
     }
     const latestRequirement = latestTaskRequirement(task);
     task.rootGoal ||= latestRequirement;
+    // Restore only the old automatically shortened title; preserve custom names.
+    if (task.rootGoal.length > 22 && task.title === task.rootGoal.slice(0, 22)) {
+      task.title = task.rootGoal;
+    }
     task.currentInstruction ||= [...task.messages]
       .reverse()
       .find((message) => message.role === "user" && message.kind === "message")?.content
       ?? task.rootGoal;
     task.currentRoundId ||= uid("round");
     migrateFinishedSideQuestionDisplay(task);
-    if (task.status === "completed" && /^本轮处理完成，共执行/.test(task.summary ?? "")) {
-      task.summary = buildExecutionSummary(latestRequirement, task.plan);
+    if (task.status === "completed" && (
+      /^本轮处理完成，共执行/.test(task.summary ?? "")
+      || completionSummaryContradictsGoal(task.summary ?? "")
+    )) {
+      task.summary = completionSummaryContradictsGoal(task.summary ?? "")
+        ? buildGoalCompletedSummary(latestRequirement, activeRoundSteps(task))
+        : buildExecutionSummary(latestRequirement, task.plan);
     }
     task.planHistory?.forEach((round) => {
-      if (round.status === "completed" && /^本轮处理完成，共执行/.test(round.summary ?? "")) {
-        round.summary = buildExecutionSummary(round.requirement, round.plan);
+      if (round.status === "completed" && (
+        /^本轮处理完成，共执行/.test(round.summary ?? "")
+        || completionSummaryContradictsGoal(round.summary ?? "")
+      )) {
+        round.summary = completionSummaryContradictsGoal(round.summary ?? "")
+          ? buildGoalCompletedSummary(round.requirement, round.plan)
+          : buildExecutionSummary(round.requirement, round.plan);
       }
     });
     return task;
@@ -1439,7 +1454,7 @@ export const useOpsStore = defineStore("ops", {
       if (this.pendingSecret?.taskId === taskId) this.pendingSecret = null;
       this.pendingUserInputs = this.pendingUserInputs.filter((item) => item.taskId !== taskId);
       if (wasActive) {
-        this.activeTaskId = this.tasks.find((item) => item.serverId === task.serverId)?.id ?? null;
+        this.activeTaskId = null;
       }
       this.addLog({
         category: "task",
@@ -1534,6 +1549,7 @@ export const useOpsStore = defineStore("ops", {
       modelId: string,
       terminalReference = "",
       selectedTaskId = "",
+      contextTaskId = "",
     ) {
       await this.hydrateCredentials();
       let task = selectedTaskId
@@ -1542,6 +1558,9 @@ export const useOpsStore = defineStore("ops", {
       if (!task || task.serverId !== serverId) {
         task = this.createTask(serverId, permission, modelId);
       }
+      const contextTask = contextTaskId
+        ? this.tasks.find((item) => item.id === contextTaskId && item.serverId === serverId) ?? task
+        : task;
       await this.ensureTaskAgentSession(task.id);
       const sourceTask = task;
       const requestsCurrentRoundAdjustment =
@@ -1559,23 +1578,24 @@ export const useOpsStore = defineStore("ops", {
         await this.requestAdjustment(task.id);
         return;
       }
-      const priorConversation = task.messages
+      const priorConversation = contextTask.messages
         .filter((message) => message.kind !== "event" || message.role !== "system")
         .slice(-24)
         .map(({ role, kind, content }) => ({ role, kind, content }));
-      const previousRequirement = [...task.messages]
+      const previousRequirement = [...contextTask.messages]
         .reverse()
         .find((message) => message.role === "user" && message.kind === "message");
-      if (!task.rootGoal && previousRequirement) task.rootGoal = previousRequirement.content;
+      if (!contextTask.rootGoal && previousRequirement) contextTask.rootGoal = previousRequirement.content;
       const workflowSnapshot = captureWorkflowState(task);
       const previousRoundSnapshot = capturePreviousRound(task);
+      const contextWorkflowSnapshot = contextTask === task ? workflowSnapshot : captureWorkflowState(contextTask);
       const previousExecution = previousRequirement
         ? {
             requirement: previousRequirement.content,
-            status: task.status,
-            summary: task.summary,
-            executionConstraints: task.executionConstraints,
-            steps: activeRoundSteps(task).map(({ title, command, expected, status, output, review, result, evidence }) => ({
+            status: contextTask.status,
+            summary: contextTask.summary,
+            executionConstraints: contextTask.executionConstraints,
+            steps: activeRoundSteps(contextTask).map(({ title, command, expected, status, output, review, result, evidence }) => ({
               title,
               command,
               expected,
@@ -1636,8 +1656,14 @@ export const useOpsStore = defineStore("ops", {
             : requestedTerminalLines > 0
               ? availableTerminalLines.slice(-requestedTerminalLines)
               : [];
+          const contextualTask = contextTask === task ? task : {
+            ...contextTask,
+            id: task.id,
+            currentRoundId: task.currentRoundId,
+            status: task.status,
+          };
           context = JSON.stringify(buildAgentContext({
-            task,
+            task: contextualTask,
             server,
             metrics: contextMetrics,
             permission,
@@ -1651,19 +1677,19 @@ export const useOpsStore = defineStore("ops", {
             },
             conversationHistory: priorConversation,
             previousExecution,
-            taskGoal: task.rootGoal ? {
-              rootGoal: task.rootGoal,
-              currentInstruction: task.currentInstruction,
-              status: workflowSnapshot.status,
+            taskGoal: contextTask.rootGoal ? {
+              rootGoal: contextTask.rootGoal,
+              currentInstruction: contextTask.currentInstruction,
+              status: contextWorkflowSnapshot.status,
             } : undefined,
-            knownExecutionFacts: extractKnownExecutionFacts(task, resolveTaskSkills(task, this.skills)),
+            knownExecutionFacts: extractKnownExecutionFacts(contextTask, resolveTaskSkills(contextTask, this.skills)),
             tools: this.tools,
-            skills: resolveTaskSkills(task, this.skills),
+            skills: resolveTaskSkills(contextTask, this.skills),
             skillDirectory: this.enabledSkills,
             secretMetadata: this.secretMetadata,
             serverId,
           }));
-          const skillDefinitions = buildSkillContext(planningSkills(task, this.enabledSkills));
+          const skillDefinitions = buildSkillContext(planningSkills(contextTask, this.enabledSkills));
           const developerRequest = {
             command: "process_ai_requirement",
             attempt: attempt + 1,
@@ -1679,6 +1705,7 @@ export const useOpsStore = defineStore("ops", {
               endpoint: model.endpoint,
               model: model.model,
               requestParameters: model.requestParameters,
+              timeoutSeconds: model.timeoutSeconds,
               context,
               generationSettings: this.aiGenerationSettings,
             }, skillDefinitions);
@@ -1764,7 +1791,7 @@ export const useOpsStore = defineStore("ops", {
         if (!processed || processed.intent === "terminal_context") {
           throw new Error("已达终端上下文读取上限，模型仍无法完成需求判断");
         }
-        const relation = normalizeRequirementRelation(processed, content, Boolean(sourceTask.rootGoal));
+        const relation = normalizeRequirementRelation(processed, content, Boolean(contextTask.rootGoal));
         if (relation === "side_question") {
           sourceTask.lastRequirementRelation = relation;
           sourceTask.currentInstruction = content;
@@ -1833,7 +1860,7 @@ export const useOpsStore = defineStore("ops", {
           task.rootGoal = content;
           task.currentInstruction = content;
           task.lastRequirementRelation = "new_goal";
-          task.title = content.slice(0, 22);
+          task.title = content;
           task.currentRoundId = uid("round");
           this.pushMessage(task, { role: "user", kind: "message", content });
           await this.ensureTaskAgentSession(task.id);
@@ -1859,11 +1886,13 @@ export const useOpsStore = defineStore("ops", {
               content: "开始处理本任务中的新一轮需求；整体目标保持不变，上一轮执行记录已保留，计划、输出和校验证据已归档。",
             });
           }
-          task.rootGoal ||= content;
+          task.rootGoal ||= relation === "continue" || relation === "supplement"
+            ? contextTask.rootGoal || content
+            : content;
           task.currentInstruction = content;
           task.lastRequirementRelation = relation;
           task.currentRoundId = uid("round");
-          task.title = task.title === "新任务" ? task.rootGoal.slice(0, 22) : task.title;
+          task.title = task.title === "新任务" ? task.rootGoal : task.title;
         }
         task.plan = [];
         task.summary = undefined;
@@ -4170,6 +4199,7 @@ export const useOpsStore = defineStore("ops", {
         endpoint: "",
         enabled: true,
         hasApiKey: false,
+        timeoutSeconds: 90,
       };
       this.models.push(model);
       this.modelAvailability[model.id] = { status: "unknown", reason: "请完成配置后保存" };
@@ -4260,6 +4290,7 @@ export const useOpsStore = defineStore("ops", {
             endpoint: model.endpoint,
             model: model.model,
             requestParameters: model.requestParameters,
+            timeoutSeconds: model.timeoutSeconds,
           });
           this.modelAvailability[model.id] = {
             status: result.available ? "available" : "unavailable",

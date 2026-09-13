@@ -30,6 +30,7 @@ export interface RuntimeConnection {
 
 export interface RuntimeModel {
   requestParameters?: import("@/types").ModelRequestParameters;
+  timeoutSeconds?: number;
   logContext?: Record<string, unknown>;
   apiKey: string;
   endpoint: string;
@@ -566,6 +567,7 @@ export const backend = {
           requirement,
           context: parameterContext(runtimeModel.context, runtimeModel.requestParameters),
           generationSettings: runtimeModel.generationSettings,
+          timeoutSeconds: runtimeModel.timeoutSeconds,
         });
       } catch (error) {
         throw normalizeModelInvocationError(error);
@@ -582,6 +584,7 @@ export const backend = {
             requirement: `${requirement}\n\n上次计划未通过本地协议校验。请依据 context.planGenerationRepair 只修复格式并重新返回完整计划。`,
             context: parameterContext(contextWithPlanRepair(runtimeModel.context, repair), runtimeModel.requestParameters),
             generationSettings: runtimeModel.generationSettings,
+            timeoutSeconds: runtimeModel.timeoutSeconds,
           });
           assertPlanRepairScope(repair, repaired);
           return normalizePlanPreconditions(repaired, requirement);
@@ -623,6 +626,7 @@ export const backend = {
           context: parameterContext(runtimeModel.context, runtimeModel.requestParameters),
           skillDefinitions,
           generationSettings: runtimeModel.generationSettings,
+          timeoutSeconds: runtimeModel.timeoutSeconds,
         });
       } catch (error) {
         throw normalizeModelInvocationError(error);
@@ -640,6 +644,7 @@ export const backend = {
             context: parameterContext(contextWithPlanRepair(runtimeModel.context, repair), runtimeModel.requestParameters),
             skillDefinitions,
             generationSettings: runtimeModel.generationSettings,
+            timeoutSeconds: runtimeModel.timeoutSeconds,
           });
           assertPlanRepairScope(repair, repaired.plan);
           return { ...result, plan: normalizePlanPreconditions(repaired.plan, requirement) };
@@ -661,6 +666,7 @@ export const backend = {
       apiKey: runtimeModel.apiKey,
       endpoint: runtimeModel.endpoint,
       model: runtimeModel.model,
+      timeoutSeconds: runtimeModel.timeoutSeconds,
     });
   },
 
@@ -686,6 +692,7 @@ export const backend = {
               evidence: evidence?.map(({ type, source, facts, scope }) => ({ type, source, facts, scope })),
             })),
           }),
+          timeoutSeconds: runtimeModel.timeoutSeconds,
         });
       } catch {
         return fallback;
@@ -716,6 +723,7 @@ export const backend = {
         model: runtimeModel.model,
         requirement,
         reviewContext: parameterContext(reviewContext, runtimeModel.requestParameters),
+        timeoutSeconds: runtimeModel.timeoutSeconds,
       });
       return { ...review, source: "model" };
     } catch {
@@ -746,6 +754,7 @@ export const backend = {
         model: runtimeModel.model,
         requirement,
         reviewContext: parameterContext(reviewContext, runtimeModel.requestParameters),
+        timeoutSeconds: runtimeModel.timeoutSeconds,
       });
       return { ...review, source: "model" };
     } catch {
@@ -777,6 +786,7 @@ export const backend = {
         requirement,
         context: parameterContext(runtimeModel.context, runtimeModel.requestParameters),
         generationSettings: runtimeModel.generationSettings,
+        timeoutSeconds: runtimeModel.timeoutSeconds,
       });
       return {
         ...decision,

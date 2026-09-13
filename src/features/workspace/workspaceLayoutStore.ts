@@ -68,6 +68,7 @@ export const useWorkspaceLayoutStore = defineStore("workspace-layout", {
     columns: { ...workspaceLayoutPresets.shell } as WorkspaceColumns,
     preset: "shell" as WorkspaceLayoutPreset | null,
     focusPanel: null as WorkspacePanel | null,
+    visiblePanels: { files: true, terminal: true, agent: true },
     hydrated: false,
   }),
   actions: {
@@ -77,6 +78,12 @@ export const useWorkspaceLayoutStore = defineStore("workspace-layout", {
         const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}") as Record<string, unknown>;
         if (isValidColumns(parsed.columns)) this.columns = { ...parsed.columns };
         if (parsed.preset === null || isPreset(parsed.preset)) this.preset = parsed.preset;
+        if (parsed.visiblePanels && typeof parsed.visiblePanels === "object") {
+          for (const panel of ["files", "terminal", "agent"] as const) {
+            const visible = (parsed.visiblePanels as Record<string, unknown>)[panel];
+            if (typeof visible === "boolean") this.visiblePanels[panel] = visible;
+          }
+        }
       } catch {
         // 布局配置损坏时使用 Shell 默认布局，不阻断工作台启动。
       }
@@ -97,6 +104,11 @@ export const useWorkspaceLayoutStore = defineStore("workspace-layout", {
       this.focusPanel = this.focusPanel === panel ? null : panel;
       // 专注模式属于临时工作状态，不跨应用启动恢复。
     },
+    togglePanel(panel: WorkspacePanel) {
+      this.focusPanel = null;
+      this.visiblePanels[panel] = !this.visiblePanels[panel];
+      this.persist();
+    },
     clearFocus() {
       this.focusPanel = null;
     },
@@ -104,6 +116,7 @@ export const useWorkspaceLayoutStore = defineStore("workspace-layout", {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({
         columns: this.columns,
         preset: this.preset,
+        visiblePanels: this.visiblePanels,
       }));
     },
   },

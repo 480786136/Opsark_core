@@ -26,7 +26,7 @@ function defaultWorkspace(): ServerAgentWorkspaceState {
     permission: "safe",
     modelId: "",
     automationEnabled: false,
-    showTasks: true,
+    showTasks: false,
   };
 }
 
@@ -76,7 +76,7 @@ export const useAgentWorkspaceStore = defineStore("agentWorkspaces", {
     reconcileTasks(serverId: string, taskIds: string[]) {
       const workspace = this.ensureServer(serverId);
       if (workspace.activeTaskId && taskIds.includes(workspace.activeTaskId)) return;
-      workspace.activeTaskId = taskIds[0] ?? "";
+      workspace.activeTaskId = "";
       this.persist();
     },
     removeServer(serverId: string) {

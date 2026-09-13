@@ -20,9 +20,9 @@ export interface KnowledgeRecord {
     step_id: string; description: string; command?: string;
     execution_status: "succeeded" | "failed" | "blocked" | "not_run" | "unknown";
     validation_status: "passed" | "failed" | "unknown" | "not_run";
-    evidence: Array<{ evidence_id: string; kind: "command_result"; summary: string }>;
+    evidence: Array<{ evidence_id: string; kind: "command_result" | "validation" | "observation"; summary: string; excerpt?: string }>;
   }>;
-  outcome: { status: "partial" | "unknown"; summary: string };
+  outcome: { status: "succeeded" | "failed" | "partial" | "unknown"; summary: string };
   redaction: { client_applied: true; ruleset_version: string };
 }
 export interface UploadEntry {

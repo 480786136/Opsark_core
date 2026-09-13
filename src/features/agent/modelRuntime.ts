@@ -12,6 +12,7 @@ export function createRuntimeModel(
   if (!model || !apiKey) return undefined;
   return {
     requestParameters: model.requestParameters,
+    timeoutSeconds: model.timeoutSeconds,
     apiKey,
     endpoint: model.endpoint,
     model: model.model,
@@ -20,4 +21,3 @@ export function createRuntimeModel(
     ...(logContext ? { logContext } : {}),
   };
 }
-

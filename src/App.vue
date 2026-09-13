@@ -83,5 +83,14 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .app-shell.custom-window-frame{margin-top:36px;height:calc(100% - 36px)}
-:global(.desktop-window .drawer-overlay), :global(.desktop-window .modal-backdrop), :global(.desktop-window .knowledge-overlay){top:36px}
+</style>
+
+<style>
+/* Outrank lazy-loaded scoped overlay rules (including inset: 0).
+   Teleported dialogs must start below the desktop window controls. */
+html.desktop-window body .drawer-overlay,
+html.desktop-window body .modal-backdrop,
+html.desktop-window body .knowledge-overlay {
+  top: 36px;
+}
 </style>

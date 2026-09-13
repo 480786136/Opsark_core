@@ -37,7 +37,9 @@ describe("agentWorkspaceStore", () => {
     store.updateServer("server-b", { activeTaskId: "task-b" });
     store.reconcileTasks("server-a", ["task-a"]);
 
-    expect(store.workspaces["server-a"].activeTaskId).toBe("task-a");
+    expect(store.workspaces["server-a"].activeTaskId).toBe("");
     expect(store.workspaces["server-b"].activeTaskId).toBe("task-b");
+    store.reconcileTasks("server-a", ["task-a", "new-history-task"]);
+    expect(store.workspaces["server-a"].activeTaskId).toBe("");
   });
 });

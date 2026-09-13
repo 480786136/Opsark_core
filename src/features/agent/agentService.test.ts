@@ -328,6 +328,18 @@ describe("agentService", () => {
     );
   });
 
+  it("does not let a recovered historical failure contradict the completed goal gate", async () => {
+    const current = task();
+    current.plan = [
+      { ...step("old-proxy-check", "false", "failed"), result: { executionStatus: "failed", observationStatus: "unknown", exitCode: 1, facts: {}, warnings: [], evidenceIds: [] } },
+      { ...step("clone-and-verify", "git clone repo target"), output: "clone complete\nHEAD=abc", result: { executionStatus: "success", observationStatus: "matched", exitCode: 0, facts: { validationPassed: true }, warnings: [], evidenceIds: [] } },
+    ];
+    const result = await summarizeTaskExecution({ task: current, model, apiKey: "secret-key" }, vi.fn().mockResolvedValue("本轮任务未完成。用户目标尚未完成。"));
+    expect(result.summary).toContain("已通过最终证据门禁");
+    expect(result.summary).toContain("早期失败已被后续恢复");
+    expect(result.summary).not.toContain("本轮任务未完成");
+  });
+
   it("combines a deterministic failure reason with the generated summary", async () => {
     const result = await summarizeFailedTask({
       task: task(),

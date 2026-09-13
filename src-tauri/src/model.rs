@@ -106,6 +106,11 @@ pub(crate) async fn post_model_request(
         let mut request = client
             .post(url)
             .bearer_auth(api_key)
+            // Let the gateway finish and persist a failure before this client deadline.
+            .header(
+                "X-Opsark-Timeout-Seconds",
+                timeout_seconds.saturating_sub(2).max(1).to_string(),
+            )
             .header(reqwest::header::ACCEPT, "application/json")
             .json(body);
         if attempt > 1 {
@@ -267,6 +272,12 @@ pub(crate) fn message_content<'a>(
 
 fn evaluate_model_list(status: StatusCode, payload: &Value, model: &str) -> ModelAvailability {
     if !status.is_success() {
+        if matches!(status.as_u16(), 404 | 405) {
+            return ModelAvailability {
+                available: true,
+                reason: "自定义接口未提供 /models，已保留配置；最终以真实生成请求为准".into(),
+            };
+        }
         let message = payload
             .pointer("/error/message")
             .and_then(Value::as_str)
@@ -289,12 +300,16 @@ fn evaluate_model_list(status: StatusCode, payload: &Value, model: &str) -> Mode
             reason: "接口、鉴权和模型名称均可用".into(),
         }
     } else {
+        let available = model_ids.iter().take(5).copied().collect::<Vec<_>>().join("、");
         ModelAvailability {
-            available: false,
+            // A custom OpenAI-compatible gateway may hide models, expose aliases,
+            // or route an arbitrary caller-provided model ID. A list mismatch is
+            // therefore advisory and must not disable an otherwise valid profile.
+            available: true,
             reason: if model_ids.is_empty() {
-                "接口未返回可用模型".into()
+                "接口可访问，但未公布模型列表；最终以真实生成请求为准".into()
             } else {
-                format!("接口可访问，但模型 {model} 不在可用列表中")
+                format!("接口可访问；/models 未列出自定义模型 ID {model}，仍允许使用。接口公布：{available}")
             },
         }
     }
@@ -362,6 +377,12 @@ pub(crate) async fn check_model_availability(
                 break;
             }
         };
+        if matches!(status.as_u16(), 404 | 405) {
+            return Ok(ModelAvailability {
+                available: true,
+                reason: "自定义接口未提供 /models，已保留配置；最终以真实生成请求为准".into(),
+            });
+        }
         match serde_json::from_slice::<Value>(&bytes) {
             Ok(payload) => {
                 if (status.as_u16() == 429 || status.is_server_error())
@@ -419,8 +440,15 @@ mod tests {
         let payload = json!({"data": [{"id": "model-a"}]});
         assert!(evaluate_model_list(StatusCode::OK, &payload, "model-a").available);
         let missing = evaluate_model_list(StatusCode::OK, &payload, "model-b");
-        assert!(!missing.available);
+        assert!(missing.available);
         assert!(missing.reason.contains("model-b"));
+    }
+
+    #[test]
+    fn accepts_custom_endpoint_without_model_listing() {
+        let missing = evaluate_model_list(StatusCode::NOT_FOUND, &json!({}), "custom-model");
+        assert!(missing.available);
+        assert!(missing.reason.contains("真实生成请求"));
     }
 
     #[test]
