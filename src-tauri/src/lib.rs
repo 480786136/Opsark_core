@@ -4,6 +4,7 @@
 
 mod agent_terminal;
 mod command_guard;
+mod connection;
 mod credential;
 mod evidence_store;
 mod file_tree;
@@ -3142,6 +3143,7 @@ pub fn run() {
             save_task_evidence,
             read_task_evidence,
             get_realtime_metrics,
+            connection::check_ssh_connection,
             probe_ssh_server,
             execute_ssh_command,
             cancel_ssh_execution,

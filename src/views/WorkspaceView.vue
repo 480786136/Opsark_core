@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { KeyRound, RefreshCw, Server, Wifi, X } from "lucide-vue-next";
+import { RefreshCw, Server, Wifi, WifiOff } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import AgentConsole from "@/components/AgentConsole.vue";
 import FileExplorer from "@/components/FileExplorer.vue";
@@ -9,6 +9,8 @@ import MetricsBar from "@/components/MetricsBar.vue";
 import TerminalWorkspace from "@/features/terminal/TerminalWorkspace.vue";
 import WorkspaceNavigation from "@/features/workspace/WorkspaceNavigation.vue";
 import WorkspaceToolbar from "@/features/workspace/WorkspaceToolbar.vue";
+import ConnectionOverlay from "@/features/workspace/ConnectionOverlay.vue";
+import AddServerModal from "@/components/AddServerModal.vue";
 import {
   resizeWorkspaceColumns,
   useWorkspaceLayoutStore,
@@ -29,7 +31,8 @@ const layout = useWorkspaceLayoutStore();
 const files = useFileWorkspaceStore();
 const windowTabs = useServerWorkspaceTabsStore();
 layout.hydrate();
-const { t } = useI18n();
+const { t, locale } = useI18n();
+const zh = computed(() => locale.value.startsWith("zh"));
 // KeepAlive views still observe the global route while hidden. Retain the last
 // server so switching to Local cannot unmount its terminal/Agent subtree.
 const serverId = ref(typeof route.params.id === "string" ? route.params.id : "");
@@ -42,15 +45,27 @@ const server = computed(() => store.servers.find((item) => item.id === serverId.
 const openedServers = computed(() => windowTabs.openServerIds
   .map((id) => store.servers.find((item) => item.id === id))
   .filter((item): item is NonNullable<typeof item> => Boolean(item)));
-const connecting = ref(false);
-const password = ref("");
-const isLive = computed(() => store.connectedServerIds.includes(serverId.value));
+const connection = computed(() => store.serverConnection(serverId.value));
+const isLive = computed(() => store.isServerConnected(serverId.value));
+const connectionBusy = computed(() => ["connecting", "reconnecting", "suspect"].includes(connection.value.status));
+const readOnlyServers = ref<Record<string, boolean>>({});
+const editingServer = ref(false);
+const connectionLabel = computed(() => ({
+  idle: zh.value ? "未连接" : "Not connected",
+  connecting: zh.value ? "正在连接" : "Connecting",
+  connected: zh.value ? "SSH 已连接" : "SSH connected",
+  suspect: zh.value ? "正在确认连接" : "Checking connection",
+  reconnecting: zh.value ? "正在重连" : "Reconnecting",
+  manual: zh.value ? "需要手动重连" : "Reconnect required",
+  auth_failed: zh.value ? "身份验证失败" : "Authentication failed",
+  disconnected: zh.value ? "已断开" : "Disconnected",
+})[connection.value.status]);
+const connectionDetail = computed(() => [connectionLabel.value, connection.value.phase, connection.value.error].filter(Boolean).join(" · "));
 const editorEntry = ref<FileEntry>();
 const workspaceGrid = ref<HTMLElement>();
+const connectionOverlays = ref<InstanceType<typeof ConnectionOverlay>[]>([]);
 const viewActive = ref(true);
-let interval: number | undefined;
 let stopResize: (() => void) | undefined;
-let serverActivationVersion = 0;
 
 const allPanelsVisible = computed(() => Object.values(layout.visiblePanels).every(Boolean));
 const workspaceGridStyle = computed<Record<string, string>>(() => ({
@@ -67,28 +82,14 @@ const workspaceGridClass = computed(() => ({
   "hide-agent": !layout.visiblePanels.agent,
 }));
 
-function startMetricsTimer() {
-  if (interval !== undefined || !server.value) return;
-  interval = window.setInterval(() => void store.refreshMetrics(serverId.value), 10000);
-}
-
-function stopMetricsTimer() {
-  if (interval !== undefined) window.clearInterval(interval);
-  interval = undefined;
-}
-
-onMounted(startMetricsTimer);
 onActivated(() => {
   viewActive.value = true;
-  startMetricsTimer();
 });
 onDeactivated(() => {
   viewActive.value = false;
-  stopMetricsTimer();
   stopResize?.();
 });
 onBeforeUnmount(() => {
-  stopMetricsTimer();
   stopResize?.();
 });
 
@@ -126,36 +127,30 @@ function startResize(handle: WorkspaceResizeHandle, event: PointerEvent) {
   window.addEventListener("pointercancel", onEnd);
 }
 
-async function connect() {
-  if (!password.value || !server.value) return;
-  await store.connectServer(server.value.id, password.value);
-  password.value = "";
-  connecting.value = server.value.status !== "online";
-}
-
 function refreshOrConnect() {
   if (isLive.value && server.value) void store.refreshServer(server.value.id);
-  else connecting.value = true;
+  else if (!connectionBusy.value) void connectionOverlays.value.find(overlay => overlay.serverId === serverId.value)?.reconnect();
+}
+
+function viewTerminalHistory() {
+  if (!layout.visiblePanels.terminal) layout.togglePanel("terminal");
+  layout.clearFocus();
+  void nextTick(() => workspaceGrid.value?.querySelector<HTMLElement>(".terminal-workspace-stack [tabindex]")?.focus());
 }
 
 function refreshFileDirectory() {
-  if (!server.value) return;
+  if (!server.value || !isLive.value) return;
   const connection = store.getRuntimeConnection(server.value.id);
   if (!connection) return;
   const currentPath = files.ensureServer(server.value.id).currentPath;
   void files.loadDirectory(server.value.id, connection, currentPath);
 }
 
-watch(serverId, async (nextServerId) => {
+watch(serverId, (nextServerId) => {
   if (!nextServerId || !store.servers.some(server => server.id === nextServerId)) return;
-  const activationVersion = serverActivationVersion + 1;
-  serverActivationVersion = activationVersion;
-  connecting.value = false;
+  editingServer.value = false;
   editorEntry.value = undefined;
-  const connected = await store.ensureServerConnected(nextServerId);
-  if (activationVersion !== serverActivationVersion || nextServerId !== serverId.value) return;
-  connecting.value = !connected;
-  void store.refreshMetrics(nextServerId);
+  void store.ensureServerConnected(nextServerId);
 }, { immediate: true });
 
 </script>
@@ -163,14 +158,25 @@ watch(serverId, async (nextServerId) => {
 <template>
   <div v-if="server" class="workspace">
     <WorkspaceNavigation>
-      <div :class="['workspace-env', { live: isLive, preparing: !isLive }]"><Wifi :size="13" />{{ isLive ? t("workspace.liveSession") : t("workspace.preparingSession") }}</div>
+      <div :class="['workspace-env', 'workspace-connection-status', connection.status]" :title="connectionDetail" tabindex="0"><Wifi v-if="isLive || connectionBusy" :size="13"/><WifiOff v-else :size="13"/><span>{{ connectionLabel }}</span></div>
       <WorkspaceToolbar />
-      <button class="refresh-button" :disabled="store.isCollecting" @click="refreshOrConnect">
+      <button class="refresh-button" :title="isLive ? t('workspace.refreshEnvironment') : connectionBusy ? connectionLabel : (zh ? '重新连接' : 'Reconnect')" :aria-label="isLive ? t('workspace.refreshEnvironment') : connectionBusy ? connectionLabel : (zh ? '重新连接' : 'Reconnect')" :disabled="store.isCollecting || connectionBusy" @click="refreshOrConnect">
         <RefreshCw v-if="isLive" :class="{ spin: store.isCollecting }" :size="15" />
-        <KeyRound v-else :size="14" />{{ isLive ? t("workspace.refreshEnvironment") : t("workspace.connectServer") }}
+        <RefreshCw v-else :size="14" /><span class="refresh-button-copy">{{ isLive ? t("workspace.refreshEnvironment") : connectionBusy ? (zh ? '正在连接' : 'Connecting') : (zh ? '重新连接' : 'Reconnect') }}</span>
       </button>
     </WorkspaceNavigation>
-    <div ref="workspaceGrid" :class="['workspace-grid', workspaceGridClass]" :style="workspaceGridStyle">
+    <div class="workspace-content">
+      <ConnectionOverlay
+        v-for="option in openedServers"
+        ref="connectionOverlays"
+        :key="`connection-${option.id}`"
+        :server-id="option.id"
+        :active="viewActive && option.id === server.id"
+        @readonly-change="readOnlyServers[option.id] = $event"
+        @view-history="viewTerminalHistory"
+        @configure="editingServer = true"
+      />
+    <div ref="workspaceGrid" :class="['workspace-grid', workspaceGridClass]" :style="workspaceGridStyle" :inert="!isLive && !readOnlyServers[server.id]" :aria-hidden="!isLive && !readOnlyServers[server.id] ? true : undefined">
       <FileExplorer :key="`files-${server.id}`" :server-id="server.id" @edit="editorEntry = $event" />
       <button
         v-if="allPanelsVisible"
@@ -212,11 +218,13 @@ watch(serverId, async (nextServerId) => {
           v-show="option.id === server.id"
           :key="`agent-${option.id}`"
           :server-id="option.id"
+          :active="viewActive && option.id === server.id"
         />
       </section>
       <p v-if="!Object.values(layout.visiblePanels).some(Boolean)" class="workspace-panels-empty">点击顶部文件、终端或 AI 图标显示对应区域</p>
     </div>
-    <MetricsBar />
+    </div>
+    <MetricsBar :server-id="server.id" />
     <div v-if="editorEntry" class="workspace-editor-backdrop">
       <FileEditorPanel
         :key="`${server.id}-${editorEntry.path}`"
@@ -226,22 +234,13 @@ watch(serverId, async (nextServerId) => {
         @saved="refreshFileDirectory"
       />
     </div>
-    <div v-if="connecting" class="modal-backdrop" @click.self="connecting = false">
-      <form class="modal-card connection-card" @submit.prevent="connect">
-        <div class="modal-title">
-          <div><h2>{{ t("workspace.connectTitle") }}</h2><p>{{ server.username }}@{{ server.host }}:{{ server.port }}</p></div>
-          <button class="icon-button" type="button" @click="connecting = false"><X :size="18" /></button>
-        </div>
-        <label>{{ t("workspace.password") }}<input v-model="password" type="password" autocomplete="current-password" :placeholder="t('workspace.passwordPlaceholder')" autofocus /></label>
-        <p class="security-hint"><KeyRound :size="14" />{{ t("workspace.securityHint") }}</p>
-        <div class="modal-actions">
-          <button class="button secondary" type="button" @click="connecting = false">{{ t("common.cancel") }}</button>
-          <button class="button primary" type="submit" :disabled="!password || store.isCollecting">{{ store.isCollecting ? t("workspace.connecting") : t("workspace.connectAndCollect") }}</button>
-        </div>
-      </form>
-    </div>
+    <AddServerModal v-if="editingServer" :server="server" @close="editingServer = false" />
   </div>
   <div v-else class="not-found">
     <Server :size="34" /><h2>{{ t("workspace.notFound") }}</h2><button class="button primary" @click="router.push('/')">{{ t("workspace.backToServers") }}</button>
   </div>
 </template>
+
+<style scoped>
+.workspace-content{position:relative;display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden}.workspace-content>.workspace-grid{flex:1;min-height:0;width:100%}.workspace-connection-status{max-width:180px;min-width:0;gap:6px;color:var(--muted);font-size:10px}.workspace-connection-status>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.workspace-connection-status.connected{color:var(--green)}.workspace-connection-status.connecting,.workspace-connection-status.reconnecting{color:var(--accent)}.workspace-connection-status.suspect,.workspace-connection-status.manual{color:var(--orange)}.workspace-connection-status.auth_failed{color:var(--red)}.workspace-connection-status:focus-visible,.refresh-button:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.refresh-button{white-space:nowrap}.refresh-button:disabled{cursor:default;opacity:.5}@media(max-width:750px){.workspace-connection-status{max-width:90px}.refresh-button-copy{display:none}}
+</style>

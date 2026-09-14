@@ -13,9 +13,9 @@ import { workspaceEntry } from "@/features/workspace/workspaceEntry";
 
 function workspaceStub(className: string) {
   return defineComponent({
-    props: { serverId: { type: String, required: true } },
+    props: { serverId: { type: String, required: true }, active: { type: Boolean, default: false } },
     setup(props) {
-      return () => h("div", { class: className, "data-server-id": props.serverId });
+      return () => h("div", { class: className, "data-server-id": props.serverId, "data-active": String(props.active) });
     },
   });
 }
@@ -82,6 +82,8 @@ describe("WorkspaceView 多服务器切换", () => {
       .toEqual(["server-a", "server-b"]);
     expect((host.querySelector('.agent-stub[data-server-id="server-a"]') as HTMLElement)?.style.display).toBe("none");
     expect((host.querySelector('.agent-stub[data-server-id="server-b"]') as HTMLElement)?.style.display).not.toBe("none");
+    expect(host.querySelector('.agent-stub[data-server-id="server-a"]')?.getAttribute("data-active")).toBe("false");
+    expect(host.querySelector('.agent-stub[data-server-id="server-b"]')?.getAttribute("data-active")).toBe("true");
     expect(store.ensureServerConnected).toHaveBeenCalledWith("server-b");
     expect(JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}")).toMatchObject({
       version: 2,
@@ -89,6 +91,63 @@ describe("WorkspaceView 多服务器切换", () => {
     });
     expect(useServerWorkspaceTabsStore(pinia).openServerIds).toEqual(["server-a", "server-b"]);
     app.unmount();
+  });
+  it("keeps panel instances through the mask and read-only mode, and the header opens missing credentials", async () => {
+    const pinia = createPinia();
+    const store = useOpsStore(pinia);
+    store.servers = [{
+      id: "server-a", name: "Alpha", host: "alpha.test", port: 22, username: "ops", group: "test", status: "offline", environment: [],
+      info: { os: "Linux", kernel: "6", cpu: "CPU", cores: 1, memoryGb: 1, diskGb: 1, uptime: "1h" }, createdAt: new Date().toISOString(),
+    }];
+    const state = store.serverConnection("server-a");
+    vi.spyOn(store, "ensureServerConnected").mockResolvedValue(false);
+    const reconnect = vi.spyOn(store, "reconnectServer").mockResolvedValue(false);
+    const metrics = vi.spyOn(store, "refreshMetrics").mockResolvedValue(undefined);
+    const router = createRouter({ history: createMemoryHistory(), routes: [{ path: "/server/:id", component: WorkspaceView }] });
+    installWorkspaceTabRouting(router, pinia);
+    await router.push("/server/server-a");
+    await router.isReady();
+    const app = createApp(defineComponent(() => () => h(RouterView)));
+    app.use(pinia).use(i18n).use(router).mount(host);
+    try {
+      await nextTick();
+      const terminal = host.querySelector(".terminal-stub");
+      const agent = host.querySelector(".agent-stub");
+      const grid = host.querySelector<HTMLElement>(".workspace-grid")!;
+      expect(grid.inert).toBe(true);
+      expect(host.querySelector(".modal-backdrop")).toBeNull();
+      expect(host.querySelector(".workspace-navigation")?.closest("[inert]")).toBeNull();
+      expect(metrics).not.toHaveBeenCalled();
+
+      host.querySelector<HTMLButtonElement>(".refresh-button")!.click();
+      await nextTick();
+      await nextTick();
+      expect(reconnect).toHaveBeenCalledWith("server-a");
+      expect(host.querySelector('input[type="password"]')).not.toBeNull();
+      expect(document.activeElement).toBe(host.querySelector('input[type="password"]'));
+      const history = [...host.querySelectorAll<HTMLButtonElement>(".connection-overlay button")].find(button => button.textContent?.includes("查看终端历史"))!;
+      history.click();
+      await nextTick();
+      expect(host.querySelector(".connection-overlay.is-readonly")).not.toBeNull();
+      expect(grid.inert).toBe(false);
+      expect(host.querySelector(".terminal-stub")).toBe(terminal);
+      expect(host.querySelector(".agent-stub")).toBe(agent);
+
+      Object.assign(state, { status: "reconnecting", phase: "正在验证 SSH 连接" });
+      await nextTick();
+      expect(host.querySelector(".connection-overlay.is-readonly")).not.toBeNull();
+      expect(grid.inert).toBe(false);
+      state.status = "connected";
+      await nextTick();
+      expect(host.querySelector(".connection-overlay")).toBeNull();
+      expect(host.querySelector(".terminal-stub")).toBe(terminal);
+      expect(host.querySelector(".agent-stub")).toBe(agent);
+      state.status = "manual";
+      await nextTick();
+      expect(host.querySelector(".connection-overlay.is-readonly")).toBeNull();
+      expect(grid.inert).toBe(true);
+      expect(host.querySelector(".terminal-stub")).toBe(terminal);
+    } finally { app.unmount(); }
   });
 
   it("经过 Local 返回服务器时保留终端与 Agent 实例且不发起无效或重复连接", async () => {

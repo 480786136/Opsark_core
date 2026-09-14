@@ -51,6 +51,34 @@ describe("workspaceLayoutStore", () => {
     expect(layout.preset).toBe("shell");
   });
 
+  it("首次进入时将临时放宽的 Shell 布局恢复为原始比例", () => {
+    localStorage.setItem("opsark.workspaceLayout.v1", JSON.stringify({
+      columns: { files: 16, terminal: 49, agent: 35 },
+      preset: "shell",
+      visiblePanels: { files: false, terminal: true, agent: true },
+    }));
+
+    const layout = useWorkspaceLayoutStore();
+    layout.hydrate();
+
+    expect(layout.columns).toEqual({ files: 16, terminal: 59, agent: 25 });
+    expect(layout.visiblePanels).toEqual({ files: false, terminal: true, agent: true });
+    expect(JSON.parse(localStorage.getItem("opsark.workspaceLayout.v1") ?? "{}").columns)
+      .toEqual({ files: 16, terminal: 59, agent: 25 });
+  });
+
+  it("不覆盖用户手动调整的其他布局比例", () => {
+    localStorage.setItem("opsark.workspaceLayout.v1", JSON.stringify({
+      columns: { files: 16, terminal: 54, agent: 30 },
+      preset: null,
+    }));
+
+    const layout = useWorkspaceLayoutStore();
+    layout.hydrate();
+
+    expect(layout.columns).toEqual({ files: 16, terminal: 54, agent: 30 });
+  });
+
   it("独立切换面板并恢复显示组合，比例预设不改变开关", () => {
     const layout = useWorkspaceLayoutStore();
     layout.togglePanel("files");

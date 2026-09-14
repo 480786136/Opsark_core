@@ -1,11 +1,14 @@
 import { validateRequestParameters } from "@/features/agent/modelParameters";
 import { defineStore } from "pinia";
+import { watch } from "vue";
+import { useConnectionStore, isConnectionTransportFailure } from "@/features/connection/connectionStore";
 import { modelLogContext } from "@/features/agent/modelLogContext";
 import { restoreConversationLinks } from "@/features/agent/conversationHistory";
 import { archiveToolEvidence } from "@/features/agent/evidenceArchive";
 import { workflowLifetime } from "@/features/agent/workflowLifetime";
 import { automaticContinuationBlocker } from "@/features/agent/workflowProgress";
 import { backend, buildExecutionSummary, isTauri, ModelInvocationError, normalizePlanPreconditions } from "@/services/backend";
+import type { RuntimeConnection } from "@/services/backend";
 import {
   classifyStepResult,
   ensureStepValidator,
@@ -118,7 +121,7 @@ import {
   runValidationLifecycle,
 } from "@/features/agent/executionLifecycle";
 import { prepareStepExecution } from "@/features/agent/executionPreparation";
-import { executeStepCommand } from "@/features/agent/executionRunner";
+import { executeStepCommand, executeStepValidation } from "@/features/agent/executionRunner";
 import { buildShellStartupTransaction } from "@/features/agent/shellStartupConfig";
 import { redactExecutionOutput } from "@/features/agent/secretTool";
 import { findSecretKeys } from "@/features/agent/secretTool";
@@ -589,6 +592,29 @@ function compactPersistedTasks(tasks: OpsTask[], aggressive = false): OpsTask[] 
   }));
 }
 
+interface ServerMetricState {
+  sample?: Metrics;
+  loading: boolean;
+  error?: string;
+  stale: boolean;
+  requestVersion: number;
+  lastAttemptAt: number;
+}
+
+const connectionMonitors = new WeakMap<object, () => void>();
+interface PendingServerCredential {
+  connection: RuntimeConnection;
+  remember: boolean;
+  committing?: Promise<void>;
+}
+const pendingServerCredentials = new WeakMap<object, Map<string, PendingServerCredential>>();
+const serverCredentialWrites = new WeakMap<object, Map<string, Promise<void>>>();
+
+function sameServerConnection(left: RuntimeConnection | undefined, right: RuntimeConnection) {
+  return Boolean(left && left.host === right.host && left.port === right.port
+    && left.username === right.username && left.password === right.password);
+}
+
 export const useOpsStore = defineStore("ops", {
   state: () => ({
     servers: initialServers(),
@@ -602,25 +628,19 @@ export const useOpsStore = defineStore("ops", {
     modelAvailability: {} as Record<string, ModelAvailability>,
     logs: initialLogs(),
     developerLogs: initialDeveloperLogs(),
-    metrics: {
-      cpu: 0,
-      memory: 0,
-      disk: 0,
-      networkIn: 0,
-      networkOut: 0,
-      sampledAt: "",
-    } as Metrics,
+    metricsByServer: {} as Record<string, ServerMetricState>,
+    connectionClock: Date.now(),
+    connectionSnapshots: {} as Record<string, string>,
+    collectingServers: [] as string[],
     activeTaskId: null as string | null,
     serverPasswords: {} as Record<string, string>,
     modelApiKeys: {} as Record<string, string>,
-    connectedServerIds: [] as string[],
     secretMetadata: initialSecretMetadata(),
     secretValues: {} as Record<string, string>,
     pendingSecret: null as PendingSecretRequest | null,
     pendingUserInputs: [] as PendingUserInput[],
     terminalLines: [] as string[],
     isCollecting: false,
-    metricsLoading: false,
     credentialsHydrated: false,
     credentialsLoading: false,
     credentialError: "",
@@ -628,6 +648,10 @@ export const useOpsStore = defineStore("ops", {
   }),
 
   getters: {
+    connectedServerIds(): string[] {
+      return Object.entries(useConnectionStore().states)
+        .filter(([, connection]) => connection.status === "connected").map(([id]) => id);
+    },
     activeTask(state): OpsTask | undefined {
       return state.tasks.find((task) => task.id === state.activeTaskId);
     },
@@ -648,6 +672,155 @@ export const useOpsStore = defineStore("ops", {
   },
 
   actions: {
+    serverConnection(serverId: string) { return useConnectionStore().state(serverId); },
+
+    isServerConnected(serverId: string) { return useConnectionStore().isConnected(serverId); },
+
+    metricState(serverId: string) {
+      const metric = this.metricsByServer[serverId];
+      return {
+        sample: metric?.sample,
+        loading: metric?.loading ?? false,
+        error: metric?.error,
+        stale: !metric?.sample || Boolean(metric.stale || metric.error)
+          || !this.isServerConnected(serverId)
+          || this.connectionClock - Date.parse(metric.sample.sampledAt) > 30_000,
+      };
+    },
+
+    contextMetrics(serverId: string): Metrics | undefined {
+      const metric = this.metricState(serverId);
+      return metric.stale ? undefined : metric.sample;
+    },
+
+    syncConnectionStates() {
+      for (const server of this.servers) {
+        const connection = this.serverConnection(server.id);
+        const snapshot = `${connection.status}:${connection.generation}`;
+        if (this.connectionSnapshots[server.id] === snapshot) continue;
+        const previous = this.connectionSnapshots[server.id];
+        this.connectionSnapshots[server.id] = snapshot;
+        server.status = connection.status === "connected" ? "online"
+          : ["connecting", "reconnecting", "suspect"].includes(connection.status) ? "testing" : "offline";
+        if (connection.status !== "connected") {
+          const metric = this.metricsByServer[server.id];
+          if (metric && (!metric.stale || metric.loading)) {
+            metric.stale = true;
+            metric.requestVersion += 1;
+            metric.loading = false;
+          }
+          useFileWorkspaceStore().markServerOffline(server.id);
+        } else {
+          void this.commitVerifiedServerCredential(server.id);
+        }
+        if (previous !== undefined && !snapshot.startsWith("idle:")) {
+          this.addLog({ category: "system", level: ["manual", "auth_failed"].includes(connection.status) ? "error"
+            : connection.status === "connected" ? "success" : "info",
+          title: `SSH 连接状态：${connection.phase}`,
+          detail: JSON.stringify({ status: connection.status, generation: connection.generation,
+            attempt: connection.attempt, error: connection.error,
+            elapsedMs: connection.startedAt ? Math.max(0, Date.now() - connection.startedAt) : undefined,
+            lastSuccessAt: connection.lastSuccessAt }), serverId: server.id });
+        }
+      }
+    },
+
+    startConnectionMonitor() {
+      if (connectionMonitors.has(this)) return;
+      const connections = useConnectionStore();
+      const stopWatch = watch(() => Object.values(connections.states)
+        .map(connection => `${connection.status}:${connection.generation}`).join("|"),
+      () => this.syncConnectionStates(), { flush: "post" });
+      const tick = (force = false) => {
+        this.connectionClock = Date.now();
+        connections.tick(this.servers.map(server => server.id), force);
+        this.syncConnectionStates();
+        for (const id of this.connectedServerIds) {
+          const metric = this.metricsByServer[id];
+          if (!metric?.loading && (!metric || this.connectionClock - metric.lastAttemptAt >= 10_000)) {
+            void this.refreshMetrics(id);
+          }
+        }
+      };
+      const interval = window.setInterval(() => tick(), 1000);
+      const onWake = () => { if (!document.hidden) tick(true); };
+      window.addEventListener("focus", onWake);
+      window.addEventListener("online", onWake);
+      document.addEventListener("visibilitychange", onWake);
+      connectionMonitors.set(this, () => {
+        window.clearInterval(interval);
+        stopWatch();
+        window.removeEventListener("focus", onWake);
+        window.removeEventListener("online", onWake);
+        document.removeEventListener("visibilitychange", onWake);
+      });
+      tick();
+    },
+
+    stopConnectionMonitor() {
+      connectionMonitors.get(this)?.();
+      connectionMonitors.delete(this);
+    },
+
+    reportConnectionFailure(serverId: string, reason: string) {
+      if (!isConnectionTransportFailure(reason)) return;
+      useConnectionStore().reportFailure(serverId, reason);
+      this.syncConnectionStates();
+    },
+
+    pauseTaskForConnection(task: OpsTask, expectedGeneration?: number) {
+      const id = executionServerId(task);
+      if (this.getRuntimeConnection(id) && (expectedGeneration === undefined
+        || this.serverConnection(id).generation === expectedGeneration)) return false;
+      const reason = "SSH 连接不可用或已更换，任务已暂停。请重连并核对执行记录；未收到结果的命令不会自动重放。";
+      task.pauseReason = reason;
+      task.autoAdjustmentSeconds = undefined;
+      task.managedAdjustmentPhase = "manual_required";
+      task.managedStopReason = "transport_recovery";
+      if (canTransitionTask(task.status, "needs_adjustment")) transitionTask(task, "needs_adjustment");
+      if (task.messages[task.messages.length - 1]?.content !== reason) this.pushMessage(task, { role: "system", kind: "event", content: reason });
+      this.persist();
+      return true;
+    },
+
+    async reconnectServer(serverId: string): Promise<boolean> {
+      await this.hydrateCredentials();
+      let password = this.serverPasswords[serverId];
+      if (!password) {
+        try { password = await backend.loadCredential("server", serverId) ?? ""; }
+        catch { this.serverConnection(serverId).error = "系统凭据读取失败，请手动填写 SSH 密码"; }
+      }
+      if (!password) return false;
+      return this.connectServer(serverId, password, false);
+    },
+
+    async commitVerifiedServerCredential(serverId: string): Promise<void> {
+      const pending = pendingServerCredentials.get(this)?.get(serverId);
+      if (!pending || !sameServerConnection(this.getRuntimeConnection(serverId), pending.connection)) return;
+      if (pending.committing) return pending.committing;
+      const changed = this.serverPasswords[serverId] !== pending.connection.password;
+      this.serverPasswords[serverId] = pending.connection.password;
+      if (changed) {
+        markTaskCredentialRevision(this.tasks, serverId);
+      }
+      let writes = serverCredentialWrites.get(this);
+      if (!writes) { writes = new Map(); serverCredentialWrites.set(this, writes); }
+      const commit = (writes.get(serverId) ?? Promise.resolve()).then(async () => {
+        if (pending.remember && sameServerConnection(this.getRuntimeConnection(serverId), pending.connection)) {
+          try { await backend.saveCredential("server", serverId, pending.connection.password); }
+          catch (error) { this.credentialError = String(error); }
+        }
+      }).finally(() => {
+        if (pendingServerCredentials.get(this)?.get(serverId) === pending) pendingServerCredentials.get(this)?.delete(serverId);
+        if (writes!.get(serverId) === commit) writes!.delete(serverId);
+      });
+      pending.committing = commit;
+      writes.set(serverId, commit);
+      void this.refreshServer(serverId);
+      void this.refreshMetrics(serverId);
+      return commit;
+    },
+
     persist(immediate = false) {
       if (persistTimer !== undefined) window.clearTimeout(persistTimer);
       const store = this;
@@ -964,11 +1137,12 @@ export const useOpsStore = defineStore("ops", {
 
     async ensureServerConnected(serverId: string) {
       await this.hydrateCredentials();
-      if (this.connectedServerIds.includes(serverId)) return true;
+      if (this.isServerConnected(serverId)) return true;
+      // Revisiting a failed/disconnected tab must not reset the user's retry budget.
+      if (this.serverConnection(serverId).status !== "idle") return false;
       const password = this.serverPasswords[serverId];
       if (!password) return false;
-      await this.connectServer(serverId, password, false);
-      return this.connectedServerIds.includes(serverId);
+      return this.connectServer(serverId, password, false);
     },
 
     addLog(event: Omit<AuditEvent, "id" | "createdAt">) {
@@ -1032,30 +1206,16 @@ export const useOpsStore = defineStore("ops", {
 
     async refreshServer(serverId: string) {
       const server = this.servers.find((item) => item.id === serverId);
-      if (!server) return;
+      const connection = this.getRuntimeConnection(serverId);
+      if (!server || !connection || this.collectingServers.includes(serverId)) return;
+      const generation = this.serverConnection(serverId).generation;
+      this.collectingServers.push(serverId);
       this.isCollecting = true;
-      server.status = "testing";
       try {
-        const password = this.serverPasswords[serverId];
-        if (password) {
-          const probe = await backend.probeSsh({
-            host: server.host,
-            port: server.port,
-            username: server.username,
-            password,
-          });
-          server.info = probe.info;
-          server.environment = probe.environment;
-          if (!this.connectedServerIds.includes(serverId)) this.connectedServerIds.push(serverId);
-          server.status = "online";
-          const connection = { host: server.host, port: server.port, username: server.username, password };
-          void Promise.allSettled([
-            useFileWorkspaceStore().loadDirectory(serverId, connection, "/"),
-            this.refreshMetrics(serverId),
-          ]);
-        } else {
-          throw new Error("未找到该服务器的 SSH 凭据，请重新连接");
-        }
+        const probe = await backend.probeSsh(connection);
+        if (!this.isServerConnected(serverId) || this.serverConnection(serverId).generation !== generation) return;
+        server.info = probe.info;
+        server.environment = probe.environment;
         this.addLog({
           category: "system",
           level: "success",
@@ -1064,60 +1224,89 @@ export const useOpsStore = defineStore("ops", {
           serverId,
         });
       } catch (error) {
-        server.status = "offline";
+        if (this.serverConnection(serverId).generation !== generation) return;
+        this.reportConnectionFailure(serverId, String(error));
         this.addLog({
           category: "system",
           level: "error",
-          title: "服务器连接失败",
+          title: "服务器环境采集失败",
           detail: String(error),
           serverId,
         });
       } finally {
-        this.isCollecting = false;
+        this.collectingServers = this.collectingServers.filter(id => id !== serverId);
+        this.isCollecting = this.collectingServers.length > 0;
         this.persist();
       }
     },
 
-    async connectServer(serverId: string, password: string, remember = true) {
-      const credentialChanged = this.serverPasswords[serverId] !== password;
-      this.serverPasswords[serverId] = password;
-      if (credentialChanged) markTaskCredentialRevision(this.tasks, serverId);
-      await this.refreshServer(serverId);
-      if (this.connectedServerIds.includes(serverId)) {
-        if (remember) {
-          try {
-            await backend.saveCredential("server", serverId, password);
-          } catch (error) {
-            this.credentialError = String(error);
-          }
-        }
-      } else {
-        delete this.serverPasswords[serverId];
+    async connectServer(serverId: string, password: string, remember = true): Promise<boolean> {
+      const server = this.servers.find(item => item.id === serverId);
+      if (!server || !password) return false;
+      const requested = {
+        host: server.host, port: server.port, username: server.username, password,
+      };
+      let pending = pendingServerCredentials.get(this);
+      if (!pending) { pending = new Map(); pendingServerCredentials.set(this, pending); }
+      const existing = pending.get(serverId);
+      if (existing && sameServerConnection(existing.connection, requested)) existing.remember ||= remember;
+      else {
+        pending.set(serverId, { connection: requested, remember });
+        // Clear the prior identity's cache BEFORE publishing connected. Clearing
+        // it afterward would invalidate the directory load triggered by that event.
+        if (this.serverPasswords[serverId] !== password) useFileWorkspaceStore().clearServerCache(serverId);
       }
+      const verified = await useConnectionStore().connect(serverId, requested);
+      const current = this.getRuntimeConnection(serverId);
+      const connected = verified && Boolean(current && current.host === requested.host
+        && current.port === requested.port && current.username === requested.username
+        && current.password === requested.password);
+      this.syncConnectionStates();
+      if (connected && this.isServerConnected(serverId)) {
+        await this.commitVerifiedServerCredential(serverId);
+      }
+      this.persist();
+      return connected && sameServerConnection(this.getRuntimeConnection(serverId), requested);
     },
 
     disconnectServer(serverId: string) {
+      pendingServerCredentials.get(this)?.delete(serverId);
       const hadCredential = Boolean(this.serverPasswords[serverId]);
       delete this.serverPasswords[serverId];
       if (hadCredential) markTaskCredentialRevision(this.tasks, serverId);
-      this.connectedServerIds = this.connectedServerIds.filter((id) => id !== serverId);
+      useConnectionStore().disconnect(serverId);
+      this.syncConnectionStates();
       const server = this.servers.find((item) => item.id === serverId);
       if (server) server.status = "offline";
     },
 
     async refreshMetrics(serverId?: string) {
-      if (this.metricsLoading) return;
-      this.metricsLoading = true;
+      if (!serverId) return;
+      const connection = this.getRuntimeConnection(serverId);
+      if (!connection) return;
+      if (!this.metricsByServer[serverId]) this.metricsByServer[serverId] = {
+        loading: false, stale: true, requestVersion: 0, lastAttemptAt: 0,
+      };
+      const metric = this.metricsByServer[serverId];
+      if (metric.loading) return;
+      metric.loading = true;
+      metric.lastAttemptAt = Date.now();
+      const version = ++metric.requestVersion;
+      const generation = this.serverConnection(serverId).generation;
       try {
-        const server = this.servers.find((item) => item.id === serverId);
-        const password = serverId ? this.serverPasswords[serverId] : undefined;
-        this.metrics = server && password
-          ? await backend.getSshMetrics({ host: server.host, port: server.port, username: server.username, password })
-          : await backend.getMetrics();
-      } catch {
-        // Keep the last valid sample when a remote collection fails.
+        const sample = await backend.getSshMetrics(connection);
+        if (metric.requestVersion !== version || !this.isServerConnected(serverId)
+          || this.serverConnection(serverId).generation !== generation) return;
+        metric.sample = sample;
+        metric.stale = false;
+        metric.error = undefined;
+      } catch (error) {
+        if (metric.requestVersion !== version || this.serverConnection(serverId).generation !== generation) return;
+        metric.stale = true;
+        metric.error = String(error);
+        this.reportConnectionFailure(serverId, String(error));
       } finally {
-        this.metricsLoading = false;
+        if (metric.requestVersion === version) metric.loading = false;
       }
     },
 
@@ -1130,6 +1319,12 @@ export const useOpsStore = defineStore("ops", {
     ) {
       const connection = this.getRuntimeConnection(serverId);
       if (!connection) throw new Error("请先连接真实服务器");
+      const generation = this.serverConnection(serverId).generation;
+      const assertConnection = () => {
+        if (!this.getRuntimeConnection(serverId) || this.serverConnection(serverId).generation !== generation) {
+          throw new Error("SSH 连接已断开或更换，已停止派发远程操作");
+        }
+      };
       const startedAt = performance.now();
       const result = await executeRegisteredToolCall(call, this.tools, {
         readEvidence: async (evidenceId, offset, limit) => {
@@ -1203,9 +1398,7 @@ export const useOpsStore = defineStore("ops", {
             throw new Error("SSH 凭据组中的用户名格式不安全，请在敏感信息管理中修正");
           }
           if (!password) throw new Error("缺少目标服务器 SSH 密码，请先查询连接资料或通过用户输入工具安全收集");
-          if (isTauri()) {
-            await backend.probeSsh({ host: request.host, port, username, password });
-          }
+          await backend.checkSshConnection({ host: request.host, port, username, password }, 15_000);
           let target = this.servers.find((server) => server.host === request.host && server.port === port);
           if (target) {
             target.username = username;
@@ -1220,9 +1413,9 @@ export const useOpsStore = defineStore("ops", {
               group: request.group ?? "智能连接",
             });
           }
-          this.serverPasswords[target.id] = password;
-          if (!this.connectedServerIds.includes(target.id)) this.connectedServerIds.push(target.id);
-          target.status = "online";
+          if (!await this.connectServer(target.id, password)) {
+            throw new Error(this.serverConnection(target.id).error || "SSH 连接未成功");
+          }
           const task = taskId ? this.tasks.find((candidate) => candidate.id === taskId) : undefined;
           if (task) {
             task.executionTargetServerId = target.id;
@@ -1251,8 +1444,9 @@ export const useOpsStore = defineStore("ops", {
           }
           return { skillId };
         },
-        getRemoteFileStructure: (request) => backend.getRemoteFileStructure(connection, request),
+        getRemoteFileStructure: (request) => { assertConnection(); return backend.getRemoteFileStructure(connection, request); },
         readRemoteFileContent: async (request: FileContentRequest): Promise<FileContentResult> => {
+          assertConnection();
           const maxBytes = request.maxBytes ?? 65_536;
           const file = await backend.readSftpFilePrefix(connection, request.path, maxBytes);
           const sampled = file.data;
@@ -1273,6 +1467,7 @@ export const useOpsStore = defineStore("ops", {
           };
         },
         checkSoftware: async (request) => {
+          assertConnection();
           const command = buildSoftwareCheckCommand(request);
           const result = await backend.executeCommand(command, connection, false, {
             executionId: call.id,
@@ -1282,6 +1477,7 @@ export const useOpsStore = defineStore("ops", {
           return parseSoftwareCheckOutput(result.output);
         },
         transferFileBetweenServers: async (request: ServerFileTransferRequest) => {
+          assertConnection();
           const target = this.servers.find((server) => [server.id, server.name, server.host].includes(request.targetServer));
           if (!target) throw new Error(`目标服务器“${request.targetServer}”尚未加入服务器管理`);
           if (target.id === serverId) throw new Error("源服务器和目标服务器不能相同");
@@ -1300,6 +1496,9 @@ export const useOpsStore = defineStore("ops", {
           return { ...transfer, targetServerId: target.id };
         },
       });
+      if (!result.success && this.serverConnection(serverId).generation === generation) {
+        this.reportConnectionFailure(serverId, result.error?.message || "");
+      }
       this.addLog({
         category: "tool",
         level: result.success ? "success" : "error",
@@ -1330,10 +1529,9 @@ export const useOpsStore = defineStore("ops", {
 
     getRuntimeConnection(serverId: string) {
       const server = this.servers.find((item) => item.id === serverId);
-      const password = this.serverPasswords[serverId];
-      return server && password
-        ? { host: server.host, port: server.port, username: server.username, password }
-        : undefined;
+      const connection = useConnectionStore().connection(serverId);
+      return server && connection && server.host === connection.host
+        && server.port === connection.port && server.username === connection.username ? connection : undefined;
     },
 
     async ensureTaskAgentSession(taskId: string) {
@@ -1385,20 +1583,28 @@ export const useOpsStore = defineStore("ops", {
       Object.assign(server, input);
       this.persist(true);
       const credential = password || this.serverPasswords[serverId];
-      if (connectionChanged) {
-        this.connectedServerIds = this.connectedServerIds.filter((id) => id !== serverId);
+      if (connectionChanged || password) {
+        useConnectionStore().disconnect(serverId);
+        useFileWorkspaceStore().clearServerCache(serverId);
+        const metric = this.metricsByServer[serverId];
+        if (metric) metric.requestVersion += 1;
+        delete this.metricsByServer[serverId];
         server.status = credential ? "testing" : "offline";
       }
       if (credential && (password || connectionChanged)) void this.connectServer(serverId, credential, Boolean(password));
     },
 
     removeServer(serverId: string) {
+      pendingServerCredentials.get(this)?.delete(serverId);
       const removedSecrets = this.secretMetadata.filter((secret) => secret.serverId === serverId);
       this.servers = this.servers.filter((server) => server.id !== serverId);
       this.secretMetadata = this.secretMetadata.filter((secret) => secret.serverId !== serverId);
       for (const secret of removedSecrets) delete this.secretValues[secretValueId(serverId, secret.key)];
       delete this.serverPasswords[serverId];
-      this.connectedServerIds = this.connectedServerIds.filter((id) => id !== serverId);
+      useConnectionStore().forget(serverId);
+      const metric = this.metricsByServer[serverId];
+      if (metric) metric.requestVersion += 1;
+      delete this.metricsByServer[serverId];
       useFileWorkspaceStore().removeServer(serverId);
       useAgentWorkspaceStore().removeServer(serverId);
       void backend.deleteCredential("server", serverId);
@@ -1552,6 +1758,7 @@ export const useOpsStore = defineStore("ops", {
       contextTaskId = "",
     ) {
       await this.hydrateCredentials();
+      if (!this.getRuntimeConnection(serverId)) throw new Error("SSH 未连接，请先手动重连后再发送需求");
       let task = selectedTaskId
         ? this.tasks.find((item) => item.id === selectedTaskId && item.serverId === serverId)
         : this.activeTask;
@@ -1640,7 +1847,7 @@ export const useOpsStore = defineStore("ops", {
           throw new Error(`“${model.name}”的 API Key 未恢复，请前往“模型与设置”重新保存一次。${keychainDetail}`);
         }
         const server = this.servers.find((item) => item.id === serverId);
-        const contextMetrics = this.metrics;
+        const contextMetrics = this.contextMetrics(serverId);
         const contextSecrets = serverSecretValues(this.secretValues, serverId);
         const availableTerminalLines = this.terminalLines.slice(-400)
           .map((line) => redactExecutionOutput(line, contextSecrets));
@@ -2237,7 +2444,7 @@ export const useOpsStore = defineStore("ops", {
         const currentPolicyFingerprint = nextStagePolicyFingerprint({
           task,
           server,
-          metrics: this.metrics,
+          metrics: this.contextMetrics(executionServerId(task)),
           tools: this.tools,
           secretMetadata: this.secretMetadata,
           skills: activeSkills,
@@ -2286,7 +2493,7 @@ export const useOpsStore = defineStore("ops", {
               task,
               failedStep: failed,
               server,
-              metrics: this.metrics,
+              metrics: this.contextMetrics(executionServerId(task)),
               tools: this.tools,
               secretMetadata: this.secretMetadata,
               model,
@@ -2561,6 +2768,7 @@ export const useOpsStore = defineStore("ops", {
     async approvePlan(taskId: string, automatic = false) {
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || task.status !== "awaiting_plan_approval") return;
+      if (this.pauseTaskForConnection(task)) return;
       const beforeNormalization = task.plan.map(({ id, command, validation }) => ({ id, command, validation }));
       task.plan = normalizePlanPreconditions(task.plan, latestTaskRequirement(task), this.tools);
       const changedSteps = task.plan.filter((step) => {
@@ -2634,7 +2842,7 @@ export const useOpsStore = defineStore("ops", {
       const executionId = task.currentExecutionId;
       const targetServerId = executionServerId(task);
       const server = this.servers.find((item) => item.id === targetServerId);
-      const password = this.serverPasswords[targetServerId];
+      const password = this.getRuntimeConnection(targetServerId)?.password;
       const agentSession = useAgentTerminalStore().sessionsByTask[task.id];
       let agentExecutionHandled = false;
       if (executionId && server && password && agentSession && agentSession.state === "busy") {
@@ -2682,6 +2890,7 @@ export const useOpsStore = defineStore("ops", {
     async advanceTask(taskId: string) {
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || !["running", "awaiting_step_approval"].includes(task.status)) return;
+      if (this.pauseTaskForConnection(task)) return;
       const lifetime = workflowLifetime(task);
       try {
       const targetServerId = executionServerId(task);
@@ -2699,7 +2908,7 @@ export const useOpsStore = defineStore("ops", {
             task,
             requirement,
             server,
-            metrics: this.metrics,
+            metrics: this.contextMetrics(executionServerId(task)),
             tools: this.tools,
             secretMetadata: this.secretMetadata,
             model,
@@ -2754,7 +2963,7 @@ export const useOpsStore = defineStore("ops", {
           model,
           apiKey,
           server,
-          metrics: this.metrics,
+          metrics: this.contextMetrics(executionServerId(task)),
           tools: this.tools,
           secretMetadata: this.secretMetadata,
           generationSettings: this.aiGenerationSettings,
@@ -2919,6 +3128,7 @@ export const useOpsStore = defineStore("ops", {
       const task = this.tasks.find((item) => item.id === taskId);
       const step = task?.plan.find((item) => item.id === stepId);
       if (!task || !step) return;
+      if (this.pauseTaskForConnection(task)) return;
       const lifetime = workflowLifetime(task);
       const toolDefinition = this.tools.find((tool) => tool.id === call.toolId);
       if (toolDefinition?.executionMode === "user-input") {
@@ -3001,9 +3211,17 @@ export const useOpsStore = defineStore("ops", {
       const task = this.tasks.find((item) => item.id === taskId);
       const step = task?.plan.find((item) => item.id === stepId);
       if (!task || !step) return;
+      if (this.pauseTaskForConnection(task)) return;
       const lifetime = workflowLifetime(task);
       step.attemptContext = taskAttemptContext(task);
       const targetServerId = executionServerId(task);
+      const connectionGeneration = this.serverConnection(targetServerId).generation;
+      const assertConnection = () => {
+        if (!this.getRuntimeConnection(targetServerId)
+          || this.serverConnection(targetServerId).generation !== connectionGeneration) {
+          throw new Error("SSH 连接已断开或更换，远程操作已暂停；已发送命令的结果需核对");
+        }
+      };
       const incompatibleSecret = findSecretKeys(`${step.command}\n${step.validation}`)
         .map((key) => ({ key, metadata: this.secretMetadata.find((item) => item.key === key && item.serverId === targetServerId) }))
         .find(({ metadata }) => metadata && secretPurposeMismatch(step, metadata.description));
@@ -3077,7 +3295,7 @@ export const useOpsStore = defineStore("ops", {
       }
 
       const server = this.servers.find((item) => item.id === targetServerId);
-      const password = this.serverPasswords[targetServerId];
+      const password = this.getRuntimeConnection(targetServerId)?.password;
       const runtimeModel = this.models.find((item) => item.id === task.modelId);
       const runtimeApiKey = this.modelApiKeys[task.modelId];
       const scopedSecrets = serverSecretValues(this.secretValues, targetServerId);
@@ -3117,6 +3335,7 @@ export const useOpsStore = defineStore("ops", {
         false,
       );
       if (!lifetime.current()) return;
+      if (this.pauseTaskForConnection(task, connectionGeneration)) return;
       if (finalSafety.issues.length) {
         const failure = failPlanSafetyCheck(step, finalSafety.issues);
         transitionTask(task, "needs_adjustment");
@@ -3219,6 +3438,7 @@ export const useOpsStore = defineStore("ops", {
           frameworkExecutionId: string,
           approvedHighRisk = false,
         ) => {
+          assertConnection();
           task.currentExecutionId = frameworkExecutionId;
           agentTerminals.begin(
             task.id,
@@ -3262,7 +3482,7 @@ export const useOpsStore = defineStore("ops", {
                 });
             const safeFrameworkOutput = redactExecutionOutput(frameworkResult.output, scopedSecrets);
             if (safeFrameworkOutput && !frameworkStreamed) {
-              agentTerminals.output(task.id, frameworkExecutionId, `${safeFrameworkOutput}\n`);
+              agentTerminals.completionOutput(task.id, frameworkExecutionId, `${safeFrameworkOutput}\n`);
             }
             agentTerminals.finish(
               task.id,
@@ -3332,7 +3552,8 @@ export const useOpsStore = defineStore("ops", {
           connection: prepared.connection,
           runtimeModel: prepared.runtimeModel,
           secretValues: scopedSecrets,
-          isCancelled: () => !lifetime.current(),
+          isCancelled: () => !lifetime.current() || !this.isServerConnected(targetServerId)
+            || this.serverConnection(targetServerId).generation !== connectionGeneration,
           onExecutionChange: (activeExecutionId) => {
             if (lifetime.current()) task.currentExecutionId = activeExecutionId;
           },
@@ -3373,6 +3594,7 @@ export const useOpsStore = defineStore("ops", {
             });
           },
           cancelExecution: async () => {
+            assertConnection();
             if (useAgentSandbox && prepared.connection && agentSession) {
               await backend.interruptAgentCommand(prepared.connection, agentSession, executionId);
               return;
@@ -3380,9 +3602,10 @@ export const useOpsStore = defineStore("ops", {
             if (prepared.connection) await backend.cancelCommand(prepared.connection, executionId);
           },
           sampleRuntimeProgress: useAgentSandbox && prepared.connection && agentSession
-            ? () => backend.sampleAgentExecutionProgress(prepared.connection!, agentSession!, executionId)
+            ? async () => { assertConnection(); return backend.sampleAgentExecutionProgress(prepared.connection!, agentSession!, executionId); }
             : undefined,
         }, async (input) => {
+          assertConnection();
           // Browser tests and the one-version rollback use the existing
           // independent stateless SSH executor. Neither route writes user PTY.
           if (!useAgentSandbox || !prepared.connection || !agentSession) {
@@ -3449,7 +3672,7 @@ export const useOpsStore = defineStore("ops", {
         const completionLines: string[] = [];
         appendCommandCompletion(completionLines, safeOutput, Boolean(streamedOutput));
         if (!streamedOutput && completionLines.length) {
-          agentTerminals.output(task.id, executionId, `${completionLines.join("\n")}\n`);
+          agentTerminals.completionOutput(task.id, executionId, `${completionLines.join("\n")}\n`);
         }
         this.addLog(buildCommandResultAudit({
           stepTitle: step.title,
@@ -3557,7 +3780,6 @@ export const useOpsStore = defineStore("ops", {
             : `${step.title}的主命令已完成，正在执行独立后置校验…`,
         });
         this.persist();
-        let validationStreamed = false;
         const validationLifecycle = commandResultOnly
           ? {
               validation: {
@@ -3585,7 +3807,6 @@ export const useOpsStore = defineStore("ops", {
                 },
                 onProgress: (safeChunk) => {
                   if (!lifetime.current()) return;
-                  validationStreamed = true;
                   appendTerminalStream(this.terminalLines, safeChunk);
                 },
                 onRetry: (firstValidationOutput, maxRetries) => {
@@ -3612,6 +3833,8 @@ export const useOpsStore = defineStore("ops", {
                 } : undefined,
               }, useAgentSandbox && prepared.connection && agentSession
                 ? async (input) => {
+                  assertConnection();
+                  let agentValidationStreamed = false;
                   agentTerminals.begin(
                     task.id,
                     input.executionId,
@@ -3632,6 +3855,7 @@ export const useOpsStore = defineStore("ops", {
                       if (!lifetime.current() || !event.data || (event.stream !== "stdout" && event.stream !== "stderr")) return;
                       const safeChunk = redactExecutionOutput(event.data, scopedSecrets);
                       if (!safeChunk) return;
+                      agentValidationStreamed = true;
                       agentTerminals.output(task.id, input.executionId, safeChunk);
                       input.onProgress?.(safeChunk, {
                         executionId: input.executionId,
@@ -3640,16 +3864,24 @@ export const useOpsStore = defineStore("ops", {
                       });
                     },
                   });
+                  const safeValidationOutput = redactExecutionOutput(result.output, scopedSecrets);
+                  if (!agentValidationStreamed && safeValidationOutput) {
+                    agentTerminals.completionOutput(
+                      task.id,
+                      input.executionId,
+                      `${safeValidationOutput}\n`,
+                    );
+                  }
                   agentTerminals.finish(task.id, input.executionId, result.exitCode);
                   return {
                     passed: result.success,
                     detail: result.success ? "后置校验通过" : `后置校验退出码 ${result.exitCode}`,
-                    output: result.output,
+                    output: safeValidationOutput,
                     exitCode: result.exitCode,
                     emptyResult: result.emptyResult,
                   };
                 }
-                : undefined);
+                : async (input) => { assertConnection(); return executeStepValidation(input); });
             })();
         if (!lifetime.current()) {
           await rollbackShellStartup("任务在验收期间已取消");
@@ -3672,7 +3904,6 @@ export const useOpsStore = defineStore("ops", {
             `验证 › ${step.validation}`,
             assembledValidation.validationOutput,
           );
-          if (!validationStreamed) agentTerminals.output(task.id, task.currentExecutionId ?? "validation", `${assembledValidation.validationOutput}\n`);
         }
         const classified = classifyStepResult(
           step,
@@ -3747,6 +3978,7 @@ export const useOpsStore = defineStore("ops", {
         await this.advanceTask(taskId);
       } catch (error) {
         if (!lifetime.current()) return;
+        if (isConnectionTransportFailure(String(error))) this.reportConnectionFailure(targetServerId, String(error));
         if (step.status === "completed") {
           this.pauseWorkflowFailure(task, error);
           return;
@@ -4220,14 +4452,11 @@ export const useOpsStore = defineStore("ops", {
 
     async runTerminalCommand(command: string, serverId?: string) {
       if (!command.trim()) return;
+      const connection = serverId ? this.getRuntimeConnection(serverId) : undefined;
+      if (serverId && !connection) throw new Error("SSH 未连接，请先重连后再执行命令");
       const activeServer = this.servers.find((item) => item.id === serverId);
       const prompt = activeServer ? `${activeServer.username}@${activeServer.host}:~$` : "local:~$";
       appendTerminalBlock(this.terminalLines, `${prompt} ${command}`);
-      const server = this.servers.find((item) => item.id === serverId);
-      const password = serverId ? this.serverPasswords[serverId] : undefined;
-      const connection = server && password
-        ? { host: server.host, port: server.port, username: server.username, password }
-        : undefined;
       const result = await backend.executeCommand(command, connection);
       const terminalOutput = result.output.split("\n");
       if (terminalOutput[0]?.startsWith("$ ")) terminalOutput.shift();

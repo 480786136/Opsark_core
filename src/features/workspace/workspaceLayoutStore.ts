@@ -12,6 +12,7 @@ export interface WorkspaceColumns {
 
 const STORAGE_KEY = "opsark.workspaceLayout.v1";
 const MIN_COLUMNS: WorkspaceColumns = { files: 12, terminal: 30, agent: 24 };
+const TEMPORARY_WIDE_AGENT_COLUMNS: WorkspaceColumns = { files: 16, terminal: 49, agent: 35 };
 
 export const workspaceLayoutPresets: Record<WorkspaceLayoutPreset, WorkspaceColumns> = {
   shell: { files: 16, terminal: 59, agent: 25 },
@@ -35,6 +36,10 @@ function isValidColumns(value: unknown): value is WorkspaceColumns {
   if (!values.every((item) => typeof item === "number" && Number.isFinite(item))) return false;
   if (columns.files! < MIN_COLUMNS.files || columns.terminal! < MIN_COLUMNS.terminal || columns.agent! < MIN_COLUMNS.agent) return false;
   return Math.abs(columns.files! + columns.terminal! + columns.agent! - 100) < 0.02;
+}
+
+function sameColumns(left: WorkspaceColumns, right: WorkspaceColumns): boolean {
+  return left.files === right.files && left.terminal === right.terminal && left.agent === right.agent;
 }
 
 /**
@@ -76,7 +81,15 @@ export const useWorkspaceLayoutStore = defineStore("workspace-layout", {
       if (this.hydrated) return;
       try {
         const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}") as Record<string, unknown>;
-        if (isValidColumns(parsed.columns)) this.columns = { ...parsed.columns };
+        let migratedTemporaryLayout = false;
+        if (isValidColumns(parsed.columns)) {
+          if (parsed.preset === "shell" && sameColumns(parsed.columns, TEMPORARY_WIDE_AGENT_COLUMNS)) {
+            this.columns = { ...workspaceLayoutPresets.shell };
+            migratedTemporaryLayout = true;
+          } else {
+            this.columns = { ...parsed.columns };
+          }
+        }
         if (parsed.preset === null || isPreset(parsed.preset)) this.preset = parsed.preset;
         if (parsed.visiblePanels && typeof parsed.visiblePanels === "object") {
           for (const panel of ["files", "terminal", "agent"] as const) {
@@ -84,6 +97,7 @@ export const useWorkspaceLayoutStore = defineStore("workspace-layout", {
             if (typeof visible === "boolean") this.visiblePanels[panel] = visible;
           }
         }
+        if (migratedTemporaryLayout) this.persist();
       } catch {
         // 布局配置损坏时使用 Shell 默认布局，不阻断工作台启动。
       }

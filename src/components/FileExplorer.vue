@@ -47,6 +47,7 @@ import { useOpsStore } from "@/stores/ops";
 import { backend, isTauri } from "@/services/backend";
 import type { FileEntry } from "@/types";
 import { useWorkspaceLinkStore } from "@/features/workspace/workspaceLinkStore";
+import { isConnectionTransportFailure } from "@/features/connection/connectionStore";
 
 type FileAction = "create" | "rename" | "delete" | "overwrite" | "uploadRename";
 interface FileDialogState {
@@ -82,6 +83,8 @@ const operationError = ref("");
 const operationPending = ref(false);
 const transferQueueOpen = ref(false);
 const uploadDragDepth = ref(0);
+const showOfflineCache = ref(false);
+let disposed = false;
 let nativeDropUnlisten: UnlistenFn | undefined;
 fileWorkspace.hydrate();
 fileWorkspace.ensureServer(props.serverId);
@@ -89,7 +92,20 @@ fileWorkspace.ensureServer(props.serverId);
 const fileState = computed(() => fileWorkspace.serverWorkspaces[props.serverId]);
 const currentPath = computed(() => fileState.value.currentPath);
 const breadcrumbs = computed(() => buildRemoteBreadcrumbs(currentPath.value));
-const isLive = computed(() => store.connectedServerIds.includes(props.serverId));
+const isLive = computed(() => store.isServerConnected(props.serverId));
+const hasSnapshot = computed(() => Boolean(fileState.value.lastSuccessAt));
+const directoryStateMessage = computed(() => {
+  const status = store.serverConnection(props.serverId).status;
+  const label = status === "suspect" ? "连接待确认"
+    : isLive.value ? (fileState.value.loading ? "正在刷新目录" : "目录刷新失败／非实时")
+    : status === "connecting" || status === "reconnecting" ? "正在连接"
+    : "离线缓存／非实时";
+  if (!hasSnapshot.value) return isLive.value ? "正在读取目录" : `${label} · 等待连接成功后读取目录`;
+  const date = new Date(fileState.value.lastSuccessAt!);
+  const updated = Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString();
+  return `${label} · 最后更新于 ${updated}`;
+});
+const showFiles = computed(() => hasSnapshot.value && (isLive.value || showOfflineCache.value));
 const draggingUpload = computed(() => isLive.value && uploadDragDepth.value > 0);
 const sortedFiles = computed(() => sortRemoteFiles(fileState.value.files, sort.value));
 const selectedSet = computed(() => new Set(selection.value.selectedPaths));
@@ -106,6 +122,7 @@ const fileTableStyle = computed(() => ({
 }));
 
 function beginPathEdit() {
+  if (!isLive.value) return;
   pathDraft.value = currentPath.value;
   editingPath.value = true;
   void nextTick(() => pathInput.value?.select());
@@ -143,6 +160,8 @@ function startColumnResize(column: "name" | "size" | "modified", event: PointerE
 }
 
 async function loadDirectory(path: string) {
+  if (disposed) return;
+  const serverId = props.serverId;
   const connection = store.getRuntimeConnection(props.serverId);
   if (!isLive.value || !connection) {
     fileWorkspace.markDirectoryError(props.serverId, "disconnected", path);
@@ -152,12 +171,13 @@ async function loadDirectory(path: string) {
   if (!result.ok) {
     // 请求已过期时，新请求负责更新界面，不能回写错误状态。
     if (result.stale) return;
+    reportTransportFailure(result.error, serverId);
     store.addLog({
       category: "system",
       level: "error",
       title: "SFTP 目录读取失败",
       detail: String(result.error),
-      serverId: props.serverId,
+      serverId,
     });
     return result;
   }
@@ -245,6 +265,7 @@ function openEntry(entry: FileEntry) {
 }
 
 function openDialog(type: FileAction, entry?: FileEntry, file?: File) {
+  if (!isLive.value || disposed) return;
   dialogError.value = "";
   dialog.value = {
     type,
@@ -267,11 +288,16 @@ function translatedNameError(value: string) {
 }
 
 async function queueUpload(file: File, remoteName = file.name) {
+  if (!isLive.value || disposed) throw new Error(t("workspace.connectServer"));
+  const serverId = props.serverId;
+  const generation = store.serverConnection(serverId).generation;
   const connection = store.getRuntimeConnection(props.serverId);
   if (!connection) throw new Error(t("workspace.connectServer"));
   const targetDirectory = currentPath.value;
   const remotePath = joinRemotePath(targetDirectory, remoteName);
   const data = new Uint8Array(await file.arrayBuffer());
+  if (disposed || serverId !== props.serverId || !isLive.value
+    || generation !== store.serverConnection(serverId).generation) throw new Error(t("workspace.connectServer"));
   transferQueue.enqueueUpload(props.serverId, connection, remoteName, remotePath, data, () => {
     store.addLog({
       category: "command",
@@ -287,7 +313,8 @@ async function queueUpload(file: File, remoteName = file.name) {
 
 async function submitDialog() {
   const state = dialog.value;
-  if (!state) return;
+  if (!state || !isLive.value || disposed) return;
+  const serverId = props.serverId;
   dialogError.value = "";
   if (state.type === "create" || state.type === "rename" || state.type === "uploadRename") {
     dialogError.value = translatedNameError(state.value);
@@ -319,6 +346,7 @@ async function submitDialog() {
     dialog.value = undefined;
   } catch (error) {
     dialogError.value = String(error);
+    reportTransportFailure(error, serverId);
   } finally {
     operationPending.value = false;
   }
@@ -326,6 +354,15 @@ async function submitDialog() {
 
 function recordFileMutation(result: FileMutationResult) {
   store.addLog(localizeFileMutationAudit(result.audit, t));
+  if (!result.refresh.ok && !result.refresh.stale) reportTransportFailure(result.refresh.error, result.audit.serverId);
+}
+
+function reportTransportFailure(error: unknown, serverId = props.serverId) {
+  if (isConnectionTransportFailure(String(error))) store.reportConnectionFailure(serverId, String(error));
+}
+
+function chooseUpload() {
+  if (isLive.value && !disposed) fileInput.value?.click();
 }
 
 async function handleUpload(event: Event) {
@@ -402,6 +439,7 @@ function localFileName(path: string) {
 }
 
 async function uploadNativePaths(paths: string[]) {
+  if (!isLive.value || disposed) return;
   const files: File[] = [];
   operationError.value = "";
   for (const path of paths) {
@@ -430,6 +468,7 @@ function handleNativeDragDrop({ payload: event }: TauriEvent<DragDropEvent>) {
 }
 
 async function download(entry: FileEntry) {
+  if (!isLive.value || disposed) return;
   operationError.value = "";
   try {
     const connection = store.getRuntimeConnection(props.serverId);
@@ -483,11 +522,15 @@ watch(() => fileState.value.files, (files) => {
   };
 });
 
-watch(isLive, (live, wasLive) => {
-  if (!live && wasLive) {
-    fileWorkspace.markDirectoryError(props.serverId, "disconnected", currentPath.value);
-  }
-});
+watch([isLive, () => store.serverConnection(props.serverId).generation], ([live]) => {
+  showOfflineCache.value = false;
+  dialog.value = undefined;
+  contextMenu.value = undefined;
+  uploadDragDepth.value = 0;
+  editingPath.value = false;
+  if (!live) fileWorkspace.markServerOffline(props.serverId);
+  else void loadDirectory(currentPath.value);
+}, { flush: "sync" });
 
 watch(
   () => workspaceLinks.sftpPathRequests[props.serverId],
@@ -510,9 +553,14 @@ onMounted(() => {
   if (isLive.value) void loadDirectory(currentPath.value);
 });
 onMounted(async () => {
-  if (isTauri()) nativeDropUnlisten = await getCurrentWebview().onDragDropEvent(handleNativeDragDrop);
+  if (isTauri()) {
+    nativeDropUnlisten = await getCurrentWebview().onDragDropEvent(handleNativeDragDrop);
+    if (disposed) nativeDropUnlisten();
+  }
 });
 onBeforeUnmount(() => {
+  disposed = true;
+  fileWorkspace.markServerOffline(props.serverId);
   document.removeEventListener("pointerdown", closeContextMenu);
   nativeDropUnlisten?.();
 });
@@ -530,10 +578,10 @@ onBeforeUnmount(() => {
     <header class="panel-header">
       <div class="file-panel-title"><span class="eyebrow">SFTP</span><strong>{{ t("files.title") }}</strong></div>
       <div class="header-actions">
-        <button type="button" :title="t('files.upload')" :disabled="!isLive" @click="fileInput?.click()"><Upload :size="15" /></button>
+        <button type="button" :title="t('files.upload')" :disabled="!isLive" @click="chooseUpload"><Upload :size="15" /></button>
         <button type="button" :title="t('files.newFolder')" :disabled="!isLive" @click="openDialog('create')"><FolderPlus :size="15" /></button>
         <button type="button" :title="t('files.openInTerminal')" :disabled="!isLive" @click="openCurrentPathInTerminal"><FolderInput :size="15" /></button>
-        <button type="button" :title="t('common.refresh')" @click="loadDirectory(currentPath)"><RefreshCw :class="{ spin: fileState.loading }" :size="15" /></button>
+        <button type="button" :title="t('common.refresh')" :disabled="!isLive" @click="loadDirectory(currentPath)"><RefreshCw :class="{ spin: fileState.loading }" :size="15" /></button>
         <button type="button" :title="t('files.transfers')" :class="{ active: transferQueueOpen }" @click="transferQueueOpen = !transferQueueOpen">
           <ArrowUpDown :size="15" /><i v-if="serverTransferCount">{{ serverTransferCount }}</i>
         </button>
@@ -546,16 +594,21 @@ onBeforeUnmount(() => {
       <small>{{ currentPath }}</small>
     </div>
     <nav class="path-bar" :aria-label="t('files.title')">
-      <button type="button" :title="t('files.goUp')" :disabled="currentPath === '/'" @click="goUp"><ChevronLeft :size="14" /></button>
+      <button type="button" :title="t('files.goUp')" :disabled="!isLive || currentPath === '/'" @click="goUp"><ChevronLeft :size="14" /></button>
       <form v-if="editingPath" class="path-editor" @submit.prevent="submitPath">
         <input ref="pathInput" v-model="pathDraft" :aria-label="t('files.path')" spellcheck="false" @keydown.esc.prevent="cancelPathEdit" @blur="submitPath" />
       </form>
       <template v-for="(item, index) in editingPath ? [] : breadcrumbs" :key="item.path">
         <ChevronRight v-if="index" :size="12" />
-        <button type="button" :class="{ current: index === breadcrumbs.length - 1 }" :title="item.path" @click="openDirectory(item.path)">{{ item.label }}</button>
+        <button type="button" :disabled="!isLive" :class="{ current: index === breadcrumbs.length - 1 }" :title="item.path" @click="openDirectory(item.path)">{{ item.label }}</button>
       </template>
-      <button v-if="!editingPath" type="button" class="path-empty-editor" :title="t('files.editPath')" :aria-label="t('files.editPath')" @click="beginPathEdit" />
+      <button v-if="!editingPath" type="button" class="path-empty-editor" :disabled="!isLive" :title="t('files.editPath')" :aria-label="t('files.editPath')" @click="beginPathEdit" />
     </nav>
+    <div v-if="!isLive || fileState.stale || fileState.loading" class="file-directory-state" role="status">
+      <TriangleAlert :size="14" />
+      <span>{{ directoryStateMessage }}</span>
+      <button v-if="!isLive && hasSnapshot" type="button" @click="showOfflineCache = !showOfflineCache">{{ showOfflineCache ? '收起缓存' : '查看离线缓存' }}</button>
+    </div>
     <div class="file-table-viewport" :style="fileTableStyle">
     <div class="file-table-head">
       <button type="button" :title="t('files.sortBy', { column: t('files.name') })" @click="toggleSort('name')">
@@ -570,8 +623,9 @@ onBeforeUnmount(() => {
     </div>
     <div ref="fileList" class="file-list" tabindex="0" role="listbox" :aria-multiselectable="true" @keydown="handleListKeydown">
       <div v-if="fileState.loading" class="file-loading"><LoaderCircle class="spin" :size="17" />{{ t("files.loading") }}</div>
+      <div v-else-if="!showFiles" class="file-empty"><Folder :size="22" /><span>{{ fileState.errorCode ? directoryErrorMessage : isLive ? t('files.loading') : t('workspace.connectServer') }}</span></div>
       <template v-else>
-        <button v-if="currentPath !== '/'" class="file-row file-parent-row" type="button" :title="t('files.goUp')" @dblclick="goUp">
+        <button v-if="currentPath !== '/'" class="file-row file-parent-row" type="button" :disabled="!isLive" :title="t('files.goUp')" @dblclick="goUp">
           <span class="file-primary"><Folder :size="16" /><span class="file-name">..</span></span>
           <small>—</small><small>—</small>
         </button>
@@ -616,7 +670,7 @@ onBeforeUnmount(() => {
         <div v-if="contextMenu" class="file-context-menu" :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }" @pointerdown.stop>
           <button v-if="contextMenu.entry.kind === 'directory'" type="button" @click="openDirectory(contextMenu.entry.path); closeContextMenu()"><FolderOpen :size="13" />{{ t("files.open") }}</button>
           <button v-else type="button" :disabled="!isLive" @click="download(contextMenu.entry); closeContextMenu()"><Download :size="13" />{{ t("files.download") }}</button>
-          <button v-if="contextMenu.entry.kind === 'file'" type="button" :disabled="!isLive" @click="emit('edit', contextMenu.entry); closeContextMenu()"><FileCode2 :size="13" />{{ t("files.edit") }}</button>
+          <button v-if="contextMenu.entry.kind === 'file'" type="button" :disabled="!isLive" @click="openEntry(contextMenu.entry); closeContextMenu()"><FileCode2 :size="13" />{{ t("files.edit") }}</button>
           <button type="button" @click="copyPath(contextMenu.entry)"><Copy :size="13" />{{ t("files.copyPath") }}</button>
           <hr />
           <button type="button" :disabled="!isLive" @click="openDialog('rename', contextMenu.entry); closeContextMenu()"><Pencil :size="13" />{{ t("files.rename") }}</button>
@@ -637,11 +691,11 @@ onBeforeUnmount(() => {
         <footer v-if="dialog.type === 'overwrite'">
           <button class="button secondary" type="button" @click="closeDialog">{{ t("files.skip") }}</button>
           <button class="button secondary" type="button" @click="beginUploadRename">{{ t("files.renameUpload") }}</button>
-          <button class="button primary" type="submit" :disabled="operationPending">{{ t("files.overwrite") }}</button>
+          <button class="button primary" type="submit" :disabled="operationPending || !isLive">{{ t("files.overwrite") }}</button>
         </footer>
         <footer v-else>
           <button class="button secondary" type="button" :disabled="operationPending" @click="closeDialog">{{ t("common.cancel") }}</button>
-          <button class="button primary" type="submit" :disabled="operationPending">
+          <button class="button primary" type="submit" :disabled="operationPending || !isLive">
             {{ dialog.type === "create" ? t("common.create") : dialog.type === "rename" ? t("common.save") : t("common.confirm") }}
           </button>
         </footer>

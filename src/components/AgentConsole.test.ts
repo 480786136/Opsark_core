@@ -28,6 +28,29 @@ describe("AgentConsole 服务器工作区隔离", () => {
     host.remove();
   });
 
+  it("发送期间连接失效时保留草稿并显示错误，离线禁用发送", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    ops.models = [{ id: "model", name: "test", provider: "test", model: "test", endpoint: "https://example.invalid", enabled: true, hasApiKey: true }];
+    ops.modelAvailability.model = { status: "available", reason: "test" };
+    ops.serverConnection("server-a").status = "connected";
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    vi.spyOn(ops, "submitRequirement").mockImplementation(async () => {
+      ops.serverConnection("server-a").status = "disconnected";
+      throw new Error("SSH 未连接，请先重连");
+    });
+    useAgentWorkspaceStore(pinia).updateServer("server-a", { automationEnabled: true, modelId: "model", draft: "检查服务器状态" });
+    const app = createApp(AgentConsole, { serverId: "server-a" }).use(pinia).use(i18n);
+    app.mount(host);
+    try {
+      await nextTick();
+      host.querySelector<HTMLFormElement>(".composer")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await vi.waitFor(() => expect(host.querySelector('[role="alert"]')?.textContent).toContain("草稿已保留"));
+      expect(host.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("检查服务器状态");
+      expect(host.querySelector<HTMLButtonElement>(".send-button")?.disabled).toBe(true);
+    } finally { app.unmount(); }
+  });
+
   it("在当前任务中连续展示同一会话的 Java 与 MySQL 记录", async () => {
     const pinia = createPinia();
     const ops = useOpsStore(pinia);
@@ -538,6 +561,42 @@ describe("AgentConsole 服务器工作区隔离", () => {
 
     expect(input.value).toBe("temporary-token");
     expect(host.textContent).toContain("安全保存失败：钥匙串已锁定");
+    app.unmount();
+  });
+
+  it("执行中自动展开过程记录并标记最新进度", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    const task = ops.createTask("server-a", "safe", "model-deepseek");
+    task.status = "running";
+    ops.pushMessage(task, { role: "system", kind: "event", content: "正在采集 Java 进程信息" });
+    useAgentWorkspaceStore(pinia).updateServer("server-a", { activeTaskId: task.id, automationEnabled: true });
+
+    const app = createApp(AgentConsole, { serverId: "server-a" }).use(pinia).use(i18n);
+    app.mount(host);
+    await nextTick();
+
+    expect(host.querySelector(".execution-record-body")).not.toBeNull();
+    expect(host.querySelector(".execution-event-row.active")?.textContent).toContain("正在采集 Java 进程信息");
+    app.unmount();
+  });
+
+  it("总结将标题和列表渲染为可扫读的信息层级", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    const task = ops.createTask("server-a", "safe", "model-deepseek");
+    task.status = "completed";
+    task.summary = "## 执行结果\n- 发现 2 个 Java 进程\n- 监听端口为 8080";
+    useAgentWorkspaceStore(pinia).updateServer("server-a", { activeTaskId: task.id, automationEnabled: true });
+
+    const app = createApp(AgentConsole, { serverId: "server-a" }).use(pinia).use(i18n);
+    app.mount(host);
+    await nextTick();
+
+    expect(host.querySelector(".summary-content h4")?.textContent).toBe("执行结果");
+    expect(host.querySelectorAll(".summary-content li")).toHaveLength(2);
     app.unmount();
   });
 });

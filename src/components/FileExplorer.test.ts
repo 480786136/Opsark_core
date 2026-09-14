@@ -54,7 +54,8 @@ describe("FileExplorer", () => {
       createdAt: new Date().toISOString(),
     });
     ops.serverPasswords["server-a"] = "secret";
-    ops.connectedServerIds.push("server-a");
+    ops.serverConnection("server-a").status = "connected";
+    vi.spyOn(ops, "getRuntimeConnection").mockReturnValue({ host: "127.0.0.1", port: 22, username: "ops", password: "secret" });
     const app = createApp(FileExplorer, { serverId: "server-a" });
     app.use(pinia).use(i18n).mount(host);
     const links = useWorkspaceLinkStore(pinia);
@@ -68,6 +69,57 @@ describe("FileExplorer", () => {
 
     expect(useFileWorkspaceStore(pinia).serverWorkspaces["server-a"].currentPath).toBe("/var/log");
     await vi.waitFor(() => expect(links.sftpPathRequests["server-a"]).toBeUndefined());
+    app.unmount();
+  });
+
+  it("首次离线不显示伪空目录或派发读取；缓存须明确打开且不可编辑", async () => {
+    const list = vi.spyOn(backend, "listSftp").mockResolvedValue([]);
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const files = useFileWorkspaceStore(pinia);
+    const app = createApp(FileExplorer, { serverId: "server-a" });
+    app.use(pinia).use(i18n).mount(host);
+    expect(host.textContent).not.toContain("目录为空");
+    expect(list).not.toHaveBeenCalled();
+    const state = files.ensureServer("server-a");
+    state.files = [{ name: "cached.txt", path: "/cached.txt", kind: "file", size: "1 B", modified: "now" }];
+    state.lastSuccessAt = new Date().toISOString();
+    await nextTick();
+    expect(host.textContent).not.toContain("cached.txt");
+    [...host.querySelectorAll("button")].find((button) => button.textContent === "查看离线缓存")?.click();
+    await nextTick();
+    expect(host.textContent).toContain("cached.txt");
+    expect(host.textContent).toContain("离线缓存／非实时");
+    expect(host.textContent).toContain(new Date(state.lastSuccessAt).toLocaleString());
+    expect(host.textContent).not.toContain(state.lastSuccessAt);
+    expect(host.querySelector<HTMLButtonElement>('button[title="上传文件"]')?.disabled).toBe(true);
+    expect(ops.isServerConnected("server-a")).toBe(false);
+    expect(list).not.toHaveBeenCalled();
+    app.unmount();
+  });
+
+  it("断线关闭已打开的写入确认框，恢复后刷新当前路径", async () => {
+    const list = vi.spyOn(backend, "listSftp").mockResolvedValue([]);
+    const create = vi.spyOn(backend, "createSftpDirectory").mockResolvedValue(undefined);
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    ops.serverConnection("server-a").status = "connected";
+    vi.spyOn(ops, "getRuntimeConnection").mockImplementation(() => ops.isServerConnected("server-a")
+      ? { host: "localhost", port: 22, username: "ops", password: "secret" } : undefined);
+    const app = createApp(FileExplorer, { serverId: "server-a" });
+    app.use(pinia).use(i18n).mount(host);
+    await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(1));
+    host.querySelector<HTMLButtonElement>(`button[title="${i18n.global.t('files.newFolder')}"]`)?.click();
+    await nextTick();
+    expect(host.querySelector(".file-dialog")).not.toBeNull();
+    ops.serverConnection("server-a").status = "suspect";
+    await nextTick();
+    expect(host.textContent).toContain("连接待确认");
+    expect(host.querySelector(".file-directory-state")?.textContent).not.toContain("离线缓存／非实时");
+    expect(host.querySelector(".file-dialog")).toBeNull();
+    expect(create).not.toHaveBeenCalled();
+    ops.serverConnection("server-a").status = "connected";
+    await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(2));
     app.unmount();
   });
 });

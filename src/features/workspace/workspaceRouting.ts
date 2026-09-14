@@ -19,6 +19,7 @@ export function closeWorkspaceTab(router: Router, id: string, pinia?: Pinia): Pr
       if (failure) return;
     }
     tabs.close(id);
+    if (id !== LOCAL_WORKSPACE_ID) useOpsStore(pinia).disconnectServer(id);
   };
   const pending = (closeQueues.get(router) ?? Promise.resolve()).then(close);
   const settled = pending.catch(() => {});

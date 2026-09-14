@@ -29,6 +29,7 @@ const TERMINAL_RECOVERY_PATTERN = /(?:\bpty\b|\bshell\b.*(?:busy|occupied|releas
 
 export function isTerminalTransportFailure(error: unknown) {
   return isSshConnectionSetupFailure(error)
+    || /^(?:Error: )?(?:SSH_(?:NETWORK_ERROR|TIMEOUT|AUTH_FAILED|SESSION_ERROR|CONNECTION_CHANGED):|SSH 连接已断开或更换)/i.test(String(error))
     || /^(?:Error: )?(?:SSH (?:用户名或密码不正确|身份认证失败)|AgentSession .*generation|AgentSession generation|无法创建 SSH 命令通道|无法执行远程命令|读取远程(?:标准|错误)输出失败)/i.test(String(error))
     || TERMINAL_RECOVERY_PATTERN.test(String(error));
 }

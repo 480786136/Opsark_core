@@ -128,4 +128,25 @@ describe("fileWorkspaceStore", () => {
     expect(renamed).toMatchObject({ operation: "rename", audit: { detail: "/apps/old -> /apps/new" } });
     expect(deleted).toMatchObject({ operation: "delete", audit: { level: "warning" } });
   });
+
+  it("离线保留时间与快照，凭据变更清空归属并废弃迟到响应", async () => {
+    const list = vi.spyOn(backend, "listSftp").mockResolvedValue([{ name: "a", path: "/a", kind: "file", size: "1", modified: "now" }]);
+    const store = useFileWorkspaceStore();
+    await store.loadDirectory("a", connection, "/old-host");
+    const lastSuccessAt = store.ensureServer("a").lastSuccessAt;
+    store.markServerOffline("a");
+    const version = store.ensureServer("a").requestVersion;
+    store.markServerOffline("a");
+    expect(store.ensureServer("a")).toMatchObject({ stale: true, lastSuccessAt, requestVersion: version });
+    expect(store.ensureServer("a").files).toHaveLength(1);
+    let resolve!: (files: []) => void;
+    list.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
+    const request = store.loadDirectory("a", connection, "/old-host/pending");
+    store.clearServerCache("a");
+    resolve([]);
+    expect(await request).toEqual({ ok: false, stale: true });
+    expect(store.ensureServer("a")).toMatchObject({ stale: true, files: [], currentPath: "/" });
+    expect(store.ensureServer("a").lastSuccessAt).toBeUndefined();
+    expect(store.restoredPathsByServer.a).toBeUndefined();
+  });
 });

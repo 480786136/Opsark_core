@@ -31,9 +31,11 @@ function suppressBrowserContextMenu(event: MouseEvent) {
 onMounted(() => {
   document.documentElement.classList.toggle("desktop-window", customFrame);
   void store.hydrateCredentials();
+  store.startConnectionMonitor();
   document.addEventListener("contextmenu", suppressBrowserContextMenu);
 });
 onBeforeUnmount(() => {
+  store.stopConnectionMonitor();
   document.documentElement.classList.remove("desktop-window");
   document.removeEventListener("contextmenu", suppressBrowserContextMenu);
 });

@@ -3,6 +3,7 @@ import { backend, type RuntimeConnection } from "@/services/backend";
 import type { FileEntry } from "@/types";
 import { createFileMutationResult } from "./fileMutationResult";
 import { normalizeRemotePath } from "./remotePath";
+import { isConnectionTransportFailure } from "@/features/connection/connectionStore";
 
 export type FileViewMode = "list" | "compact";
 export type DirectoryLoadErrorCode = "permission" | "disconnected" | "notFound" | "unknown";
@@ -14,6 +15,8 @@ export interface ServerFileWorkspace {
   requestVersion: number;
   lastSuccessfulPath: string;
   failedPath: string;
+  lastSuccessAt?: string;
+  stale: boolean;
   errorCode?: DirectoryLoadErrorCode;
 }
 
@@ -37,6 +40,7 @@ function createServerWorkspace(initialFiles: FileEntry[] = []): ServerFileWorksp
     requestVersion: 0,
     lastSuccessfulPath: "/",
     failedPath: "",
+    stale: true,
   };
 }
 
@@ -45,7 +49,7 @@ export function classifyDirectoryLoadError(error: unknown, connected: boolean): 
   const message = String(error).toLocaleLowerCase();
   if (/permission denied|access denied|\beacces\b|权限|无权/.test(message)) return "permission";
   if (/no such file|not found|\benoent\b|不存在/.test(message)) return "notFound";
-  if (/disconnect|not connected|connection.*closed|broken pipe|连接.*断/.test(message)) return "disconnected";
+  if (isConnectionTransportFailure(message)) return "disconnected";
   return "unknown";
 }
 
@@ -95,8 +99,24 @@ export const useFileWorkspaceStore = defineStore("fileWorkspace", {
       workspace.loading = false;
       workspace.errorCode = code;
       workspace.failedPath = failedPath;
+      workspace.stale = true;
+    },
+    markServerOffline(serverId: string) {
+      const workspace = this.serverWorkspaces[serverId];
+      if (!workspace || (workspace.stale && !workspace.loading && workspace.errorCode === "disconnected")) return;
+      this.markDirectoryError(serverId, "disconnected", workspace.currentPath);
+    },
+    clearServerCache(serverId: string) {
+      // Invalidate the old object before replacing it; late requests retain that reference.
+      const previous = this.serverWorkspaces[serverId];
+      if (previous) previous.requestVersion += 1;
+      this.serverWorkspaces[serverId] = createServerWorkspace();
+      delete this.restoredPathsByServer[serverId];
+      this.persistPreferences();
     },
     removeServer(serverId: string) {
+      const previous = this.serverWorkspaces[serverId];
+      if (previous) previous.requestVersion += 1;
       delete this.serverWorkspaces[serverId];
       delete this.restoredPathsByServer[serverId];
       this.persistPreferences();
@@ -119,6 +139,8 @@ export const useFileWorkspaceStore = defineStore("fileWorkspace", {
         workspace.lastSuccessfulPath = normalizedPath;
         workspace.failedPath = "";
         workspace.errorCode = undefined;
+        workspace.lastSuccessAt = new Date().toISOString();
+        workspace.stale = false;
         this.restoredPathsByServer[serverId] = normalizedPath;
         this.persistPreferences();
         return { ok: true, path: normalizedPath };
@@ -126,19 +148,26 @@ export const useFileWorkspaceStore = defineStore("fileWorkspace", {
         if (workspace.requestVersion !== requestVersion) return { ok: false, stale: true };
         workspace.failedPath = normalizedPath;
         workspace.errorCode = classifyDirectoryLoadError(error, true);
+        workspace.stale = true;
         return { ok: false, stale: false, error };
       } finally {
         if (workspace.requestVersion === requestVersion) workspace.loading = false;
       }
     },
     async createDirectory(serverId: string, connection: RuntimeConnection, path: string) {
+      const workspace = this.ensureServer(serverId);
+      const requestVersion = workspace.requestVersion;
       await backend.createSftpDirectory(connection, path);
-      const refresh = await this.loadDirectory(serverId, connection, this.ensureServer(serverId).currentPath);
+      const refresh: DirectoryLoadResult = workspace.requestVersion === requestVersion
+        ? await this.loadDirectory(serverId, connection, workspace.currentPath) : { ok: false, stale: true };
       return createFileMutationResult({ operation: "createDirectory", serverId, targetPath: path, refresh });
     },
     async renameEntry(serverId: string, connection: RuntimeConnection, fromPath: string, toPath: string) {
+      const workspace = this.ensureServer(serverId);
+      const requestVersion = workspace.requestVersion;
       await backend.renameSftpEntry(connection, fromPath, toPath);
-      const refresh = await this.loadDirectory(serverId, connection, this.ensureServer(serverId).currentPath);
+      const refresh: DirectoryLoadResult = workspace.requestVersion === requestVersion
+        ? await this.loadDirectory(serverId, connection, workspace.currentPath) : { ok: false, stale: true };
       return createFileMutationResult({
         operation: "rename",
         serverId,
@@ -148,8 +177,11 @@ export const useFileWorkspaceStore = defineStore("fileWorkspace", {
       });
     },
     async deleteEntry(serverId: string, connection: RuntimeConnection, entry: FileEntry) {
+      const workspace = this.ensureServer(serverId);
+      const requestVersion = workspace.requestVersion;
       await backend.deleteSftpEntry(connection, entry.path, entry.kind);
-      const refresh = await this.loadDirectory(serverId, connection, this.ensureServer(serverId).currentPath);
+      const refresh: DirectoryLoadResult = workspace.requestVersion === requestVersion
+        ? await this.loadDirectory(serverId, connection, workspace.currentPath) : { ok: false, stale: true };
       return createFileMutationResult({ operation: "delete", serverId, sourcePath: entry.path, refresh });
     },
     persistPreferences() {

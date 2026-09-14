@@ -7,6 +7,27 @@ use std::time::Duration;
 
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
+/// Use libssh2's error codes, not the stage alone, to distinguish bad credentials
+/// from a connection disappearing while authenticating. Never include inputs.
+pub(crate) fn connection_error(stage: &str, error: &ssh2::Error) -> String {
+    match error.code() {
+        ssh2::ErrorCode::Session(-18 | -19 | -48) => {
+            "SSH_AUTH_FAILED: SSH 身份认证失败，请检查用户名、密码或服务器认证设置".into()
+        }
+        ssh2::ErrorCode::Session(-15) => "SSH_AUTH_FAILED: SSH 密码已过期，请更新服务器凭据".into(),
+        ssh2::ErrorCode::Session(-9 | -30) => {
+            format!("SSH_TIMEOUT: {stage}超时")
+        }
+        ssh2::ErrorCode::Session(-2 | -3 | -7 | -13 | -43 | -45) => {
+            format!(
+                "SSH_NETWORK_ERROR: {stage}时网络连接中断（{}）",
+                error.code()
+            )
+        }
+        _ => format!("SSH_SESSION_ERROR: {stage}失败（{}）", error.code()),
+    }
+}
+
 pub(crate) struct InteractivePromptCredential {
     pub(crate) kind: String,
     pub(crate) username: Option<String>,
@@ -55,9 +76,9 @@ pub(crate) fn connect_ssh(
         .map_err(|error| format!("SSH 握手失败：{error}"))?;
     session
         .userauth_password(username, password)
-        .map_err(|_| "SSH 用户名或密码不正确".to_string())?;
+        .map_err(|error| connection_error("SSH 身份验证", &error))?;
     if !session.authenticated() {
-        return Err("SSH 身份认证失败".into());
+        return Err("SSH_AUTH_FAILED: SSH 身份认证失败".into());
     }
     Ok(session)
 }
@@ -323,6 +344,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authentication_errors_do_not_mislabel_network_failures_or_expose_inputs() {
+        for (code, prefix) in [
+            (-18, "SSH_AUTH_FAILED:"),
+            (-15, "SSH_AUTH_FAILED:"),
+            (-9, "SSH_TIMEOUT:"),
+            (-30, "SSH_TIMEOUT:"),
+            (-13, "SSH_NETWORK_ERROR:"),
+            (-43, "SSH_NETWORK_ERROR:"),
+            (-33, "SSH_SESSION_ERROR:"),
+        ] {
+            let error = ssh2::Error::new(ssh2::ErrorCode::Session(code), "untrusted secret");
+            let message = connection_error("SSH 身份验证", &error);
+            assert!(message.starts_with(prefix), "{message}");
+            assert!(!message.contains("untrusted secret"));
+        }
+    }
 
     #[test]
     fn quotes_posix_shell_arguments_without_interpolation() {

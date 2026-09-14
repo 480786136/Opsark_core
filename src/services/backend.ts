@@ -234,6 +234,11 @@ export const backend = {
     await invoke("delete_credential", { kind, id });
   },
 
+  async checkSshConnection(connection: RuntimeConnection, timeoutMs = 5000): Promise<void> {
+    if (!isTauri()) return requireDesktopRuntime("SSH 连接确认");
+    return invoke<void>("check_ssh_connection", { ...connection, timeoutMs });
+  },
+
   async probeSsh(connection: RuntimeConnection): Promise<SshProbe> {
     if (!isTauri()) {
       return requireDesktopRuntime("SSH 连接");

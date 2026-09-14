@@ -124,7 +124,7 @@ function secretVariableContext(secretMetadata: SecretMetadata[], serverId: strin
 export interface AgentContextInput {
   task?: OpsTask;
   server?: ServerProfile;
-  metrics: Metrics;
+  metrics?: Metrics;
   permission: PermissionLevel;
   terminalReference?: string;
   terminalContext?: {
@@ -178,7 +178,7 @@ export function buildAgentContext(input: AgentContextInput) {
 
 interface WorkflowContextInput {
   server?: ServerProfile;
-  metrics: Metrics;
+  metrics?: Metrics;
   task: OpsTask;
   tools: ToolDefinition[];
   secretMetadata: SecretMetadata[];
@@ -250,6 +250,7 @@ export function buildAdjustmentContext(
       } : undefined,
     },
     metrics: input.metrics,
+    metricsStatus: input.metrics ? "当前服务器最近成功采样，时间见 sampledAt" : "当前服务器暂无有效实时指标，不得据此推断资源状态",
     previousPlan: focusedSafety?.previousPlan,
     failedStep: focusedSafety?.failedStep,
   };

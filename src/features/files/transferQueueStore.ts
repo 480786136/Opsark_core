@@ -1,5 +1,7 @@
 import { defineStore } from "pinia";
 import { backend, type RuntimeConnection, type SftpTransferProgressEvent } from "@/services/backend";
+import { useOpsStore } from "@/stores/ops";
+import { isConnectionTransportFailure } from "@/features/connection/connectionStore";
 
 export type TransferDirection = "upload" | "download";
 export type TransferStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -22,6 +24,7 @@ export interface SftpTransferTask {
 
 interface TransferPayload {
   connection: RuntimeConnection;
+  generation: number;
   uploadData?: Uint8Array;
   onComplete?: (data?: Uint8Array) => void;
 }
@@ -68,6 +71,16 @@ function isCancelledError(error: unknown) {
   return String(error).includes("SFTP_TRANSFER_CANCELLED");
 }
 
+function currentTransferConnection(serverId: string, payload: TransferPayload, requireGeneration = true) {
+  const ops = useOpsStore();
+  if (!ops.isServerConnected(serverId)) return undefined;
+  if (requireGeneration && ops.serverConnection(serverId).generation !== payload.generation) return undefined;
+  const connection = ops.getRuntimeConnection(serverId);
+  if (!connection || ["host", "port", "username", "password"].some((key) =>
+    connection[key as keyof RuntimeConnection] !== payload.connection[key as keyof RuntimeConnection])) return undefined;
+  return connection;
+}
+
 export const useTransferQueueStore = defineStore("sftpTransferQueue", {
   state: () => ({
     tasks: [] as SftpTransferTask[],
@@ -86,7 +99,7 @@ export const useTransferQueueStore = defineStore("sftpTransferQueue", {
       onComplete?: () => void,
     ) {
       const task = createTask(serverId, "upload", fileName, remotePath, data.byteLength);
-      payloads.set(task.id, { connection, uploadData: data, onComplete });
+      payloads.set(task.id, { connection, generation: useOpsStore().serverConnection(serverId).generation, uploadData: data, onComplete });
       this.tasks.unshift(task);
       void this.processQueue();
       return task.id;
@@ -99,7 +112,7 @@ export const useTransferQueueStore = defineStore("sftpTransferQueue", {
       onComplete: (data: Uint8Array) => void,
     ) {
       const task = createTask(serverId, "download", fileName, remotePath, 0);
-      payloads.set(task.id, { connection, onComplete: (data) => onComplete(data ?? new Uint8Array()) });
+      payloads.set(task.id, { connection, generation: useOpsStore().serverConnection(serverId).generation, onComplete: (data) => onComplete(data ?? new Uint8Array()) });
       this.tasks.unshift(task);
       void this.processQueue();
       return task.id;
@@ -129,22 +142,30 @@ export const useTransferQueueStore = defineStore("sftpTransferQueue", {
           task.startedAt = new Date().toISOString();
           task.error = undefined;
           try {
+            const connection = currentTransferConnection(task.serverId, payload);
+            if (!connection) throw new Error("SFTP_SERVER_NOT_CONNECTED_OR_CHANGED");
+            const activeTask = task;
+            const onProgress = (event: SftpTransferProgressEvent) => {
+              if (currentTransferConnection(activeTask.serverId, payload)) this.updateProgress(activeTask, event);
+            };
             if (task.direction === "upload" && payload.uploadData) {
               await backend.uploadSftpTransfer(
-                payload.connection,
+                connection,
                 task.id,
                 task.remotePath,
                 payload.uploadData,
-                (event) => this.updateProgress(task!, event),
+                onProgress,
               );
+              if (!currentTransferConnection(task.serverId, payload)) throw new Error("SFTP_TRANSFER_RESULT_UNCONFIRMED");
               payload.onComplete?.();
             } else {
               const data = await backend.downloadSftpTransfer(
-                payload.connection,
+                connection,
                 task.id,
                 task.remotePath,
-                (event) => this.updateProgress(task!, event),
+                onProgress,
               );
+              if (!currentTransferConnection(task.serverId, payload)) throw new Error("SFTP_TRANSFER_RESULT_UNCONFIRMED");
               payload.onComplete?.(data);
             }
             task.status = "completed";
@@ -154,6 +175,10 @@ export const useTransferQueueStore = defineStore("sftpTransferQueue", {
           } catch (error) {
             task.status = isCancelledError(error) ? "cancelled" : "failed";
             task.error = isCancelledError(error) ? undefined : String(error);
+            if (isConnectionTransportFailure(String(error))
+              && useOpsStore().serverConnection(task.serverId).generation === payload.generation) {
+              useOpsStore().reportConnectionFailure(task.serverId, String(error));
+            }
           }
           task = this.tasks.find(({ status }) => status === "queued");
         }
@@ -173,6 +198,10 @@ export const useTransferQueueStore = defineStore("sftpTransferQueue", {
     retry(taskId: string) {
       const task = this.tasks.find(({ id }) => id === taskId);
       if (!task || !["failed", "cancelled"].includes(task.status) || !payloads.has(taskId)) return;
+      const payload = payloads.get(taskId)!;
+      // A lost upload result needs verification by the user, never a blind duplicate write.
+      if (task.error?.includes("SFTP_TRANSFER_RESULT_UNCONFIRMED") || !currentTransferConnection(task.serverId, payload, false)) return;
+      payload.generation = useOpsStore().serverConnection(task.serverId).generation;
       task.status = "queued";
       task.transferredBytes = 0;
       task.speedBytesPerSecond = 0;

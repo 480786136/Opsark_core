@@ -38,6 +38,7 @@ import { conversationHistoryRounds } from "@/features/agent/conversationHistory"
 
 const props = defineProps<{ serverId: string; active?: boolean }>();
 const store = useOpsStore();
+const connectionReady = computed(() => store.isServerConnected(props.serverId));
 const agentWorkspaces = useAgentWorkspaceStore();
 const workspaceLinks = useWorkspaceLinkStore();
 const { t, locale } = useI18n();
@@ -57,6 +58,7 @@ const permission = persistedField("permission");
 const modelId = persistedField("modelId");
 const automationEnabled = persistedField("automationEnabled");
 const checkingModels = ref(false);
+const submissionError = ref("");
 const showModelSettings = ref(false);
 const showTasks = persistedField("showTasks");
 const expandedSteps = ref<string[]>([]);
@@ -177,6 +179,42 @@ const currentRecords = computed(() => {
 const activeRecordId = computed(() => isBusy.value
   ? currentRecords.value[currentRecords.value.length - 1]?.id
   : undefined);
+const currentRecordPreview = computed(() => currentRecords.value.slice(-3));
+
+type SummaryBlock =
+  | { type: "heading" | "paragraph"; text: string }
+  | { type: "list"; items: string[] };
+
+function summaryBlocks(value?: string): SummaryBlock[] {
+  const lines = (value ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const blocks: SummaryBlock[] = [];
+  let listItems: string[] = [];
+  const flushList = () => {
+    if (!listItems.length) return;
+    blocks.push({ type: "list", items: listItems });
+    listItems = [];
+  };
+  for (const line of lines) {
+    const listMatch = line.match(/^(?:[-*•]|\d+[.)])\s+(.+)$/u);
+    if (listMatch) { listItems.push(listMatch[1]); continue; }
+    flushList();
+    const headingMatch = line.match(/^#{1,4}\s+(.+)$/u);
+    const labelledHeading = line.match(/^([^:：]{2,12})[:：]\s*$/u);
+    if (headingMatch || labelledHeading) {
+      blocks.push({ type: "heading", text: headingMatch?.[1] ?? labelledHeading?.[1] ?? line });
+    } else {
+      blocks.push({ type: "paragraph", text: line });
+    }
+  }
+  flushList();
+  return blocks.length ? blocks : [{ type: "paragraph", text: value || "-" }];
+}
+
+watch(isBusy, (busy) => {
+  if (busy && !expandedRecords.value.includes("current")) {
+    expandedRecords.value = [...expandedRecords.value, "current"];
+  }
+}, { immediate: true });
 
 watch(
   () => [task.value?.messages.length, task.value?.plan.length, task.value?.phaseHistory?.length, task.value?.status],
@@ -212,6 +250,7 @@ function toggleStep(id: string) {
 async function submit() {
   const value = input.value.trim();
   if (!value || !automationEnabled.value || isBusy.value || !modelId.value || !store.connectedServerIds.includes(props.serverId)) return;
+  submissionError.value = "";
   showTasks.value = false;
   let selectedTask = task.value;
   let contextTaskId = "";
@@ -243,6 +282,10 @@ async function submit() {
     if (store.activeTaskId && store.activeTaskId !== workspaceState.activeTaskId) {
       agentWorkspaces.updateServer(props.serverId, { activeTaskId: store.activeTaskId });
     }
+  } catch (error) {
+    if (!input.value) input.value = value;
+    submissionError.value = error instanceof Error ? error.message : String(error);
+    return;
   } finally {
     pendingFreshRequirement.value = "";
   }
@@ -595,7 +638,16 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                 <ShieldAlert v-else-if="['failed', 'needs_adjustment', 'awaiting_continuation', 'planning_failed'].includes(round.status)" :size="17" />
                 <Square v-else :size="15" />
               </div>
-              <div><span>{{ summaryTitle(round.status) }}</span><p>{{ round.summary ?? round.pauseReason }}</p></div>
+              <div class="summary-card-content">
+                <span class="summary-eyebrow">{{ summaryTitle(round.status) }}</span>
+                <div class="summary-content">
+                  <template v-for="(block, index) in summaryBlocks(round.summary ?? round.pauseReason)" :key="index">
+                    <h4 v-if="block.type === 'heading'">{{ block.text }}</h4>
+                    <ul v-else-if="block.type === 'list'"><li v-for="item in block.items" :key="item">{{ item }}</li></ul>
+                    <p v-else>{{ block.text }}</p>
+                  </template>
+                </div>
+              </div>
             </div>
           </template>
 
@@ -777,6 +829,11 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
               <span><LoaderCircle v-if="isBusy" class="spin execution-record-running" :size="15" /><ListTree v-else :size="15" /><span><strong>{{ t("agent.executionRecord") }}</strong><small>{{ t("agent.recordsHint", { count: currentRecords.length }) }}</small></span></span>
               <span><ChevronDown v-if="expandedRecords.includes('current')" :size="15" /><ChevronRight v-else :size="15" /></span>
             </button>
+            <div v-if="!expandedRecords.includes('current') && currentRecordPreview.length" class="execution-record-preview">
+              <div v-for="record in currentRecordPreview" :key="`preview-${record.id}`" :class="['execution-preview-row', { active: record.id === activeRecordId }]">
+                <i></i><span>{{ record.content }}</span><time>{{ new Date(record.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
+              </div>
+            </div>
             <div v-if="expandedRecords.includes('current')" class="execution-record-body">
               <div v-for="record in currentRecords" :key="record.id" :class="['execution-event-row', { active: record.id === activeRecordId }]">
                 <time>{{ new Date(record.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
@@ -798,19 +855,29 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
               <ShieldAlert v-else-if="['failed', 'needs_adjustment', 'awaiting_continuation', 'planning_failed'].includes(task.status)" :size="17" />
               <Square v-else :size="15" />
             </div>
-            <div><span>{{ summaryTitle(task.status) }}</span><p>{{ task.summary ?? task.pauseReason }}</p></div>
+            <div class="summary-card-content">
+              <span class="summary-eyebrow">{{ summaryTitle(task.status) }}</span>
+              <div class="summary-content">
+                <template v-for="(block, index) in summaryBlocks(task.summary ?? task.pauseReason)" :key="index">
+                  <h4 v-if="block.type === 'heading'">{{ block.text }}</h4>
+                  <ul v-else-if="block.type === 'list'"><li v-for="item in block.items" :key="item">{{ item }}</li></ul>
+                  <p v-else>{{ block.text }}</p>
+                </template>
+              </div>
+            </div>
           </div>
         </template>
       </div>
 
       <form class="composer" @submit.prevent="submit">
+        <p v-if="submissionError" class="agent-connection-hint" role="alert">{{ submissionError }} · 草稿已保留</p>
         <div v-if="terminalReference" class="context-chip">
           <Quote :size="12" /><span>{{ t("agent.referencedTerminal", { count: terminalReference.split('\n').length }) }}</span>
           <button type="button" @click="terminalReference = ''">×</button>
         </div>
         <textarea
           v-model="input"
-          :disabled="Boolean(isBusy)"
+          :disabled="Boolean(isBusy) || !connectionReady"
           rows="3"
           :placeholder="t(task ? 'agent.continuePlaceholder' : 'agent.newPlaceholder')"
         ></textarea>
@@ -832,7 +899,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
             <option value="safe">{{ t("agent.permissionSafe") }}</option>
             <option value="managed">{{ t("agent.permissionManaged") }}</option>
           </select>
-          <button class="send-button" type="submit" :disabled="!input.trim() || Boolean(isBusy) || !modelId"><Send :size="16" /></button>
+          <button class="send-button" type="submit" :disabled="!input.trim() || Boolean(isBusy) || !modelId || !connectionReady" :title="connectionReady ? undefined : 'SSH 未连接，请先重连'"><Send :size="16" /></button>
         </div>
       </form>
     </template>

@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { backend, type RuntimeConnection } from "@/services/backend";
 import { calculateTransferMetrics, useTransferQueueStore } from "./transferQueueStore";
+import { useOpsStore } from "@/stores/ops";
 
 const connection: RuntimeConnection = {
   host: "127.0.0.1",
@@ -16,6 +17,10 @@ describe("transferQueueStore", () => {
   beforeEach(() => {
     setActivePinia(createPinia());
     vi.restoreAllMocks();
+    const ops = useOpsStore();
+    ops.serverConnection("server-1").status = "connected";
+    vi.spyOn(ops, "getRuntimeConnection").mockReturnValue(connection);
+    vi.spyOn(ops, "reportConnectionFailure").mockImplementation(() => undefined);
   });
 
   it("根据实际字节和耗时计算速度与剩余时间", () => {
@@ -63,5 +68,25 @@ describe("transferQueueStore", () => {
 
     await vi.waitFor(() => expect(queue.tasks[0].status).toBe("completed"));
     expect(upload).toHaveBeenCalledTimes(2);
+  });
+
+  it("断线后阻止排队传输和重试，迟到上传结果标记待确认", async () => {
+    let resolve!: () => void;
+    const upload = vi.spyOn(backend, "uploadSftpTransfer").mockImplementation(() => new Promise<undefined>((done) => { resolve = () => done(undefined); }));
+    const ops = useOpsStore();
+    const queue = useTransferQueueStore();
+    const completed = vi.fn();
+    const first = queue.enqueueUpload("server-1", connection, "a.txt", "/a.txt", new Uint8Array(4), completed);
+    const second = queue.enqueueUpload("server-1", connection, "b.txt", "/b.txt", new Uint8Array(4));
+    ops.serverConnection("server-1").status = "suspect";
+    resolve();
+    await vi.waitFor(() => expect(queue.tasks.every(({ status }) => status === "failed")).toBe(true));
+    expect(completed).not.toHaveBeenCalled();
+    expect(queue.tasks.find(({ id }) => id === first)?.error).toContain("RESULT_UNCONFIRMED");
+    queue.retry(second);
+    expect(upload).toHaveBeenCalledTimes(1);
+    ops.serverConnection("server-1").status = "connected";
+    queue.retry(first);
+    expect(upload).toHaveBeenCalledTimes(1);
   });
 });

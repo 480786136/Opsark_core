@@ -18,11 +18,7 @@ import {
   type TerminalCommandDraft,
   type TerminalPasteAnalysis,
 } from "@/features/terminal/terminalInput";
-import {
-  MAX_TERMINAL_RECONNECT_ATTEMPTS,
-  reconnectDelay,
-  shouldHandleTerminalGeneration,
-} from "@/features/terminal/terminalReconnect";
+import { shouldHandleTerminalGeneration } from "@/features/terminal/terminalReconnect";
 import { backend, type TerminalOutputEvent, type TerminalStatusEvent } from "@/services/backend";
 import { usePreferenceStore } from "@/features/preferences/preferenceStore";
 import { useOpsStore } from "@/stores/ops";
@@ -52,10 +48,11 @@ const selectedTerminalText = ref("");
 const statusMessage = ref("");
 const pendingSftpSync = ref(false);
 const connectionState = ref<"connecting" | "connected" | "disconnected" | "error" | "reconnecting">(
-  store.connectedServerIds.includes(props.serverId) ? "connecting" : "disconnected",
+  store.isServerConnected(props.serverId) ? "connecting" : "disconnected",
 );
 const terminalId = `pty-${props.serverId}-${props.sessionId}`;
-const isLive = computed(() => store.connectedServerIds.includes(props.serverId));
+const isLive = computed(() => store.isServerConnected(props.serverId));
+const canWrite = computed(() => isLive.value && connectionState.value === "connected");
 const filteredHistory = computed(() => {
   const query = historyQuery.value.trim().toLocaleLowerCase();
   return [...commandHistory.value].reverse()
@@ -73,10 +70,16 @@ let inputDisposable: IDisposable | undefined;
 let selectionDisposable: IDisposable | undefined;
 let transcript: TerminalTranscriptState = { lines: [], remainder: "" };
 let resizeTimer: number | undefined;
-let reconnectTimer: number | undefined;
 let pendingTerminalOutputEvents: TerminalOutputEvent[] = [];
 let activeGeneration: number | undefined;
-let reconnectAttempts = 0;
+let lifecycle = 0;
+let disposed = false;
+let listenersReady = false;
+let starting = false;
+let shellEnded = false;
+let openedBefore = false;
+let sessionServerGeneration: number | undefined;
+let lifecycleQueue: Promise<unknown> = Promise.resolve();
 let pendingStatusEvent: TerminalStatusEvent | undefined;
 let commandDraft: TerminalCommandDraft = { value: "", recordable: false };
 let osc7Buffer = "";
@@ -135,6 +138,7 @@ function trackCommandInput(data: string) {
 
 /** This is the only path that writes into the user-owned PTY. */
 function writeTerminalInput(data: string, confirmed = false) {
+  if (!canWrite.value || disposed) return;
   const analysis = analyzeTerminalPaste(data);
   if (!confirmed && analysis.requiresConfirmation) {
     pendingPaste.value = { data, analysis };
@@ -144,7 +148,10 @@ function writeTerminalInput(data: string, confirmed = false) {
   if (submitted && shouldPreserveViewportBeforeCommand(submitted) && terminal) {
     terminal.write("\r\n".repeat(Math.max(1, terminal.rows)));
   }
-  if (connectionState.value === "connected") void backend.writeTerminal(terminalId, data);
+  const currentLifecycle = lifecycle;
+  void backend.writeTerminal(terminalId, data).catch((error) => {
+    if (currentLifecycle === lifecycle && !disposed) reportTerminalFailure(error);
+  });
 }
 
 function confirmPaste() {
@@ -166,6 +173,7 @@ function toggleHistory() {
 }
 
 function reuseHistory(command: string) {
+  if (!canWrite.value) return;
   historyVisible.value = false;
   terminal?.paste(command);
   terminal?.focus();
@@ -190,7 +198,7 @@ function trackTerminalDirectory(chunk: string) {
 }
 
 function syncSftpDirectory() {
-  if (connectionState.value !== "connected") return;
+  if (!canWrite.value) return;
   const directory = workspaceLinks.paneDirectories[props.sessionId];
   if (directory) {
     workspaceLinks.requestSftpPath(props.serverId, directory);
@@ -218,9 +226,51 @@ function syncActiveTranscript() {
     : [...transcript.lines];
 }
 
-async function startLiveTerminal(): Promise<number | undefined> {
+function invalidateSession() {
+  lifecycle += 1;
+  activeGeneration = undefined;
+  sessionServerGeneration = undefined;
+  starting = false;
+  pendingStatusEvent = undefined;
+  pendingTerminalOutputEvents = [];
+  pendingPaste.value = undefined;
+  pendingSftpSync.value = false;
+  commandDraft = { value: "", recordable: false };
+}
+
+function closeLiveTerminal() {
+  invalidateSession();
+  lifecycleQueue = lifecycleQueue.catch(() => undefined)
+    .then(() => backend.closeTerminal(terminalId)).catch(() => undefined);
+  return lifecycleQueue;
+}
+
+function reportTerminalFailure(error: unknown) {
+  connectionState.value = "error";
+  statusMessage.value = String(error);
+  void closeLiveTerminal();
+  store.reportConnectionFailure(props.serverId, String(error));
+}
+
+function startLiveTerminal(): Promise<unknown> {
+  if (disposed || !listenersReady || !isLive.value || shellEnded) return Promise.resolve();
+  const requestedLifecycle = lifecycle;
+  lifecycleQueue = lifecycleQueue.catch(() => undefined).then(async () => {
+    if (disposed || requestedLifecycle !== lifecycle || !isLive.value || shellEnded) return;
+    if (activeGeneration !== undefined || starting) return;
+    await openLiveTerminal(requestedLifecycle);
+  });
+  return lifecycleQueue;
+}
+
+async function openLiveTerminal(requestedLifecycle: number) {
   const connection = store.getRuntimeConnection(props.serverId);
   if (!connection) return;
+  const serverGeneration = store.serverConnection(props.serverId).generation;
+  starting = true;
+  sessionServerGeneration = serverGeneration;
+  if (openedBefore) terminal?.writeln("\r\n[Opsark] ── 新的终端会话（不会恢复之前的远程进程）──\r\n");
+  openedBefore = true;
   statusMessage.value = "";
   connectionState.value = "connecting";
   activeGeneration = undefined;
@@ -228,7 +278,13 @@ async function startLiveTerminal(): Promise<number | undefined> {
     if (terminalHost.value?.clientWidth) fitAddon?.fit();
     const cols = Math.max(2, terminal?.cols ?? 120);
     const rows = remoteTerminalRows();
-    activeGeneration = await backend.startTerminal(terminalId, connection, cols, rows);
+    const generation = await backend.startTerminal(terminalId, connection, cols, rows);
+    if (disposed || requestedLifecycle !== lifecycle || !isLive.value
+      || serverGeneration !== store.serverConnection(props.serverId).generation) {
+      await backend.closeTerminal(terminalId);
+      return;
+    }
+    activeGeneration = generation;
     if (pendingStatusEvent && shouldHandleTerminalGeneration(activeGeneration, pendingStatusEvent.generation)) {
       handleTerminalStatus(pendingStatusEvent);
     }
@@ -237,18 +293,18 @@ async function startLiveTerminal(): Promise<number | undefined> {
     pendingTerminalOutputEvents = [];
     pendingOutput.forEach(handleTerminalOutputEvent);
     scheduleFit();
-    return activeGeneration;
   } catch (error) {
-    statusMessage.value = String(error);
+    if (disposed || requestedLifecycle !== lifecycle) return;
+    reportTerminalFailure(error);
     terminal?.writeln(`\r\n\u001b[31m${String(error)}\u001b[0m`);
-    return undefined;
+  } finally {
+    if (requestedLifecycle === lifecycle) starting = false;
   }
 }
 
 function handleTerminalStatus(event: TerminalStatusEvent) {
+  if (disposed || sessionServerGeneration !== store.serverConnection(props.serverId).generation) return;
   if (event.status === "connected") {
-    clearReconnectTimer();
-    reconnectAttempts = 0;
     connectionState.value = "connected";
     statusMessage.value = "";
     scheduleFit();
@@ -260,31 +316,8 @@ function handleTerminalStatus(event: TerminalStatusEvent) {
   }
   connectionState.value = event.status;
   statusMessage.value = event.reason ?? t("terminal.disconnected");
-  if (event.retryable && isLive.value) scheduleReconnect();
-}
-
-function clearReconnectTimer() {
-  if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
-  reconnectTimer = undefined;
-}
-
-function scheduleReconnect() {
-  clearReconnectTimer();
-  const attempt = reconnectAttempts + 1;
-  const delay = reconnectDelay(attempt);
-  if (delay === undefined) {
-    connectionState.value = "error";
-    statusMessage.value = t("terminal.reconnectExhausted");
-    return;
-  }
-  reconnectAttempts = attempt;
-  connectionState.value = "reconnecting";
-  statusMessage.value = t("terminal.reconnecting", {
-    seconds: delay / 1_000,
-    attempt,
-    max: MAX_TERMINAL_RECONNECT_ATTEMPTS,
-  });
-  reconnectTimer = window.setTimeout(() => void startLiveTerminal(), delay);
+  if (event.status === "disconnected" && !event.retryable) shellEnded = true;
+  else if (event.retryable || /身份认证失败|authentication failed/i.test(statusMessage.value)) reportTerminalFailure(statusMessage.value);
 }
 
 function scheduleFit() {
@@ -292,8 +325,11 @@ function scheduleFit() {
   resizeTimer = window.setTimeout(() => {
     if (!terminal || !fitAddon || !terminalHost.value?.clientWidth) return;
     fitAddon.fit();
-    if (connectionState.value === "connected" && terminal.cols > 0 && terminal.rows > 0) {
-      void backend.resizeTerminal(terminalId, terminal.cols, remoteTerminalRows());
+    if (canWrite.value && terminal.cols > 0 && terminal.rows > 0) {
+      const currentLifecycle = lifecycle;
+      void backend.resizeTerminal(terminalId, terminal.cols, remoteTerminalRows()).catch((error) => {
+        if (currentLifecycle === lifecycle && !disposed) reportTerminalFailure(error);
+      });
     }
   }, 60);
 }
@@ -305,7 +341,9 @@ function renderTerminalOutput(data: string) {
 }
 
 function handleTerminalOutputEvent(event: TerminalOutputEvent) {
+  if (disposed || sessionServerGeneration !== store.serverConnection(props.serverId).generation) return;
   if (activeGeneration === undefined) {
+    if (!starting) return;
     pendingTerminalOutputEvents.push(event);
     if (pendingTerminalOutputEvents.length > 200) pendingTerminalOutputEvents.shift();
     return;
@@ -318,12 +356,14 @@ function remoteTerminalRows() {
 }
 
 async function reconnect() {
-  if (!isLive.value) return;
-  clearReconnectTimer();
-  reconnectAttempts = 0;
-  activeGeneration = undefined;
-  await backend.closeTerminal(terminalId);
-  terminal?.clear();
+  if (disposed || starting) return;
+  shellEnded = false;
+  if (!isLive.value) {
+    await store.reconnectServer(props.serverId);
+    return;
+  }
+  await closeLiveTerminal();
+  if (disposed || !isLive.value) return;
   await startLiveTerminal();
   terminal?.focus();
 }
@@ -353,8 +393,9 @@ async function copySelection() {
 }
 
 function interrupt() {
+  if (!canWrite.value) return;
   commandDraft = { value: "", recordable: false };
-  if (connectionState.value === "connected") void backend.writeTerminal(terminalId, "\u0003");
+  writeTerminalInput("\u0003", true);
   terminal?.focus();
 }
 
@@ -388,7 +429,7 @@ onMounted(async () => {
     if (matchesTerminalShortcut(event, "history", preferences.terminalShortcutPreset)) { toggleHistory(); return false; }
     if (matchesTerminalShortcut(event, "copy", preferences.terminalShortcutPreset)) { void copySelection(); return false; }
     if (matchesTerminalShortcut(event, "clear", preferences.terminalShortcutPreset)) { clearTerminal(); return false; }
-    return true;
+    return canWrite.value;
   });
   inputDisposable = terminal.onData((data) => writeTerminalInput(data));
   const selectionSource = terminal as Terminal & { onSelectionChange?: (listener: () => void) => IDisposable };
@@ -398,14 +439,17 @@ onMounted(async () => {
   outputUnlisten = await backend.onTerminalOutput((event) => {
     if (event.terminalId === terminalId) handleTerminalOutputEvent(event);
   });
+  if (disposed) { outputUnlisten(); return; }
   statusUnlisten = await backend.onTerminalStatus((event) => {
-    if (event.terminalId !== terminalId) return;
+    if (disposed || event.terminalId !== terminalId) return;
     if (activeGeneration === undefined) {
-      pendingStatusEvent = event;
+      if (starting) pendingStatusEvent = event;
       return;
     }
     if (shouldHandleTerminalGeneration(activeGeneration, event.generation)) handleTerminalStatus(event);
   });
+  if (disposed) { statusUnlisten(); return; }
+  listenersReady = true;
   resizeObserver = new ResizeObserver(scheduleFit);
   resizeObserver.observe(terminalHost.value!);
   themeObserver = new MutationObserver(() => {
@@ -415,6 +459,7 @@ onMounted(async () => {
   });
   themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
   if (isLive.value) await startLiveTerminal();
+  if (disposed) return;
   scheduleFit();
   if (props.active) {
     syncActiveTranscript();
@@ -422,15 +467,16 @@ onMounted(async () => {
   }
 });
 
-watch(isLive, async (live) => {
-  if (live) await startLiveTerminal();
-  else {
-    clearReconnectTimer();
-    activeGeneration = undefined;
-    connectionState.value = "disconnected";
-    await backend.closeTerminal(terminalId);
+watch([() => store.serverConnection(props.serverId).status, () => store.serverConnection(props.serverId).generation], ([status]) => {
+  if (status === "connected") {
+    if (sessionServerGeneration !== undefined && sessionServerGeneration !== store.serverConnection(props.serverId).generation) void closeLiveTerminal();
+    void startLiveTerminal();
   }
-});
+  else if (status !== "suspect") {
+    connectionState.value = "disconnected";
+    void closeLiveTerminal();
+  }
+}, { flush: "sync" });
 
 watch(() => props.active, (active) => {
   if (!active) return;
@@ -462,9 +508,9 @@ watch(
 );
 
 onBeforeUnmount(() => {
+  disposed = true;
   if (resizeTimer !== undefined) window.clearTimeout(resizeTimer);
-  clearReconnectTimer();
-  activeGeneration = undefined;
+  void closeLiveTerminal();
   resizeObserver?.disconnect();
   themeObserver?.disconnect();
   inputDisposable?.dispose();
@@ -473,7 +519,6 @@ onBeforeUnmount(() => {
   statusUnlisten?.();
   terminal?.dispose();
   workspaceLinks.removePane(props.sessionId);
-  void backend.closeTerminal(terminalId);
 });
 </script>
 
@@ -483,12 +528,12 @@ onBeforeUnmount(() => {
       <button type="button" class="terminal-pane-tools-trigger" :class="{ active: toolsMenuOpen }" :title="t('terminal.moreActions')" :aria-expanded="toolsMenuOpen" @click.stop="toolsMenuOpen = !toolsMenuOpen"><Ellipsis :size="16" /></button>
       <Transition name="terminal-search">
         <div v-if="toolsMenuOpen" class="terminal-pane-tools-menu" @keydown.esc="toolsMenuOpen = false">
-          <button v-if="isLive" type="button" :title="t('terminal.reconnect')" @click="reconnect(); toolsMenuOpen = false"><RefreshCw :size="14" /><span>{{ t("terminal.reconnect") }}</span></button>
+          <button type="button" :title="t('terminal.reconnect')" :disabled="connectionState === 'connecting' || connectionState === 'reconnecting'" @click="reconnect(); toolsMenuOpen = false"><RefreshCw :size="14" /><span>{{ t("terminal.reconnect") }}</span></button>
           <button v-if="isLive" type="button" :title="t('terminal.syncSftpDirectory')" :disabled="connectionState !== 'connected'" @click="syncSftpDirectory(); toolsMenuOpen = false"><FolderSync :size="14" /><span>{{ t("terminal.syncSftpDirectory") }}</span></button>
           <button type="button" :title="t('terminal.find')" :class="{ active: searchVisible }" @click="toggleSearch(); toolsMenuOpen = false"><Search :size="14" /><span>{{ t("terminal.find") }}</span></button>
           <button type="button" :title="t('terminal.history')" :class="{ active: historyVisible }" @click="toggleHistory(); toolsMenuOpen = false"><History :size="14" /><span>{{ t("terminal.history") }}</span></button>
           <button type="button" :title="t('terminal.fit')" @click="scheduleFit(); toolsMenuOpen = false"><Maximize2 :size="14" /><span>{{ t("terminal.fit") }}</span></button>
-          <button type="button" :title="t('terminal.interrupt')" @click="interrupt(); toolsMenuOpen = false"><CircleStop :size="14" /><span>{{ t("terminal.interrupt") }}</span></button>
+          <button type="button" :title="t('terminal.interrupt')" :disabled="!canWrite" @click="interrupt(); toolsMenuOpen = false"><CircleStop :size="14" /><span>{{ t("terminal.interrupt") }}</span></button>
           <button type="button" :title="t('terminal.copySelection')" @click="copySelection(); toolsMenuOpen = false"><Copy :size="14" /><span>{{ t("terminal.copySelection") }}</span></button>
           <button type="button" :title="t('terminal.clearScreen')" @click="clearTerminal(); toolsMenuOpen = false"><Trash2 :size="14" /><span>{{ t("terminal.clearScreen") }}</span></button>
         </div>
@@ -503,7 +548,7 @@ onBeforeUnmount(() => {
       <section v-if="historyVisible" class="terminal-history-panel">
         <header><History :size="13" /><strong>{{ t("terminal.history") }}</strong><button type="button" :title="t('common.close')" @click="toggleHistory"><X :size="13" /></button></header>
         <label><Search :size="12" /><input v-model="historyQuery" :placeholder="t('terminal.historySearch')" /></label>
-        <div class="terminal-history-list"><button v-for="(command, index) in filteredHistory" :key="`${index}-${command}`" type="button" @click="reuseHistory(command)"><code>{{ command }}</code></button><p v-if="!filteredHistory.length">{{ t("terminal.historyEmpty") }}</p></div>
+        <div class="terminal-history-list"><button v-for="(command, index) in filteredHistory" :key="`${index}-${command}`" type="button" :disabled="!canWrite" @click="reuseHistory(command)"><code>{{ command }}</code></button><p v-if="!filteredHistory.length">{{ t("terminal.historyEmpty") }}</p></div>
         <small>{{ t("terminal.historyHint") }}</small>
       </section>
     </Transition>
@@ -514,7 +559,7 @@ onBeforeUnmount(() => {
       <section class="terminal-paste-dialog">
         <header><strong>{{ t("terminal.pasteTitle") }}</strong><button type="button" :title="t('common.close')" @click="cancelPaste"><X :size="14" /></button></header>
         <p>{{ t("terminal.pasteHint", { lines: pendingPaste.analysis.lineCount }) }}</p><p v-if="pendingPaste.analysis.dangerous" class="terminal-paste-warning">{{ t("terminal.dangerousPasteHint") }}</p><label>{{ t("terminal.pastePreview") }}</label><pre>{{ pendingPaste.analysis.content }}</pre>
-        <footer><button class="button secondary" type="button" @click="cancelPaste">{{ t("common.cancel") }}</button><button class="button primary" type="button" @click="confirmPaste">{{ t("terminal.pasteConfirm") }}</button></footer>
+        <footer><button class="button secondary" type="button" @click="cancelPaste">{{ t("common.cancel") }}</button><button class="button primary" type="button" :disabled="!canWrite" @click="confirmPaste">{{ t("terminal.pasteConfirm") }}</button></footer>
       </section>
     </div>
   </section>

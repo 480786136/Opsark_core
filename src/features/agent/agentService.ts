@@ -54,7 +54,7 @@ export interface PlanDiscoveryContinuationInput {
   task: OpsTask;
   requirement: string;
   server?: ServerProfile;
-  metrics: Metrics;
+  metrics?: Metrics;
   tools: ToolDefinition[];
   secretMetadata: SecretMetadata[];
   model: ModelProfile;
@@ -67,7 +67,7 @@ export interface PlanTaskAdjustmentInput {
   task: OpsTask;
   failedStep?: PlanStep;
   server?: ServerProfile;
-  metrics: Metrics;
+  metrics?: Metrics;
   tools: ToolDefinition[];
   secretMetadata: SecretMetadata[];
   model: ModelProfile;
@@ -110,7 +110,7 @@ export interface ReviewTaskGoalInput {
 
 export interface DecideTaskNextStageInput extends ReviewTaskGoalInput {
   server?: ServerProfile;
-  metrics: Metrics;
+  metrics?: Metrics;
   tools: ToolDefinition[];
   secretMetadata: SecretMetadata[];
   generationSettings: AiGenerationSettings;

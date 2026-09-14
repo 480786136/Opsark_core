@@ -10,6 +10,7 @@ import {
   normalizePlanPreconditions,
 } from "@/services/backend";
 import { useOpsStore } from "@/stores/ops";
+import { useConnectionStore } from "@/features/connection/connectionStore";
 import type { PlanStep } from "@/types";
 import { sanitizeTerminalOutput } from "@/utils/terminal";
 import {
@@ -60,7 +61,7 @@ describe("智能任务状态机", () => {
     Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   });
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.restoreAllMocks();
     localStorage.clear();
     localStorage.setItem("opsark.servers", JSON.stringify([
@@ -138,6 +139,7 @@ describe("智能任务状态机", () => {
       steps: [],
     });
     vi.spyOn(backend, "loadCredential").mockResolvedValue(null);
+    vi.spyOn(backend, "checkSshConnection").mockResolvedValue(undefined);
     vi.spyOn(backend, "saveCredential").mockResolvedValue();
     vi.spyOn(backend, "deleteCredential").mockResolvedValue();
     vi.spyOn(backend, "checkModel").mockResolvedValue({
@@ -150,6 +152,13 @@ describe("智能任务状态机", () => {
       warnings: [],
     });
     useOpsStore().modelApiKeys["model-deepseek"] = "test-model-api-key";
+    // Workflow tests operate on an authenticated transport fixture; connection
+    // failure and credential lifecycle are covered separately in ops.connection.test.
+    for (const server of useOpsStore().servers) {
+      await useConnectionStore().connect(server.id, {
+        host: server.host, port: server.port, username: server.username, password: "fixture-ssh-password",
+      });
+    }
   });
 
   it("将审计事件归档到任务所属服务器并保留名称快照", () => {
@@ -1094,6 +1103,9 @@ describe("智能任务状态机", () => {
       port: 22,
       username: "root",
       group: "test",
+    });
+    await useConnectionStore().connect(target.id, {
+      host: target.host, port: target.port, username: target.username, password: "target-fixture-password",
     });
     const task = store.createTask("srv-production-01", "safe", "model-deepseek");
     task.executionTargetServerId = target.id;
@@ -2463,7 +2475,7 @@ describe("智能任务状态机", () => {
     await store.approveStep(task.id, task.plan[0].id);
     expect(backend.executeCommand).toHaveBeenCalledWith(
       "rm -rf /tmp/explicit-target",
-      undefined,
+      useConnectionStore().connection(task.serverId),
       true,
       expect.objectContaining({
         executionId: expect.any(String),
@@ -2502,7 +2514,7 @@ describe("智能任务状态机", () => {
 
     expect(backend.executeCommand).toHaveBeenCalledWith(
       expect.stringContaining("__opsark_preserved_failure_status=$?"),
-      undefined,
+      useConnectionStore().connection(task.serverId),
       true,
       expect.objectContaining({ executionId: expect.any(String) }),
     );
@@ -2566,7 +2578,7 @@ describe("智能任务状态机", () => {
     expect(task.plan[0].status).toBe("completed");
     expect(backend.executeCommand).toHaveBeenCalledWith(
       "deploy --token temporary-deploy-token",
-      undefined,
+      useConnectionStore().connection(task.serverId),
       true,
       expect.objectContaining({ executionId: expect.any(String) }),
     );
@@ -2673,7 +2685,7 @@ describe("智能任务状态机", () => {
     expect(store.pendingSecret).toBeNull();
     expect(backend.executeCommand).toHaveBeenCalledWith(
       expect.stringContaining("saved-database-password"),
-      undefined,
+      useConnectionStore().connection(task.serverId),
       false,
       expect.anything(),
     );
@@ -2681,6 +2693,9 @@ describe("智能任务状态机", () => {
   });
 
   it("启动时恢复服务器密码和模型 API Key，并按需自动连接", async () => {
+    // This case explicitly starts before the first verified connection.
+    useConnectionStore().disconnect("srv-tencent-test");
+    useConnectionStore().state("srv-tencent-test").status = "idle";
     vi.mocked(backend.loadCredential).mockImplementation(async (kind, id) => {
       if (kind === "server" && id === "srv-tencent-test") return "remembered-ssh-password";
       if (kind === "model" && id === "model-deepseek") return "remembered-model-key";
@@ -3274,7 +3289,7 @@ describe("智能任务状态机", () => {
 
     expect(backend.validateStep).toHaveBeenCalledWith(
       expect.objectContaining({ validation: expect.stringContaining("private-validation-value") }),
-      undefined,
+      useConnectionStore().connection(task.serverId),
       expect.objectContaining({
         executionId: expect.any(String),
         onProgress: expect.any(Function),

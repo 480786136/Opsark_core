@@ -3,11 +3,13 @@ import { computed } from "vue";
 import { ArrowDownToLine, ArrowUpFromLine, RotateCcw, Trash2, X } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import { useTransferQueueStore, type SftpTransferTask } from "./transferQueueStore";
+import { useOpsStore } from "@/stores/ops";
 
 const props = defineProps<{ serverId: string }>();
 defineEmits<{ close: [] }>();
 const { t } = useI18n();
 const queue = useTransferQueueStore();
+const ops = useOpsStore();
 const tasks = computed(() => queue.tasks.filter(({ serverId }) => serverId === props.serverId));
 
 function progress(task: SftpTransferTask) {
@@ -48,7 +50,7 @@ function detail(task: SftpTransferTask) {
           <small :title="task.error">{{ detail(task) }}</small>
         </div>
         <button v-if="task.status === 'queued' || task.status === 'running'" type="button" :title="t('files.cancelTransfer')" @click="queue.cancel(task.id)"><X :size="13" /></button>
-        <button v-else-if="task.status === 'failed' || task.status === 'cancelled'" type="button" :title="t('files.retryTransfer')" @click="queue.retry(task.id)"><RotateCcw :size="13" /></button>
+        <button v-else-if="task.status === 'failed' || task.status === 'cancelled'" type="button" :disabled="!ops.isServerConnected(serverId) || task.error?.includes('SFTP_TRANSFER_RESULT_UNCONFIRMED')" :title="t('files.retryTransfer')" @click="queue.retry(task.id)"><RotateCcw :size="13" /></button>
       </div>
     </div>
   </section>

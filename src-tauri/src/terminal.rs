@@ -209,7 +209,24 @@ fn emit_terminal_status(
 }
 
 fn is_retryable_terminal_error(error: &str) -> bool {
-    !error.contains("身份认证失败") && !error.contains("密码")
+    let message = error.to_lowercase();
+    [
+        "连接超时",
+        "连接失败",
+        "断开",
+        "连接关闭",
+        "broken pipe",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection refused",
+        "connection closed",
+        "socket",
+        "network",
+        "transport",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 fn emit_terminal(
@@ -403,7 +420,7 @@ pub(crate) fn start_ssh_terminal(
                     &app_handle,
                     &terminal_id,
                     generation,
-                    "\r\n[Opsark] 远程 SSH PTY 已断开\r\n",
+                    "\r\n[Opsark] 远程 Shell 已结束；可手动打开新的终端会话\r\n",
                     "system",
                 );
                 emit_terminal_status(
@@ -411,8 +428,8 @@ pub(crate) fn start_ssh_terminal(
                     &terminal_id,
                     generation,
                     "disconnected",
-                    None,
-                    true,
+                    Some("远程 Shell 已结束".to_string()),
+                    false,
                 );
             }
             Ok(TerminalExit::ClosedByClient) => {
@@ -567,6 +584,12 @@ mod tests {
     fn retries_network_failures_but_not_authentication_failures() {
         assert!(is_retryable_terminal_error("连接超时"));
         assert!(!is_retryable_terminal_error("SSH 身份认证失败"));
+        assert!(!is_retryable_terminal_error(
+            "无法申请远程 PTY：administratively prohibited"
+        ));
+        assert!(!is_retryable_terminal_error(
+            "无法启动远程 Shell：request denied"
+        ));
     }
 
     #[test]
