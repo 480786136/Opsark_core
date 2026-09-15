@@ -59,14 +59,7 @@ function apiTokenUsage(value: unknown) {
 }
 
 function redactDeveloperText(value: string, secretValues: Record<string, string>) {
-  const exactRedacted = Object.values(secretValues).reduce(
-    (current, secret) => secret ? current.split(secret).join("••••••••") : current,
-    value,
-  );
-  if (!/(?:password|passwd|pwd|api[_-]?key|access[_-]?token|secret)/iu.test(exactRedacted)) {
-    return exactRedacted;
-  }
-  return redactExecutionOutput(exactRedacted, {});
+  return redactExecutionOutput(value, secretValues);
 }
 
 export function safeDeveloperEndpoint(endpoint?: string) {

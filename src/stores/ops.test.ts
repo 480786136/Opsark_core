@@ -3286,6 +3286,9 @@ describe("智能任务状态机", () => {
     }));
 
     await store.runStep(task.id, "validation-secret-step");
+    expect(task.status).toBe("awaiting_step_approval");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    await store.approveStep(task.id, "validation-secret-step");
 
     expect(backend.validateStep).toHaveBeenCalledWith(
       expect.objectContaining({ validation: expect.stringContaining("private-validation-value") }),
@@ -3299,6 +3302,7 @@ describe("智能任务状态机", () => {
     expect(task.plan[0].output).not.toContain("legacy-password-from-file");
     expect(task.plan[0].output).toContain("password: ••••••••");
     expect(store.logs.map((event) => event.detail).join("\n")).not.toContain("private-validation-value");
+    expect(JSON.stringify(store.developerLogs)).not.toContain("private-validation-value");
   });
 
   it("无模型时的通用总结会展示最后步骤的真实输出", () => {
@@ -3710,6 +3714,7 @@ describe("智能任务状态机", () => {
   });
 
   it("模型确认整体目标已达成时跳过剩余步骤并完成任务", async () => {
+    vi.mocked(backend.validateStep).mockResolvedValueOnce({ passed: false, exitCode: 2, detail: "独立校验与主输出冲突，需要复核" });
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
@@ -3738,7 +3743,7 @@ describe("智能任务状态机", () => {
     expect(backend.executeCommand).toHaveBeenCalledTimes(1);
   });
 
-  it("证据无法解析时才调用模型并允许暂停调整", async () => {
+  it("原始 Shell 输出未作领域解释不单独触发失败调整", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
@@ -3761,9 +3766,10 @@ describe("智能任务状态机", () => {
 
     await store.runStep(task.id, "unknown-http");
 
-    expect(task.status).toBe("needs_adjustment");
-    expect(task.plan[0].status).toBe("failed");
-    expect(backend.reviewStep).toHaveBeenCalledTimes(1);
+    expect(task.status).toBe("completed");
+    expect(task.plan[0].status).toBe("completed");
+    expect(task.plan[0].result?.observationStatus).toBe("unknown");
+    expect(backend.reviewStep).not.toHaveBeenCalled();
   });
 
   it("主命令成功但程序校验失败时会调用一次模型复核", async () => {
@@ -3947,7 +3953,7 @@ describe("智能任务状态机", () => {
     vi.useRealTimers();
   });
 
-  it("结构化校验器区分 SQL 不存在、HTTP 异常和进程无匹配", () => {
+  it("没有结构化输出契约的 Shell 不生成 SQL、HTTP、进程或端口事实", () => {
     const sqlStep = ensureStepValidator({
       ...structuredClone(plan[0]),
       command: "mysql -Nse \"SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='ffp';\"",
@@ -3958,8 +3964,8 @@ describe("智能任务状态机", () => {
       { success: true, exitCode: 0, output: "$ mysql\n0\n[exit: 0]" },
       { passed: true, exitCode: 0, detail: "通过", output: "$ mysql\n0\n[exit: 0]" },
     );
-    expect(sql.result.observationStatus).toBe("not_found");
-    expect(sql.result.facts.exists).toBe(false);
+    expect(sql.result.observationStatus).toBe("unknown");
+    expect(sql.result.facts.exists).toBeUndefined();
 
     const createSqlStep = ensureStepValidator({
       ...structuredClone(plan[1]),
@@ -3972,7 +3978,7 @@ describe("智能任务状态机", () => {
       { success: true, exitCode: 0, output: "$ mysql\n命令未产生输出\n[exit: 0]" },
       { passed: true, exitCode: 0, detail: "通过", output: "$ mysql\n1\n[exit: 0]" },
     );
-    expect(created.result.observationStatus).toBe("matched");
+    expect(created.result.observationStatus).toBe("unknown");
     expect(created.needsModelReview).toBe(false);
 
     const httpStep = ensureStepValidator({
@@ -3986,8 +3992,8 @@ describe("智能任务状态机", () => {
       { success: true, exitCode: 0, output: "$ curl\nHTTP/1.1 500 Internal Server Error\n[exit: 0]" },
       { passed: false, exitCode: 22, detail: "非成功状态", output: "$ curl\n[exit: 22]" },
     );
-    expect(http.accepted).toBe(true);
-    expect(http.result.observationStatus).toBe("unhealthy");
+    expect(http.accepted).toBe(false);
+    expect(http.result.observationStatus).toBe("unknown");
 
     const processStep = ensureStepValidator({
       ...structuredClone(plan[0]),
@@ -4000,7 +4006,7 @@ describe("智能任务状态机", () => {
       { success: true, exitCode: 1, emptyResult: true, output: "$ pgrep\n未发现匹配项（命令正常完成）\n[exit: 1]" },
       { passed: false, exitCode: 1, emptyResult: true, detail: "无匹配是有效状态", output: "$ pgrep\n[exit: 1]" },
     );
-    expect(process.result.observationStatus).toBe("not_found");
+    expect(process.result.observationStatus).toBe("unknown");
 
     const portStep = ensureStepValidator({
       ...structuredClone(plan[0]),
@@ -4017,11 +4023,11 @@ describe("智能任务状态机", () => {
       },
       { passed: true, exitCode: 0, detail: "通过", output: "$ ss\nLISTEN 0 128 0.0.0.0:8080\n[exit: 0]" },
     );
-    expect(port.result.facts.ports).toEqual([8080]);
-    expect(port.result.facts.ownershipConfirmed).toBe(true);
+    expect(port.result.facts.ports).toBeUndefined();
+    expect(port.result.facts.ownershipConfirmed).toBeUndefined();
   });
 
-  it("将空 SQL 备份识别为决定性不完整证据", () => {
+  it("保留备份原文和真实失败校验，不根据描述推导领域事实", () => {
     const step = ensureStepValidator({
       ...structuredClone(plan[0]),
       title: "检查 SQL 备份是否完整",
@@ -4036,10 +4042,11 @@ describe("智能任务状态机", () => {
       { passed: false, exitCode: 1, detail: "文件为空", output: "" },
     );
 
-    expect(classified.result.observationStatus).toBe("unhealthy");
-    expect(classified.result.facts.emptyRequiredFile).toBe(true);
-    expect(classified.result.facts.blockingSignal).toBe(true);
-    expect(classified.needsModelReview).toBe(true);
+    expect(classified.result.observationStatus).toBe("unknown");
+    expect(classified.result.facts.emptyRequiredFile).toBeUndefined();
+    expect(classified.result.facts.blockingSignal).toBe(false);
+    expect(classified.accepted).toBe(false);
+    expect(classified.result.facts.evidenceConflict).toBe(true);
   });
 
   it("通用核心不解释领域工具的私有错误标记", () => {
@@ -4093,7 +4100,7 @@ describe("智能任务状态机", () => {
       },
     );
 
-    expect(runtimeStep.validator?.type).toBe("runtime");
+    expect(runtimeStep.validator?.type).toBe("command");
     expect(classified.accepted).toBe(false);
     expect(classified.result.executionStatus).toBe("success");
     expect(classified.result.observationStatus).toBe("unhealthy");
@@ -4166,6 +4173,7 @@ describe("智能任务状态机", () => {
     const runtimeStep = ensureStepValidator({
       ...structuredClone(plan[0]),
       title: "检查 Node.js 版本",
+      kind: "observe",
       command: "node --version",
       validation: "node --version | grep -q '^v16\\.'",
     });
@@ -4183,7 +4191,7 @@ describe("智能任务状态机", () => {
 
     expect(classified.accepted).toBe(true);
     expect(classified.result.executionStatus).toBe("success");
-    expect(classified.needsModelReview).toBe(true);
+    expect(classified.needsModelReview).toBe(false);
   });
 
   it("压缩下载进度覆盖帧但保留最终进度和业务输出", () => {
@@ -4221,7 +4229,7 @@ describe("智能任务状态机", () => {
       { passed: true, exitCode: 0, detail: "通过", output: "$ test\n[exit: 0]" },
     );
 
-    expect(classified.result.observationStatus).toBe("matched");
+    expect(classified.result.observationStatus).toBe("unknown");
     expect(classified.result.facts).not.toHaveProperty("currentNodeVersion");
     expect(classified.result.facts.blockingSignal).toBe(false);
   });

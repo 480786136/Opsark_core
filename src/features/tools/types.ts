@@ -57,7 +57,13 @@ export interface ToolResult<T = unknown> {
   truncated?: boolean;
 }
 
-export type UserInputFieldType = "text" | "password" | "number";
+export type UserInputFieldType = "text" | "password" | "number" | "select";
+
+export interface UserInputOption {
+  /** Exact, non-sensitive value from known evidence or user-provided candidates. */
+  value: string;
+  label: string;
+}
 
 export interface UserInputCredentialDescriptor {
   /** Form-local identifier shared by the username and secret fields. */
@@ -74,6 +80,8 @@ export interface UserInputField {
   description: string;
   type: UserInputFieldType;
   placeholder?: string;
+  /** Required only for select fields; values are unique and no option is preselected. */
+  options?: UserInputOption[];
   required: boolean;
   /** Explicit pairing contract. Credential storage must never be inferred from prose when present. */
   credential?: UserInputCredentialDescriptor;
@@ -94,6 +102,11 @@ export interface PendingUserInput extends UserInputRequest {
   taskId: string;
   stepId: string;
   callId: string;
+  /** Bound by the workflow, never supplied by the model. */
+  roundId?: string;
+  workflowEpoch?: number;
+  serverId?: string;
+  command?: string;
   error?: string;
 }
 
@@ -186,6 +199,10 @@ export interface SoftwareCheckResult {
 export interface PendingSecretRequest {
   taskId: string;
   stepId: string;
+  roundId?: string;
+  workflowEpoch?: number;
+  serverId?: string;
+  command?: string;
   key: string;
   label: string;
   description: string;

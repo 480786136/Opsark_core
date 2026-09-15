@@ -2,13 +2,13 @@ import type { OpsTask, TaskStatus } from "@/types";
 
 const TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
   draft: ["planning", "cancelled"],
-  planning: ["awaiting_plan_approval", "awaiting_continuation", "planning_failed", "needs_adjustment", "completed", "failed", "cancelled"],
+  planning: ["awaiting_input", "awaiting_plan_approval", "awaiting_continuation", "planning_failed", "needs_adjustment", "completed", "failed", "cancelled"],
   planning_failed: ["planning", "cancelled"],
-  awaiting_plan_approval: ["running", "cancelled", "failed"],
+  awaiting_plan_approval: ["awaiting_input", "running", "cancelled", "failed"],
   running: ["planning", "awaiting_step_approval", "awaiting_input", "validating", "needs_adjustment", "completed", "failed", "cancelled"],
   awaiting_step_approval: ["running", "cancelled", "failed"],
   awaiting_input: ["running", "cancelled", "failed"],
-  validating: ["running", "awaiting_continuation", "needs_adjustment", "completed", "failed", "cancelled"],
+  validating: ["awaiting_input", "running", "awaiting_continuation", "needs_adjustment", "completed", "failed", "cancelled"],
   awaiting_continuation: ["planning", "awaiting_plan_approval", "failed", "cancelled"],
   needs_adjustment: ["planning", "awaiting_plan_approval", "failed", "cancelled"],
   completed: ["planning"],

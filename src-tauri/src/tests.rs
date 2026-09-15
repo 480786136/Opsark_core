@@ -160,6 +160,149 @@ fn plan_prompts_require_the_true_json_string_for_tool_validation() {
 }
 
 #[test]
+fn clarification_prompts_distinguish_discoverable_facts_from_user_decisions() {
+    assert!(GENERAL_PLAN_SYSTEM.contains("先区分可查证的环境事实与必须由用户作出的决定"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("有限、最少必要的只读发现步骤"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("不得把可自行查证的事实全部转交用户"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("当前计划必须只有一个 user.request_input 步骤"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("用可执行的替代方案偷换原目标"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("已明确回答且仍适用于同一目标的问题必须复用"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("已有未回答问题时复用原问题并保持等待"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("“继续、托管、批准”不替代未回答的具体问题"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("user.request_input 只收集输入，不改变目标环境，应使用 kind=observe"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("必须保持真实阻断；不得用 Shell 模拟提问、猜测回答"));
+    for prompt in [GENERAL_PLAN_SYSTEM, NEXT_STAGE_DECISION_SYSTEM, GENERAL_REVIEW_SYSTEM] {
+        assert!(prompt.contains("等待用户不是业务执行失败"));
+    }
+}
+
+#[test]
+fn clarification_prompts_use_known_choices_without_inventing_or_preselecting_answers() {
+    assert!(GENERAL_PLAN_SYSTEM.contains("按 context.tools 中 user.request_input 的 inputSchema 构造"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("只读发现已给出候选时，优先使用 select 字段"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("options 必须是 1 至 100 个 {value,label} 对象"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("value 按原值精确唯一"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("开放信息使用 text，敏感值使用 password"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("候选未知时不得编造 options"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("所有字段不得设置默认值或预选项"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("重大操作的确认或授权须独立保留，不能由目标选择代替，不得默认同意"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("实际候选及其标识必须来自已知事实"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("示例不替代 context.tools 中的 schema"));
+    assert!(!GENERAL_PLAN_SYSTEM.contains("普通决定使用 text 字段"));
+}
+
+#[test]
+fn select_input_survives_the_model_plan_parser_and_normalizers_unchanged() {
+    let args = json!({
+        "title": "确认操作目标",
+        "description": "只读发现已得到两个候选，等待用户明确选择。",
+        "fields": [{
+            "key": "target", "label": "操作目标", "description": "请选择本次操作的目标。",
+            "type": "select", "required": true,
+            "options": [
+                {"value": "target-a", "label": "目标 A"},
+                {"value": "Target-B", "label": "目标 B"}
+            ]
+        }]
+    });
+    let command = format!("opsark-tool user.request_input {args}");
+    let visible = HashSet::from(["user.request_input".to_string()]);
+
+    for validation in [json!("true"), json!(true), json!("")] {
+        let response = json!({"steps": [{
+            "kind": "observe", "title": "确认操作目标", "description": "收集缺少的目标选择。",
+            "command": command, "expected": "用户明确选择本次操作目标。", "validation": validation,
+            "risk": "low", "executionScope": "user_action"
+        }]}).to_string();
+        let mut steps: Vec<AiPlanStep> = parse_model_array_field(&response, "steps").unwrap();
+        normalize_model_tool_validations(&mut steps);
+        normalize_recoverable_plan_failure_masks(&mut steps);
+        validate_ai_plan_contract(&steps, &AiGenerationSettings::default()).unwrap();
+        validate_visible_tool_policy(&steps, Some(&visible)).unwrap();
+        let converted = convert_ai_plan_steps(steps).unwrap();
+
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].kind, "observe");
+        assert_eq!(converted[0].execution_scope, "user_action");
+        assert_eq!(converted[0].validation, "true");
+        assert_eq!(converted[0].command, command);
+        let preserved: Value = serde_json::from_str(
+            converted[0].command.strip_prefix("opsark-tool user.request_input ").unwrap(),
+        ).unwrap();
+        assert_eq!(preserved, args);
+    }
+}
+
+#[test]
+fn clarification_keeps_the_existing_execute_classification_contract() {
+    assert!(GENERAL_REQUIREMENT_SYSTEM.contains("仍返回 execute"));
+    assert!(GENERAL_REQUIREMENT_SYSTEM.contains("由后续规划通过 user.request_input 询问并等待"));
+    assert!(GENERAL_REQUIREMENT_SYSTEM.contains("用户回答已有待决问题通常是 supplement"));
+    assert!(GENERAL_REQUIREMENT_SYSTEM.contains("复用仍然有效的授权"));
+
+    let response = json!({
+        "intent": "execute", "relation": "supplement", "answer": "",
+        "constraints": {
+            "changePolicy": "requested_changes_only", "environmentPolicy": "unspecified",
+            "failurePolicy": "unspecified", "prohibitedActions": [],
+            "requiredConditions": [], "userDirectives": []
+        },
+        "terminalContextLines": 0, "selectedSkillIds": []
+    });
+    let decision: AiRequirementDecision = serde_json::from_value(response.clone()).unwrap();
+    assert!(classification_contract_error(&decision, None).is_none());
+    let mut unsupported = response;
+    unsupported["intent"] = json!("clarify");
+    let decision: AiRequirementDecision = serde_json::from_value(unsupported).unwrap();
+    assert!(classification_contract_error(&decision, None).is_some());
+}
+
+#[test]
+fn clarification_uses_one_tool_step_in_the_existing_next_stage_contract() {
+    let command = format!(
+        "opsark-tool user.request_input {}",
+        json!({
+            "title": "确认操作范围", "description": "当前有多个可能目标，需要先明确本次范围。",
+            "fields": [{"key": "target", "label": "操作目标", "description": "请指定本次操作的目标。",
+                "type": "select", "required": true,
+                "options": [{"value": "target-a", "label": "目标 A"}, {"value": "target-b", "label": "目标 B"}]}]
+        })
+    );
+    let response = json!({
+        "decision": "adjust", "reason": "缺少目标选择，等待用户明确范围。", "summary": "等待目标选择。",
+        "steps": [{"kind": "observe", "title": "确认操作目标", "description": "收集当前缺少的用户决定。",
+            "command": command, "expected": "用户明确选择本次操作目标。", "validation": "true", "risk": "low",
+            "executionScope": "user_action"}]
+    });
+    let raw: AiNextStageDecision = parse_model_json(&response.to_string()).unwrap();
+    let visible = HashSet::from(["user.request_input".to_string()]);
+    let converted = validate_and_convert_ai_next_stage(
+        raw, &AiGenerationSettings::default(), &HashSet::new(), Some(&visible),
+    ).unwrap();
+    assert_eq!(converted.decision, "adjust");
+    assert_eq!(converted.steps.len(), 1);
+    assert_eq!(converted.steps[0].command, command);
+    assert_eq!(converted.steps[0].execution_scope, "user_action");
+    assert!(NEXT_STAGE_DECISION_SYSTEM.contains("steps 中只能有一个 user.request_input 步骤"));
+    assert!(NEXT_STAGE_DECISION_SYSTEM.contains("用户回答只解决对应决定，不证明整体目标完成"));
+}
+
+#[test]
+fn review_routes_missing_user_decisions_to_planning_without_adding_steps() {
+    assert!(GENERAL_REVIEW_SYSTEM.contains("返回 adjust，reason 明确待决事项及影响"));
+    assert!(GENERAL_REVIEW_SYSTEM.contains("交由现有规划生成唯一 user.request_input 步骤并等待"));
+    assert!(GENERAL_REVIEW_SYSTEM.contains("本复核协议没有 steps 字段"));
+    assert!(GENERAL_REVIEW_SYSTEM.contains("不得因无法在此输出提问步骤而谎称 complete"));
+    let review: AiStepReview = serde_json::from_value(json!({
+        "decision": "adjust", "reason": "需明确目标范围，由规划询问并等待。", "summary": "等待用户决定。"
+    })).unwrap();
+    let serialized = serde_json::to_value(review).unwrap();
+    assert_eq!(serialized.as_object().unwrap().len(), 3);
+    assert_eq!(serialized["decision"], "adjust");
+    assert!(serialized.get("steps").is_none());
+}
+
+#[test]
 fn next_stage_complete_requires_empty_steps_and_serializes_the_public_contract() {
     let settings = AiGenerationSettings::default();
     let forbidden = HashSet::new();
@@ -895,6 +1038,100 @@ fn applies_a_focused_plan_step_repair_without_rewriting_other_steps() {
 }
 
 #[test]
+fn fingerprints_plan_safety_failures_by_step_field_and_rule() {
+    let empty_fallback = plan_failure_fingerprint(
+        "第 3 个计划步骤的 command 未通过执行前安全检查（EMPTY_SUCCESS_FALLBACK：以 || true（或等价空操作）结束）；必须修复",
+        12,
+    )
+    .unwrap();
+    let pipeline = plan_failure_fingerprint(
+        "第 3 个计划步骤的 command 未通过执行前安全检查（PIPELINE_STATUS_LOST：关键命令 | head/tail）；必须修复",
+        12,
+    )
+    .unwrap();
+    let later_empty_fallback = plan_failure_fingerprint(
+        "第 12 个计划步骤的 command 未通过执行前安全检查（EMPTY_SUCCESS_FALLBACK：以 || true（或等价空操作）结束）；必须修复",
+        12,
+    )
+    .unwrap();
+
+    assert_eq!(empty_fallback.step_index, 3);
+    assert_eq!(empty_fallback.field, "command");
+    assert_eq!(empty_fallback.failure_id, "EMPTY_SUCCESS_FALLBACK");
+    assert_eq!(pipeline.failure_id, "PIPELINE_STATUS_LOST");
+    assert_eq!(later_empty_fallback.step_index, 12);
+    assert_ne!(empty_fallback, pipeline);
+    assert_ne!(empty_fallback, later_empty_fallback);
+}
+
+#[test]
+fn repair_budget_allows_a_progressing_safety_failure_chain() {
+    let fingerprint = |step_index, failure_id: &str| PlanFailureFingerprint {
+        step_index,
+        field: "command",
+        failure_id: failure_id.into(),
+    };
+    let mut budget = PlanRepairBudget::default();
+
+    assert!(budget.try_start_call(false));
+    budget.observe_failure(Some(fingerprint(3, "EMPTY_SUCCESS_FALLBACK")), false);
+    assert!(budget.try_start_call(true));
+    budget.observe_failure(Some(fingerprint(3, "PIPELINE_STATUS_LOST")), true);
+    assert!(budget.try_start_call(true));
+    budget.observe_failure(Some(fingerprint(12, "EMPTY_SUCCESS_FALLBACK")), true);
+
+    // The observed production chain made progress on every repair. A third
+    // focused repair must still be available for the newly exposed step 12.
+    assert!(budget.try_start_call(true));
+    assert_eq!(budget.total_model_calls, 4);
+    assert_eq!(budget.focused_repair_calls, 3);
+    assert!(budget.stop_reason.is_none());
+}
+
+#[test]
+fn repair_budget_stops_after_two_unchanged_focused_repairs() {
+    let failure = PlanFailureFingerprint {
+        step_index: 3,
+        field: "command",
+        failure_id: "EMPTY_SUCCESS_FALLBACK".into(),
+    };
+    let mut budget = PlanRepairBudget::default();
+
+    assert!(budget.try_start_call(false));
+    budget.observe_failure(Some(failure.clone()), false);
+    for _ in 0..PLAN_MAX_STAGNANT_REPAIRS {
+        assert!(budget.try_start_call(true));
+        budget.observe_failure(Some(failure.clone()), true);
+    }
+
+    assert!(!budget.try_start_call(true));
+    assert_eq!(budget.total_model_calls, 3);
+    assert_eq!(budget.focused_repair_calls, 2);
+    assert!(budget.stop_reason().contains("同一计划校验失败"));
+}
+
+#[test]
+fn repair_budget_enforces_full_generation_and_total_hard_limits() {
+    let mut full_budget = PlanRepairBudget::default();
+    for _ in 0..PLAN_MAX_FULL_GENERATION_CALLS {
+        assert!(full_budget.try_start_call(false));
+    }
+    assert!(!full_budget.try_start_call(false));
+    assert!(full_budget.stop_reason().contains("完整计划生成硬上限"));
+
+    let mut total_budget = PlanRepairBudget::default();
+    for _ in 0..PLAN_MAX_FULL_GENERATION_CALLS {
+        assert!(total_budget.try_start_call(false));
+    }
+    for _ in 0..PLAN_MAX_FOCUSED_REPAIR_CALLS {
+        assert!(total_budget.try_start_call(true));
+    }
+    assert_eq!(total_budget.total_model_calls, PLAN_MAX_TOTAL_MODEL_CALLS);
+    assert!(!total_budget.try_start_call(true));
+    assert!(total_budget.stop_reason().contains("模型调用硬上限"));
+}
+
+#[test]
 fn permits_repeated_observations_but_rejects_untracked_background_operations() {
     let step = AiPlanStep {
         kind: "change".into(),
@@ -1366,6 +1603,46 @@ fn loads_only_model_selected_skills_into_plan_context() {
         json!(["server.resolve_connection"])
     );
     assert_eq!(value["tools"], json!([{"id":"files.read_content"}]));
+}
+
+#[test]
+fn skill_allow_lists_preserve_visible_clarification_without_overriding_tool_blocks() {
+    let mut skill = ModelSkillDefinition {
+        id: "bounded-workflow".into(), name: "有限工作流".into(),
+        description: "仅允许读取指定内容".into(), version: 1,
+        instructions: "按已确认目标读取内容".into(),
+        allowed_tool_ids: Some(vec!["files.read_content".into()]),
+        forbidden_tool_ids: Vec::new(),
+    };
+    let selected = vec![skill.id.clone()];
+    let context = r#"{"tools":[{"id":"files.read_content"},{"id":"user.request_input"},{"id":"evidence.read"},{"id":"files.get_structure"}]}"#;
+    let question = AiPlanStep {
+        command: r#"opsark-tool user.request_input {"title":"确认目标","fields":[{"key":"target","label":"目标","description":"请指定操作目标。","type":"text","required":true}]}"#.into(),
+        ..AiPlanStep::default()
+    };
+
+    let enriched = context_with_selected_skills(context, &[skill.clone()], &selected, None).unwrap();
+    let visible = context_visible_tool_ids(&enriched).unwrap().unwrap();
+    assert_eq!(visible, HashSet::from([
+        "files.read_content".to_string(), "user.request_input".to_string(), "evidence.read".to_string(),
+    ]));
+    assert!(validate_visible_tool_policy(std::slice::from_ref(&question), Some(&visible)).is_ok());
+
+    // Disabled/non-planner tools are removed by the frontend before this wire
+    // context is built. The backend must never synthesize an absent schema.
+    let disabled_context = r#"{"tools":[{"id":"files.read_content"},{"id":"evidence.read"}]}"#;
+    let enriched = context_with_selected_skills(disabled_context, &[skill.clone()], &selected, None).unwrap();
+    let visible = context_visible_tool_ids(&enriched).unwrap().unwrap();
+    assert!(!visible.contains("user.request_input"));
+    assert!(validate_visible_tool_policy(std::slice::from_ref(&question), Some(&visible)).is_err());
+
+    skill.forbidden_tool_ids.push("user.request_input".into());
+    let enriched = context_with_selected_skills(context, &[skill], &selected, None).unwrap();
+    let visible = context_visible_tool_ids(&enriched).unwrap().unwrap();
+    assert!(!visible.contains("user.request_input"));
+    let forbidden = active_skill_forbidden_tool_ids(&enriched).unwrap();
+    assert!(validate_active_skill_tool_policy(std::slice::from_ref(&question), &forbidden).is_err());
+    assert!(validate_visible_tool_policy(&[question], Some(&visible)).is_err());
 }
 
 #[test]

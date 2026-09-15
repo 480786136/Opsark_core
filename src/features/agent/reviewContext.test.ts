@@ -35,6 +35,21 @@ function task(): OpsTask {
 }
 
 describe("review context", () => {
+  it("failure and validation reviews retain available credential references and route rejection evidence", () => {
+    const currentTask = task();
+    currentTask.authenticationCredentials = [{ ref: "server-credential:db", kind: "database", target: "db.internal:3306",
+      usernamePlaceholder: "${secret.DB_USER}", secretPlaceholder: "${secret.DB_PASSWORD}" }];
+    currentTask.authenticationEvidence = [{ id: "auth-1", taskId: currentTask.id, stepId: "current", serverId: currentTask.serverId,
+      client: "mysql", target: "db.internal:3306", transport: "tcp", credentialKeys: ["DB_USER", "DB_PASSWORD"],
+      accountRef: "DB_USER", materialProvided: true, outcome: "route_rejected", createdAt: new Date().toISOString(),
+      source: "main", credentialRevision: 0 }];
+    for (const context of [buildExecutionFailureReviewContext(currentTask, currentTask.plan[1], []),
+      buildEvidenceReviewContext(currentTask, currentTask.plan[1], [], true)]) {
+      expect(context.authentication.availableCredentials).toEqual(currentTask.authenticationCredentials);
+      expect(context.authentication.attempts[0].outcome).toBe("route_rejected");
+      expect(context.authentication.instruction).toContain("不等于密码错误");
+    }
+  });
   it("builds stable policy flags for every review trigger", () => {
     const currentTask = task();
     const current = currentTask.plan[1];

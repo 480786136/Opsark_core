@@ -4,6 +4,7 @@ import {
   runTaskCompletion,
 } from "@/features/agent/taskAdvancement";
 import type { ModelProfile, OpsTask, PlanStep } from "@/types";
+import { buildPlanNormalizationRepair, PlanProtocolError } from "@/services/backend";
 
 const model: ModelProfile = {
   id: "model-1",
@@ -65,6 +66,15 @@ function discoveryInput(currentTask: OpsTask) {
 }
 
 describe("task advancement", () => {
+  it("preserves typed protocol failures across discovery continuation", async () => {
+    const currentTask = task();
+    const repair = buildPlanNormalizationRepair(new Error("工具参数无效"), [step("input", "pending")]);
+    const error = new PlanProtocolError(repair, "不得改写业务");
+    const planner = vi.fn().mockRejectedValue(error);
+    const result = await runDiscoveryRefinement(discoveryInput(currentTask), planner);
+    expect(result).toMatchObject({ kind: "failed", protocolError: error });
+    expect(planner).toHaveBeenCalledOnce();
+  });
   it("returns a continuation and automatic approval for managed tasks", async () => {
     const currentTask = task("managed");
     const pending = step("deploy", "pending");
@@ -92,6 +102,10 @@ describe("task advancement", () => {
     );
 
     expect(result.kind).toBe("unavailable");
+    if (result.kind === "unavailable") {
+      expect(result.pauseReason).toContain("已确认输入和真实证据");
+      expect(result.pauseReason).not.toContain("后续变更计划");
+    }
     expect(planner).not.toHaveBeenCalled();
     expect(input.onStart).not.toHaveBeenCalled();
   });
@@ -105,7 +119,7 @@ describe("task advancement", () => {
 
     expect(result).toMatchObject({
       kind: "failed",
-      pauseReason: "发现后续计划生成失败：Error: invalid plan",
+      pauseReason: "后续计划生成失败：Error: invalid plan",
     });
     expect(currentTask.plan).toHaveLength(1);
   });

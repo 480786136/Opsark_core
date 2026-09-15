@@ -3,6 +3,7 @@ import {
   runCommandLifecycle,
   runValidationLifecycle,
 } from "@/features/agent/executionLifecycle";
+import type { ExecuteStepCommandInput } from "@/features/agent/executionRunner";
 import type { OpsTask, PlanStep } from "@/types";
 
 function createStep(overrides: Partial<PlanStep> = {}): PlanStep {
@@ -74,6 +75,16 @@ describe("execution lifecycle", () => {
     expect(input.waitBeforeRetry.mock.calls.flat()).toEqual([500, 1500]);
     expect(input.onExecutionChange).toHaveBeenLastCalledWith(undefined);
   });
+  it.each(["Host 'client' is not allowed to connect", "Access denied for user (using password: YES)",
+    "Access denied for user (using password: NO)", "SELECT command denied to user"])(
+    "认证/权限阻断不是状态未稳定，不重复校验：%s", async output => {
+      const input = transportValidationInput();
+      const execute = vi.fn().mockResolvedValue({ passed: false, exitCode: 1, output, detail: output });
+      const result = await runValidationLifecycle(input, execute);
+      expect(result.validation.passed).toBe(false);
+      expect(execute).toHaveBeenCalledOnce();
+      expect(input.waitBeforeRetry).not.toHaveBeenCalled();
+    });
 
   it.each(["channel closed", "SSH 用户名或密码不正确", "绑定终端未返回命令结束标记"])("不重试已发送或非瞬态错误：%s", async (error) => {
     const input = transportValidationInput();
@@ -139,6 +150,54 @@ describe("execution lifecycle", () => {
     expect(result.streamedOutput).toBe("50%");
     expect(stop).toHaveBeenCalledOnce();
     expect(executionChanges).toEqual(["exec-1", undefined]);
+  });
+
+  it("passes referenced secret keys to the command redaction boundary", async () => {
+    const step = createStep({
+      command: "login --pin ${secret.PIN}",
+      validation: "check --pin ${secret.PIN}",
+    });
+    const execute = vi.fn(async (_input: ExecuteStepCommandInput) => ({
+      output: "ok",
+      success: true,
+      simulated: false,
+      exitCode: 0,
+    }));
+
+    await runCommandLifecycle({
+      task: createTask(step),
+      step,
+      requirement: "check",
+      command: "login --pin 1",
+      validation: "check --pin 1",
+      executionId: "exec-secret",
+      secretValues: { PIN: "1", UNUSED: "20" },
+      isCancelled: () => false,
+      onExecutionChange: noop,
+      onProgress: noop,
+      onHeartbeat: noop,
+      onEvent: noop,
+      onAudit: noop,
+      onError: noop,
+    }, execute, () => ({
+      stop: noop,
+      getState: () => ({
+        reviewRound: 0,
+        validationPassed: false,
+        workload: "bounded",
+        outputFingerprint: "",
+        lastOutputChangeAt: "2026-08-14T00:00:00.000Z",
+        noProgressSeconds: 0,
+        noProgressReviewRounds: 0,
+        consecutiveContinueRounds: 0,
+        salientEvidence: [],
+        runtimeIdleReviewRounds: 0,
+        modelReviewCount: 0,
+        skippedModelReviewCount: 0,
+      }),
+    }));
+
+    expect(execute.mock.calls[0][0].exactSecretKeys).toEqual(["PIN"]);
   });
 
   it("clears command execution state when the executor throws", async () => {

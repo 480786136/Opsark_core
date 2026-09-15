@@ -7,7 +7,10 @@ import {
   normalizeLongRunningCommandOutput,
   normalizePlanPreconditions,
   normalizeSecretPlaceholders,
+  normalizeToolCommandSyntax,
 } from "@/features/agent/planNormalizer";
+import { textFingerprint } from "@/features/agent/longRunningReviewOutput";
+import { parseToolCommand } from "@/features/tools/toolExecutor";
 import { buildExecutionSummary } from "@/features/agent/executionSummary";
 import {
   normalizeFileStructureRequest,
@@ -18,6 +21,7 @@ import {
 } from "@/features/agent/planSafety";
 import type { PlanStepSafetyAnalysis } from "@/features/agent/planSafety";
 import { isTerminalTransportFailure } from "@/features/agent/adjustmentIncident";
+import { planCommandIdentity } from "@/features/agent/taskProgression";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -156,6 +160,10 @@ function requireDesktopRuntime(operation: string): never {
 
 export interface PlanNormalizationRepair {
   errorCode: "tool_schema_validation_failed" | "plan_normalization_failed";
+  repairStrategy?:
+    | { type: "field_local" }
+    | { type: "plan_protocol" }
+    | { type: "standalone_stage_split"; standaloneStepIndex: number; toolId: string };
   fieldPath?: string;
   expected?: string;
   validationError: string;
@@ -163,24 +171,80 @@ export interface PlanNormalizationRepair {
   instruction: string;
 }
 
+export class PlanProtocolError extends Error {
+  processed?: RequirementProcessingResult;
+  constructor(public repair: PlanNormalizationRepair, public repairError: string) {
+    super(`计划协议校验失败：${repair.validationError}\n协议修复失败：${repairError}。未执行该计划，原始计划已保留；仅允许修复协议，不得重规划业务。`);
+    this.name = "PlanProtocolError";
+  }
+}
+
+type StandaloneStageSplitStrategy = Extract<NonNullable<PlanNormalizationRepair["repairStrategy"]>, {
+  type: "standalone_stage_split";
+}>;
+const STANDALONE_STAGE_SPLIT_EXPECTED = "当前执行阶段按原顺序确定性拆分：standalone 之前有步骤时只保留未改写的完整连续前缀；standalone 位于首步时只保留该原步骤；其余整体目标步骤延后到后续规划";
+
+function standaloneStageSplitStrategy(validationError: string): StandaloneStageSplitStrategy | undefined {
+  if (!validationError.includes("standalone 工具必须是唯一待执行步骤")) return undefined;
+  const match = validationError.match(/第\s*(\d+)\s*个计划步骤调用 standalone 工具\s+([^\s；;]+)/);
+  return match
+    ? { type: "standalone_stage_split", standaloneStepIndex: Math.max(0, Number(match[1]) - 1), toolId: match[2] }
+    : undefined;
+}
+
+function standaloneStageSplitInstruction(strategy: StandaloneStageSplitStrategy) {
+  return `这是全局阶段协议修复，不是业务重规划。Core 将确定性缩小当前执行阶段：若第 ${strategy.standaloneStepIndex + 1} 步 ${strategy.toolId} standalone 之前存在步骤，本轮只保留原计划开头至该步之前的完整连续前缀；若该 standalone 位于首步，本轮只保留该原步骤。未进入本轮的原步骤只是延后到 completionMode=refine 的后续阶段，不是删除整体目标。保持整体目标和用户授权不变；不得新增、重排或改写任何返回步骤的字段、工具或命令。`;
+}
+
+/** Upgrades a persisted pre-strategy repair without changing its preserved model output. */
+function normalizePlanRepairStrategy(repair: PlanNormalizationRepair): PlanNormalizationRepair {
+  const strategy = repair.repairStrategy?.type === "standalone_stage_split"
+    ? repair.repairStrategy
+    : standaloneStageSplitStrategy(repair.validationError);
+  if (!strategy) return repair;
+  return {
+    ...repair,
+    repairStrategy: strategy,
+    fieldPath: "steps",
+    expected: STANDALONE_STAGE_SPLIT_EXPECTED,
+    instruction: standaloneStageSplitInstruction(strategy),
+  };
+}
+
 /** Builds the bounded, non-secret feedback used for one model protocol-repair attempt. */
 export function buildPlanNormalizationRepair(error: unknown, steps: PlanStep[]): PlanNormalizationRepair {
   const validationError = String(error);
   const stepNumber = validationError.match(/第\s*(\d+)\s*个计划步骤/)?.[1];
   const credentialType = validationError.match(/凭据参数\s+([A-Za-z][A-Za-z0-9_]*)\s+必须使用 password 类型/);
+  const credentialTarget = validationError.match(/参数\s+([A-Za-z][A-Za-z0-9_]*)\s+的 credential\.target/);
+  const standaloneStrategy = standaloneStageSplitStrategy(validationError);
+  const repairStrategy: NonNullable<PlanNormalizationRepair["repairStrategy"]> = standaloneStrategy
+    ? standaloneStrategy
+    : validationError.includes("工具参数无效")
+      ? { type: "field_local" }
+      : { type: "plan_protocol" };
   return {
     errorCode: validationError.includes("工具参数无效")
       ? "tool_schema_validation_failed"
       : "plan_normalization_failed",
-    fieldPath: credentialType
-      ? `steps[${Math.max(0, Number(stepNumber ?? 1) - 1)}].command.arguments.fields[key=${credentialType[1]}].type`
-      : stepNumber
-        ? `steps[${Math.max(0, Number(stepNumber) - 1)}]`
-        : undefined,
-    expected: credentialType ? "password" : undefined,
+    repairStrategy,
+    fieldPath: standaloneStrategy
+      ? "steps"
+      : credentialType
+        ? `steps[${Math.max(0, Number(stepNumber ?? 1) - 1)}].command.arguments.fields[key=${credentialType[1]}].type`
+        : credentialTarget
+          ? `steps[${Math.max(0, Number(stepNumber ?? 1) - 1)}].command.arguments.fields[key=${credentialTarget[1]}].credential.target`
+          : stepNumber
+            ? `steps[${Math.max(0, Number(stepNumber) - 1)}]`
+            : undefined,
+    expected: standaloneStrategy
+      ? STANDALONE_STAGE_SPLIT_EXPECTED
+      : credentialType ? "password" : credentialTarget ? "已确认的主机:端口或明确的 socket 绝对路径；遵守 credential.kind 对应目标规则" : undefined,
     validationError,
     previousModelOutput: steps,
-    instruction: "只修复上述结构或工具参数错误；保持业务目的、步骤范围、风险和用户授权不变，不增加无关步骤。工具参数修复必须逐字保留每个步骤的 kind、title、description、risk、expected、validation 及步骤数量；只修改报错步骤 command 内的错误参数，不要润色描述或重写计划。",
+    instruction: standaloneStrategy
+      ? standaloneStageSplitInstruction(standaloneStrategy)
+      : "只修复上述结构或工具参数错误；保持业务目的、步骤范围、风险和用户授权不变，不增加无关步骤。工具参数修复必须逐字保留每个步骤的 kind、title、description、risk、expected、validation 及步骤数量；只修改报错步骤 command 内的错误参数，不要润色描述或重写计划。",
   };
 }
 
@@ -196,16 +260,164 @@ function contextWithPlanRepair(context: string, repair: PlanNormalizationRepair)
   return JSON.stringify({ originalContext: context, planGenerationRepair: repair });
 }
 
-function assertPlanRepairScope(repair: PlanNormalizationRepair, repaired: PlanStep[]) {
+export function assertPlanRepairScope(repair: PlanNormalizationRepair, repaired: PlanStep[]) {
+  repair = normalizePlanRepairStrategy(repair);
+  if (repair.repairStrategy?.type === "standalone_stage_split") {
+    const { standaloneStepIndex, toolId } = repair.repairStrategy;
+    const originalStandalone = repair.previousModelOutput[standaloneStepIndex];
+    let originalTool: string | undefined;
+    try {
+      originalTool = originalStandalone
+        ? parseToolCommand(normalizeToolCommandSyntax(originalStandalone.command), "standalone-repair-context")?.toolId
+        : undefined;
+    } catch { /* The preserved plan is rejected below as inconsistent. */ }
+    if (!originalStandalone || originalTool !== toolId) {
+      throw new Error("standalone 阶段修复上下文与原计划不一致");
+    }
+    if (!repaired.length) throw new Error("standalone 阶段修复必须返回非空的原计划阶段子集");
+    const authoredFields = [
+      "kind", "title", "description", "command", "risk", "expected", "validation",
+      "executionScope", "validationScope", "sessionContextChange", "runtimeClass", "status",
+    ] as const;
+    const stable = (value: unknown) => JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
+      ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item);
+    const sameAuthoredStep = (previous: PlanStep, candidate: PlanStep) => authoredFields.every((field) => (
+      stable(previous[field]) === stable(candidate[field])
+    ));
+    const standaloneOnly = repaired.length === 1 && sameAuthoredStep(originalStandalone, repaired[0]);
+    const precedingPrefix = repaired.length <= standaloneStepIndex
+      && repaired.every((candidate, index) => sameAuthoredStep(repair.previousModelOutput[index], candidate));
+    const stillMixed = repaired.length > 1
+      && repaired.some((candidate) => sameAuthoredStep(originalStandalone, candidate));
+    if (stillMixed) {
+      throw new Error("standalone 阶段修复后仍将 standalone 工具与其他待执行步骤混排");
+    }
+    if (!standaloneOnly && !precedingPrefix) {
+      throw new Error("standalone 阶段修复只能返回原计划的连续前置阶段或未改写的 standalone 单步；不得新增、重排或改写字段、工具和命令");
+    }
+    return;
+  }
   if (repair.errorCode !== "tool_schema_validation_failed") return;
   if (repair.previousModelOutput.length !== repaired.length) {
     throw new Error("工具参数格式修复不得改变计划步骤数量");
   }
   const immutable = ["kind", "title", "description", "risk", "expected", "validation"] as const;
+  const errorStep = repair.fieldPath?.match(/^steps\[(\d+)\]/)?.[1];
   repair.previousModelOutput.forEach((previous, index) => {
     const changed = immutable.find((field) => previous[field] !== repaired[index]?.[field]);
     if (changed) throw new Error(`工具参数格式修复不得改写 steps[${index}].${changed}`);
+    const originalTool = previous.command.match(/^opsark-tool\s+(\S+)/)?.[1];
+    if (originalTool !== repaired[index]?.command.match(/^opsark-tool\s+(\S+)/)?.[1]) {
+      throw new Error("工具参数修复不得替换工具或转成 Shell 命令");
+    }
+    if ((!originalTool || (errorStep !== undefined && index !== Number(errorStep))) && previous.command !== repaired[index].command) {
+      throw new Error(`工具参数格式修复不得改写无关命令 steps[${index}].command`);
+    }
+    const localField = repair.fieldPath?.match(/fields\[key=([^\]]+)\]\.(type|credential\.target)$/);
+    if (originalTool && localField && index === Number(errorStep)) {
+      const stable = (value: unknown): string => JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
+        ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item);
+      const remainder = (command: string) => {
+        const args = JSON.parse(command.replace(/^opsark-tool\s+\S+\s+/, ""));
+        const field = args.fields?.find((item: { key?: string }) => item.key === localField[1]);
+        if (!field) throw new Error("协议修复不得删除报错字段");
+        if (localField[2] === "type") delete field.type;
+        else if (field.credential) delete field.credential.target;
+        return stable(args);
+      };
+      if (remainder(previous.command) !== remainder(repaired[index].command)) {
+        throw new Error("协议修复只能修改报错字段，不能改写其他工具参数");
+      }
+    }
   });
+}
+
+function normalizeStandaloneRepairStage(
+  repair: PlanNormalizationRepair,
+  requirement: string,
+  context: string,
+): PlanStep[] | undefined {
+  repair = normalizePlanRepairStrategy(repair);
+  if (repair.repairStrategy?.type !== "standalone_stage_split") return undefined;
+  const { standaloneStepIndex } = repair.repairStrategy;
+  const originalStandalone = repair.previousModelOutput[standaloneStepIndex];
+  const validationStage = standaloneStepIndex > 0
+    ? repair.previousModelOutput.slice(0, standaloneStepIndex)
+    : originalStandalone ? [originalStandalone] : [];
+  assertPlanRepairScope(repair, validationStage);
+
+  const completed = completedPlanEvidence(context);
+  let firstRemaining = 0;
+  while (firstRemaining < repair.previousModelOutput.length
+    && completedPlanStep(repair.previousModelOutput[firstRemaining], completed)) {
+    firstRemaining += 1;
+  }
+  if (firstRemaining >= repair.previousModelOutput.length) {
+    throw new Error("standalone 阶段拆分后没有新的待执行步骤");
+  }
+
+  const remaining = repair.previousModelOutput.slice(firstRemaining);
+  try {
+    return normalizePlanPreconditions(remaining, requirement);
+  } catch (error) {
+    const remainingRepair = buildPlanNormalizationRepair(error, remaining);
+    if (remainingRepair.repairStrategy?.type !== "standalone_stage_split") {
+      throw new PlanProtocolError(
+        remainingRepair,
+        "确定性拆分后的剩余计划仍未通过协议校验",
+      );
+    }
+    const nextStandaloneIndex = remainingRepair.repairStrategy.standaloneStepIndex;
+    const nextStandalone = remaining[nextStandaloneIndex];
+    const stage = nextStandaloneIndex > 0
+      ? remaining.slice(0, nextStandaloneIndex)
+      : nextStandalone ? [nextStandalone] : [];
+    assertPlanRepairScope(remainingRepair, stage);
+    try {
+      return normalizePlanPreconditions(stage, requirement);
+    } catch (stageError) {
+      const stageRepair = buildPlanNormalizationRepair(stageError, stage);
+      throw new PlanProtocolError(
+        stageRepair,
+        "确定性拆分出的当前阶段仍未通过协议校验",
+      );
+    }
+  }
+}
+
+interface CompletedPlanEvidence {
+  fingerprints: Set<string>;
+}
+
+function completedPlanEvidence(context: string): CompletedPlanEvidence {
+  const evidence: CompletedPlanEvidence = { fingerprints: new Set() };
+  const record = (value: unknown): Record<string, unknown> | undefined => (
+    value && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : undefined
+  );
+  const collect = (value: unknown, depth = 0) => {
+    const root = record(value);
+    if (!root || depth > 1) return;
+    if (Array.isArray(root.completedCommandFingerprints)) {
+      root.completedCommandFingerprints.forEach((fingerprint) => {
+        if (typeof fingerprint === "string") evidence.fingerprints.add(fingerprint);
+      });
+    }
+    if (typeof root.originalContext === "string") {
+      try { collect(JSON.parse(root.originalContext), depth + 1); } catch { /* Opaque legacy context. */ }
+    }
+  };
+  try { collect(JSON.parse(context || "{}")); } catch { /* Opaque legacy context. */ }
+  return evidence;
+}
+
+function completedPlanStep(step: PlanStep, evidence: CompletedPlanEvidence) {
+  return evidence.fingerprints.has(textFingerprint(planCommandIdentity(step.command)));
+}
+
+function planProtocolRepairRequirement(repair: PlanNormalizationRepair) {
+  return `只修复 context.planGenerationRepair 中保留的原计划协议。不得改变业务、工具、步骤范围或授权。${repair.instruction}`;
 }
 
 export const backend = {
@@ -563,6 +775,30 @@ export const backend = {
 
   async generatePlan(requirement: string, runtimeModel?: RuntimeModel): Promise<PlanStep[]> {
     if (isTauri() && runtimeModel?.apiKey) {
+      let pendingRepair: PlanNormalizationRepair | undefined;
+      try { pendingRepair = JSON.parse(runtimeModel.context || "{}").planGenerationRepair; } catch { /* legacy context */ }
+      if (pendingRepair) {
+        pendingRepair = normalizePlanRepairStrategy(pendingRepair);
+        try {
+          const localStage = normalizeStandaloneRepairStage(pendingRepair, requirement, runtimeModel.context);
+          if (localStage) return localStage;
+        } catch (error) {
+          if (error instanceof PlanProtocolError) throw error;
+          throw new PlanProtocolError(pendingRepair, String(normalizeModelInvocationError(error)));
+        }
+        try {
+          const repaired = await invoke<PlanStep[]>("generate_ai_plan", {
+            apiKey: runtimeModel.apiKey, endpoint: runtimeModel.endpoint, model: runtimeModel.model,
+            requirement: planProtocolRepairRequirement(pendingRepair),
+            context: parameterContext(contextWithPlanRepair(runtimeModel.context, pendingRepair), runtimeModel.requestParameters),
+            generationSettings: runtimeModel.generationSettings, timeoutSeconds: runtimeModel.timeoutSeconds,
+          });
+          assertPlanRepairScope(pendingRepair, repaired);
+          return normalizePlanPreconditions(repaired, requirement);
+        } catch (error) {
+          throw new PlanProtocolError(pendingRepair, String(normalizeModelInvocationError(error)));
+        }
+      }
       let steps: PlanStep[];
       try {
         steps = await invoke<PlanStep[]>("generate_ai_plan", {
@@ -582,11 +818,18 @@ export const backend = {
       } catch (firstError) {
         const repair = buildPlanNormalizationRepair(firstError, steps);
         try {
+          const localStage = normalizeStandaloneRepairStage(repair, requirement, runtimeModel.context);
+          if (localStage) return localStage;
+        } catch (repairError) {
+          if (repairError instanceof PlanProtocolError) throw repairError;
+          throw new PlanProtocolError(repair, String(normalizeModelInvocationError(repairError)));
+        }
+        try {
           const repaired = await invoke<PlanStep[]>("generate_ai_plan", {
             apiKey: runtimeModel.apiKey,
             endpoint: runtimeModel.endpoint,
             model: runtimeModel.model,
-            requirement: `${requirement}\n\n上次计划未通过本地协议校验。请依据 context.planGenerationRepair 只修复格式并重新返回完整计划。`,
+            requirement: `${requirement}\n\n上次计划未通过本地协议校验。${planProtocolRepairRequirement(repair)}`,
             context: parameterContext(contextWithPlanRepair(runtimeModel.context, repair), runtimeModel.requestParameters),
             generationSettings: runtimeModel.generationSettings,
             timeoutSeconds: runtimeModel.timeoutSeconds,
@@ -594,7 +837,7 @@ export const backend = {
           assertPlanRepairScope(repair, repaired);
           return normalizePlanPreconditions(repaired, requirement);
         } catch (repairError) {
-          throw normalizeModelInvocationError(repairError);
+          throw new PlanProtocolError(repair, String(normalizeModelInvocationError(repairError)));
         }
       }
     }
@@ -641,20 +884,16 @@ export const backend = {
       } catch (firstError) {
         const repair = buildPlanNormalizationRepair(firstError, result.plan);
         try {
-          const repaired = await invoke<RequirementProcessingResult>("process_ai_requirement", {
-            apiKey: runtimeModel.apiKey,
-            endpoint: runtimeModel.endpoint,
-            model: runtimeModel.model,
-            requirement: `${requirement}\n\n上次执行计划未通过本地协议校验。保持已判定的用户意图和任务关系，仅依据 context.planGenerationRepair 修复计划格式。`,
-            context: parameterContext(contextWithPlanRepair(runtimeModel.context, repair), runtimeModel.requestParameters),
-            skillDefinitions,
-            generationSettings: runtimeModel.generationSettings,
-            timeoutSeconds: runtimeModel.timeoutSeconds,
+          const repaired = await backend.generatePlan(requirement, {
+            ...runtimeModel,
+            context: contextWithPlanRepair(runtimeModel.context, repair),
           });
-          assertPlanRepairScope(repair, repaired.plan);
-          return { ...result, plan: normalizePlanPreconditions(repaired.plan, requirement) };
+          return { ...result, plan: repaired };
         } catch (repairError) {
-          throw normalizeModelInvocationError(repairError);
+          const error = repairError instanceof PlanProtocolError ? repairError
+            : new PlanProtocolError(repair, String(normalizeModelInvocationError(repairError)));
+          error.processed = result;
+          throw error;
         }
       }
     }
@@ -793,12 +1032,17 @@ export const backend = {
         generationSettings: runtimeModel.generationSettings,
         timeoutSeconds: runtimeModel.timeoutSeconds,
       });
-      return {
-        ...decision,
-        steps: normalizePlanPreconditions(decision.steps, requirement),
-        source: "model",
-      };
+      try {
+        return { ...decision, steps: normalizePlanPreconditions(decision.steps, requirement), source: "model" };
+      } catch (error) {
+        const repair = buildPlanNormalizationRepair(error, decision.steps);
+        // Preserve the joint decision. Only the invalid plan protocol is retried.
+        const steps = await backend.generatePlan(requirement, { ...runtimeModel,
+          context: contextWithPlanRepair(runtimeModel.context, repair) });
+        return { ...decision, steps, source: "model" };
+      }
     } catch (error) {
+      if (error instanceof PlanProtocolError) throw error;
       throw normalizeModelInvocationError(error);
     }
   },

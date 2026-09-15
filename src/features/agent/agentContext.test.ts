@@ -10,6 +10,9 @@ import {
 import type { OpsTask, ServerProfile } from "@/types";
 import { resolveToolRegistry } from "@/features/tools/toolRegistry";
 import { resolveSkillRegistry } from "@/features/skills/skillRegistry";
+import { taskAttemptContext } from "@/features/agent/attemptState";
+import { planCommandIdentity } from "@/features/agent/taskProgression";
+import { textFingerprint } from "@/features/agent/longRunningReviewOutput";
 
 describe("agent context", () => {
   it("contains enabled tools and secret metadata without values", () => {
@@ -244,6 +247,49 @@ describe("agent context", () => {
       .toBeLessThan(JSON.stringify(adjustment).indexOf('"baseSnapshot"'));
     expect(JSON.stringify(continuation).indexOf('"tools"'))
       .toBeLessThan(JSON.stringify(continuation).indexOf('"completedDiscovery"'));
+  });
+
+  it("carries valid completed identities across archived and current standalone phases", () => {
+    const task = createTask();
+    task.currentRoundId = "round-1";
+    const attemptContext = taskAttemptContext(task);
+    const prefix = { ...task.plan[0], id: "prefix", command: "uname -a", attemptContext };
+    task.phaseHistory = [{
+      id: "phase-prefix",
+      roundId: "round-1",
+      requirement: "部署 k8s 集群",
+      reason: "replan",
+      plan: [prefix],
+      createdAt: "now",
+      completedAt: "now",
+    }];
+    const standalone = {
+      ...task.plan[0],
+      id: "resolve-worker",
+      command: 'opsark-tool server.resolve_connection {"host":"10.213.81.53","port":22}',
+      attemptContext,
+      result: {
+        executionStatus: "success" as const,
+        observationStatus: "matched" as const,
+        facts: { toolId: "server.resolve_connection" },
+        warnings: [],
+        evidenceIds: [],
+      },
+    };
+    task.plan = [standalone];
+
+    const context = buildContinuationContext({
+      task,
+      tools: resolveToolRegistry([]),
+      secretMetadata: [],
+    });
+
+    expect(new Set(context.completedCommandFingerprints)).toEqual(new Set([
+      textFingerprint(planCommandIdentity(prefix.command)),
+      textFingerprint(planCommandIdentity(standalone.command)),
+    ]));
+    expect(context.knownExecutionFacts.completedSteps.map(({ stepId }) => stepId)).toContain("prefix");
+    expect(context.completedDiscovery.map(({ stepId }) => stepId)).toEqual(["resolve-worker"]);
   });
 
   it("builds one next-stage context with only the active Skill tool policy", () => {

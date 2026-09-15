@@ -52,6 +52,8 @@ export function selectPlanningTools(
     : undefined;
   if (skills.some((skill) => skill.planningContract)) allowed?.add("context.expand");
   allowed?.add("evidence.read");
+  // Clarification stays available when a Skill omits the basic interaction.
+  allowed?.add("user.request_input");
   return tools.filter((tool) => (
     tool.enabled
     && (tool.modelExposure ?? "planner") === "planner"

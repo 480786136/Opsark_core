@@ -32,6 +32,15 @@ describe("task machine", () => {
     expect(() => transitionTask(task("draft"), "completed")).toThrow("非法任务状态迁移");
   });
 
+  it("allows planning and review to ask directly without weakening input waiting", () => {
+    for (const status of ["planning", "validating", "awaiting_plan_approval"] as const) {
+      expect(canTransitionTask(status, "awaiting_input")).toBe(true);
+    }
+    for (const status of ["planning", "validating", "completed", "needs_adjustment"] as const) {
+      expect(canTransitionTask("awaiting_input", status)).toBe(false);
+    }
+  });
+
   it("updates status and audit timestamp together", () => {
     const current = task("draft");
     transitionTask(current, "planning", "2026-08-14T01:00:00.000Z");

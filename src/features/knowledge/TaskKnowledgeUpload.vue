@@ -15,8 +15,14 @@ function prepare(){
   try{
     error.value="";confirmed.value=false;entryId.value="";
     if(!knowledge.config.uploadEnabled)throw new Error("请先在设置 → 知识服务中保存接口、Key、目标库并启用上传");
-    const secrets=[...Object.values(ops.serverPasswords),...Object.values(ops.modelApiKeys),...Object.values(ops.secretValues),...ops.servers.flatMap(s=>[s.host,s.name])];
-    preview.value=buildKnowledgeRecord(props.task,knowledge.config.knowledgeBaseId,knowledge.nextRevision(props.task.id),secrets,includeCommands.value);
+    const secretValues={...ops.getServerSecretValues(props.task.serverId)};
+    const serverPassword=ops.serverPasswords[props.task.serverId];
+    if(serverPassword)secretValues.__SERVER_PASSWORD__=serverPassword;
+    const modelApiKey=ops.modelApiKeys[props.task.modelId];
+    if(modelApiKey)secretValues.__MODEL_API_KEY__=modelApiKey;
+    preview.value=buildKnowledgeRecord(props.task,knowledge.config.knowledgeBaseId,knowledge.nextRevision(props.task.id),{
+      secretValues,redactIpAddresses:true,
+    },includeCommands.value);
     if(!preview.value.steps.length)throw new Error("当前记录没有可上传的执行步骤，请选择已完成实际执行的任务记录。");
     destination.value={...knowledge.config};
     previewBody.value=serializeRecord(preview.value);open.value=true;

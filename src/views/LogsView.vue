@@ -23,7 +23,14 @@ watch(serverFilter, (value) => {
   else if (selectedServerId.value !== value) selectedServerId.value = value;
 });
 
-type TaskGroup = { key: string; taskId?: string; title: string; status?: TaskStatus; events: AuditEvent[] };
+type TaskGroup = {
+  key: string;
+  taskId?: string;
+  title: string;
+  scope: "task" | "server" | "unassigned";
+  status?: TaskStatus;
+  events: AuditEvent[];
+};
 type ServerGroup = { key: string; serverId?: string; name: string; host?: string; status?: string; events: AuditEvent[]; tasks: TaskGroup[] };
 
 const serverOptions = computed(() => {
@@ -74,11 +81,19 @@ const groupedLogs = computed<ServerGroup[]>(() => {
       servers.set(key, group);
     }
     group.events.push(event);
-    const taskKey = event.taskId || "__unassigned__";
+    const scope: TaskGroup["scope"] = event.taskId ? "task" : event.serverId ? "server" : "unassigned";
+    const taskKey = event.taskId || (scope === "server" ? "__server_events__" : "__unassigned__");
     let task = group.tasks.find((item) => item.key === taskKey);
     if (!task) {
       const currentTask = event.taskId ? store.tasks.find((item) => item.id === event.taskId) : undefined;
-      task = { key: taskKey, taskId: event.taskId, title: event.taskTitle || currentTask?.title || t("logs.unassignedTask"), status: currentTask?.status, events: [] };
+      task = {
+        key: taskKey,
+        taskId: event.taskId,
+        title: event.taskTitle || currentTask?.title || (scope === "server" ? t("logs.serverEvents") : t("logs.unassignedTask")),
+        scope,
+        status: currentTask?.status,
+        events: [],
+      };
       group.tasks.push(task);
     }
     task.events.push(event);
@@ -171,12 +186,12 @@ function commandContent(log: AuditEvent) {
         <div class="server-log-columns">
           <aside class="server-task-list">
             <div class="task-list-heading"><span class="eyebrow">TASKS</span><strong>{{ t("logs.taskList") }}</strong><span>{{ selectedTasks.length }}</span></div>
-            <button v-for="task in selectedTasks" :key="task.key" type="button" :class="['server-task-item', { active: selectedTask?.key === task.key }]" @click="selectTask(task)"><span class="task-marker"></span><span><strong>{{ task.title }}</strong><small>{{ task.taskId || t("logs.noTaskId") }}</small></span><span class="task-item-count">{{ task.events.length }}</span></button>
+            <button v-for="task in selectedTasks" :key="task.key" type="button" :class="['server-task-item', { active: selectedTask?.key === task.key }]" @click="selectTask(task)"><span class="task-marker"></span><span><strong>{{ task.title }}</strong><small>{{ task.taskId || (task.scope === "server" ? t("logs.serverScope") : t("logs.noTaskId")) }}</small></span><span class="task-item-count">{{ task.events.length }}</span></button>
             <div v-if="!selectedTasks.length" class="task-list-empty">{{ t("logs.noTaskForFilter") }}</div>
           </aside>
           <main class="task-process-panel">
             <template v-if="selectedTask">
-              <header class="task-process-heading"><div><span class="eyebrow">TASK EXECUTION / TIMELINE</span><h2>{{ selectedTask.title }}</h2><p>{{ selectedTask.taskId || t("logs.noTaskId") }}<span v-if="selectedTask.status"> · {{ t(`logs.taskStatus.${selectedTask.status}`) }}</span></p></div><span class="task-count">{{ selectedTask.events.length }} {{ t("logs.events") }}</span></header>
+              <header class="task-process-heading"><div><span class="eyebrow">{{ selectedTask.scope === "server" ? "SERVER / SYSTEM TIMELINE" : "TASK EXECUTION / TIMELINE" }}</span><h2>{{ selectedTask.title }}</h2><p>{{ selectedTask.taskId || (selectedTask.scope === "server" ? t("logs.serverScope") : t("logs.noTaskId")) }}<span v-if="selectedTask.status"> · {{ t(`logs.taskStatus.${selectedTask.status}`) }}</span></p></div><span class="task-count">{{ selectedTask.events.length }} {{ t("logs.events") }}</span></header>
               <div class="complete-process-list">
                 <article v-for="(log, index) in selectedTask.events" :key="log.id" class="complete-process-event">
                   <div class="process-rail"><span :class="['log-level', log.level]"></span><span v-if="index < selectedTask.events.length - 1" class="process-line"></span></div>

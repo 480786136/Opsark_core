@@ -1,4 +1,5 @@
 import type { ObservationStatus, PlanStep, ValidatorType } from "@/types";
+import { classifyAuthenticationFailure } from "@/features/agent/authenticationEvidence";
 
 export interface ValidationObservation {
   facts: Record<string, unknown>;
@@ -100,28 +101,11 @@ export function analyzeSkillOutputSignals(lines: string[], semantic = ""): Skill
 
 export function analyzeSkillCommandFailure(text: string) {
   const lines = commandOutputLines(text);
-  const interactiveCredential = findDiagnosticLine(
-    lines,
-    /could not read Username.*terminal prompts disabled|terminal prompts disabled.*(?:username|password)/i,
-  );
-  if (interactiveCredential) return classifiedFailure(
-    "Git HTTPS 需要交互认证，但当前命令禁用了凭据提示",
-    "interactive_credential_required",
-    interactiveCredential,
-    { credentialRejected: false },
-  );
-
-  const rejectedCredential = findDiagnosticLine(
-    lines,
-    /authentication failed|invalid (?:username|password|credentials?)|incorrect (?:user(?:name)?|account)(?: or|\/)? password|http basic:\s*access denied|access denied.*(?:token|password|credential)|permission denied \(publickey[^)]*password|(?:用户名|账号|账户).{0,8}密码.{0,8}(?:错误|不正确)|仓库认证未通过.*再次请求/i,
-  );
-  if (rejectedCredential) return classifiedFailure(
-    "仓库服务器拒绝了当前账户与密码/令牌组合",
-    "credential_rejected",
-    rejectedCredential,
-    { credentialRejected: true },
-  );
-
+  const authentication = classifyAuthenticationFailure(lines.join("\n"));
+  if (authentication && authentication !== "connection_failed") {
+    return classifiedFailure(`认证阶段阻断：${authentication}（不据此认定密码错误）`,
+      `auth_${authentication}`, undefined, { authenticationStage: authentication, credentialRejected: authentication === "authentication_rejected" });
+  }
   const jdkToolingIncompatible = findDiagnosticLine(
     lines,
     /\b(?:NoSuchFieldError|NoSuchMethodError|IllegalAccessError)\b.*\b(?:com\.sun\.tools\.javac|jdk\.compiler)\b/i,
@@ -222,7 +206,7 @@ const presence = (lines: string[], emptyResult: boolean): ValidationObservation 
 });
 const generic = (lines: string[], emptyResult: boolean): ValidationObservation => ({
   facts: { lineCount: lines.length, outputPresent: found(lines, emptyResult) },
-  status: emptyResult ? "not_found" : "matched",
+  status: "unknown",
 });
 
 export const validationAdapters: ValidationAdapter[] = [
@@ -339,7 +323,9 @@ export const validationAdapters: ValidationAdapter[] = [
 ];
 
 export function inferSkillValidator(step: Pick<PlanStep, "title" | "description" | "command" | "validation">) {
-  return validationAdapters.find((adapter) => adapter.matches(step)) ?? validationAdapters[validationAdapters.length - 1];
+  void step;
+  // Legacy adapters remain available only for explicit parser contracts/tests.
+  return validationAdapters[validationAdapters.length - 1];
 }
 
 export function parseSkillObservation(type: ValidatorType, lines: string[], emptyResult: boolean, step: PlanStep) {

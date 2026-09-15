@@ -4,6 +4,8 @@ import { planningSkills } from "@/features/skills/skillPlanning";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { buildAdjustmentContext } from "@/features/agent/agentContext";
 import { buildToolStepOutcome } from "@/features/agent/toolStepResult";
+import { buildPlanningToolContext } from "@/features/tools/toolContext";
+import { resolveToolRegistry } from "@/features/tools/toolRegistry";
 import type { OpsTask, PlanStep } from "@/types";
 
 const task = (): OpsTask => ({ id: "task", title: "deploy", serverId: "server", modelId: "model",
@@ -34,6 +36,34 @@ function orderedSkill() {
 }
 
 describe("evidence-driven Skill projection", () => {
+  it.each([true, false])("keeps clarification during stage projection when the Skill declares it: %s", (declaresInput) => {
+    const definition = orderedSkill();
+    definition.allowedToolIds = ["files.read_content", "software.check", ...(declaresInput ? ["user.request_input"] : [])];
+    definition.planningContract!.stages[0].allowedToolIds.push("server.connect");
+    const projected = planningSkills(task(), [definition])[0];
+    const ids = buildPlanningToolContext(resolveToolRegistry([]), [projected]).map(({ id }) => id);
+
+    expect(projected.planningEvidence?.stageId).toBe("first");
+    expect(projected.allowedToolIds).toContain("user.request_input");
+    expect(ids).toContain("user.request_input");
+    expect(ids).toContain("evidence.read");
+    expect(ids).toContain("files.read_content");
+    expect(ids).not.toContain("software.check");
+    expect(ids).not.toContain("server.connect");
+  });
+
+  it("preserves an explicit clarification ban through stage projection", () => {
+    const definition = orderedSkill();
+    definition.forbiddenToolIds = ["user.request_input"];
+    definition.planningContract!.stages[0].allowedToolIds.push("user.request_input");
+    const projected = planningSkills(task(), [definition])[0];
+
+    expect(projected.planningEvidence?.stageId).toBe("first");
+    expect(projected.forbiddenToolIds).toEqual(["user.request_input"]);
+    expect(projected.allowedToolIds).not.toContain("user.request_input");
+    expect(buildPlanningToolContext(resolveToolRegistry([]), [projected]).map(({ id }) => id)).not.toContain("user.request_input");
+  });
+
   it("keeps build acceptance and recovery boundaries through discovery and preparation", () => {
     const current = task();
     const build = skill("project-build");

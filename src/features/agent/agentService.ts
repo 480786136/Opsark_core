@@ -1,4 +1,4 @@
-import { backend } from "@/services/backend";
+import { backend, PlanProtocolError } from "@/services/backend";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { workflowLifetime, StaleWorkflowError } from "./workflowLifetime";
 import { DECISION_EVIDENCE_INSTRUCTION } from "./decisionEvidence";
@@ -375,6 +375,7 @@ export async function decideTaskNextStage(
     };
   } catch (combinedError) {
     assertCurrent();
+    if (combinedError instanceof PlanProtocolError) throw combinedError;
     const fallback = await reviewTaskGoal(input, fallbackReview);
     return {
       ...fallback,
@@ -407,7 +408,7 @@ export async function planDiscoveryContinuation(
     skills: input.skills,
   }));
   const candidates = await generatePlan(
-    `整体目标：${latestTaskRequirement(input.task)}\n当前指令：${input.requirement}\n\n发现阶段已完成，请仅规划尚未完成的变更与最终验收。`,
+    `整体目标：${latestTaskRequirement(input.task)}\n当前指令：${input.requirement}\n\n当前阶段已完成，请依据已确认输入和真实证据，在原目标与授权边界内规划剩余目标的最少必要步骤。缺少环境事实时可进行有限只读取证；缺少必须由用户作出的决定时，只返回一个 user.request_input 步骤并等待。只读目标不得生成变更，不得重复已完成且仍有效的步骤。`,
     input.model.provider === "Built-in"
       ? undefined
       : createRuntimeModel(input.model, input.apiKey, context, input.generationSettings),

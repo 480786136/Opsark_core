@@ -10,6 +10,8 @@ import {
   summarizeTaskExecution,
 } from "@/features/agent/agentService";
 import type { ModelProfile, OpsTask, PlanStep } from "@/types";
+import { defaultToolCatalog } from "@/features/tools/toolCatalog";
+import { PlanProtocolError } from "@/services/backend";
 
 const model: ModelProfile = {
   id: "model-1",
@@ -113,6 +115,30 @@ describe("agentService", () => {
     expect(fallbackReview).toHaveBeenCalledTimes(1);
   });
 
+  it("does not hide a plan protocol failure behind the legacy goal-review fallback", async () => {
+    const repair = {
+      errorCode: "plan_normalization_failed" as const,
+      validationError: "standalone 阶段冲突",
+      previousModelOutput: [step("standalone", "pwd", "pending")],
+      instruction: "只修复协议",
+    };
+    const protocolError = new PlanProtocolError(repair, "确定性拆分失败");
+    const fallbackReview = vi.fn();
+
+    await expect(decideTaskNextStage({
+      task: task(),
+      model,
+      apiKey: "secret-key",
+      metrics: { cpu: 1, memory: 2, disk: 3, networkIn: 0, networkOut: 0, sampledAt: "now" },
+      tools: [],
+      secretMetadata: [],
+      generationSettings,
+      skills: [],
+    }, vi.fn().mockRejectedValue(protocolError), fallbackReview)).rejects.toBe(protocolError);
+
+    expect(fallbackReview).not.toHaveBeenCalled();
+  });
+
   it("builds discovery context and removes repeated continuation commands", async () => {
     const generatePlan = vi.fn().mockResolvedValue([
       step("duplicate", " pwd ", "pending"),
@@ -131,9 +157,46 @@ describe("agentService", () => {
 
     expect(continuation.map((item) => item.id)).toEqual(["deploy"]);
     expect(generatePlan).toHaveBeenCalledWith(
-      expect.stringContaining("发现阶段已完成"),
+      expect.stringContaining("当前阶段已完成"),
       expect.objectContaining({ apiKey: "secret-key", context: expect.stringContaining("continue_after_discovery") }),
     );
+  });
+
+  it.each([
+    ["read-only evidence", "stat -- '/opt/resource'", ""],
+    ["another necessary clarification", 'opsark-tool user.request_input {"title":"确认查询内容","fields":[{"key":"detail","label":"查询内容","description":"请明确本次需要查看的状态信息。","type":"text","required":true}]}', "true"],
+  ])("allows %s after user input without requiring changes", async (_scenario, command, validation) => {
+    const currentTask = task();
+    currentTask.rootGoal = "检查指定目标的状态";
+    currentTask.executionConstraints = {
+      changePolicy: "read_only", environmentPolicy: "unspecified", failurePolicy: "unspecified",
+      prohibitedActions: [], requiredConditions: [], userDirectives: [],
+    };
+    currentTask.plan = [{
+      ...step("target-input", 'opsark-tool user.request_input {"title":"确认目标","fields":[{"key":"target","label":"目标","description":"请指定检查目标。","type":"text","required":true}]}'),
+      kind: "observe", output: '{"title":"确认目标","values":{"target":"/opt/resource"}}',
+      result: {
+        executionStatus: "success", observationStatus: "matched", facts: { toolId: "user.request_input" },
+        warnings: [], evidenceIds: [],
+      },
+    }];
+    const next = { ...step("next", command, "pending"), kind: "observe" as const, validation };
+    const generatePlan = vi.fn().mockResolvedValue([next]);
+    const continuation = await planDiscoveryContinuation({
+      task: currentTask, requirement: currentTask.rootGoal, tools: defaultToolCatalog,
+      secretMetadata: [], model, apiKey: "secret-key", generationSettings,
+    }, generatePlan);
+
+    expect(continuation).toEqual([next]);
+    const [requirement, runtimeModel] = generatePlan.mock.calls[0];
+    expect(requirement).toContain("有限只读取证");
+    expect(requirement).toContain("只返回一个 user.request_input 步骤并等待");
+    expect(requirement).not.toContain("仅规划尚未完成的变更与最终验收");
+    const context = JSON.parse(runtimeModel.context);
+    expect(context.executionConstraints.changePolicy).toBe("read_only");
+    expect(context.completedDiscovery[0].output).toMatchObject({ values: { target: "/opt/resource" } });
+    expect(context.instruction).toContain("read_only 目标只能进行只读操作");
+    expect(context.instruction).toContain("已完成且仍有效的步骤");
   });
 
   it("rejects a continuation that contains no new executable command", async () => {

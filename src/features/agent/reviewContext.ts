@@ -13,6 +13,7 @@ import {
 } from "@/features/agent/reviewPayload";
 import type { OpsTask, PlanStep } from "@/types";
 import { modelLogContext } from "./modelLogContext";
+import { authenticationContext } from "./authenticationEvidence";
 
 const REVIEW_HISTORY_STEP_LIMIT = 6;
 const REVIEW_REMAINING_STEP_LIMIT = 6;
@@ -92,6 +93,7 @@ export function buildPreconditionReviewContext(
       failureFactsCannotBeRewritten: true,
     },
     executionConstraints: task.executionConstraints,
+    authentication: authenticationContext(task),
     task: taskSnapshot(task),
     blockingEvidence: {
       ...compactReviewPlanStep(blockerStep, { commandLimit: 800, validationLimit: 480 }),
@@ -127,6 +129,7 @@ export function buildLongRunningReviewContext(input: {
   const nextStep = input.task.plan.find((step) => step !== input.step && step.status === "pending");
   return {
     trigger: "periodic_long_running",
+    authentication: authenticationContext(input.task),
     _log: modelLogContext(input.task, input.step),
     reviewPolicy: {
       periodicLongRunningReview: true,
@@ -174,6 +177,7 @@ export function buildExecutionFailureReviewContext(
   const remaining = remainingSteps.map(plannedStepSnapshot);
   return {
     trigger: "主命令执行失败，需要判断是否影响用户整体目标和剩余计划",
+    authentication: authenticationContext(task),
     reviewPolicy: {
       exceptionalReview: true,
       commandExecutionFailed: true,
@@ -216,6 +220,7 @@ export function buildEvidenceReviewContext(
         ? "主命令执行成功，但独立后置校验通道未返回真实结束标记"
         : "主命令执行成功，但独立后置校验未通过"
       : "程序发现证据不可解释或相互冲突",
+    authentication: authenticationContext(task),
     reviewPolicy: postconditionReview ? {
       exceptionalReview: true,
       mainExecutionSucceeded: true,

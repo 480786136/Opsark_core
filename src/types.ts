@@ -165,6 +165,7 @@ export interface Metrics {
 }
 
 export interface PlanStep {
+  authenticationGate?: { fingerprint: string; reason: string; approved?: boolean };
   id: string;
   /** Executor-owned target/session/credential identity at attempt start. */
   attemptContext?: string;
@@ -375,6 +376,13 @@ export interface OpsTask {
     policyFingerprint?: string;
     createdAt: string;
   };
+  /** A failed protocol repair is not a new business failure. Bound to the task round/target. */
+  protocolRepair?: {
+    roundId?: string;
+    serverId: string;
+    repair: import("@/services/backend").PlanNormalizationRepair;
+    repairError: string;
+  };
   /** Remaining delay before managed mode automatically requests an adjustment plan. */
   autoAdjustmentSeconds?: number;
   /** Ephemeral UI state while adjustment prerequisites or a replacement plan are being prepared. */
@@ -395,6 +403,8 @@ export interface OpsTask {
   transportRecovery?: TransportRecoveryAttempt;
   /** Changes whenever task-visible server or service credentials actually change. */
   credentialRevision?: number;
+  authenticationEvidence?: import("@/features/agent/authenticationEvidence").AuthenticationEvidence[];
+  authenticationCredentials?: Array<{ ref: string; target?: string; kind: string; usernamePlaceholder: string; secretPlaceholder: string }>;
   discoveryRefined?: boolean;
   refinementCount?: number;
   activeSkillIds?: string[];
@@ -421,7 +431,7 @@ export interface SubmittedTaskInput {
   value: string | number;
   label: string;
   description: string;
-  type: "text" | "number";
+  type: "text" | "number" | "select";
   /** Identifies fields submitted together, so a username is never paired with an unrelated password. */
   groupId: string;
   groupTitle: string;
@@ -554,6 +564,7 @@ export interface FileEntry {
 }
 
 export interface SecretMetadata {
+  authenticationEvidence?: import("@/features/agent/authenticationEvidence").AuthenticationEvidence[];
   key: string;
   description: string;
   scope: "server";

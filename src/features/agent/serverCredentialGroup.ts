@@ -1,5 +1,6 @@
 import type { UserInputField } from "@/features/tools/types";
 import type { SecretMetadata } from "@/types";
+import { normalizeAuthenticationTarget } from "./authenticationTarget";
 
 export type ServerCredentialKind = NonNullable<SecretMetadata["credentialKind"]>;
 
@@ -71,7 +72,7 @@ export function inferCredentialInputPair(title: string, fields: UserInputField[]
       usernameField,
       secretField,
       kind: descriptor.kind,
-      target: descriptor.target,
+      target: normalizeAuthenticationTarget(descriptor.kind, descriptor.target),
       label: title.trim() || `${usernameField.label} / ${secretField.label}`,
     };
   }
@@ -171,6 +172,8 @@ export function credentialGroupContext(metadata: SecretMetadata[], serverId: str
     label: group.label,
     usernamePlaceholder: `\${secret.${group.username.key}}`,
     secretPlaceholder: `\${secret.${group.secret.key}}`,
-    instruction: "该凭据组已保存于当前服务器；用途匹配时直接引用，不得再向用户索取真实值。",
+    recentAuthentication: (group.secret.authenticationEvidence ?? []).filter(e => e.serverId === serverId
+      && Date.now() >= Date.parse(e.createdAt) && Date.now() - Date.parse(e.createdAt) < 30 * 60_000).slice(-4),
+    instruction: "凭据已保存不等于每种连接方式均可用。仅复用目标、身份、方式匹配的引用；连接/来源拒绝不证明密码错误，未提交密码不证明已保存凭据错误。历史成功只证明当时状态，不得跨实例或擅自换账号/免密。",
   }));
 }

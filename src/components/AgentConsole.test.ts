@@ -7,12 +7,56 @@ import { i18n } from "@/features/preferences/i18n";
 import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
 import { useOpsStore } from "@/stores/ops";
 import { buildAdjustmentBlockerSnapshot, openAdjustmentIncident } from "@/features/agent/adjustmentIncident";
+import type { PendingUserInput } from "@/features/tools/types";
+import type { OpsTask, TaskStatus } from "@/types";
 
 vi.mock("@/components/ModelSettingsModal.vue", () => ({
   default: defineComponent(() => () => h("div")),
 }));
 
 import AgentConsole from "./AgentConsole.vue";
+
+function clarificationTask(ops: ReturnType<typeof useOpsStore>) {
+  const task = ops.createTask("server-a", "safe", "model-deepseek");
+  task.status = "awaiting_input";
+  task.currentRoundId = "round-current";
+  task.plan = [{
+    id: "clarify",
+    title: "确认任务范围",
+    description: "继续执行前需要用户确认",
+    command: "request_user_input",
+    expected: "用户确认范围",
+    validation: "",
+    risk: "low",
+    status: "awaiting_input",
+  }];
+  const request: PendingUserInput = {
+    taskId: task.id,
+    stepId: "clarify",
+    callId: "clarification-call",
+    title: "确认任务范围",
+    fields: [{ key: "scope", label: "范围", description: "指定需要处理的范围", type: "text", required: true }],
+  };
+  ops.pendingUserInputs.push(request);
+  return task;
+}
+
+function selectionTask(ops: ReturnType<typeof useOpsStore>, withConfirmation = false) {
+  const task = clarificationTask(ops);
+  ops.pendingUserInputs[0].fields = [{
+    key: "target",
+    label: "处理目标",
+    description: "选择本次任务的目标",
+    type: "select",
+    required: true,
+    placeholder: "请选择处理目标",
+    options: [{ value: "target-a", label: "目标 A（测试环境）" }, { value: "target-b", label: "目标 B（演示环境）" }],
+  }];
+  if (withConfirmation) ops.pendingUserInputs[0].fields.push({
+    key: "confirmation", label: "确认说明", description: "单独填写确认说明", type: "text", required: true,
+  });
+  return task;
+}
 
 describe("AgentConsole 服务器工作区隔离", () => {
   let host: HTMLElement;
@@ -26,6 +70,331 @@ describe("AgentConsole 服务器工作区隔离", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     host.remove();
+  });
+
+  function mountTask(pinia: ReturnType<typeof createPinia>, task: OpsTask) {
+    const ops = useOpsStore(pinia);
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    useAgentWorkspaceStore(pinia).updateServer("server-a", { activeTaskId: task.id, automationEnabled: true });
+    const app = createApp(AgentConsole, { serverId: "server-a", active: false }).use(pinia).use(i18n);
+    app.mount(host);
+    return app;
+  }
+
+  function enterClarification(value: string) {
+    const input = host.querySelector<HTMLInputElement>(".user-input-card input")!;
+    input.value = value;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    return input;
+  }
+
+  function submitClarification(form = host.querySelector<HTMLFormElement>(".user-input-card")!) {
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+  }
+
+  async function chooseTarget(index = 0) {
+    host.querySelector<HTMLElement>(".user-input-card .parameter-select summary")!.click();
+    await nextTick();
+    host.querySelectorAll<HTMLButtonElement>(".user-input-card [role='option']")[index].click();
+    await nextTick();
+  }
+
+  it("单选字段初始为空，必填未选时不提交，也不显示凭据保存说明", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = selectionTask(ops);
+    const provide = vi.spyOn(ops, "provideUserInput").mockResolvedValue(true);
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      const form = host.querySelector<HTMLFormElement>(".user-input-card")!;
+      const trigger = form.querySelector<HTMLElement>("summary")!;
+      expect(trigger.textContent).toBe("请选择处理目标");
+      expect(trigger.getAttribute("aria-label")).toBe("处理目标");
+      expect(form.querySelector("[role='option'][aria-selected='true']")).toBeNull();
+      expect(form.querySelector("[role='listbox']")?.getAttribute("aria-required")).toBe("true");
+      expect(form.querySelector("input, select")).toBeNull();
+      expect(form.querySelector(".user-input-actions > span")).toBeNull();
+      expect(form.querySelector<HTMLButtonElement>("button[type='submit']")?.disabled).toBe(true);
+      submitClarification();
+      expect(provide).not.toHaveBeenCalled();
+    } finally { app.unmount(); }
+  });
+
+  it("单选提交真实 value，提交期间禁用选择和重复提交，失败后保留选择", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = selectionTask(ops);
+    let finish!: (submitted: boolean) => void;
+    const provide = vi.spyOn(ops, "provideUserInput").mockImplementation(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      await chooseTarget(1);
+      const trigger = host.querySelector<HTMLElement>(".user-input-card summary")!;
+      expect(trigger.textContent).toBe("目标 B（演示环境）");
+      submitClarification();
+      submitClarification();
+      expect(provide).toHaveBeenCalledExactlyOnceWith(task.id, { target: "target-b" }, "clarification-call");
+      await nextTick();
+      expect(trigger.getAttribute("aria-disabled")).toBe("true");
+      expect(host.querySelector<HTMLButtonElement>(".user-input-card button[type='submit']")?.disabled).toBe(true);
+      const options = host.querySelectorAll<HTMLButtonElement>(".user-input-card [role='option']");
+      expect([...options].every((option) => option.disabled)).toBe(true);
+      trigger.click();
+      options[0].click();
+      await nextTick();
+      expect(trigger.closest("details")?.open).toBe(false);
+      expect(trigger.textContent).toBe("目标 B（演示环境）");
+      finish(false);
+      await vi.waitFor(() => expect(trigger.getAttribute("aria-disabled")).toBe("false"));
+      expect(trigger.textContent).toBe("目标 B（演示环境）");
+      provide.mockResolvedValue(true);
+      submitClarification();
+      await vi.waitFor(() => expect(trigger.textContent).toBe("请选择处理目标"));
+      expect(provide).toHaveBeenCalledTimes(2);
+    } finally { app.unmount(); }
+  });
+
+  it("选择目标不会代替独立的必填文本确认", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = selectionTask(ops, true);
+    const provide = vi.spyOn(ops, "provideUserInput").mockResolvedValue(true);
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      await chooseTarget();
+      const confirmation = host.querySelector<HTMLInputElement>(".user-input-card input")!;
+      expect(confirmation.type).toBe("text");
+      expect(confirmation.value).toBe("");
+      expect(confirmation.required).toBe(true);
+      submitClarification();
+      expect(provide).not.toHaveBeenCalled();
+      enterClarification("仅处理选定目标");
+      submitClarification();
+      expect(provide).toHaveBeenCalledExactlyOnceWith(task.id, {
+        target: "target-a", confirmation: "仅处理选定目标",
+      }, "clarification-call");
+    } finally { app.unmount(); }
+  });
+
+  it.each([false, true])("仅可选单选允许清空为未填写，required=%s", async (required) => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = selectionTask(ops);
+    ops.pendingUserInputs[0].fields[0].required = required;
+    const provide = vi.spyOn(ops, "provideUserInput").mockResolvedValue(true);
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      await chooseTarget();
+      const trigger = host.querySelector<HTMLElement>(".user-input-card summary")!;
+      trigger.click();
+      await nextTick();
+      const clear = host.querySelector<HTMLButtonElement>(".user-input-card .parameter-clear");
+      if (required) {
+        expect(clear).toBeNull();
+      } else {
+        expect(clear?.getAttribute("aria-label")).toBe("清空 处理目标");
+        expect(clear?.closest("[role='listbox']")).toBeNull();
+        clear!.click();
+        await nextTick();
+        expect(trigger.textContent).toBe("请选择处理目标");
+        expect(host.querySelector(".user-input-card [aria-selected='true']")).toBeNull();
+        expect(host.querySelectorAll(".user-input-card [role='option']")).toHaveLength(2);
+        submitClarification();
+        expect(provide).toHaveBeenCalledExactlyOnceWith(task.id, { target: "" }, "clarification-call");
+      }
+    } finally { app.unmount(); }
+  });
+
+  it.each(["text", "password", "credential"] as const)("仅凭据相关表单显示长期保存说明：%s", async (kind) => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = clarificationTask(ops);
+    const field = ops.pendingUserInputs[0].fields[0];
+    if (kind === "password") field.type = "password";
+    if (kind === "credential") field.credential = { group: "auth", kind: "service", role: "username", target: "service.example" };
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      const hint = host.querySelector(".user-input-actions > span");
+      if (kind === "text") expect(hint).toBeNull();
+      else expect(hint?.textContent).toContain("系统钥匙串");
+    } finally { app.unmount(); }
+  });
+
+  it("只在任务等待输入时显示澄清表单，状态变更立即拒绝旧表单提交", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = clarificationTask(ops);
+    const provide = vi.spyOn(ops, "provideUserInput").mockResolvedValue(true);
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      const form = host.querySelector<HTMLFormElement>(".user-input-card")!;
+      expect(form).not.toBeNull();
+      task.status = "planning";
+      submitClarification(form);
+      expect(provide).not.toHaveBeenCalled();
+      const inactiveStatuses: TaskStatus[] = ["planning", "running", "validating", "awaiting_plan_approval", "awaiting_step_approval", "needs_adjustment", "completed", "cancelled"];
+      for (const status of inactiveStatuses) {
+        task.status = status;
+        await nextTick();
+        expect(host.querySelector(".user-input-card"), status).toBeNull();
+      }
+    } finally { app.unmount(); }
+  });
+
+  it("拒绝任务、步骤、轮次或执行上下文不匹配的澄清请求", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = clarificationTask(ops);
+    const current = { ...ops.pendingUserInputs[0] };
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      expect(host.querySelector(".user-input-card")).not.toBeNull();
+      const invalidBindings: Partial<PendingUserInput>[] = [
+        { taskId: "another-task" }, { stepId: "another-step" }, { roundId: "previous-round" },
+        { workflowEpoch: 99 }, { serverId: "another-server" }, { command: "superseded-command" },
+      ];
+      for (const binding of invalidBindings) {
+        ops.pendingUserInputs = [{ ...current, ...binding }];
+        await nextTick();
+        expect(host.querySelector(".user-input-card"), JSON.stringify(binding)).toBeNull();
+      }
+      ops.pendingUserInputs = [current];
+      task.plan[0].status = "completed";
+      await nextTick();
+      expect(host.querySelector(".user-input-card")).toBeNull();
+      task.plan[0].status = "awaiting_input";
+      task.cancelRequested = true;
+      await nextTick();
+      expect(host.querySelector(".user-input-card")).toBeNull();
+    } finally { app.unmount(); }
+  });
+
+  it("澄清等待不会被遗留的步骤审批按钮遮挡", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = clarificationTask(ops);
+    task.plan.unshift({ ...task.plan[0], id: "old-approval", status: "awaiting_approval" });
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      expect(host.querySelector(".user-input-card")).not.toBeNull();
+      expect(host.querySelector(".approval-bar")).toBeNull();
+    } finally { app.unmount(); }
+  });
+
+  it("澄清提交期间禁用输入与按钮并防止重复提交，失败后保留输入供重试", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = clarificationTask(ops);
+    let finish!: (submitted: boolean) => void;
+    const provide = vi.spyOn(ops, "provideUserInput").mockImplementation(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      const input = enterClarification("测试环境");
+      submitClarification();
+      submitClarification();
+      expect(provide).toHaveBeenCalledExactlyOnceWith(task.id, { scope: "测试环境" }, "clarification-call");
+      await nextTick();
+      expect(input.disabled).toBe(true);
+      expect(host.querySelector<HTMLButtonElement>(".user-input-card button[type='submit']")?.disabled).toBe(true);
+      ops.pendingUserInputs[0].error = "请进一步说明范围";
+      finish(false);
+      await vi.waitFor(() => expect(input.disabled).toBe(false));
+      expect(input.value).toBe("测试环境");
+      expect(host.textContent).toContain("请进一步说明范围");
+      provide.mockResolvedValue(true);
+      submitClarification();
+      await vi.waitFor(() => expect(input.value).toBe(""));
+      expect(provide).toHaveBeenCalledTimes(2);
+    } finally { app.unmount(); }
+  });
+
+  it.each(["request", "task", "round"] as const)("旧提交完成后保留新表单内容：切换 %s", async (change) => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = clarificationTask(ops);
+    let finish!: (submitted: boolean) => void;
+    const provide = vi.spyOn(ops, "provideUserInput").mockImplementation(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      enterClarification("旧答案");
+      submitClarification();
+      await nextTick();
+      if (change === "task") {
+        const nextTask = clarificationTask(ops);
+        useAgentWorkspaceStore(pinia).updateServer("server-a", { activeTaskId: nextTask.id });
+      } else if (change === "round") {
+        task.currentRoundId = "next-round";
+        ops.pendingUserInputs = [{ ...ops.pendingUserInputs[0], roundId: "next-round" }];
+      } else {
+        ops.pendingUserInputs = [{ ...ops.pendingUserInputs[0], callId: "next-clarification-call" }];
+      }
+      await nextTick();
+      const newInput = host.querySelector<HTMLInputElement>(".user-input-card input")!;
+      expect(newInput.value).toBe("");
+      expect(newInput.disabled).toBe(false);
+      enterClarification("新答案");
+      finish(true);
+      await vi.waitFor(() => expect(provide.mock.settledResults[0]?.type).toBe("fulfilled"));
+      await nextTick();
+      expect(newInput.value).toBe("新答案");
+    } finally { app.unmount(); }
+  });
+
+  it("步骤审批只在对应等待状态显示，状态改变后旧按钮也不可触发审批", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = clarificationTask(ops);
+    task.status = "awaiting_step_approval";
+    task.plan[0].status = "awaiting_approval";
+    const approve = vi.spyOn(ops, "approveStep").mockResolvedValue(undefined);
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      const button = host.querySelector<HTMLButtonElement>(".approval-bar .primary")!;
+      expect(button).not.toBeNull();
+      task.status = "planning";
+      button.click();
+      expect(approve).not.toHaveBeenCalled();
+      const inactiveStatuses: TaskStatus[] = ["planning", "running", "validating", "awaiting_input", "completed", "cancelled"];
+      for (const status of inactiveStatuses) {
+        task.status = status;
+        await nextTick();
+        expect(host.querySelector(".approval-bar"), status).toBeNull();
+      }
+    } finally { app.unmount(); }
+  });
+
+  it.each(["awaiting_plan_approval", "awaiting_step_approval"] as const)("审批在途时防止重复点击：%s", async (status) => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = clarificationTask(ops);
+    task.status = status;
+    task.plan[0].status = status === "awaiting_step_approval" ? "awaiting_approval" : "pending";
+    let finish!: () => void;
+    const approve = vi.spyOn(ops, status === "awaiting_step_approval" ? "approveStep" : "approvePlan")
+      .mockImplementation(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      const button = host.querySelector<HTMLButtonElement>(".approval-bar .primary")!;
+      button.click();
+      button.click();
+      expect(approve).toHaveBeenCalledTimes(1);
+      await nextTick();
+      expect(button.disabled).toBe(true);
+      finish();
+      await vi.waitFor(() => expect(button.disabled).toBe(false));
+    } finally { app.unmount(); }
   });
 
   it("发送期间连接失效时保留草稿并显示错误，离线禁用发送", async () => {

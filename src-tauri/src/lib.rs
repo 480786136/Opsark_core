@@ -152,7 +152,8 @@ const NEXT_STAGE_DECISION_SYSTEM: &str = r#"本调用把阶段结束后的整体
 - 计划文字、步骤标题、expected、阶段 summary、模型 review、指令和待执行步骤都不是完成证据；历史证据只能证明其自身 scope，不能外推当前状态。
 - 任一目标尚无证据、证据过期或作用域不匹配，或者存在未恢复的执行失败、安全拦截、审批/输入阻断、冲突证据或未满足的 Skill 验收条件时，禁止返回 complete。
 - 只有结构化成功证据已经充分证明整体目标及全部最终验收条件时才能返回 complete，并且 steps 必须为空数组。
-- 尚未完成时必须在同一个响应中返回至少一个当前证据允许的最小下一阶段步骤。当前阶段正常结束且可直接推进时返回 continue；需要因失败、阻断、证据缺口或错误假设改变方案时返回 adjust。不得重复已经有结构化完成证据的工作。"#;
+- 尚未完成时必须在同一个响应中返回至少一个当前证据允许的最小下一阶段步骤。当前阶段正常结束且可直接推进时返回 continue；需要因失败、阻断、证据缺口或错误假设改变方案时返回 adjust。不得重复已经有结构化完成证据的工作。
+- 缺少必须由用户作出的决定时返回 adjust，steps 中只能有一个 user.request_input 步骤；已有未回答问题时复用原问题，reason 和 summary 说明具体待决事项与等待原因。等待用户不是业务执行失败，不得据此改换目标或生成绕过问题的恢复方案；用户回答只解决对应决定，不证明整体目标完成。"#;
 const NEXT_STAGE_OUTPUT_CONTRACT: &str = r#"输出必须严格为 {"decision":"complete|continue|adjust","reason":"非空字符串","summary":"非空字符串","steps":[]}，顶层不得增加其他字段。
 decision=complete 时 steps 必须严格为空数组。decision=continue 或 adjust 时 steps 必须至少有 1 个元素。
 每个步骤必须严格包含：{"kind":"observe|change","title":"非空字符串","description":"非空字符串","command":"非空字符串","expected":"非空字符串","validation":"字符串","risk":"low|medium|high"}。可选字段只允许 executionScope、validationScope、runtimeClass 和 sessionContextChange；其枚举、作用域、独立校验、长任务和进程跟踪要求与 GENERAL_PLAN_SYSTEM 相同。
@@ -170,13 +171,18 @@ const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
 1. 先识别用户的整体目标、明确约束和现有证据。
    context.taskGoal.rootGoal 存在时它是不可被“继续、重试、补充”等短指令覆盖的最终目标；currentInstruction 只决定本轮增量。计划必须继续满足整体目标，并复用历史已完成证据。
 2. 不得预设技术栈、工具、路径、端口、服务名或资源名。
-3. 证据不足时，只生成最少必要的只读发现步骤；不得同时生成依赖未知发现结果的推测性变更。
-   当当前阻断发生在依赖解析、编译、打包或镜像构建阶段时，本阶段只能生成修复构建及验收构建产物的最少步骤。构建产物未经结构化程序证据确认前，不得生成启动、后台运行、部署、端口探测或应用健康检查步骤；待产物验收成功后再续接独立部署阶段。
-4. 证据充足时，按“必要确认→变更→最终验收”生成最少必要的计划。
+3. 信息不足时先区分可查证的环境事实与必须由用户作出的决定。仅缺少环境事实时，在已明确目标和授权边界内生成有限、最少必要的只读发现步骤；不得同时生成依赖未知发现结果的推测性变更，也不得把可自行查证的事实全部转交用户。
+   目标或目标对象存在会影响实际操作的多种解释，或者下一步缺少用户必须确认的方案、范围、偏好或授权（包括替代目标、扩大操作影响）时，当前计划必须只有一个 user.request_input 步骤，等待明确回答后再生成后续步骤。不得猜测用户选择、用可执行的替代方案偷换原目标，或把发现的可用资源、模型建议和默认值当成用户决定。
+   提问必须按 context.tools 中 user.request_input 的 inputSchema 构造，只收集阻止当前推进的最少必要决定，并说明已知事实、待决事项和相关影响。已知有限候选，尤其只读发现已给出候选时，优先使用 select 字段；options 必须是 1 至 100 个 {value,label} 对象，value 和 label 为非空字符串，value 按原值精确唯一。开放信息使用 text，敏感值使用 password；候选未知时不得编造 options。所有字段不得设置默认值或预选项，必须等待用户明确输入或选择；重大操作的确认或授权须独立保留，不能由目标选择代替，不得默认同意。
+   例如仅当现有证据已经列出目标 A、目标 B 时，可按当前 inputSchema 生成字段 {"key":"target","label":"操作目标","description":"请选择本次操作的目标。","type":"select","required":true,"options":[{"value":"target-a","label":"目标 A"},{"value":"target-b","label":"目标 B"}]}；实际候选及其标识必须来自已知事实，示例不替代 context.tools 中的 schema。
+   已明确回答且仍适用于同一目标的问题必须复用，不得重复索取。已有未回答问题时复用原问题并保持等待，不得追加发现或业务步骤来绕过它；“继续、托管、批准”不替代未回答的具体问题。等待用户不是业务执行失败，不得以此重拟替代目标或恢复方案。
+   user.request_input 只收集输入，不改变目标环境，应使用 kind=observe。该工具未开放、被禁用或被当前 Skill 明确禁止时，必须保持真实阻断；不得用 Shell 模拟提问、猜测回答、编造完成证据或改选替代方案继续。
+   在上述用户决定和授权已明确的前提下，当当前阻断发生在依赖解析、编译、打包或镜像构建阶段时，本阶段只能生成修复构建及验收构建产物的最少步骤。构建产物未经结构化程序证据确认前，不得生成启动、后台运行、部署、端口探测或应用健康检查步骤；待产物验收成功后再续接独立部署阶段。
+4. 证据充足且必要用户决定已明确时，按“必要确认→变更→最终验收”生成最少必要的计划。
 5. 默认每步在独立非交互 Shell 中运行，所需目录和环境必须在当步建立。只有后续步骤确实需要复用工作目录、非敏感环境变量或 source 文件时，才可选用 executionScope=agent_session 并用 sessionContextChange 明确记录可重放状态；主 command 仍必须自行建立它当次依赖的环境。
 6. 用户只要求修改已有资源的部分字段时，必须保留无关内容并做可恢复备份；不得用新模板覆盖整个结构化配置，除非用户明确要求整体替换或证据证明这是完整目标内容。
 7. 下载、安装、构建等可能长时间运行的命令必须保留实时标准输出和真实退出码；不得将整个主命令直接管道给非跟随模式的 tail/head 以截断输出。如需限制展示，应在主命令完成并保存真实退出状态后处理日志。
-8. 用户给出的明确命令、地址、标识符或协议必须保持语义不变，除非真实证据证明不可用并明确说明替代原因。
+8. 用户给出的明确命令、地址、标识符或协议必须保持语义不变。真实证据证明不可用只能作为阻断证据；若替代方案改变用户指定的目标、约束或授权范围，必须先通过 user.request_input 取得用户决定，不能仅说明替代原因就直接执行。
 9. 所有远程命令步骤都必须由执行器跟踪到真实退出；不得使用未受管的单独 &、disown、setsid -f 或伪造轮询让进程脱离执行生命周期，也不得用 || true、末尾 ; true 或失败分支 exit 0 掩盖主命令和校验的真实失败。有限操作必须前台执行；长驻进程应使用环境已有的受管机制，并通过独立只读证据校验状态。不得重复已完成的输入、发现、变更或验收步骤。
 10. context.activeSkills 是需求理解阶段从已启用目录中选出的领域工作流。存在多个 Skill 时，必须同时遵循全部 Skill 的阶段、工具选择和验收要求，将相容阶段合并且不得静默丢弃任一 Skill；如指令冲突，必须优先满足用户明确约束和核心安全规则，并仅规划可安全确定的阶段。没有激活 Skill 时仅使用通用最小证据流程。工具只能按 context.tools 中的输入协议、planMode 和 completionMode 调用，不得猜测工具能力。需要敏感变量时使用语义明确的 ${secret.NAME} 占位符，禁止把真实值写入计划。不同目标系统、账户、身份或用途的凭据不得静默复用；用途不一致时必须由对应 Skill 指定语义化变量并向用户收集。
 11. 用户提供的路径、文件名和其他可能包含空格、括号、通配符或非 ASCII 字符的值，作为 Shell 参数时必须逐项完整安全引用，并在命令支持时使用 -- 结束选项；不得依赖未引用文本恰好能被当前 Shell 解析。
@@ -189,17 +195,26 @@ const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
 - 对象不存在、查询无匹配或观察到异常可以是有效发现，不等于命令失败。
 - 只读状态发现若把“不存在、未运行、未监听、无匹配”作为有效分类，必须显式区分所用命令文档定义的“无匹配”退出码与真正执行错误：只把已知无匹配码转换为分类输出，其他非零码原样退出；禁止用 command || echo 把所有错误都改成成功。
 - 认证失败、权限不足、网络不可达等只能作为阻断证据，不能当作用户查询或变更目标已完成；各领域的成功验收条件由已选 Skill 定义。
+- authentication 和 serverCredentialGroups 中的证据只证明记录时刻的目标、身份、连接方式与凭据引用组合。来源/连接方式被拒绝不等于密码错误；未提交凭据不等于已保存凭据错误。不得自行换账号、免密或跨实例复用；目标或认证方法不确定时调用 user.request_input 并等待。
+- interpretation=raw 或 observationStatus=unknown 表示输出尚未按领域契约解释，不单独构成执行失败。lineCount 是文本行数，不是数据库行数；必须阅读原始输出，分别判断主命令、独立校验和整体目标，不能从命令标题或路径关键词推导业务事实。
 - 不得重复已完成步骤，不得生成超出用户授权的不可逆操作。
 
 输出：只返回符合计划输出契约的 JSON 对象。"#;
 const GENERAL_DISCOVERY_RULES: &str = "对于需要发现实际实现方式的任务，先读取目标自带的说明、声明、配置、入口和已有状态，由证据确定依赖、运行方式、构建方式、部署方式和验收标准。核心不提供任何领域工具或技术栈的默认方案；只能使用当前证据明确展示的能力。发现步骤的校验只确认证据可获得，不要把可选信息缺失判为失败。";
-const GENERAL_REQUIREMENT_SYSTEM: &str = "你是通用运维需求分类、任务关系判断与 Skill 编排器，本阶段不生成计划。先将用户本次输入和 context.taskGoal.rootGoal 比较，区分继续、补充、旁问、独立新目标、明确替换或取消；不得让‘继续部署’、‘重试’取代整体目标，也不得让临时问题破坏原任务。判断用户是仅需要不依赖当前环境的知识性回答，还是需要读取或改变真实目标环境。需要当前状态、真实数据或任何环境变更时必须返回 execute。对 execute 必须用 constraints.changePolicy 明确表达本轮只读或变更边界，不得返回 unspecified。从系统提供的 Skill 目录中依据名称、适用场景和选择提示进行语义选择，允许复合需求选择零个、一个或多个 Skill；没有直接适用 Skill 时必须返回空数组并使用通用流程，不得选择最相近的 Skill 凑数，也不得编造目录外 Skill。environmentPolicy、failurePolicy 和其他结构化约束只能来自用户明确表达，不得猜测或自行增加。";
+const GENERAL_REQUIREMENT_SYSTEM: &str = r#"你是通用运维需求分类、任务关系判断与 Skill 编排器，本阶段不生成计划。先将用户本次输入和 context.taskGoal.rootGoal 比较，区分继续、补充、旁问、独立新目标、明确替换或取消；不得让‘继续部署’、‘重试’取代整体目标，也不得让临时问题破坏原任务。判断用户是仅需要不依赖当前环境的知识性回答，还是需要读取或改变真实目标环境。需要当前状态、真实数据或任何环境变更时必须返回 execute。
+执行意图已明确但目标有歧义、缺少必要用户决定或授权时，仍返回 execute，由后续规划通过 user.request_input 询问并等待；本阶段不得用 answer 代替执行前澄清，也不得增加分类字段或猜测替代目标。用户回答已有待决问题通常是 supplement；‘继续、托管、批准’不替代未回答的具体问题，也不自动扩大授权。对 execute 必须用 constraints.changePolicy 明确表达本轮只读或变更边界，不得返回 unspecified；依据当前任务中用户已经明确的操作提取边界，复用仍然有效的授权，任务中尚无变更授权时为 read_only。
+从系统提供的 Skill 目录中依据名称、适用场景和选择提示进行语义选择，允许复合需求选择零个、一个或多个 Skill；没有直接适用 Skill 时必须返回空数组并使用通用流程，不得选择最相近的 Skill 凑数，也不得编造目录外 Skill。environmentPolicy、failurePolicy 和其他结构化约束只能来自用户明确表达，不得猜测或自行增加。"#;
 const GENERAL_SUMMARY_SYSTEM: &str = "你是通用运维结果总结器。仅根据当前轮用户目标和当前轮脱敏的真实执行证据总结，不得用旧轮证据回答新的状态问题。结构化 result、evidence.facts 和 evidence.scope 优先于预期文本和旧总结。证据只能证明自己的 scope/persistence：agent_session 成功不证明用户已打开 Shell 或新 Shell 自动加载，显式 source 成功不证明启动文件会自动加载。有效的“未发现”、“非健康”或“警告”是观察结果，不等于命令执行失败。若存在关键失败且无后续证据证明目标已达成，必须明确说明任务未完成、最终阻断、已确认结果和尚未满足的目标。不得虚构、输出命令或泄露敏感信息。使用一至三段中文纯文本。";
-const GENERAL_REVIEW_SYSTEM: &str = "你是运维执行复核员。根据用户目标、trigger、executionConstraints、当前步骤或 baseSnapshot 的结构化结果、关键错误和剩余步骤，判断 continue、adjust 或 complete。priorVerifiedFacts 只用于避免重复，不能代替当前状态证据。不得把失败改写为成功，不得虚构证据、命令或授权。证据作用域必须与 expected 一致。存在确定恢复路径时 continue；已阻断、证据不足或作用域不匹配时 adjust；只有目标被真实且作用域匹配的证据充分证明时 complete。安全拦截、审批、执行结果和程序门禁不可被覆盖。只返回包含 decision、reason、summary 的 JSON。";
+const GENERAL_REVIEW_SYSTEM: &str = r#"你是运维执行复核员。根据用户目标、trigger、executionConstraints、当前步骤或 baseSnapshot 的结构化结果、关键错误和剩余步骤，判断 continue、adjust 或 complete。priorVerifiedFacts 只用于避免重复，不能代替当前状态证据。不得把失败改写为成功，不得虚构证据、命令或授权。证据作用域必须与 expected 一致。存在授权内的确定恢复路径且必要用户决定已明确时 continue；已阻断、证据不足或作用域不匹配时 adjust；只有目标被真实且作用域匹配的证据充分证明时 complete。安全拦截、审批、执行结果和程序门禁不可被覆盖。
+缺少可查证的环境事实时，reason 指明有限只读发现所需证据；目标歧义、缺少必要用户决定或需要扩大授权时返回 adjust，reason 明确待决事项及影响，交由现有规划生成唯一 user.request_input 步骤并等待。已有未回答问题时说明仍等待原问题，不得重复索取已明确回答且适用于同一目标的信息。等待用户不是业务执行失败，不能据此重拟替代目标或恢复方案；‘继续、托管、批准’不替代未回答的具体问题，用户回答本身也不证明业务目标完成。
+本复核协议没有 steps 字段，只返回包含 decision、reason、summary 的 JSON；不得额外输出问题、命令或计划字段，也不得因无法在此输出提问步骤而谎称 complete。"#;
 const LONG_RUNNING_REVIEW_SYSTEM: &str = "你是长任务运行状态复核员。输入只包含压缩后的用户目标、当前步骤、下一步骤提示、跨轮关键证据、进度状态和本轮新增终端输出。只判断当前命令应 continue 还是 adjust：语义输出或可验证进度仍在变化时返回 continue；仅旋转图标、时间戳或重复行变化不算进展。连续无进展、出现认证或交互等待、明确错误、达到等待上限时返回 adjust。continue 仅表示继续等待当前命令，不能进入下一步；主命令未返回真实退出且 periodicObservation.passed=false 时不得 complete。terminalOutput.omittedCharacters 仅表示旧输出被压缩，不代表失败；salientEvidence 是前轮已保留的关键错误、警告或里程碑，不得忽略。不得虚构输出、退出码、命令或授权。只返回 decision、reason、summary 三个字段的简短 JSON，reason 和 summary 各不超过 60 个字。";
 const STRUCTURED_OUTPUT_ATTEMPTS: usize = 2;
 const REQUIREMENT_RELATION_RULE: &str = "关系自检：句式是提问不等于 side_question。例如新任务‘现在有哪些 Java 服务在运行’需要查询真实服务器，应返回 intent=execute、relation=new_goal、changePolicy=read_only、answer=空字符串、selectedSkillIds=[]。只有无需读取真实环境的咨询才使用 answer + side_question；已有整体目标时依据实际关系选择 continue/supplement/new_goal，不得自动替换原目标。";
-const PLAN_GENERATION_ATTEMPTS: usize = 3;
+const PLAN_MAX_TOTAL_MODEL_CALLS: usize = 6;
+const PLAN_MAX_FULL_GENERATION_CALLS: usize = 2;
+const PLAN_MAX_FOCUSED_REPAIR_CALLS: usize = 4;
+const PLAN_MAX_STAGNANT_REPAIRS: usize = 2;
 
 fn deserialize_model_validation<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
@@ -534,7 +549,7 @@ fn context_with_selected_skills(
                     !forbidden
                         && (!restrict_to_allow_lists
                             || allowed_tool_ids.contains(id)
-                            || id == "evidence.read")
+                            || matches!(id, "evidence.read" | "user.request_input"))
                 })
                 .unwrap_or(true)
         });
@@ -1411,6 +1426,104 @@ fn plan_error_step_index(error: &str, step_count: usize) -> Option<usize> {
         .collect::<String>();
     let one_based = digits.parse::<usize>().ok()?;
     (one_based > 0 && one_based <= step_count).then_some(one_based)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanFailureFingerprint {
+    step_index: usize,
+    field: &'static str,
+    failure_id: String,
+}
+
+fn plan_failure_fingerprint(error: &str, step_count: usize) -> Option<PlanFailureFingerprint> {
+    let step_index = plan_error_step_index(error, step_count)?;
+    let field = if error.contains("计划步骤的 command ") {
+        "command"
+    } else if error.contains("计划步骤的 validation ") {
+        "validation"
+    } else {
+        "step"
+    };
+    let failure_id = error
+        .split_once("未通过执行前安全检查（")
+        .and_then(|(_, remainder)| remainder.split_once('：'))
+        .map(|(rule_id, _)| rule_id.trim())
+        .filter(|rule_id| {
+            !rule_id.is_empty()
+                && rule_id.chars().all(|character| {
+                    character.is_ascii_uppercase() || character.is_ascii_digit() || character == '_'
+                })
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| error.trim().to_string());
+    Some(PlanFailureFingerprint {
+        step_index,
+        field,
+        failure_id,
+    })
+}
+
+#[derive(Debug, Default)]
+struct PlanRepairBudget {
+    total_model_calls: usize,
+    full_generation_calls: usize,
+    focused_repair_calls: usize,
+    stagnant_repairs: usize,
+    last_failure: Option<PlanFailureFingerprint>,
+    stop_reason: Option<String>,
+}
+
+impl PlanRepairBudget {
+    fn try_start_call(&mut self, focused_repair: bool) -> bool {
+        if self.stop_reason.is_some() {
+            return false;
+        }
+        if self.total_model_calls >= PLAN_MAX_TOTAL_MODEL_CALLS {
+            self.stop_reason = Some(format!(
+                "达到计划生成模型调用硬上限 {PLAN_MAX_TOTAL_MODEL_CALLS} 次"
+            ));
+            return false;
+        }
+        if focused_repair {
+            if self.focused_repair_calls >= PLAN_MAX_FOCUSED_REPAIR_CALLS {
+                self.stop_reason = Some(format!(
+                    "达到局部针对性修复硬上限 {PLAN_MAX_FOCUSED_REPAIR_CALLS} 次"
+                ));
+                return false;
+            }
+            self.focused_repair_calls += 1;
+        } else {
+            if self.full_generation_calls >= PLAN_MAX_FULL_GENERATION_CALLS {
+                self.stop_reason = Some(format!(
+                    "达到完整计划生成硬上限 {PLAN_MAX_FULL_GENERATION_CALLS} 次"
+                ));
+                return false;
+            }
+            self.full_generation_calls += 1;
+        }
+        self.total_model_calls += 1;
+        true
+    }
+
+    fn observe_failure(&mut self, failure: Option<PlanFailureFingerprint>, focused_repair: bool) {
+        if focused_repair && failure.is_some() && failure == self.last_failure {
+            self.stagnant_repairs += 1;
+        } else {
+            self.stagnant_repairs = 0;
+        }
+        self.last_failure = failure;
+        if self.stagnant_repairs >= PLAN_MAX_STAGNANT_REPAIRS {
+            self.stop_reason = Some(format!(
+                "同一计划校验失败在连续 {PLAN_MAX_STAGNANT_REPAIRS} 次局部修复后仍未变化"
+            ));
+        }
+    }
+
+    fn stop_reason(&self) -> &str {
+        self.stop_reason
+            .as_deref()
+            .unwrap_or("计划仍未通过协议或安全校验")
+    }
 }
 
 fn focused_plan_repair_instruction(
@@ -2446,21 +2559,22 @@ async fn generate_ai_plan_with_trace(
     let deployment_rules = GENERAL_DISCOVERY_RULES;
     let mut last_error = "模型未返回计划".to_string();
     let mut last_repairable_steps = None;
-    for attempt in 0..PLAN_GENERATION_ATTEMPTS {
-        let focused_repair_index = (attempt > 0)
-            .then(|| {
-                last_repairable_steps
-                    .as_ref()
-                    .and_then(|steps: &Vec<AiPlanStep>| {
-                        plan_error_step_index(&last_error, steps.len())
-                    })
-            })
-            .flatten();
+    let mut repair_budget = PlanRepairBudget::default();
+    loop {
+        let had_previous_attempt = repair_budget.total_model_calls > 0;
+        let focused_repair_index = last_repairable_steps
+            .as_ref()
+            .and_then(|steps: &Vec<AiPlanStep>| plan_error_step_index(&last_error, steps.len()));
+        let focused_repair = focused_repair_index.is_some();
+        if !repair_budget.try_start_call(focused_repair) {
+            break;
+        }
+        let attempt_number = repair_budget.total_model_calls;
         let correction = match (focused_repair_index, last_repairable_steps.as_deref()) {
             (Some(index), Some(steps)) => {
                 focused_plan_repair_instruction(&last_error, steps, index)
             }
-            _ if attempt > 0 => {
+            _ if had_previous_attempt => {
                 plan_repair_instruction(&last_error, last_repairable_steps.as_deref())
             }
             _ => String::new(),
@@ -2485,24 +2599,30 @@ async fn generate_ai_plan_with_trace(
         }
         let request_snapshot = body.clone();
         let started_at = Instant::now();
-        let payload =
-            match post_model_request(&url, &api_key, &body, "计划生成", timeout_seconds, developer_log_path)
-                .await
-            {
-                Ok(payload) => payload,
-                Err(error) => {
-                    record_model_attempt(
-                        developer_trace,
-                        "plan_generation",
-                        attempt + 1,
-                        started_at,
-                        request_snapshot,
-                        None,
-                        Some(error.clone()),
-                    );
-                    return Err(error);
-                }
-            };
+        let payload = match post_model_request(
+            &url,
+            &api_key,
+            &body,
+            "计划生成",
+            timeout_seconds,
+            developer_log_path,
+        )
+        .await
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                record_model_attempt(
+                    developer_trace,
+                    "plan_generation",
+                    attempt_number,
+                    started_at,
+                    request_snapshot,
+                    None,
+                    Some(error.clone()),
+                );
+                return Err(error);
+            }
+        };
         let finish_reason = payload
             .pointer("/choices/0/finish_reason")
             .and_then(Value::as_str);
@@ -2518,11 +2638,16 @@ async fn generate_ai_plan_with_trace(
             record_model_attempt(
                 developer_trace,
                 "plan_generation",
-                attempt + 1,
+                attempt_number,
                 started_at,
                 request_snapshot,
                 Some(payload),
                 Some(last_error.clone()),
+            );
+            let step_count = last_repairable_steps.as_ref().map_or(0, Vec::len);
+            repair_budget.observe_failure(
+                plan_failure_fingerprint(&last_error, step_count),
+                focused_repair,
             );
             continue;
         }
@@ -2552,6 +2677,7 @@ async fn generate_ai_plan_with_trace(
             Ok(mut raw_steps) => {
                 normalize_model_tool_validations(&mut raw_steps);
                 normalize_recoverable_plan_failure_masks(&mut raw_steps);
+                let raw_step_count = raw_steps.len();
                 last_repairable_steps = Some(raw_steps.clone());
                 match validate_ai_plan_contract(&raw_steps, &generation_settings)
                     .and_then(|_| {
@@ -2566,7 +2692,7 @@ async fn generate_ai_plan_with_trace(
                         record_model_attempt(
                             developer_trace,
                             "plan_generation",
-                            attempt + 1,
+                            attempt_number,
                             started_at,
                             request_snapshot,
                             Some(payload),
@@ -2579,11 +2705,15 @@ async fn generate_ai_plan_with_trace(
                         record_model_attempt(
                             developer_trace,
                             "plan_generation",
-                            attempt + 1,
+                            attempt_number,
                             started_at,
                             request_snapshot,
                             Some(payload),
                             Some(last_error.clone()),
+                        );
+                        repair_budget.observe_failure(
+                            plan_failure_fingerprint(&last_error, raw_step_count),
+                            focused_repair,
                         );
                     }
                 }
@@ -2593,11 +2723,16 @@ async fn generate_ai_plan_with_trace(
                 record_model_attempt(
                     developer_trace,
                     "plan_generation",
-                    attempt + 1,
+                    attempt_number,
                     started_at,
                     request_snapshot,
                     Some(payload),
                     Some(last_error.clone()),
+                );
+                let step_count = last_repairable_steps.as_ref().map_or(0, Vec::len);
+                repair_budget.observe_failure(
+                    plan_failure_fingerprint(&last_error, step_count),
+                    focused_repair,
                 );
             }
         }
@@ -2644,8 +2779,10 @@ async fn generate_ai_plan_with_trace(
         }
     }
     Err(format!(
-        "{last_error}（已携带上一版计划和具体错误，连续要求模型针对性修复 {} 次）",
-        PLAN_GENERATION_ATTEMPTS - 1,
+        "{last_error}（计划生成模型实际调用 {} 次，其中局部针对性修复 {} 次；停止原因：{}）",
+        repair_budget.total_model_calls,
+        repair_budget.focused_repair_calls,
+        repair_budget.stop_reason(),
     ))
 }
 

@@ -39,17 +39,17 @@ describe("validation output signals", () => {
     expect(analyzeSkillCommandFailure(
       "fatal: could not read Username for 'https://gitee.com': terminal prompts disabled",
     )).toMatchObject({
-      facts: { category: "interactive_credential_required", credentialRejected: false },
+      facts: { category: "auth_material_missing", credentialRejected: false },
     });
     expect(analyzeSkillCommandFailure(
       "remote: HTTP Basic: Access denied\nfatal: Authentication failed for 'https://gitee.com/team/app.git/'",
     )).toMatchObject({
-      facts: { category: "credential_rejected", credentialRejected: true },
+      facts: { category: "auth_authentication_rejected", credentialRejected: true },
     });
     expect(analyzeSkillCommandFailure(
       "仓库认证未通过，远端再次请求密码或访问令牌；已停止本次命令。",
     )).toMatchObject({
-      facts: { category: "credential_rejected", credentialRejected: true },
+      facts: { category: "auth_authentication_rejected", credentialRejected: true },
     });
   });
 

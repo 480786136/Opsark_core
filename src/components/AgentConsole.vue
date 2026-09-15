@@ -28,8 +28,10 @@ import {
 import { useI18n } from "vue-i18n";
 import { useOpsStore } from "@/stores/ops";
 import type { ObservationStatus, OpsTask, PlanStep, TaskPlanHistory } from "@/types";
+import type { PendingUserInput } from "@/features/tools/types";
 import AgentExecutionPhase from "@/components/AgentExecutionPhase.vue";
 import ModelSettingsModal from "@/components/ModelSettingsModal.vue";
+import ParameterSelect from "@/components/ParameterSelect.vue";
 import TaskKnowledgeUpload from "@/features/knowledge/TaskKnowledgeUpload.vue";
 import { isAdjustmentProgressMessage, isPlanProgressMessage } from "@/features/agent/taskMessages";
 import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
@@ -67,6 +69,8 @@ const expandedRecords = ref<string[]>([]);
 const terminalReference = ref("");
 const secretInput = ref("");
 const userInputValues = ref<Record<string, string>>({});
+const submittingUserInputs = ref(new Set<PendingUserInput>());
+const submittingApprovals = ref(new Set<string>());
 const timeline = ref<HTMLElement>();
 const pendingFreshRequirement = ref("");
 
@@ -74,7 +78,14 @@ const serverTasks = computed(() => store.tasks.filter((task) => task.serverId ==
 const task = computed(() => serverTasks.value.find((item) => item.id === workspaceState.activeTaskId));
 const filteredTasks = computed(() => serverTasks.value.filter(item => item.title.toLowerCase().includes(taskQuery.value.toLowerCase())));
 const conversationRounds = computed(() => task.value ? conversationHistoryRounds(serverTasks.value, task.value) : []);
-const pendingApproval = computed(() => task.value?.plan.find((step) => step.status === "awaiting_approval"));
+const canApprovePlan = computed(() => Boolean(task.value
+  && task.value.status === "awaiting_plan_approval"
+  && !task.value.cancelRequested
+  && !task.value.adjustmentInProgress));
+const pendingApproval = computed(() => task.value?.status === "awaiting_step_approval"
+  && !task.value.cancelRequested && !task.value.adjustmentInProgress
+  ? task.value.plan.find((step) => step.status === "awaiting_approval")
+  : undefined);
 const failedStep = computed(() => task.value?.plan.find((step) => step.status === "failed"));
 const adjustmentLabel = computed(() =>
   task.value?.status === "awaiting_continuation"
@@ -88,9 +99,31 @@ const adjustmentLabel = computed(() =>
 const pendingSecretRequest = computed(() =>
   store.pendingSecret?.taskId === task.value?.id ? store.pendingSecret : undefined,
 );
-const pendingUserInputRequest = computed(() =>
-  store.pendingUserInputs.find((request) => request.taskId === task.value?.id),
-);
+const pendingUserInputRequest = computed(() => {
+  const current = task.value;
+  if (!current || current.status !== "awaiting_input" || current.cancelRequested || current.adjustmentInProgress) return undefined;
+  return store.pendingUserInputs.find((request) => {
+    const step = current.plan.find((item) => item.id === request.stepId);
+    return request.taskId === current.id && step?.status === "awaiting_input"
+      && (request.roundId === undefined || request.roundId === current.currentRoundId)
+      && (request.workflowEpoch === undefined || request.workflowEpoch === (current.workflowEpoch ?? 0))
+      && (request.serverId === undefined || request.serverId === (current.executionTargetServerId || current.serverId))
+      && (request.command === undefined || request.command === step.command);
+  });
+});
+const isSubmittingUserInput = computed(() => Boolean(pendingUserInputRequest.value
+  && submittingUserInputs.value.has(pendingUserInputRequest.value)));
+const isUserInputIncomplete = computed(() => pendingUserInputRequest.value?.fields.some((field) => {
+  const value = String(userInputValues.value[field.key] ?? "");
+  return (field.required && !value.trim())
+    || (field.type === "select" && Boolean(value) && !field.options?.some((option) => option.value === value));
+}));
+const hasCredentialUserInput = computed(() => pendingUserInputRequest.value?.fields.some((field) =>
+  field.type === "password" || Boolean(field.credential)));
+const approvalKey = computed(() => task.value && (canApprovePlan.value || pendingApproval.value)
+  ? JSON.stringify([task.value.id, task.value.currentRoundId, task.value.workflowEpoch, pendingApproval.value?.id ?? null])
+  : undefined);
+const isSubmittingApproval = computed(() => Boolean(approvalKey.value && submittingApprovals.value.has(approvalKey.value)));
 const isBusy = computed(() => task.value && (
   task.value.adjustmentInProgress
   || ["planning", "running", "validating"].includes(task.value.status)
@@ -136,14 +169,40 @@ function conversationMessageContent(content: string) {
   return isAdjustmentProgressMessage(content) ? t("agent.nextPhaseReady") : content;
 }
 
-watch(() => pendingUserInputRequest.value?.callId, () => {
+watch(() => [task.value?.id, task.value?.currentRoundId, pendingUserInputRequest.value], () => {
   userInputValues.value = {};
-});
+}, { flush: "sync" });
 
 async function submitUserInput() {
-  if (!task.value || !pendingUserInputRequest.value) return;
-  const submitted = await store.provideUserInput(task.value.id, userInputValues.value);
-  if (submitted) userInputValues.value = {};
+  const current = task.value;
+  const request = pendingUserInputRequest.value;
+  if (!current || !request || submittingUserInputs.value.has(request) || isUserInputIncomplete.value) return;
+  const values = userInputValues.value;
+  const roundId = current.currentRoundId;
+  submittingUserInputs.value.add(request);
+  try {
+    const submitted = await store.provideUserInput(current.id, { ...values }, request.callId);
+    if (submitted && task.value === current && task.value.currentRoundId === roundId
+      && pendingUserInputRequest.value === request && userInputValues.value === values) {
+      userInputValues.value = {};
+    }
+  } finally {
+    submittingUserInputs.value.delete(request);
+  }
+}
+
+async function submitApproval() {
+  const current = task.value;
+  const key = approvalKey.value;
+  const step = pendingApproval.value;
+  if (!current || !key || submittingApprovals.value.has(key)) return;
+  submittingApprovals.value.add(key);
+  try {
+    if (step) await store.approveStep(current.id, step.id);
+    else if (canApprovePlan.value) await store.approvePlan(current.id);
+  } finally {
+    submittingApprovals.value.delete(key);
+  }
 }
 
 async function submitSecret() {
@@ -734,14 +793,14 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                 </div>
               </div>
             </div>
-            <div v-if="task.status === 'awaiting_plan_approval'" class="approval-bar">
+            <div v-if="canApprovePlan" class="approval-bar">
               <button class="button secondary" @click="store.rejectTask(task.id)"><Square :size="13" />{{ t("common.cancel") }}</button>
-              <button class="button primary" @click="store.approvePlan(task.id)"><Play :size="13" />{{ t("agent.approvePlan") }}</button>
+              <button class="button primary" :disabled="isSubmittingApproval" @click="submitApproval"><Play :size="13" />{{ t("agent.approvePlan") }}</button>
             </div>
             <div v-else-if="pendingApproval" class="approval-bar warning">
-              <span><ShieldAlert :size="15" />{{ t("agent.stepApproval") }}</span>
+              <span><ShieldAlert :size="15" />{{ pendingApproval.authenticationGate?.reason || t("agent.stepApproval") }}</span>
               <button class="button secondary" @click="store.rejectTask(task.id)">{{ t("agent.stop") }}</button>
-              <button class="button primary" @click="store.approveStep(task.id, pendingApproval.id)">{{ t("agent.executeStep") }}</button>
+              <button class="button primary" :disabled="isSubmittingApproval" @click="submitApproval">{{ t("agent.executeStep") }}</button>
             </div>
             <form v-else-if="pendingUserInputRequest" class="user-input-card" @submit.prevent="submitUserInput">
               <div class="user-input-head">
@@ -752,25 +811,45 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                 </div>
               </div>
               <div class="user-input-fields">
-                <label v-for="field in pendingUserInputRequest.fields" :key="field.key">
+                <component
+                  :is="field.type === 'select' ? 'div' : 'label'"
+                  v-for="field in pendingUserInputRequest.fields"
+                  :key="field.key"
+                  :class="{ 'user-input-select-field': field.type === 'select' }"
+                >
                   <span class="user-input-label">
                     <strong>{{ field.label }}</strong>
                     <i>{{ field.required ? t('agent.requiredParameter') : t('agent.optionalParameter') }}</i>
                   </span>
                   <small>{{ field.description }}</small>
+                  <ParameterSelect
+                    v-if="field.type === 'select'"
+                    :model-value="userInputValues[field.key] ?? ''"
+                    :options="field.options ?? []"
+                    :ariaLabel="field.label"
+                    :placeholder="field.placeholder || t('agent.parameterSelectPlaceholder', { label: field.label })"
+                    :required="field.required"
+                    :clearable="!field.required"
+                    :clear-label="t('common.clear')"
+                    :disabled="isSubmittingUserInput"
+                    @update:model-value="userInputValues[field.key] = $event"
+                  />
                   <input
+                    v-else
                     v-model="userInputValues[field.key]"
                     :type="field.type === 'password' ? 'password' : field.type === 'number' ? 'number' : 'text'"
                     :autocomplete="field.type === 'password' ? 'new-password' : 'off'"
                     :placeholder="field.placeholder || t('agent.parameterPlaceholder', { label: field.label })"
+                    :disabled="isSubmittingUserInput"
+                    :required="field.required"
                   />
                   <em v-if="field.type === 'password'"><KeyRound :size="11" />{{ t('agent.passwordParameterHint') }}</em>
-                </label>
+                </component>
               </div>
               <p v-if="pendingUserInputRequest.error" class="user-input-error">{{ pendingUserInputRequest.error }}</p>
               <div class="user-input-actions">
-                <span>{{ t('agent.userInputSecurityHint') }}</span>
-                <button class="button primary" type="submit">{{ t('agent.confirmParameters') }}</button>
+                <span v-if="hasCredentialUserInput">{{ t('agent.userInputSecurityHint') }}</span>
+                <button class="button primary" type="submit" :disabled="isSubmittingUserInput || isUserInputIncomplete">{{ t('agent.confirmParameters') }}</button>
               </div>
             </form>
             <form v-else-if="pendingSecretRequest" class="secret-unlock-card" @submit.prevent="submitSecret">
@@ -910,3 +989,11 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
     />
   </section>
 </template>
+
+<style scoped>
+.user-input-select-field { min-width: 0; display: grid; align-content: start; gap: 5px; }
+.user-input-select-field > small { min-height: 2.7em; color: var(--muted); font-size: 7.5px; line-height: 1.35; }
+.user-input-select-field :deep(summary) { height: 32px; padding: 0 9px; border-radius: 4px; background: var(--surface); font-size: 8px; }
+.user-input-select-field :deep(.parameter-options) { position: static; margin-top: 5px; font-size: 8px; }
+.user-input-actions .button { margin-left: auto; }
+</style>

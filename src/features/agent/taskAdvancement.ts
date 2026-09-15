@@ -9,6 +9,7 @@ import type {
 } from "@/features/agent/agentService";
 import type { AuditEventDraft } from "@/features/agent/auditTrail";
 import type { ModelProfile } from "@/types";
+import { PlanProtocolError } from "@/services/backend";
 
 type ContinuationPlanner = (
   input: PlanDiscoveryContinuationInput,
@@ -32,7 +33,7 @@ export async function runDiscoveryRefinement(
   if (!input.model || (input.model.provider !== "Built-in" && !input.apiKey)) {
     return {
       kind: "unavailable" as const,
-      pauseReason: "发现阶段已完成，但模型不可用，无法依据真实证据生成后续变更计划。",
+      pauseReason: "当前阶段已完成，但模型不可用，无法依据已确认输入和真实证据生成后续计划。",
     };
   }
 
@@ -45,13 +46,14 @@ export async function runDiscoveryRefinement(
 
     const autoApprove = input.task.permission === "managed";
     const eventMessage = input.task.permission === "managed"
-      ? `已根据发现证据生成 ${pending.length} 个后续步骤，完全托管模式自动批准并继续。`
-      : `已根据发现证据生成 ${pending.length} 个后续步骤，请审批后继续。`;
+      ? `已根据已有输入和真实证据生成 ${pending.length} 个后续步骤，完全托管模式自动批准并继续。`
+      : `已根据已有输入和真实证据生成 ${pending.length} 个后续步骤，请审批后继续。`;
     return { kind: "success" as const, pending, autoApprove, eventMessage };
   } catch (error) {
     if (input.isCancelled()) return { kind: "cancelled" as const };
-    const pauseReason = `发现后续计划生成失败：${String(error)}`;
-    return { kind: "failed" as const, pauseReason, eventMessage: pauseReason };
+    const pauseReason = `后续计划生成失败：${String(error)}`;
+    return { kind: "failed" as const, pauseReason, eventMessage: pauseReason,
+      protocolError: error instanceof PlanProtocolError ? error : undefined };
   }
 }
 

@@ -17,7 +17,7 @@ import type {
   ServerProfile,
 } from "@/types";
 import { credentialGroupContext } from "@/features/agent/serverCredentialGroup";
-import { allTaskSteps, taskGoal } from "@/features/agent/taskGoal";
+import { activeRoundSteps, allTaskSteps, taskGoal } from "@/features/agent/taskGoal";
 import { buildTaskDecisionSnapshot } from "@/features/agent/taskDecisionSnapshot";
 import { compactReviewText, textFingerprint } from "@/features/agent/longRunningReviewOutput";
 import type { StepReview } from "@/types";
@@ -26,6 +26,8 @@ import { modelLogContext } from "./modelLogContext";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { executionContextEvidence, EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION } from "@/features/agent/executionContextEvidence";
 import { DECISION_EVIDENCE_INSTRUCTION } from "./decisionEvidence";
+import { authenticationContext } from "./authenticationEvidence";
+import { completedContinuationCommandFingerprints } from "./taskProgression";
 
 export function trimEvidence(value: string | undefined, limit = 3200) {
   if (!value) return "";
@@ -35,6 +37,7 @@ export function trimEvidence(value: string | undefined, limit = 3200) {
 export function extractKnownExecutionFacts(task: OpsTask, skills = resolveTaskSkills(task), excludedIds = new Set<string>()) {
   const steps = allTaskSteps(task).filter((step) => step.status === "completed" && !excludedIds.has(step.id));
   return {
+    authentication: authenticationContext(task),
     skillFacts: collectSkillFacts(task, skills),
     completedSteps: steps.slice(-12).map((step) => ({
       stepId: step.id,
@@ -217,13 +220,23 @@ export function buildAdjustmentContext(
     : undefined;
   return {
     workflowPhase: "adjust_after_failure",
+    completedCommandFingerprints: completedContinuationCommandFingerprints(
+      activeRoundSteps(input.task),
+      taskAttemptContext(input.task),
+    ),
+    authentication: authenticationContext(input.task),
+    planGenerationRepair: input.task.protocolRepair?.roundId === input.task.currentRoundId
+      && input.task.protocolRepair?.serverId === (input.task.executionTargetServerId || input.task.serverId)
+      ? input.task.protocolRepair.repair : undefined,
     _log: modelLogContext(input.task, failedStep),
     skillEvidence: buildSkillEvidenceContext(activeSkills),
     // Keep policy content ahead of per-attempt evidence so providers can reuse
     // the longest stable request prefix across adjustments for the same goal.
     tools: boundedPlanningTools(input.tools, activeSkills),
     activeSkills: boundedPlanningSkills(activeSkills),
-    instruction: planSafetyRejection
+    instruction: input.task.protocolRepair
+      ? "只修复 planGenerationRepair 中的原始计划协议；不得重新理解需求、换目标、换工具或改写无关字段。认证和历史证据不是扩大本次修复范围的授权。"
+      : planSafetyRejection
       ? "这是执行前确定性安全门禁，不是远端执行失败。命令尚未发送到服务器。只修复 failedStep.offendingFields 列出的字段，必须保留真实失败退出码；不要改写步骤标题、风险、预期结果、其他步骤或用户授权。只返回该步骤的一个完整替代步骤，它仍会重新经过统一安全门禁。"
       : "只根据 baseSnapshot、adjustmentTrigger 和尚未完成目标生成最少必要步骤。recentPhases 是最近两个阶段，historyCheckpoint 是更早历史的滚动摘要；不得要求重复其中已经完成的工作。计划描述和阶段总结不是成功证据，只有结构化 result/evidence 才能证明状态。失败方法必须有实质变化后才能重试。每步在独立非交互 Shell 中建立自身环境，并以 activeSkills 要求的独立验收结束。",
     server: serverSnapshot(input.server),
@@ -297,6 +310,11 @@ export function buildNextStageContext(input: WorkflowContextInput) {
   const policyFingerprint = nextStagePolicyFingerprint(input);
   return {
     workflowPhase: "decide_after_phase",
+    completedCommandFingerprints: completedContinuationCommandFingerprints(
+      activeRoundSteps(input.task),
+      taskAttemptContext(input.task),
+    ),
+    authentication: authenticationContext(input.task),
     _log: modelLogContext(input.task),
     skillEvidence: buildSkillEvidenceContext(activeSkills),
     tools: buildPlanningToolContext(input.tools, activeSkills),
@@ -317,11 +335,16 @@ export function buildContinuationContext(input: WorkflowContextInput) {
   const activeSkills = planningSkills(input.task, input.skills ?? resolveTaskSkills(input.task));
   return {
     workflowPhase: "continue_after_discovery",
+    completedCommandFingerprints: completedContinuationCommandFingerprints(
+      activeRoundSteps(input.task),
+      taskAttemptContext(input.task),
+    ),
+    authentication: authenticationContext(input.task),
     _log: modelLogContext(input.task),
     skillEvidence: buildSkillEvidenceContext(activeSkills),
     tools: buildPlanningToolContext(input.tools, activeSkills),
     activeSkills: buildSkillContext(activeSkills),
-    instruction: `只使用本轮已完成发现的真实证据，生成完成用户剩余目标所需的最少变更和最终验收。不得重复发现步骤或猜测路径、工具、端口和服务名。${EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION}`,
+    instruction: `依据已确认输入、本轮真实证据和仍有效的历史证据，在整体目标及 executionConstraints 的授权边界内生成最少必要的后续步骤。read_only 目标只能进行只读操作；缺少环境事实时可有限只读取证，缺少必须由用户作出的决定时只生成一个 user.request_input 步骤并等待。复用已回答的问题和已完成且仍有效的步骤，不得猜测路径、工具、端口、服务名或用户选择。用户提交输入仅补充对应决定，不代表目标完成，也不能被外推为未明确给出的授权。${EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION}`,
     taskGoal: {
       rootGoal: taskGoal(input.task),
       currentInstruction: input.task.currentInstruction,

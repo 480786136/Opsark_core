@@ -14,6 +14,7 @@ beforeEach(()=>{localStorage.clear();vi.clearAllMocks();host=document.createElem
 afterEach(()=>{app?.unmount();host.remove();});
 async function mountTask(){
   const pinia=createPinia();setActivePinia(pinia);const ops=useOpsStore();const task=ops.createTask("server-a","safe","model-a");task.title="检查服务";
+  task.plan=[{id:"step-1",title:"检查服务",description:"读取状态",command:"echo ok",validation:"",risk:"low",kind:"observe",status:"completed",expected:"返回 ok",result:{executionStatus:"success",observationStatus:"matched",exitCode:0,facts:{},warnings:[],evidenceIds:[]}}];
   const knowledge=useKnowledgeStore();knowledge.config={...knowledge.config,hasApiKey:true,uploadEnabled:true,knowledgeBaseId:"kb-1"};
   app=createApp(TaskKnowledgeUpload,{task}).use(pinia);app.mount(host);await nextTick();return knowledge;
 }

@@ -1,4 +1,5 @@
 import { normalizeFileStructureRequest } from "@/features/tools/fileStructure";
+import { normalizeAuthenticationTarget } from "@/features/agent/authenticationTarget";
 import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 import { normalizeSoftwareCheckRequest } from "@/features/tools/softwareCheck";
 import type {
@@ -282,43 +283,74 @@ function isAuthenticationHost(value: string) {
   ));
 }
 
+function assertUserInputProperties(value: Record<string, unknown>, allowed: string[], path: string) {
+  const unknown = Object.keys(value).find((key) => !allowed.includes(key));
+  if (unknown) throw new Error(`${path} 不支持字段：${unknown}`);
+}
+
 export function parseUserInputArguments(value: Record<string, unknown>): UserInputRequest {
+  if (!isRecord(value)) throw new Error("用户输入参数必须是对象");
+  assertUserInputProperties(value, ["title", "description", "fields"], "用户输入参数");
   const title = typeof value.title === "string" ? value.title.trim() : "";
   const description = typeof value.description === "string" ? value.description.trim() : undefined;
   if (!title) throw new Error("title 必须说明需要用户补充什么信息");
+  if (value.description !== undefined && typeof value.description !== "string") throw new Error("表单 description 必须是字符串");
   if (!Array.isArray(value.fields) || value.fields.length === 0) throw new Error("fields 至少需要一个参数");
   if (value.fields.length > 8) throw new Error("单次最多请求 8 个参数");
   const fields = value.fields.map((field, index) => {
     if (!isRecord(field)) throw new Error(`第 ${index + 1} 个参数定义无效`);
+    assertUserInputProperties(field, ["key", "label", "description", "type", "placeholder", "options", "required", "credential"], `第 ${index + 1} 个参数`);
     const key = typeof field.key === "string" ? field.key.trim() : "";
     const label = typeof field.label === "string" ? field.label.trim() : "";
     const fieldDescription = typeof field.description === "string" ? field.description.trim() : "";
     if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(key)) throw new Error(`第 ${index + 1} 个参数 key 格式无效`);
     if (!label) throw new Error(`参数 ${key} 缺少显示名称`);
     if (!fieldDescription) throw new Error(`参数 ${key} 缺少用途说明`);
-    if (!["text", "password", "number"].includes(String(field.type))) throw new Error(`参数 ${key} 的类型无效`);
+    if (typeof field.type !== "string" || !["text", "password", "number", "select"].includes(field.type)) throw new Error(`参数 ${key} 的类型无效`);
     if (/(?:PASSWORD|PASSWD|TOKEN|API_?KEY|SECRET|CREDENTIAL)$/i.test(key) && field.type !== "password") {
       throw new Error(`敏感参数 ${key} 必须使用 password 类型`);
     }
     if (typeof field.required !== "boolean") throw new Error(`参数 ${key} 必须明确是否必填`);
     if (field.placeholder !== undefined && typeof field.placeholder !== "string") throw new Error(`参数 ${key} 的输入提示无效`);
+    let options: UserInputField["options"];
+    if (field.type === "select") {
+      if (!Array.isArray(field.options) || field.options.length < 1 || field.options.length > 100) {
+        throw new Error(`参数 ${key} 的 options 必须包含 1 至 100 个候选`);
+      }
+      const seenValues = new Set<string>();
+      options = Array.from(field.options, (option, optionIndex) => {
+        const path = `参数 ${key} 的第 ${optionIndex + 1} 个候选`;
+        if (!isRecord(option)) throw new Error(`${path} 必须是对象`);
+        assertUserInputProperties(option, ["value", "label"], path);
+        if (typeof option.value !== "string" || !option.value.trim()) throw new Error(`${path} 的 value 必须是非空字符串`);
+        if (typeof option.label !== "string" || !option.label.trim()) throw new Error(`${path} 的 label 必须是非空字符串`);
+        if (seenValues.has(option.value)) throw new Error(`参数 ${key} 的 options.value 不能重复`);
+        seenValues.add(option.value);
+        // Check blank strings without changing an option's exact identity.
+        return { value: option.value, label: option.label };
+      });
+    } else if (Object.prototype.hasOwnProperty.call(field, "options")) {
+      throw new Error(`参数 ${key} 只有 select 类型允许 options`);
+    }
     let credential: UserInputField["credential"];
     if (field.credential !== undefined) {
+      if (field.type === "select") throw new Error(`参数 ${key} 的 select 类型不允许 credential`);
       if (!isRecord(field.credential)) throw new Error(`参数 ${key} 的 credential 必须是对象`);
+      assertUserInputProperties(field.credential, ["group", "kind", "role", "target"], `参数 ${key} 的 credential`);
       const group = typeof field.credential.group === "string" ? field.credential.group.trim() : "";
       const kind = String(field.credential.kind ?? "");
       const role = String(field.credential.role ?? "");
-      const target = typeof field.credential.target === "string"
-        ? field.credential.target.trim().toLocaleLowerCase()
-        : "";
+      let target = "";
+      try {
+        target = normalizeAuthenticationTarget(kind, typeof field.credential.target === "string" ? field.credential.target : "");
+      } catch (error) {
+        throw new Error(`参数 ${key} 的 credential.target 无效：${String(error)}`);
+      }
       if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(group)) throw new Error(`参数 ${key} 的 credential.group 格式无效`);
       if (!["git-https", "ssh-password", "database", "service"].includes(kind)) {
         throw new Error(`参数 ${key} 的 credential.kind 无效`);
       }
       if (!["username", "secret"].includes(role)) throw new Error(`参数 ${key} 的 credential.role 无效`);
-      if (!target || /[\s/@]/.test(target) || target.includes("://")) {
-        throw new Error(`参数 ${key} 的 credential.target 必须是不含凭据的主机或服务标识`);
-      }
       if (["git-https", "ssh-password"].includes(kind) && !isAuthenticationHost(target)) {
         throw new Error(`参数 ${key} 的 credential.target 必须是精确主机名或 IP 地址`);
       }
@@ -335,10 +367,11 @@ export function parseUserInputArguments(value: Record<string, unknown>): UserInp
       key,
       label,
       description: fieldDescription,
-      type: field.type as "text" | "password" | "number",
+      type: field.type as UserInputField["type"],
       placeholder: field.placeholder as string | undefined,
+      ...(options ? { options } : {}),
       required: field.required,
-      credential,
+      ...(credential ? { credential } : {}),
     };
   });
   if (new Set(fields.map((field) => field.key.toLowerCase())).size !== fields.length) throw new Error("参数 key 不能重复");

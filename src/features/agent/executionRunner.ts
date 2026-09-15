@@ -18,6 +18,7 @@ export interface ExecuteStepCommandInput {
   approvedHighRisk: boolean;
   executionId: string;
   secretValues: Record<string, string>;
+  exactSecretKeys?: string[];
   onProgress?(safeChunk: string, event: CommandOutputEvent): void;
 }
 
@@ -37,6 +38,7 @@ export interface ExecuteStepValidationInput {
   connection?: RuntimeConnection;
   executionId: string;
   secretValues: Record<string, string>;
+  exactSecretKeys?: string[];
   onProgress?(safeChunk: string, event: CommandOutputEvent): void;
 }
 
@@ -51,14 +53,18 @@ export async function executeStepCommand(
     {
       executionId: input.executionId,
       onProgress: (event) => {
-        const safeChunk = redactExecutionOutput(sanitizeTerminalOutput(event.data), input.secretValues);
+        const safeChunk = redactExecutionOutput(sanitizeTerminalOutput(event.data), input.secretValues, {
+          exactSecretKeys: input.exactSecretKeys,
+        });
         if (safeChunk) input.onProgress?.(safeChunk, event);
       },
     },
   );
   return {
     ...result,
-    output: redactExecutionOutput(sanitizeTerminalOutput(result.output), input.secretValues),
+    output: redactExecutionOutput(sanitizeTerminalOutput(result.output), input.secretValues, {
+      exactSecretKeys: input.exactSecretKeys,
+    }),
   };
 }
 
@@ -69,14 +75,18 @@ export async function executeStepValidation(
   const result = await executor(input.step, input.connection, {
     executionId: input.executionId,
     onProgress: (event) => {
-      const safeChunk = redactExecutionOutput(sanitizeTerminalOutput(event.data), input.secretValues);
+      const safeChunk = redactExecutionOutput(sanitizeTerminalOutput(event.data), input.secretValues, {
+        exactSecretKeys: input.exactSecretKeys,
+      });
       if (safeChunk) input.onProgress?.(safeChunk, event);
     },
   });
   return {
     ...result,
     output: result.output
-      ? redactExecutionOutput(sanitizeTerminalOutput(result.output), input.secretValues)
+      ? redactExecutionOutput(sanitizeTerminalOutput(result.output), input.secretValues, {
+        exactSecretKeys: input.exactSecretKeys,
+      })
       : result.output,
   };
 }

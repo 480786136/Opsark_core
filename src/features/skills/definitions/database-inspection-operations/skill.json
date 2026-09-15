@@ -4,7 +4,7 @@
   "name": "数据库检查与操作",
   "category": "data",
   "description": "对 MySQL、MariaDB、PostgreSQL 等数据库执行库表查询、连接诊断、初始化、迁移和受控变更，以真实查询结果验收。",
-  "version": 2,
+  "version": 4,
   "enabled": true,
   "builtIn": true,
   "matchRules": [

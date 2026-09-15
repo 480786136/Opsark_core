@@ -25,6 +25,8 @@ import {
 } from "@/utils/terminal";
 import type { OpsTask, PlanStep } from "@/types";
 import { isSshConnectionSetupFailure } from "@/features/agent/adjustmentIncident";
+import { findSecretKeys } from "@/features/agent/secretTool";
+import { classifyAuthenticationFailure } from "./authenticationEvidence";
 
 type CommandExecutor = (input: ExecuteStepCommandInput) => Promise<ExecutionCommandResult>;
 type ValidationExecutor = (input: ExecuteStepValidationInput) => Promise<StepValidationResult>;
@@ -66,6 +68,9 @@ export async function runCommandLifecycle(
   executeCommand: CommandExecutor = executeStepCommand,
   startMonitor: MonitorStarter = startLongRunningMonitor,
 ): Promise<CommandLifecycleResult> {
+  const exactSecretKeys = [...new Set(findSecretKeys(
+    `${input.step.command}\n${input.step.validation}`,
+  ))];
   let streamedOutput = "";
   let outputAccumulator = createTerminalOutputAccumulator();
   input.onExecutionChange(input.executionId);
@@ -96,6 +101,7 @@ export async function runCommandLifecycle(
       approvedHighRisk: input.step.risk === "high",
       executionId: input.executionId,
       secretValues: input.secretValues,
+      exactSecretKeys,
       onProgress: (safeChunk) => {
         outputAccumulator = appendTerminalOutputChunk(outputAccumulator, safeChunk);
         streamedOutput = outputAccumulator.output;
@@ -149,6 +155,8 @@ export interface ValidationLifecycleResult {
 export const VALIDATION_STABILIZATION_DELAYS_MS = [500, 1_500, 3_000] as const;
 
 function validationMayStillStabilize(validation: StepValidationResult) {
+  // Authentication is not eventual consistency. Do not repeat rejected credentials.
+  if (classifyAuthenticationFailure(validation.output ?? validation.detail)) return false;
   return !validation.passed && ![2, 126, 127].includes(validation.exitCode ?? 1);
 }
 
@@ -165,6 +173,9 @@ export async function runValidationLifecycle(
   input: RunValidationLifecycleInput,
   executeValidation: ValidationExecutor = executeStepValidation,
 ): Promise<ValidationLifecycleResult> {
+  const exactSecretKeys = [...new Set(findSecretKeys(
+    `${input.step.command}\n${input.step.validation}`,
+  ))];
   let transportRetries = 0;
   let attemptCount = 0;
   const runOnce = async (executionId: string) => {
@@ -176,6 +187,7 @@ export async function runValidationLifecycle(
         connection: input.connection,
         executionId,
         secretValues: input.secretValues,
+        exactSecretKeys,
         onProgress: input.onProgress,
       });
     } finally {

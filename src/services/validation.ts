@@ -10,7 +10,6 @@ import {
   expectedSkillDiagnosticExit,
   analyzeSkillCommandFailure,
   analyzeSkillOutputSignals,
-  inferSkillValidator,
   parseSkillObservation,
   validStatesForSkillValidator,
   type SkillOutputSignals,
@@ -69,7 +68,10 @@ export function isReadOnlyStep(step: PlanStep) {
 }
 
 export function inferValidatorType(step: Pick<PlanStep, "title" | "description" | "command" | "validation">): ValidatorType {
-  return inferSkillValidator(step).type;
+  // Arbitrary Shell output has no registered business-output contract.
+  // Neither prose nor a keyword inside a path establishes such a contract.
+  void step;
+  return "command";
 }
 
 function defaultValidStates(type: ValidatorType): ObservationStatus[] {
@@ -77,7 +79,7 @@ function defaultValidStates(type: ValidatorType): ObservationStatus[] {
 }
 
 export function ensureStepValidator(step: PlanStep): NormalizedPlanStep {
-  if (step.validator) {
+  if (step.validator && /^opsark-tool\s/.test(step.command.trim())) {
     return {
       ...step,
       validator: {
@@ -122,7 +124,7 @@ export function classifyStepResult(
   const commandResultOnly = step.kind === "observe";
   const validator = step.validator;
   const mainParsed = parseObservation(step, execution);
-  const semantic = `${step.title}\n${step.description}\n${step.expected}`;
+  const semantic = "";
   const mainSignals = analyzeSkillOutputSignals(outputLines(mainOutput(execution.output)), semantic);
   const validationSignals = commandResultOnly
     ? { facts: {}, warnings: [], blocking: false } as SkillOutputSignals
@@ -151,14 +153,14 @@ export function classifyStepResult(
   };
   const validationLines = outputLines(validation.output ?? "");
   let validationParsed = !commandResultOnly && validation.output
-    ? parseObservation(step, {
+    ? parseObservation(ensureStepValidator({ ...step, command: step.validation, validation: "", validator: undefined }), {
         output: validation.output,
         success: validation.passed,
         exitCode: validation.exitCode,
         emptyResult: validation.emptyResult,
       })
     : undefined;
-  if (validationParsed && validationLines.length === 0) {
+  if (validationParsed && validationLines.length === 0 && validator.type !== "command") {
     validationParsed = {
       facts: validationParsed.facts,
       status: validation.passed
@@ -207,6 +209,8 @@ export function classifyStepResult(
     ),
   );
   const evidenceConflict = !commandResultOnly && (
+    (execution.success && !validation.passed)
+    ||
     (!validation.passed && validationAccepted && !diagnosticFailureConsistent)
     || semanticConflict
   );
@@ -222,7 +226,7 @@ export function classifyStepResult(
     id: evidenceId("main"),
     type: validator.type,
     source: "main",
-    facts: parsed.facts,
+    facts: mainParsed.facts,
     rawOutput: execution.output,
     collectedAt,
     scope: scopeTarget ? buildStepScopeEvidence(step, "main", scopeTarget) : undefined,
@@ -246,7 +250,9 @@ export function classifyStepResult(
   const evidence = commandResultOnly ? [mainEvidence] : [mainEvidence, validationEvidence];
   return {
     accepted,
-    needsModelReview: accepted && (parsed.status === "unknown" || evidenceConflict || outputSignals.blocking),
+    // Uninterpreted raw output is not an execution failure. Overall-goal review
+    // still receives the raw evidence; do not loop on a missing domain parser.
+    needsModelReview: accepted && ((parsed.status === "unknown" && validator.type !== "command") || evidenceConflict || outputSignals.blocking),
     evidence,
     result: {
       executionStatus: execution.success ? "success" : "failed",
@@ -254,6 +260,8 @@ export function classifyStepResult(
       exitCode: execution.exitCode,
       facts: {
         ...parsed.facts,
+        interpretation: validator.type === "command" ? "raw" : "structured",
+        proves: "command_execution_only",
         mainObservationStatus: mainParsed.status,
         verificationMode: commandResultOnly ? "command_result" : "postcondition",
         validationObservationStatus: validationParsed?.status,

@@ -27,6 +27,24 @@ describe("developer log safety", () => {
     expect(entry.tokenUsage).toEqual({ input: 120, output: 30, total: 150, source: "api" });
   });
 
+  it("preserves structured numbers when unrelated saved secrets are short", () => {
+    const entry = createDeveloperLog({
+      level: "success",
+      operation: "system_observation",
+      title: "system metrics",
+      summary: "CentOS 10, CPU 20, disk 87%",
+      response: { createdAt: "2026-09-14T22:50:00Z", exitCode: 0, cpuCount: 20 },
+    }, "dev-3", "2026-09-14T22:50:00Z", {
+      SHORT: "1",
+      COUNT: "20",
+      DATE: "2026-09-14",
+    });
+
+    expect(entry.summary).toBe("CentOS 10, CPU 20, disk 87%");
+    expect(entry.response).toContain('"createdAt": "2026-09-14T22:50:00Z"');
+    expect(entry.response).toContain('"cpuCount": 20');
+  });
+
   it("keeps complete in-memory entries and only compacts the emergency persistence fallback", () => {
     const detail = "x".repeat(90_000);
     const entry = createDeveloperLog({

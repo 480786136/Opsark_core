@@ -94,6 +94,41 @@ describe("knowledge record",()=>{
     const cleaned=redactKnowledgeText('Authorization: Bearer abc\npassword="secret value"\nhttps://user:pass@host/path\n-----BEGIN PRIVATE KEY-----\nprivate\n-----END PRIVATE KEY-----');
     for(const secret of ["abc","secret value","user:pass","\nprivate\n"])expect(cleaned).not.toContain(secret);
   });
+  it("keeps MySQL evidence intact when unrelated scoped secrets are short",()=>{
+    const t=task(),step=t.plan[0];
+    step.status="completed";
+    step.command='mysql --host=localhost --port=3306 --user="${secret.MYSQL_USERNAME}" --password="${secret.MYSQL_PASSWORD}" --execute="SHOW DATABASES;" 2>&1';
+    step.result={executionStatus:"success",observationStatus:"matched",exitCode:0,facts:{},warnings:[],evidenceIds:["main"]};
+    step.evidence=[{id:"main",type:"command-output",source:"main",facts:{},rawOutput:"mysql Ver 8.0.43\nERROR 1045 (28000)\nDatabase\ninformation_schema\nmysql\noaoa\nproject_db\nCURRENT_USER()\tUSER()\nroot@%\troot@localhost\nGrants for root@%\nGRANT ALL ON *.* TO root@%\n[exit: 0]",collectedAt:t.updatedAt}];
+    t.summary="当前账户可见 5 个数据库：information_schema、mysql、oaoa、project_db、sys。";
+    const context={secretValues:{MYSQL_USERNAME:"root",MYSQL_PASSWORD:"1",OTHER_COUNT:"5",OTHER_PORT:"3306",OTHER_CHAR:"a"},redactIpAddresses:true};
+    const record=buildKnowledgeRecord(t,"kb-1",1,context,true);
+    const body=serializeRecord(record);
+    expect(record.steps[0].command).toContain("--port=3306");
+    expect(record.steps[0].command).toContain("2>&1");
+    expect(record.steps[0].command).not.toContain('${secret.MYSQL_PASSWORD}');
+    expect(record.steps[0].evidence[0].summary).toContain("退出码=0");
+    expect(record.steps[0].evidence[0].excerpt).toContain("8.0.43");
+    expect(record.steps[0].evidence[0].excerpt).toContain("1045 (28000)");
+    expect(record.steps[0].evidence[0].excerpt).toContain("oaoa");
+    expect(record.steps[0].evidence[0].excerpt).toContain("数据库身份与授权明细已省略");
+    expect(record.steps[0].evidence[0].excerpt).not.toContain("GRANT ALL");
+    expect(record.steps[0].evidence[0].excerpt).not.toContain("root@localhost");
+    expect(record.outcome.summary).toContain("共 1/1 步");
+    expect(record.outcome.summary).toContain("可见 5 个数据库");
+    expect(record.redaction.ruleset_version).toBe("core-upload-v3");
+    expect(()=>JSON.parse(body)).not.toThrow();
+    t.rootGoal="审计当前账户权限和 SHOW GRANTS";
+    expect(buildKnowledgeRecord(t,"kb-1",2,context).steps[0].evidence[0].excerpt).toContain("GRANT ALL");
+  });
+  it("can force-redact a short value when handling unredacted legacy text",()=>{
+    const cleaned=redactKnowledgeText(
+      "legacy credential is x; CPU=20",
+      {secretValues:{LEGACY_PASSWORD:"x",OTHER_COUNT:"20"}},
+      ["LEGACY_PASSWORD"],
+    );
+    expect(cleaned).toBe("legacy credential is [已脱敏]; CPU=20");
+  });
   it("limits steps and characters without breaking Unicode",()=>{
     const t=task();t.title="😀".repeat(201);t.plan=Array(35).fill(t.plan[0]);
     const record=buildKnowledgeRecord(t,"kb-1",1,[]);expect(record.steps).toHaveLength(30);expect(Array.from(record.title)).toHaveLength(200);

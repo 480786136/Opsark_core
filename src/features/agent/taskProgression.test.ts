@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  completedContinuationCommandFingerprints,
   findUnresolvedBlockingStep,
   latestTaskRequirement,
   resolveTaskProgression,
@@ -79,6 +80,51 @@ describe("taskProgression", () => {
     expect(selectAdjustmentSteps([prior], [next], "target-a:v2")).toEqual([next]);
   });
 
+  it("exports only valid completed command identities while consuming the latest server switch", () => {
+    const current = task([], { executionTargetServerId: "server-2", currentRoundId: "round-1" });
+    const previousContext = JSON.stringify(["server-1", "round-1", "", 0, 0]);
+    const currentContext = taskAttemptContext(current);
+    const oldObservation = step({
+      id: "old-target",
+      kind: "observe",
+      command: "uname -a",
+      attemptContext: previousContext,
+    });
+    const serverSwitch = step({
+      id: "connect-target",
+      kind: "observe",
+      command: 'opsark-tool server.connect {"host":"10.0.0.2","credentialRef":"managed-server:server-2"}',
+      attemptContext: previousContext,
+      output: '{"serverId":"server-2"}',
+      result: {
+        executionStatus: "success",
+        observationStatus: "matched",
+        facts: { toolId: "server.connect" },
+        warnings: [],
+        evidenceIds: [],
+      },
+    });
+    const currentObservation = step({
+      id: "current-target",
+      kind: "observe",
+      command: "pwd",
+      attemptContext: currentContext,
+    });
+    current.plan = [oldObservation, serverSwitch, currentObservation];
+
+    expect(completedContinuationCommandFingerprints(current.plan, currentContext)).toHaveLength(2);
+    expect(selectContinuationSteps(current.plan, [
+      { ...oldObservation, id: "recheck", status: "pending" },
+      { ...serverSwitch, id: "reconnect", status: "pending" },
+      { ...currentObservation, id: "duplicate-current", status: "pending" },
+    ], currentContext).map(({ id }) => id)).toEqual(["recheck"]);
+
+    current.executionTargetServerId = "server-3";
+    expect(selectContinuationSteps(current.plan, [
+      { ...serverSwitch, id: "return-to-server-2", status: "pending" },
+    ], taskAttemptContext(current)).map(({ id }) => id)).toEqual(["return-to-server-2"]);
+  });
+
   it("does not invalidate a blocker for a planned or safety-blocked mutation", () => {
     const health = step({ command: "curl -f http://localhost/health", kind: "observe", validation: "", status: "failed" });
     const restart = step({ id: "restart", kind: "change", command: "systemctl restart app", status: "pending" });
@@ -119,7 +165,9 @@ describe("taskProgression", () => {
       title: "Need parameters",
       command: 'opsark-tool user.request_input {"title":"Deploy","fields":[{"key":"PORT","label":"服务端口","description":"项目对外监听端口","type":"number","required":true}]}',
     })]);
-    expect(resolveTaskProgression(current)).toEqual({ kind: "refine-discovery" });
+    expect(resolveTaskProgression(current)).toEqual({ kind: "refine-discovery", afterUserInput: true });
+    current.refinementCount = 8;
+    expect(resolveTaskProgression(current)).toEqual({ kind: "refine-discovery", afterUserInput: true });
   });
 
   it("refines after a terminal tool when its catalog metadata requires follow-up", () => {
@@ -160,6 +208,70 @@ describe("taskProgression", () => {
       step({ id: "new", command: "npm run build" }),
       step({ id: "new-copy", command: "npm run build" }),
     ]).map((item) => item.id)).toEqual(["new"]);
+  });
+
+  it.each(["awaiting_input", "awaiting_approval", "running", "validating"] as const)(
+    "waits for a %s step instead of executing a later pending step",
+    (status) => {
+      const waiting = step({ id: "waiting", status });
+      const pending = step({ id: "next", status: "pending" });
+      const current = task([step({ id: "done" }), waiting, pending]);
+      const snapshot = JSON.stringify(current);
+
+      expect(resolveTaskProgression(current)).toEqual({ kind: "wait", step: waiting });
+      expect(JSON.stringify(current)).toBe(snapshot);
+    },
+  );
+
+  it.each(["awaiting_input", "awaiting_approval", "running", "validating"] as const)(
+    "does not complete or refine a plan with a %s step and no pending steps",
+    (status) => {
+      const waiting = step({ id: "waiting", status });
+      const tools: ToolDefinition[] = [{
+        id: "custom.discovery", implementation: "custom", name: "Custom", description: "Custom",
+        usageInstructions: "Custom", inputSchema: {}, outputDescription: "Custom",
+        completionMode: "refine", enabled: true, builtIn: false, version: 1, updatedAt: "now",
+      }];
+      const current = task([
+        step({ id: "done", command: "opsark-tool custom.discovery {}" }), waiting,
+      ]);
+
+      expect(resolveTaskProgression(current, tools)).toEqual({ kind: "wait", step: waiting });
+      tools[0].completionMode = "complete";
+      expect(resolveTaskProgression(current, tools)).toEqual({ kind: "wait", step: waiting });
+      expect(resolveTaskProgression(task([waiting]))).toEqual({ kind: "wait", step: waiting });
+    },
+  );
+
+  it("does not start a pending step in an out-of-order plan with an active execution", () => {
+    const pending = step({ id: "pending", status: "pending" });
+    const active = step({ id: "active", status: "running" });
+
+    expect(resolveTaskProgression(task([pending, active]))).toEqual({ kind: "wait", step: active });
+  });
+
+  it("resumes discovery after user input really completes while the task is running", () => {
+    const input = step({
+      id: "input", status: "awaiting_input",
+      command: 'opsark-tool user.request_input {"title":"目标确认","fields":[{"key":"TARGET","label":"目标","description":"本次操作的目标","type":"text","required":true}]}',
+    });
+    const current = task([input]);
+
+    expect(resolveTaskProgression(current)).toEqual({ kind: "wait", step: input });
+    input.status = "completed";
+    expect(resolveTaskProgression(current)).toEqual({ kind: "refine-discovery", afterUserInput: true });
+    expect(current.status).toBe("running");
+  });
+
+  it("keeps terminal failures and skips available for existing progression and goal review", () => {
+    const failed = step({ id: "failed", status: "failed" });
+    const skipped = step({ id: "skipped", status: "skipped" });
+    const pending = step({ id: "pending", status: "pending" });
+    const current = task([failed, skipped, pending]);
+
+    expect(resolveTaskProgression(current)).toEqual({ kind: "execute-step", step: pending });
+    current.plan = [failed, skipped];
+    expect(resolveTaskProgression(current)).toEqual({ kind: "complete" });
   });
 
   it("rejects an unchanged failed adjustment but permits a validation-only repair", () => {

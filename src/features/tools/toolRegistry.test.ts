@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 import { buildPlanningToolContext, buildToolContext } from "@/features/tools/toolContext";
+import { builtInSkillCatalog } from "@/features/skills/skillCatalog";
 import {
   createToolOverrides,
   parseToolOverrides,
@@ -56,7 +57,7 @@ describe("tool registry", () => {
     expect(context[0]).not.toHaveProperty("builtIn");
   });
 
-  it("limits full tool schemas to the selected built-in Skill policy", () => {
+  it("retains basic interaction when a Skill allow-list omits it without exposing other tools", () => {
     const tools = resolveToolRegistry([]);
     const softwareSkill = {
       id: "software-installation",
@@ -68,7 +69,7 @@ describe("tool registry", () => {
       builtIn: true,
       matchRules: [],
       instructions: "检查后安装",
-      allowedToolIds: ["software.check", "user.request_input"],
+      allowedToolIds: ["software.check"],
       updatedAt: "now",
     };
 
@@ -77,6 +78,28 @@ describe("tool registry", () => {
       "evidence.read",
       "software.check",
     ]);
+  });
+
+  it.each(["disabled", "context", "internal"] as const)("respects %s clarification tool visibility", (visibility) => {
+    const tools = resolveToolRegistry([]);
+    const inputTool = tools.find(tool => tool.id === "user.request_input")!;
+    if (visibility === "disabled") inputTool.enabled = false;
+    else inputTool.modelExposure = visibility;
+    const skill = structuredClone(builtInSkillCatalog[0]);
+    skill.allowedToolIds = [];
+
+    expect(buildPlanningToolContext(tools, [skill]).map(({ id }) => id)).not.toContain("user.request_input");
+  });
+
+  it("respects an explicit clarification ban from any active Skill", () => {
+    const allowing = structuredClone(builtInSkillCatalog[0]);
+    allowing.allowedToolIds = ["user.request_input"];
+    const forbidding = { ...allowing, id: "forbidding", allowedToolIds: [], forbiddenToolIds: ["user.request_input"] };
+
+    const ids = buildPlanningToolContext(resolveToolRegistry([]), [allowing, forbidding]).map(({ id }) => id);
+    expect(ids).not.toContain("user.request_input");
+    expect(ids).toContain("evidence.read");
+    expect(ids).not.toContain("server.connect");
   });
 
   it("keeps planner-visible tools for legacy custom Skills without a declared policy", () => {

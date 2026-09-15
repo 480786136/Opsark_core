@@ -6,8 +6,9 @@ import { modelLogContext } from "@/features/agent/modelLogContext";
 import { restoreConversationLinks } from "@/features/agent/conversationHistory";
 import { archiveToolEvidence } from "@/features/agent/evidenceArchive";
 import { workflowLifetime } from "@/features/agent/workflowLifetime";
+import { restoreUserInputRequests } from "@/features/agent/restoreUserInputRequests";
 import { automaticContinuationBlocker } from "@/features/agent/workflowProgress";
-import { backend, buildExecutionSummary, isTauri, ModelInvocationError, normalizePlanPreconditions } from "@/services/backend";
+import { backend, buildExecutionSummary, isTauri, ModelInvocationError, PlanProtocolError, normalizePlanPreconditions } from "@/services/backend";
 import type { RuntimeConnection } from "@/services/backend";
 import {
   classifyStepResult,
@@ -122,6 +123,8 @@ import {
 } from "@/features/agent/executionLifecycle";
 import { prepareStepExecution } from "@/features/agent/executionPreparation";
 import { executeStepCommand, executeStepValidation } from "@/features/agent/executionRunner";
+import { authenticationBlocker, authenticationFingerprint, recordAuthentication } from "@/features/agent/authenticationEvidence";
+import { credentialGroupContext } from "@/features/agent/serverCredentialGroup";
 import { buildShellStartupTransaction } from "@/features/agent/shellStartupConfig";
 import { redactExecutionOutput } from "@/features/agent/secretTool";
 import { findSecretKeys } from "@/features/agent/secretTool";
@@ -210,6 +213,39 @@ const adjustingTaskIds = new Map<string, ReturnType<typeof workflowLifetime>>();
 const managedAdjustmentSchedulers = new Map<string, { requested: boolean; current(): boolean }>();
 const recoveringAdjustmentTaskIds = new Set<string>();
 const resumingTransportTaskIds = new Set<string>();
+// Short-lived ownership, not persisted task state. Release before intentionally
+// handing off to the next stage; an old finally must not release a newer owner.
+const advancingTasks = new WeakMap<OpsTask, ReturnType<typeof workflowLifetime>>();
+const executingTaskSteps = new WeakMap<OpsTask, ReturnType<typeof workflowLifetime>>();
+const submittingTaskInputs = new WeakMap<OpsTask, ReturnType<typeof workflowLifetime>>();
+const inputCredentialWrites = new WeakMap<object, Promise<void>>();
+
+/** Keep cancelled input rollback ahead of newer input writes, even across rounds. */
+function reserveInputCredentialWrite(owner: object) {
+  const ready = inputCredentialWrites.get(owner) ?? Promise.resolve();
+  let finish!: () => void;
+  const done = new Promise<void>(resolve => { finish = resolve; });
+  inputCredentialWrites.set(owner, done);
+  return { ready, release() {
+    finish();
+    if (inputCredentialWrites.get(owner) === done) inputCredentialWrites.delete(owner);
+  } };
+}
+
+function claimTaskOperation(owners: WeakMap<OpsTask, ReturnType<typeof workflowLifetime>>, task: OpsTask) {
+  if (owners.get(task)?.current()) return undefined;
+  const lifetime = workflowLifetime(task);
+  owners.set(task, lifetime);
+  return {
+    ...lifetime,
+    release() { if (owners.get(task) === lifetime) owners.delete(task); },
+  };
+}
+
+function hasWaitingStep(task: OpsTask) {
+  return task.plan.some(step => step.status === "awaiting_input" || step.status === "awaiting_approval");
+}
+
 const secretValueId = (serverId: string, key: string) => `${serverId}::${key}`;
 
 function serverSecretValues(values: Record<string, string>, serverId: string) {
@@ -221,11 +257,14 @@ function serverSecretValues(values: Record<string, string>, serverId: string) {
   );
 }
 
-function markTaskCredentialRevision(tasks: OpsTask[], serverId: string) {
+function markTaskCredentialRevision(tasks: OpsTask[], serverId: string, metadata: SecretMetadata[] = []) {
+  metadata.filter(m => m.serverId === serverId).forEach(m => { m.authenticationEvidence = undefined; });
   tasks
     .filter((task) => executionServerId(task) === serverId)
     .forEach((task) => {
       task.credentialRevision = (task.credentialRevision ?? 0) + 1;
+      task.authenticationEvidence = undefined;
+      task.authenticationCredentials = undefined;
     });
 }
 
@@ -246,8 +285,9 @@ function normalizeSubmittedInputs(value: OpsTask["submittedInputs"]): NonNullabl
   if (!value || typeof value !== "object") return {};
   return Object.fromEntries(Object.entries(value).filter(([, input]) => (
     input
-    && (input.type === "text" || input.type === "number")
+    && (input.type === "text" || input.type === "number" || input.type === "select")
     && (typeof input.value === "string" || typeof input.value === "number")
+    && (input.type !== "select" || typeof input.value === "string")
     && typeof input.label === "string"
     && typeof input.description === "string"
     && typeof input.groupId === "string"
@@ -479,6 +519,7 @@ function initialTasks() {
     task.submittedInputs = normalizeSubmittedInputs(task.submittedInputs);
     task.submittedSecretBindings = normalizeSubmittedSecretBindings(task.submittedSecretBindings);
     task.plan = task.plan.map(ensureStepValidator);
+    task.plan.forEach(step => { step.authenticationGate = undefined; });
     if (task.latestGoalReview?.nextPlan) {
       task.latestGoalReview.nextPlan = task.latestGoalReview.nextPlan.map(ensureStepValidator);
     }
@@ -616,12 +657,15 @@ function sameServerConnection(left: RuntimeConnection | undefined, right: Runtim
 }
 
 export const useOpsStore = defineStore("ops", {
-  state: () => ({
+  state: () => {
+    const tasks = initialTasks();
+    const tools = initialTools();
+    return {
     servers: initialServers(),
-    tasks: initialTasks(),
+    tasks,
     models: initialModels(),
     aiGenerationSettings: initialAiGenerationSettings(),
-    tools: initialTools(),
+    tools,
     toolSaveError: "",
     skills: initialSkills(),
     skillSaveError: "",
@@ -638,14 +682,15 @@ export const useOpsStore = defineStore("ops", {
     secretMetadata: initialSecretMetadata(),
     secretValues: {} as Record<string, string>,
     pendingSecret: null as PendingSecretRequest | null,
-    pendingUserInputs: [] as PendingUserInput[],
+    pendingUserInputs: restoreUserInputRequests(tasks, tools, () => uid("tool-call")) as PendingUserInput[],
     terminalLines: [] as string[],
     isCollecting: false,
     credentialsHydrated: false,
     credentialsLoading: false,
     credentialError: "",
     persistenceWarning: "",
-  }),
+    };
+  },
 
   getters: {
     connectedServerIds(): string[] {
@@ -801,7 +846,7 @@ export const useOpsStore = defineStore("ops", {
       const changed = this.serverPasswords[serverId] !== pending.connection.password;
       this.serverPasswords[serverId] = pending.connection.password;
       if (changed) {
-        markTaskCredentialRevision(this.tasks, serverId);
+        markTaskCredentialRevision(this.tasks, serverId, this.secretMetadata);
       }
       let writes = serverCredentialWrites.get(this);
       if (!writes) { writes = new Map(); serverCredentialWrites.set(this, writes); }
@@ -1273,7 +1318,7 @@ export const useOpsStore = defineStore("ops", {
       pendingServerCredentials.get(this)?.delete(serverId);
       const hadCredential = Boolean(this.serverPasswords[serverId]);
       delete this.serverPasswords[serverId];
-      if (hadCredential) markTaskCredentialRevision(this.tasks, serverId);
+      if (hadCredential) markTaskCredentialRevision(this.tasks, serverId, this.secretMetadata);
       useConnectionStore().disconnect(serverId);
       this.syncConnectionStates();
       const server = this.servers.find((item) => item.id === serverId);
@@ -1581,6 +1626,7 @@ export const useOpsStore = defineStore("ops", {
         || server.port !== input.port
         || server.username !== input.username;
       Object.assign(server, input);
+      if (connectionChanged || password) markTaskCredentialRevision(this.tasks, serverId, this.secretMetadata);
       this.persist(true);
       const credential = password || this.serverPasswords[serverId];
       if (connectionChanged || password) {
@@ -1857,6 +1903,7 @@ export const useOpsStore = defineStore("ops", {
         let requestedTerminalLines = selectedLines.length;
         let context = "";
         let processed;
+        let pendingProtocolError: PlanProtocolError | undefined;
         for (let attempt = 0; attempt < 4; attempt += 1) {
           const includedLines = selectedLines.length
             ? selectedLines
@@ -1982,7 +2029,10 @@ export const useOpsStore = defineStore("ops", {
               endpoint: model.endpoint,
               durationMs: Date.now() - startedAt,
             });
-            throw error;
+            if (error instanceof PlanProtocolError && error.processed) {
+              pendingProtocolError = error;
+              processed = { ...error.processed, plan: [] };
+            } else throw error;
           }
           if (sourceTask.cancelRequested || sourceTask.workflowEpoch !== submissionEpoch) return;
           if (processed.intent !== "terminal_context") break;
@@ -2111,6 +2161,7 @@ export const useOpsStore = defineStore("ops", {
         task.adjustmentIncident = undefined;
         task.latestGoalReview = undefined;
         task.lastAdjustmentBlocker = undefined;
+        task.protocolRepair = undefined;
         task.transportRecovery = undefined;
         task.discoveryRefined = false;
         task.refinementCount = 0;
@@ -2119,6 +2170,7 @@ export const useOpsStore = defineStore("ops", {
         this.activeTaskId = task.id;
         const selectedSkillIds = processed.selectedSkillIds ?? [];
         task.activeSkillIds = mergeTaskSkillIds(task.activeSkillIds, selectedSkillIds, relation);
+        if (pendingProtocolError) throw pendingProtocolError;
         if (processed.planError) {
           const selectedSkillNames = resolveTaskSkills(task, this.skills).map((skill) => skill.name);
           const selectionSummary = selectedSkillNames.length
@@ -2197,6 +2249,7 @@ export const useOpsStore = defineStore("ops", {
           serverId,
           taskId: task.id,
         });
+        if (this.presentTaskUserInput(task.id)) return;
         this.pushPlanProgressMessage(
           task,
           permission === "managed"
@@ -2213,6 +2266,18 @@ export const useOpsStore = defineStore("ops", {
         }
       } catch (error) {
         if (task.cancelRequested || sourceTask.workflowEpoch !== submissionEpoch) return;
+        if (error instanceof PlanProtocolError) {
+          task.protocolRepair = { roundId: task.currentRoundId, serverId: executionServerId(task),
+            repair: error.repair, repairError: error.repairError };
+          transitionTask(task, "needs_adjustment");
+          task.pauseReason = error.message;
+          task.managedAdjustmentPhase = "manual_required";
+          task.managedStopReason = "model_generation_failed";
+          task.autoAdjustmentSeconds = undefined;
+          this.pushMessage(task, { role: "assistant", kind: "event", content: error.message });
+          this.persist();
+          return;
+        }
         transitionTask(task, "planning_failed");
         task.summary = undefined;
         const message = error instanceof Error ? error.message : String(error);
@@ -2254,6 +2319,9 @@ export const useOpsStore = defineStore("ops", {
     pauseWorkflowFailure(task: OpsTask, error: unknown) {
       if (task.cancelRequested || ["completed", "cancelled"].includes(task.status)) return;
       if (canTransitionTask(task.status, "needs_adjustment")) transitionTask(task, "needs_adjustment");
+      if (error instanceof PlanProtocolError) task.protocolRepair = {
+        roundId: task.currentRoundId, serverId: executionServerId(task), repair: error.repair, repairError: error.repairError,
+      };
       task.pauseReason = `后续流程暂不可用：${String(error)}。已完成步骤及其执行证据保持有效，可检查后继续。`;
       task.managedAdjustmentPhase = "manual_required";
       task.managedStopReason = "workflow_error";
@@ -2276,6 +2344,7 @@ export const useOpsStore = defineStore("ops", {
     ) {
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || !["needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)) return;
+      if (hasWaitingStep(task) || task.protocolRepair) return;
 
       if (options.transportRecovery) {
         const failed = [...task.plan].reverse().find((step) => step.status === "failed");
@@ -2418,6 +2487,7 @@ export const useOpsStore = defineStore("ops", {
       if (adjustingTaskIds.get(taskId)?.current()) return;
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || !["needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)) return;
+      if (hasWaitingStep(task) || (automatic && task.protocolRepair)) return;
       if (expectedFingerprint && task.adjustmentIncident?.fingerprint !== expectedFingerprint) return;
       const lifetime = workflowLifetime(task);
       if (automatic && this.stopAutomaticLoop(task)) return;
@@ -2450,7 +2520,7 @@ export const useOpsStore = defineStore("ops", {
           skills: activeSkills,
         });
         const cachedPlanFresh = Boolean(
-          reusableGoalReview?.nextPlan?.length
+          !task.protocolRepair && reusableGoalReview?.nextPlan?.length
           && reusableGoalReview.policyFingerprint === currentPolicyFingerprint
           && reusableGoalReview.continuationIncidentFingerprint
           && reusableGoalReview.continuationIncidentFingerprint === currentIncidentFingerprint
@@ -2462,7 +2532,7 @@ export const useOpsStore = defineStore("ops", {
           kind: "event",
           content: cachedPlanFresh
             ? "正在采用整体目标判断时已生成的下一阶段计划…"
-            : "正在结合失败输出重新生成调整计划…",
+            : task.protocolRepair ? "正在修复保留的原计划协议，不重规划业务…" : "正在结合失败输出重新生成调整计划…",
         });
         this.persist();
         try {
@@ -2516,7 +2586,9 @@ export const useOpsStore = defineStore("ops", {
           }
           archiveActivePhase(task, "adjustment", now(), phaseSummary);
           task.plan = adjustment.plan;
+          task.protocolRepair = undefined;
           task.latestGoalReview = undefined;
+          if (this.presentTaskUserInput(taskId)) return;
           transitionTask(task, "awaiting_plan_approval");
           this.pushPlanProgressMessage(
             task,
@@ -2542,6 +2614,22 @@ export const useOpsStore = defineStore("ops", {
           }
         } catch (error) {
           if (!lifetime.current()) return;
+          if (error instanceof PlanProtocolError) {
+            task.protocolRepair = { roundId: task.currentRoundId, serverId: executionServerId(task),
+              repair: error.repair, repairError: error.repairError };
+            transitionTask(task, "needs_adjustment");
+            task.pauseReason = error.message;
+            task.autoAdjustmentSeconds = undefined;
+            task.managedAdjustmentPhase = "manual_required";
+            task.managedStopReason = "model_generation_failed";
+            this.addLog({ category: "model", level: "error", title: "计划协议修复失败（未执行）",
+              detail: JSON.stringify({ originalError: error.repair.validationError, repairError: error.repairError,
+                fieldPath: error.repair.fieldPath, stepCount: error.repair.previousModelOutput.length }),
+              taskId, serverId: executionServerId(task) });
+            this.pushMessage(task, { role: "system", kind: "event", content: error.message });
+            this.persist();
+            return;
+          }
           const adjustmentIncident = task.adjustmentIncident;
           if (adjustmentIncident
             && (!expectedFingerprint || adjustmentIncident.fingerprint === expectedFingerprint)) {
@@ -2586,6 +2674,8 @@ export const useOpsStore = defineStore("ops", {
       if (adjustingTaskIds.get(taskId)?.current()) return;
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || !["needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)) return;
+      if (hasWaitingStep(task)) return;
+      if (task.protocolRepair && automatic) return;
       const failed = [...task.plan].reverse().find((step) => step.status === "failed");
       const target = this.adjustmentTargetState(task);
       const snapshot = buildAdjustmentBlockerSnapshot(task, failed, target);
@@ -2679,6 +2769,7 @@ export const useOpsStore = defineStore("ops", {
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || task.permission !== "managed"
         || !["needs_adjustment", "awaiting_continuation"].includes(task.status)) return;
+      if (hasWaitingStep(task) || task.protocolRepair) return;
       if (task.managedStopReason === "workflow_error" || this.stopAutomaticLoop(task)) return;
       const failed = [...task.plan].reverse().find((step) => step.status === "failed");
       if (buildAdjustmentBlockerSnapshot(task, failed, this.adjustmentTargetState(task)).kind === "transport") {
@@ -2704,7 +2795,7 @@ export const useOpsStore = defineStore("ops", {
           const current = this.tasks.find((item) => item.id === taskId);
           if (!current || current.permission !== "managed"
             || !["needs_adjustment", "awaiting_continuation"].includes(current.status)
-            || current.cancelRequested) break;
+            || current.cancelRequested || hasWaitingStep(current)) break;
           if (this.stopAutomaticLoop(current)) break;
           const blockedStep = [...current.plan].reverse().find((step) => step.status === "failed");
           if (buildAdjustmentBlockerSnapshot(current, blockedStep, this.adjustmentTargetState(current)).kind === "transport") {
@@ -2718,7 +2809,7 @@ export const useOpsStore = defineStore("ops", {
           for (let remaining = seconds; remaining > 0; remaining -= 1) {
             if (!lifetime.current()) break;
             if (!["needs_adjustment", "awaiting_continuation"].includes(current.status)
-              || current.cancelRequested) break;
+              || current.cancelRequested || hasWaitingStep(current)) break;
             current.autoAdjustmentSeconds = remaining;
             this.persist();
             await wait(1_000);
@@ -2726,6 +2817,7 @@ export const useOpsStore = defineStore("ops", {
           if (!lifetime.current()) break;
           if (!["needs_adjustment", "awaiting_continuation"].includes(current.status)
             || current.cancelRequested) continue;
+          if (hasWaitingStep(current)) break;
           if (current.managedStopReason === "transport_recovery") break;
           const latestFailed = [...current.plan].reverse().find((step) => step.status === "failed");
           if (buildAdjustmentBlockerSnapshot(current, latestFailed, this.adjustmentTargetState(current)).kind === "transport") {
@@ -2765,9 +2857,57 @@ export const useOpsStore = defineStore("ops", {
       }
     },
 
+    /** Present a standalone clarification locally; asking is not an execution approval. */
+    presentTaskUserInput(taskId: string) {
+      const task = this.tasks.find(item => item.id === taskId);
+      if (!task || task.cancelRequested
+        || !["planning", "validating", "awaiting_plan_approval", "running"].includes(task.status)) return false;
+      const unfinished = task.plan.filter(step => !["completed", "failed", "skipped"].includes(step.status));
+      if (unfinished.length !== 1 || unfinished[0].status !== "pending") return false;
+      const step = unfinished[0];
+      const skills = resolveTaskSkills(task, this.skills);
+      const dispatch = resolveStepDispatch(step, [], uid("tool-call"), this.tools, [],
+        [...new Set(skills.flatMap(skill => skill.forbiddenToolIds ?? []))],
+        selectPlanningTools(this.tools, skills).map(tool => tool.id));
+      if (dispatch.kind !== "tool"
+        || !this.tools.some(tool => tool.id === dispatch.call.toolId && tool.enabled && tool.executionMode === "user-input")) return false;
+      let request;
+      try { request = parseUserInputArguments(dispatch.call.arguments); }
+      catch { return false; } // Normal protocol handling reports malformed forms.
+
+      // Entering a user decision boundary invalidates older planning/review work,
+      // including its error callbacks. No remote call or auto-adjustment is needed.
+      task.workflowEpoch = (task.workflowEpoch ?? 0) + 1;
+      transitionStep(step, "awaiting_input");
+      transitionTask(task, "awaiting_input");
+      task.adjustmentInProgress = false;
+      task.autoAdjustmentSeconds = undefined;
+      task.managedAdjustmentPhase = task.permission === "managed" ? "manual_required" : undefined;
+      task.managedStopReason = "user_input_required";
+      task.latestGoalReview = undefined;
+      task.summary = undefined;
+      task.pauseReason = "等待用户明确回答；提交前不会执行后续操作或自动调整。";
+      step.startedAt = now();
+      step.progressMessage = "等待用户确认";
+      this.pendingUserInputs = this.pendingUserInputs.filter(item => item.taskId !== taskId).concat({
+        taskId, stepId: step.id, callId: dispatch.call.id,
+        roundId: task.currentRoundId, workflowEpoch: task.workflowEpoch,
+        serverId: executionServerId(task), command: step.command, ...request,
+      });
+      this.pushMessage(task, { role: "assistant", kind: "event", content: `${request.title}：${task.pauseReason}` });
+      this.addLog({ category: "task", level: "info", title: "任务等待用户确认",
+        detail: JSON.stringify({ callId: dispatch.call.id, stepId: step.id, title: request.title,
+          roundId: task.currentRoundId, fields: request.fields.map(field => ({ key: field.key, label: field.label })) }),
+        serverId: executionServerId(task), taskId });
+      this.persist();
+      return true;
+    },
+
     async approvePlan(taskId: string, automatic = false) {
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || task.status !== "awaiting_plan_approval") return;
+      if (hasWaitingStep(task)) return;
+      if (this.presentTaskUserInput(taskId)) return;
       if (this.pauseTaskForConnection(task)) return;
       const beforeNormalization = task.plan.map(({ id, command, validation }) => ({ id, command, validation }));
       task.plan = normalizePlanPreconditions(task.plan, latestTaskRequirement(task), this.tools);
@@ -2889,17 +3029,22 @@ export const useOpsStore = defineStore("ops", {
 
     async advanceTask(taskId: string) {
       const task = this.tasks.find((item) => item.id === taskId);
-      if (!task || !["running", "awaiting_step_approval"].includes(task.status)) return;
+      if (!task || task.status !== "running" || task.cancelRequested) return;
+      if (hasWaitingStep(task) || executingTaskSteps.get(task)?.current()
+        || submittingTaskInputs.get(task)?.current()) return;
+      if (this.presentTaskUserInput(taskId)) return;
       if (this.pauseTaskForConnection(task)) return;
-      const lifetime = workflowLifetime(task);
+      const lifetime = claimTaskOperation(advancingTasks, task);
+      if (!lifetime) return;
       try {
       const targetServerId = executionServerId(task);
       const server = this.servers.find((item) => item.id === targetServerId);
       const progression = resolveTaskProgression(task, this.tools);
+      if (progression.kind === "wait") return;
       if (progression.kind !== "execute-step") {
         if (progression.kind === "refine-discovery") {
           task.discoveryRefined = true;
-          task.refinementCount = (task.refinementCount ?? 0) + 1;
+          if (!progression.afterUserInput) task.refinementCount = (task.refinementCount ?? 0) + 1;
           transitionTask(task, "planning");
           const requirement = latestTaskRequirement(task);
           const model = this.models.find((item) => item.id === task.modelId);
@@ -2920,7 +3065,9 @@ export const useOpsStore = defineStore("ops", {
               this.pushMessage(task, {
                 role: "system",
                 kind: "event",
-                content: "发现阶段已完成，正在依据真实证据生成一次后续变更与验收计划…",
+                content: progression.afterUserInput
+                  ? "已收到用户回答，正在保持原目标和授权范围的前提下规划下一步…"
+                  : "发现阶段已完成，正在依据真实证据确定后续只读检查、必要询问或已授权操作…",
               });
               this.persist();
             },
@@ -2930,6 +3077,13 @@ export const useOpsStore = defineStore("ops", {
             transitionTask(task, "needs_adjustment");
             task.pauseReason = refinement.pauseReason;
             if (refinement.kind === "failed") {
+              if (refinement.protocolError) {
+                task.protocolRepair = { roundId: task.currentRoundId, serverId: executionServerId(task),
+                  repair: refinement.protocolError.repair, repairError: refinement.protocolError.repairError };
+                task.managedAdjustmentPhase = "manual_required";
+                task.managedStopReason = "model_generation_failed";
+                task.autoAdjustmentSeconds = undefined;
+              }
               this.pushMessage(task, {
                 role: "assistant",
                 kind: "event",
@@ -2940,10 +3094,12 @@ export const useOpsStore = defineStore("ops", {
             return;
           }
           task.plan = [...task.plan, ...refinement.pending];
+          if (this.presentTaskUserInput(taskId)) return;
           transitionTask(task, "awaiting_plan_approval");
           this.pushPlanProgressMessage(task, refinement.eventMessage);
           this.persist();
           if (refinement.autoApprove) {
+            lifetime.release();
             await this.approvePlan(task.id, true);
           }
           return;
@@ -2984,6 +3140,12 @@ export const useOpsStore = defineStore("ops", {
           taskId,
         });
         if (!goalReview.complete) {
+          if (goalReview.nextPlan?.length) {
+            const previousPlan = task.plan;
+            task.plan = [...previousPlan, ...goalReview.nextPlan];
+            if (this.presentTaskUserInput(taskId)) return;
+            task.plan = previousPlan;
+          }
           transitionTask(task, "awaiting_continuation");
           task.pauseReason = goalReview.decision.summary;
           const continuationIncident = buildAdjustmentBlockerSnapshot(
@@ -3105,18 +3267,24 @@ export const useOpsStore = defineStore("ops", {
         this.persist();
         return;
       }
+      lifetime.release();
       await this.runStep(taskId, step.id);
       } catch (error) {
         if (lifetime.current()) this.pauseWorkflowFailure(task, error);
+      } finally {
+        lifetime.release();
       }
     },
 
     async approveStep(taskId: string, stepId: string) {
       const task = this.tasks.find((item) => item.id === taskId);
       const step = task?.plan.find((item) => item.id === stepId);
-      if (!task || !step) return;
+      if (!task || !step || task.cancelRequested || task.status !== "awaiting_step_approval"
+        || task.plan.find(item => !["completed", "failed", "skipped"].includes(item.status)) !== step
+        || advancingTasks.get(task)?.current() || executingTaskSteps.get(task)?.current()) return;
       const approval = acceptStepApproval(step);
       if (!approval) return;
+      if (step.authenticationGate?.fingerprint === authenticationFingerprint(task, step)) step.authenticationGate.approved = true;
       transitionTask(task, approval.taskStatus);
       await this.runStep(taskId, stepId);
       if (task.permission === "managed" && ["needs_adjustment", "awaiting_continuation"].includes(task.status)) {
@@ -3127,28 +3295,15 @@ export const useOpsStore = defineStore("ops", {
     async runToolStep(taskId: string, stepId: string, call: ToolCall) {
       const task = this.tasks.find((item) => item.id === taskId);
       const step = task?.plan.find((item) => item.id === stepId);
-      if (!task || !step) return;
-      if (this.pauseTaskForConnection(task)) return;
-      const lifetime = workflowLifetime(task);
+      if (!task || !step || task.status !== "running" || task.cancelRequested
+        || !["pending", "awaiting_approval"].includes(step.status)
+        || task.plan.find(item => !["completed", "failed", "skipped"].includes(item.status)) !== step
+        || task.plan.some(item => item !== step && ["awaiting_input", "awaiting_approval", "running", "validating"].includes(item.status))
+        || advancingTasks.get(task)?.current() || submittingTaskInputs.get(task)?.current()) return;
       const toolDefinition = this.tools.find((tool) => tool.id === call.toolId);
       if (toolDefinition?.executionMode === "user-input") {
-        try {
-          const request = parseUserInputArguments(call.arguments);
-          transitionStep(step, "awaiting_input");
-          transitionTask(task, "awaiting_input");
-          step.startedAt = now();
-          step.progressMessage = "等待用户补充参数";
-          this.pendingUserInputs = this.pendingUserInputs
-            .filter((item) => item.taskId !== taskId)
-            .concat({ taskId, stepId, callId: call.id, ...request });
-          this.pushMessage(task, {
-            role: "assistant",
-            kind: "event",
-            content: `需要用户补充 ${request.fields.length} 个参数后才能继续；每个参数的用途已在输入区说明。`,
-          });
-          this.persist();
-        } catch (error) {
-          const failure = failToolCommandParsing(step, error);
+        if (!this.presentTaskUserInput(taskId)) {
+          const failure = failToolCommandParsing(step, "用户确认必须是当前唯一待执行步骤，且参数有效");
           transitionTask(task, "needs_adjustment");
           task.pauseReason = failure.pauseReason;
           this.pushMessage(task, { role: "assistant", kind: "event", content: failure.eventMessage });
@@ -3156,6 +3311,10 @@ export const useOpsStore = defineStore("ops", {
         }
         return;
       }
+      if (this.pauseTaskForConnection(task)) return;
+      const lifetime = claimTaskOperation(executingTaskSteps, task);
+      if (!lifetime) return;
+      try {
       task.currentExecutionId = call.id;
       const lifecycle = await runToolStepLifecycle({
         step,
@@ -3200,19 +3359,31 @@ export const useOpsStore = defineStore("ops", {
           step.result.facts.category = "terminal_transport";
           step.result.facts.commandCompleted = false;
           step.result.facts.terminalReleased = false;
+          lifetime.release();
           await this.routeAutomaticAdjustment(taskId, { transportRecovery: true });
         }
         return;
       }
+      lifetime.release();
       await this.advanceTask(taskId);
+      } finally {
+        lifetime.release();
+      }
     },
 
     async runStep(taskId: string, stepId: string) {
       const task = this.tasks.find((item) => item.id === taskId);
       const step = task?.plan.find((item) => item.id === stepId);
-      if (!task || !step) return;
+      if (!task || !step || task.cancelRequested || task.status !== "running"
+        || !["pending", "awaiting_approval"].includes(step.status)
+        || task.plan.find(item => !["completed", "failed", "skipped"].includes(item.status)) !== step
+        || task.plan.some(item => item !== step && ["awaiting_input", "awaiting_approval", "running", "validating"].includes(item.status))
+        || advancingTasks.get(task)?.current() || submittingTaskInputs.get(task)?.current()) return;
+      if (this.presentTaskUserInput(taskId)) return;
       if (this.pauseTaskForConnection(task)) return;
-      const lifetime = workflowLifetime(task);
+      const lifetime = claimTaskOperation(executingTaskSteps, task);
+      if (!lifetime) return;
+      try {
       step.attemptContext = taskAttemptContext(task);
       const targetServerId = executionServerId(task);
       const connectionGeneration = this.serverConnection(targetServerId).generation;
@@ -3256,19 +3427,26 @@ export const useOpsStore = defineStore("ops", {
           secretDescription: metadata?.description,
         });
         if (entry.kind === "tool") {
+          lifetime.release();
           await this.runToolStep(taskId, stepId, entry.call);
           return;
         }
         if (entry.kind === "stop") {
           transitionTask(task, entry.taskStatus);
+          if (entry.taskStatus === "awaiting_input") {
+            task.workflowEpoch = (task.workflowEpoch ?? 0) + 1;
+            task.autoAdjustmentSeconds = undefined;
+            task.managedStopReason = "user_input_required";
+          }
           task.pauseReason = entry.pauseReason;
           if (entry.pendingSecretKey) {
-            this.pendingSecret = buildSecretUnlockRequest({
+            this.pendingSecret = { ...buildSecretUnlockRequest({
               taskId,
               step,
               key: entry.pendingSecretKey,
               metadataDescription: metadata?.description,
-            });
+            }), roundId: task.currentRoundId, workflowEpoch: task.workflowEpoch,
+              serverId: targetServerId, command: step.command };
           }
           this.pushMessage(task, {
             role: "assistant",
@@ -3296,6 +3474,22 @@ export const useOpsStore = defineStore("ops", {
 
       const server = this.servers.find((item) => item.id === targetServerId);
       const password = this.getRuntimeConnection(targetServerId)?.password;
+      task.authenticationCredentials = credentialGroupContext(this.secretMetadata, targetServerId);
+      const authenticationReason = authenticationBlocker(task, step, this.secretMetadata)
+        ?? (step.validation ? authenticationBlocker(task, { ...step, command: step.validation }, this.secretMetadata) : undefined);
+      const authenticationIdentity = authenticationFingerprint(task, step);
+      if (authenticationReason && !(step.authenticationGate?.approved && step.authenticationGate.fingerprint === authenticationIdentity)) {
+        step.authenticationGate = { fingerprint: authenticationIdentity, reason: authenticationReason };
+        transitionStep(step, "awaiting_approval");
+        transitionTask(task, "awaiting_step_approval");
+        task.pauseReason = authenticationReason;
+        task.autoAdjustmentSeconds = undefined;
+        this.pushMessage(task, { role: "assistant", kind: "event", content: authenticationReason });
+        this.addLog({ category: "task", level: "warning", title: "认证方式需要明确确认（未执行）",
+          detail: authenticationReason, taskId, serverId: targetServerId });
+        this.persist();
+        return;
+      }
       const runtimeModel = this.models.find((item) => item.id === task.modelId);
       const runtimeApiKey = this.modelApiKeys[task.modelId];
       const scopedSecrets = serverSecretValues(this.secretValues, targetServerId);
@@ -3623,7 +3817,9 @@ export const useOpsStore = defineStore("ops", {
             onSessionInvalidated: invalidateAgentSession,
             onProgress: (event) => {
               if (!lifetime.current() || !event.data || (event.stream !== "stdout" && event.stream !== "stderr")) return;
-              const safeChunk = redactExecutionOutput(event.data, scopedSecrets);
+              const safeChunk = redactExecutionOutput(event.data, scopedSecrets, {
+                exactSecretKeys: input.exactSecretKeys,
+              });
               if (!safeChunk) return;
               agentTerminals.output(task.id, input.executionId, safeChunk);
               input.onProgress?.(safeChunk, {
@@ -3634,7 +3830,12 @@ export const useOpsStore = defineStore("ops", {
             },
           });
           agentTerminals.finish(task.id, input.executionId, result.exitCode);
-          return { ...result, output: redactExecutionOutput(result.output, scopedSecrets) };
+          return {
+            ...result,
+            output: redactExecutionOutput(result.output, scopedSecrets, {
+              exactSecretKeys: input.exactSecretKeys,
+            }),
+          };
         });
         const result = commandLifecycle.result;
         const streamedOutput = commandLifecycle.streamedOutput;
@@ -3659,6 +3860,12 @@ export const useOpsStore = defineStore("ops", {
           return;
         }
         let safeOutput = result.output;
+        const authentication = recordAuthentication(task, step, this.secretMetadata, result, "main", executionId);
+        if (authentication) this.addDeveloperLog({ level: authentication.outcome === "authenticated" ? "success" : "warning",
+          operation: "authentication_evidence", title: "主命令认证证据", summary: authentication.outcome,
+          response: authentication, taskId, serverId: targetServerId });
+        // Explicit consent applies to one attempt, not future retries.
+        step.authenticationGate = undefined;
         if (monitorDecision?.decision === "adjust") {
           await rollbackShellStartup("长任务复核已停止当前命令");
         } else if (!result.success) {
@@ -3705,6 +3912,7 @@ export const useOpsStore = defineStore("ops", {
             content: coordination.eventMessage,
           });
           this.persist();
+          lifetime.release();
           await this.routeAutomaticAdjustment(taskId);
           return;
         }
@@ -3753,6 +3961,8 @@ export const useOpsStore = defineStore("ops", {
           this.persist();
           if (!coordination.shouldAdvance) return;
           await wait(250);
+          if (!lifetime.current()) return;
+          lifetime.release();
           await this.advanceTask(taskId);
           return;
         }
@@ -3853,7 +4063,9 @@ export const useOpsStore = defineStore("ops", {
                     onSessionInvalidated: invalidateAgentSession,
                     onProgress: (event) => {
                       if (!lifetime.current() || !event.data || (event.stream !== "stdout" && event.stream !== "stderr")) return;
-                      const safeChunk = redactExecutionOutput(event.data, scopedSecrets);
+                      const safeChunk = redactExecutionOutput(event.data, scopedSecrets, {
+                        exactSecretKeys: input.exactSecretKeys,
+                      });
                       if (!safeChunk) return;
                       agentValidationStreamed = true;
                       agentTerminals.output(task.id, input.executionId, safeChunk);
@@ -3864,7 +4076,9 @@ export const useOpsStore = defineStore("ops", {
                       });
                     },
                   });
-                  const safeValidationOutput = redactExecutionOutput(result.output, scopedSecrets);
+                  const safeValidationOutput = redactExecutionOutput(result.output, scopedSecrets, {
+                    exactSecretKeys: input.exactSecretKeys,
+                  });
                   if (!agentValidationStreamed && safeValidationOutput) {
                     agentTerminals.completionOutput(
                       task.id,
@@ -3888,6 +4102,13 @@ export const useOpsStore = defineStore("ops", {
           return;
         }
         let validation = validationLifecycle.validation;
+        if (step.validation && step.kind !== "observe") {
+          const authentication = recordAuthentication(task, step, this.secretMetadata,
+            { success: validation.passed, exitCode: validation.exitCode, output: validation.output ?? validation.detail }, "validation", `${executionId}:validation`);
+          if (authentication) this.addDeveloperLog({ level: authentication.outcome === "authenticated" ? "success" : "warning",
+            operation: "authentication_evidence", title: "独立校验认证证据", summary: authentication.outcome,
+            response: authentication, taskId, serverId: targetServerId });
+        }
         if (!validation.passed && startupTransaction) {
           await rollbackShellStartup("新 Shell 验收未通过");
           validation = {
@@ -3975,6 +4196,8 @@ export const useOpsStore = defineStore("ops", {
         this.persist();
         if (!coordination.shouldAdvance) return;
         await wait(250);
+        if (!lifetime.current()) return;
+        lifetime.release();
         await this.advanceTask(taskId);
       } catch (error) {
         if (!lifetime.current()) return;
@@ -4000,6 +4223,7 @@ export const useOpsStore = defineStore("ops", {
               content: `${failure.pauseReason}。已转入终端通道恢复，不会让模型改写业务计划。`,
             });
             this.persist();
+            lifetime.release();
             await this.routeAutomaticAdjustment(taskId, { transportRecovery: true });
             return;
           }
@@ -4066,21 +4290,40 @@ export const useOpsStore = defineStore("ops", {
         });
         this.persist();
         if (step.result?.facts.category === "terminal_transport") {
+          lifetime.release();
           await this.routeAutomaticAdjustment(taskId, { transportRecovery: true });
         }
       }
+      } finally {
+        lifetime.release();
+      }
     },
 
-    async provideUserInput(taskId: string, rawValues: Record<string, string>) {
+    async provideUserInput(taskId: string, rawValues: Record<string, string>, expectedCallId?: string) {
       const request = this.pendingUserInputs.find((item) => item.taskId === taskId);
       const task = this.tasks.find((item) => item.id === taskId);
       const step = task?.plan.find((item) => item.id === request?.stepId);
-      if (!request || !task || !step) return false;
+      if (!request || !task || !step || task.cancelRequested
+        || task.status !== "awaiting_input" || step.status !== "awaiting_input"
+        || expectedCallId !== undefined && request.callId !== expectedCallId
+        || request.roundId !== undefined && request.roundId !== task.currentRoundId
+        || request.workflowEpoch !== undefined && request.workflowEpoch !== (task.workflowEpoch ?? 0)
+        || request.command !== undefined && request.command !== step.command
+        || request.serverId !== undefined && request.serverId !== executionServerId(task)) return false;
       const targetServerId = executionServerId(task);
 
       const missing = request.fields.find((field) => field.required && !String(rawValues[field.key] ?? "").trim());
       if (missing) {
-        request.error = `请填写必填参数“${missing.label}”`;
+        request.error = missing.type === "select"
+          ? `请选择必填参数“${missing.label}”`
+          : `请填写必填参数“${missing.label}”`;
+        return false;
+      }
+      const invalidSelection = request.fields.find(field => field.type === "select"
+        && String(rawValues[field.key] ?? "") !== ""
+        && !field.options?.some(option => option.value === String(rawValues[field.key])));
+      if (invalidSelection) {
+        request.error = `参数“${invalidSelection.label}”必须选择当前候选项中的有效选项`;
         return false;
       }
       const invalidNumber = request.fields.find((field) => field.type === "number" && String(rawValues[field.key] ?? "").trim()
@@ -4090,12 +4333,25 @@ export const useOpsStore = defineStore("ops", {
         return false;
       }
 
+      const lifetime = claimTaskOperation(submittingTaskInputs, task);
+      if (!lifetime) return false;
+      const currentRequest = () => lifetime.current() && task.status === "awaiting_input"
+        && task.plan.find(item => item.id === step.id) === step && step.status === "awaiting_input"
+        && this.pendingUserInputs.includes(request) && executionServerId(task) === targetServerId
+        && (request.command === undefined || request.command === step.command);
+      const assertCurrentRequest = () => { if (!currentRequest()) throw new Error("用户确认请求已过期"); };
+      const credentialWrite = request.fields.some(field => field.type === "password")
+        ? reserveInputCredentialWrite(this) : undefined;
+      try {
+      if (credentialWrite) await credentialWrite.ready;
+      if (!currentRequest()) return false;
       const values: Record<string, string | number> = {};
+      const submittedInputs = { ...task.submittedInputs };
+      const submittedSecretBindings = { ...task.submittedSecretBindings };
+      const confirmedSecretKeys = [...(task.confirmedSecretKeys ?? [])];
       let credentialChanged = false;
       try {
         this.credentialError = "";
-        task.submittedInputs ??= {};
-        task.submittedSecretBindings ??= {};
         const submittedAt = now();
         const handledCredentialFields = new Set<string>();
         const credentialPair = inferCredentialInputPair(request.title, request.fields);
@@ -4154,6 +4410,7 @@ export const useOpsStore = defineStore("ops", {
               for (const write of writes) {
                 await backend.saveCredential("secret", secretValueId(targetServerId, write.key), write.value);
                 applied.push(write);
+                assertCurrentRequest();
               }
             } catch (error) {
               await Promise.allSettled(applied.map((write) => write.previous === undefined
@@ -4194,9 +4451,8 @@ export const useOpsStore = defineStore("ops", {
                 ...groupMetadata,
               });
               this.secretValues[secretValueId(targetServerId, key)] = value;
-              task.confirmedSecretKeys ??= [];
-              if (!task.confirmedSecretKeys.includes(key)) task.confirmedSecretKeys.push(key);
-              task.submittedSecretBindings![key] = {
+              if (!confirmedSecretKeys.includes(key)) confirmedSecretKeys.push(key);
+              submittedSecretBindings[key] = {
                 key,
                 label: field.label,
                 description: field.description,
@@ -4207,15 +4463,18 @@ export const useOpsStore = defineStore("ops", {
               values[field.key] = `已安全保存为 \${secret.${key}}`;
               handledCredentialFields.add(field.key);
             });
-            delete task.submittedInputs[credentialPair.usernameField.key];
+            delete submittedInputs[credentialPair.usernameField.key];
             if (writes.length) credentialChanged = true;
           }
         }
         for (const field of request.fields) {
           if (handledCredentialFields.has(field.key)) continue;
           const supplied = String(rawValues[field.key] ?? "");
-          const raw = field.type === "password" ? supplied : supplied.trim();
-          if (!raw.trim()) continue;
+          // Select values are identifiers, not display text; preserve exact identity.
+          const raw = field.type === "password" || field.type === "select" ? supplied : supplied.trim();
+          // An empty optional selection is an explicit omission for this form;
+          // record it so an older value with the same key cannot be reused.
+          if (!raw.trim() && field.type !== "select") continue;
           if (field.type === "password") {
             const secretKey = field.key.toUpperCase();
             const valueId = secretValueId(targetServerId, secretKey);
@@ -4223,7 +4482,14 @@ export const useOpsStore = defineStore("ops", {
             // Commit to the system keychain before advertising the metadata in
             // memory/localStorage. A failed keychain write must leave the input
             // card open instead of creating a phantom "saved" credential.
+            const previous = this.secretValues[valueId];
             await backend.saveCredential("secret", valueId, raw);
+            if (!currentRequest()) {
+              await Promise.allSettled([previous === undefined
+                ? backend.deleteCredential("secret", valueId)
+                : backend.saveCredential("secret", valueId, previous)]);
+              return false;
+            }
             this.secretValues[valueId] = raw;
             const metadata = this.secretMetadata.find((item) => item.key === secretKey && item.serverId === targetServerId);
             if (!metadata) {
@@ -4231,9 +4497,8 @@ export const useOpsStore = defineStore("ops", {
             } else if (metadata.description !== field.description) {
               metadata.description = field.description;
             }
-            task.confirmedSecretKeys ??= [];
-            if (!task.confirmedSecretKeys.includes(secretKey)) task.confirmedSecretKeys.push(secretKey);
-            task.submittedSecretBindings[secretKey] = {
+            if (!confirmedSecretKeys.includes(secretKey)) confirmedSecretKeys.push(secretKey);
+            submittedSecretBindings[secretKey] = {
               key: secretKey,
               label: field.label,
               description: field.description,
@@ -4245,7 +4510,7 @@ export const useOpsStore = defineStore("ops", {
           } else {
             const value = field.type === "number" ? Number(raw) : raw;
             values[field.key] = value;
-            task.submittedInputs[field.key] = {
+            submittedInputs[field.key] = {
               value,
               label: field.label,
               description: field.description,
@@ -4256,8 +4521,13 @@ export const useOpsStore = defineStore("ops", {
             };
           }
         }
-        if (credentialChanged) markTaskCredentialRevision(this.tasks, targetServerId);
+        assertCurrentRequest();
+        task.submittedInputs = submittedInputs;
+        task.submittedSecretBindings = submittedSecretBindings;
+        task.confirmedSecretKeys = confirmedSecretKeys;
+        if (credentialChanged) markTaskCredentialRevision(this.tasks, targetServerId, this.secretMetadata);
       } catch (error) {
+        if (!currentRequest()) return false;
         this.credentialError = String(error);
         request.error = `保存输入失败：${this.credentialError}`;
         this.persist(true);
@@ -4268,6 +4538,7 @@ export const useOpsStore = defineStore("ops", {
       // the task. This closes the window where a refresh after submission left
       // a keychain value with no visible row in Sensitive Information.
       this.persist(true);
+      credentialWrite?.release();
 
       request.error = undefined;
       this.pendingUserInputs = this.pendingUserInputs.filter((item) => item !== request);
@@ -4279,7 +4550,7 @@ export const useOpsStore = defineStore("ops", {
         execute: async () => ({ callId: call.id, toolId: call.toolId, success: true, data: { title: request.title, values } }),
         createEvidenceId: () => uid("evidence-user-input"),
         now,
-        isCancelled: () => task.cancelRequested === true,
+        isCancelled: () => !lifetime.current(),
         onStart: () => {
           transitionTask(task, "running");
           this.pushMessage(task, {
@@ -4289,16 +4560,23 @@ export const useOpsStore = defineStore("ops", {
           });
         },
       });
-      if (lifecycle.cancelled || task.cancelRequested) return false;
+      if (lifecycle.cancelled || !lifetime.current()) return false;
       transitionTask(task, lifecycle.taskStatus);
       task.pauseReason = lifecycle.pauseReason;
+      task.managedAdjustmentPhase = undefined;
+      task.managedStopReason = undefined;
       this.pushMessage(task, { role: "assistant", kind: "event", content: "用户输入已安全确认，正在基于这些参数继续任务。" });
       this.persist();
+      lifetime.release();
       if (lifecycle.shouldAdvance) await this.advanceTask(taskId);
       if (task.permission === "managed" && ["needs_adjustment", "awaiting_continuation"].includes(task.status)) {
         void this.queueManagedAdjustment(task.id, 5);
       }
       return true;
+      } finally {
+        credentialWrite?.release();
+        lifetime.release();
+      }
     },
 
     async provideSecret(value: string) {
@@ -4306,9 +4584,24 @@ export const useOpsStore = defineStore("ops", {
       if (!request || !value) return false;
       const task = this.tasks.find((item) => item.id === request.taskId);
       const step = task?.plan.find((item) => item.id === request.stepId);
-      if (!task || !step) return false;
+      if (!task || !step || task.cancelRequested || task.status !== "awaiting_input" || step.status !== "awaiting_input"
+        || request.roundId !== undefined && request.roundId !== task.currentRoundId
+        || request.workflowEpoch !== undefined && request.workflowEpoch !== (task.workflowEpoch ?? 0)
+        || request.serverId !== undefined && request.serverId !== executionServerId(task)
+        || request.command !== undefined && request.command !== step.command) return false;
+      const lifetime = claimTaskOperation(submittingTaskInputs, task);
+      if (!lifetime) return false;
+      const credentialWrite = reserveInputCredentialWrite(this);
+      try {
+      await credentialWrite.ready;
       const targetServerId = executionServerId(task);
+      const currentRequest = () => lifetime.current() && this.pendingSecret === request
+        && task.status === "awaiting_input" && step.status === "awaiting_input"
+        && task.plan.includes(step) && executionServerId(task) === targetServerId
+        && (request.command === undefined || request.command === step.command);
+      if (!currentRequest()) return false;
       const valueId = secretValueId(targetServerId, request.key);
+      const previous = this.secretValues[valueId];
       const credentialChanged = this.secretValues[valueId] !== value;
       this.credentialError = "";
       request.error = undefined;
@@ -4317,13 +4610,20 @@ export const useOpsStore = defineStore("ops", {
         // in-memory value until durable storage has accepted the credential.
         await backend.saveCredential("secret", valueId, value);
       } catch (error) {
+        if (!currentRequest()) return false;
         this.credentialError = String(error);
         request.error = `安全保存失败：${this.credentialError}`;
         this.persist(true);
         return false;
       }
+      if (!currentRequest()) {
+        await Promise.allSettled([previous === undefined
+          ? backend.deleteCredential("secret", valueId)
+          : backend.saveCredential("secret", valueId, previous)]);
+        return false;
+      }
       this.secretValues[valueId] = value;
-      if (credentialChanged) markTaskCredentialRevision(this.tasks, targetServerId);
+      if (credentialChanged) markTaskCredentialRevision(this.tasks, targetServerId, this.secretMetadata);
       if (!this.secretMetadata.some((item) => item.key === request.key && item.serverId === targetServerId)) {
         this.secretMetadata.push({ key: request.key, description: request.description, scope: "server", serverId: targetServerId });
       }
@@ -4333,12 +4633,20 @@ export const useOpsStore = defineStore("ops", {
       resumeStepAfterSecret(step);
       transitionTask(task, "running");
       this.pushMessage(task, { role: "user", kind: "event", content: `已安全提供“${request.label}”，正在解锁并继续当前步骤。` });
+      task.managedStopReason = undefined;
+      task.managedAdjustmentPhase = undefined;
       this.persist();
+      credentialWrite.release();
+      lifetime.release();
       await this.runStep(request.taskId, request.stepId);
       if (task.permission === "managed" && ["needs_adjustment", "awaiting_continuation"].includes(task.status)) {
         void this.queueManagedAdjustment(task.id, 5);
       }
       return true;
+      } finally {
+        credentialWrite.release();
+        lifetime.release();
+      }
     },
 
     addSecretMetadata(key: string, description: string, value: string, serverId: string) {
@@ -4346,7 +4654,7 @@ export const useOpsStore = defineStore("ops", {
       if (!normalized || !serverId || this.secretMetadata.some((item) => item.key === normalized && item.serverId === serverId)) return;
       this.secretMetadata.push({ key: normalized, description: description.trim() || "敏感变量", scope: "server", serverId });
       if (value) this.secretValues[secretValueId(serverId, normalized)] = value;
-      markTaskCredentialRevision(this.tasks, serverId);
+      markTaskCredentialRevision(this.tasks, serverId, this.secretMetadata);
       this.persist();
     },
 
@@ -4364,7 +4672,7 @@ export const useOpsStore = defineStore("ops", {
       secret.key = normalized;
       if (value) this.secretValues[nextId] = value;
       delete this.secretValues[oldId];
-      markTaskCredentialRevision(this.tasks, serverId);
+      markTaskCredentialRevision(this.tasks, serverId, this.secretMetadata);
       this.persist(true);
       return true;
     },
@@ -4379,7 +4687,7 @@ export const useOpsStore = defineStore("ops", {
       const removedKeys = new Set(removed.map((item) => item.key));
       this.secretMetadata = this.secretMetadata.filter((item) => item.serverId !== serverId || !removedKeys.has(item.key));
       removedKeys.forEach((removedKey) => delete this.secretValues[secretValueId(serverId, removedKey)]);
-      markTaskCredentialRevision(this.tasks, serverId);
+      markTaskCredentialRevision(this.tasks, serverId, this.secretMetadata);
       this.persist(true);
     },
 
@@ -4410,7 +4718,7 @@ export const useOpsStore = defineStore("ops", {
           : backend.deleteCredential("secret", id);
       }));
       [...new Set(this.secretMetadata.map((secret) => secret.serverId))]
-        .forEach((serverId) => markTaskCredentialRevision(this.tasks, serverId));
+        .forEach((serverId) => markTaskCredentialRevision(this.tasks, serverId, this.secretMetadata));
       this.persist(true);
     },
 

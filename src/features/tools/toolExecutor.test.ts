@@ -3,6 +3,111 @@ import { executeToolCall, parseToolCommand, parseUserInputArguments } from "@/fe
 import { resolveToolRegistry } from "@/features/tools/toolRegistry";
 
 describe("tool executor", () => {
+  const selectField = {
+    key: "target",
+    label: "目标目录",
+    description: "从已发现目录中选择需要继续检查的目标",
+    type: "select",
+    required: true,
+    options: [
+      { value: "/srv/app-a", label: "应用 A" },
+      { value: "/srv/app-b", label: "应用 B" },
+    ],
+  };
+
+  it("normalizes select forms without preselection or changing exact option strings", () => {
+    const options = [
+      { value: " /srv/app ", label: " 含空格的目录 " },
+      { value: "/srv/app", label: "普通目录" },
+    ];
+    const request = parseUserInputArguments({
+      title: "  选择检查目标  ", description: "  已发现两个目录  ",
+      fields: [{ ...selectField, placeholder: "请选择目标", options }],
+    });
+    expect(request.title).toBe("选择检查目标");
+    expect(request.description).toBe("已发现两个目录");
+    expect(request.fields[0]).toMatchObject({ type: "select", options, placeholder: "请选择目标" });
+    expect(request.fields[0]).not.toHaveProperty("value");
+    expect(request.fields[0]).not.toHaveProperty("default");
+    expect(request.fields[0]).not.toHaveProperty("credential");
+    expect(request.fields[0].options).not.toBe(options);
+    expect(parseUserInputArguments({ ...request })).toEqual(request);
+    expect(parseUserInputArguments(JSON.parse(JSON.stringify(request)))).toEqual(request);
+    expect(parseToolCommand(
+      `opsark-tool user.request_input ${JSON.stringify(request)}`, "select-restored",
+    )?.arguments).toEqual(request);
+  });
+
+  it.each([1, 100])("accepts %i known select candidates and an optional placeholder", (count) => {
+    const options = Array.from({ length: count }, (_, index) => ({ value: `target-${index}`, label: `目标 ${index}` }));
+    const request = parseUserInputArguments({ title: "选择目标", fields: [{ ...selectField, options }] });
+    expect(request.fields[0].options).toEqual(options);
+    expect(request.fields[0].placeholder).toBeUndefined();
+  });
+
+  it.each([
+    { name: "missing options", patch: { options: undefined } },
+    { name: "empty options", patch: { options: [] } },
+    { name: "non-array options", patch: { options: "target-a" } },
+    { name: "sparse options", patch: { options: Array(1) } },
+    { name: "too many options", patch: { options: Array.from({ length: 101 }, (_, index) => ({ value: String(index), label: String(index) })) } },
+    { name: "empty option value", patch: { options: [{ value: "", label: "目录" }] } },
+    { name: "blank option value", patch: { options: [{ value: " \t ", label: "目录" }] } },
+    { name: "non-string option value", patch: { options: [{ value: 1, label: "目录" }] } },
+    { name: "empty option label", patch: { options: [{ value: "/srv/app", label: "" }] } },
+    { name: "blank option label", patch: { options: [{ value: "/srv/app", label: " \t " }] } },
+    { name: "missing option label", patch: { options: [{ value: "/srv/app" }] } },
+    { name: "non-object option", patch: { options: ["/srv/app"] } },
+    { name: "duplicate exact option values", patch: { options: [{ value: "/srv/app", label: "A" }, { value: "/srv/app", label: "B" }] } },
+    { name: "options on text", patch: { type: "text" } },
+    { name: "options on password", patch: { type: "password" } },
+    { name: "options on number", patch: { type: "number" } },
+    { name: "sensitive select field", patch: { key: "API_TOKEN" } },
+    { name: "credential attached to select", patch: { credential: { group: "db", kind: "database", role: "username", target: "db.internal:3306" } } },
+    { name: "default on field", patch: { default: "/srv/app-a" } },
+    { name: "defaultValue on field", patch: { defaultValue: "/srv/app-a" } },
+    { name: "selectedValue on field", patch: { selectedValue: "/srv/app-a" } },
+    { name: "value on field", patch: { value: "/srv/app-a" } },
+    { name: "preselected option", patch: { options: [{ value: "/srv/app", label: "目录", selected: true }] } },
+    { name: "default option", patch: { options: [{ value: "/srv/app", label: "目录", default: true }] } },
+  ])("rejects invalid select arguments in direct and command parsing: $name", ({ patch }) => {
+    const request = { title: "选择目标", fields: [{ ...selectField, ...patch }] };
+    expect(() => parseUserInputArguments(request)).toThrow();
+    expect(() => parseToolCommand(
+      `opsark-tool user.request_input ${JSON.stringify(request)}`, "select-invalid",
+    )).toThrow();
+  });
+
+  it("rejects unexpected form and credential properties when called directly", () => {
+    expect(() => parseUserInputArguments({ title: "选择目标", fields: [selectField], default: "/srv/app-a" }))
+      .toThrow("不支持字段：default");
+    expect(() => parseUserInputArguments({ title: "选择目标", description: 3, fields: [selectField] }))
+      .toThrow("description 必须是字符串");
+    expect(() => parseUserInputArguments({ title: "输入凭据", fields: [{
+      key: "username", label: "账户", description: "连接数据库", type: "password", required: true,
+      credential: { group: "db", kind: "database", role: "username", target: "db.internal:3306", default: "root" },
+    }] })).toThrow("不支持字段：default");
+  });
+
+  it("routes select values as exact strings and rejects malformed forms before requesting input", async () => {
+    const request = parseUserInputArguments({
+      title: "选择操作目标", fields: [{ ...selectField, options: [{ value: "001", label: "实例 001" }] }],
+    });
+    const requestUserInput = vi.fn().mockResolvedValue({ title: request.title, values: { target: "001" } });
+    const result = await executeToolCall({
+      id: "select-valid", toolId: "user.request_input", arguments: { ...request },
+    }, resolveToolRegistry([]), { getRemoteFileStructure: vi.fn(), requestUserInput });
+    expect(requestUserInput).toHaveBeenCalledWith(request);
+    expect(result).toMatchObject({ success: true, data: { values: { target: "001" } } });
+    requestUserInput.mockClear();
+    const invalid = await executeToolCall({
+      id: "select-invalid", toolId: "user.request_input",
+      arguments: { title: "选择操作目标", fields: [{ ...selectField, options: [] }] },
+    }, resolveToolRegistry([]), { getRemoteFileStructure: vi.fn(), requestUserInput });
+    expect(invalid.success).toBe(false);
+    expect(requestUserInput).not.toHaveBeenCalled();
+  });
+
   it("locally protects an explicitly declared credential username without changing its binding", () => {
     const fields = [
       { key: "mysql_user", label: "用户名", description: "数据库账户", type: "text", required: true,
@@ -19,6 +124,19 @@ describe("tool executor", () => {
     fields[1].credential.target = "db.internal:3306";
     fields[0].required = false;
     expect(() => parseToolCommand(command(), "optional-credential")).toThrow("必填");
+  });
+  it("accepts the logged select + socket credential form without model repair and preserves path case", () => {
+    const fields = [
+      { key: "AUTH", label: "认证方式", description: "选择已确认方式", type: "select", required: true,
+        options: [{ value: "socket", label: "本机 socket" }] },
+      ...["username", "secret"].map(role => ({ key: role === "username" ? "DB_USER" : "DB_PASSWORD", label: role,
+        description: "凭据", type: "password", required: true,
+        credential: { group: "db", kind: "database", role, target: "/Run/My DB/mysql.sock" } })),
+    ];
+    const command = `opsark-tool user.request_input ${JSON.stringify({ title: "数据库认证", fields })}`;
+    const first = parseToolCommand(command, "socket")!;
+    expect(first.arguments.fields).toEqual(fields);
+    expect(parseToolCommand(`opsark-tool user.request_input ${JSON.stringify(first.arguments)}`, "again")!.arguments).toEqual(first.arguments);
   });
   it("reads task-scoped evidence pages and rejects task overrides", async () => {
     const evidenceId = "a".repeat(64);

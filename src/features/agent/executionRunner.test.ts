@@ -53,4 +53,25 @@ describe("execution runner", () => {
     expect(chunks.join("")).not.toContain("secret-value");
     expect(result.output).not.toContain("secret-value");
   });
+
+  it("force-redacts a referenced one-character secret without masking other numbers", async () => {
+    const executor = vi.fn(async () => ({
+      output: "pin=1 CPU=20 CentOS=10\n[exit: 0]",
+      success: true,
+      simulated: false,
+      exitCode: 0,
+    }));
+
+    const result = await executeStepCommand({
+      command: "check",
+      approvedHighRisk: false,
+      executionId: "exec-short",
+      secretValues: { PIN: "1", UNUSED_COUNT: "20" },
+      exactSecretKeys: ["PIN"],
+    }, executor);
+
+    expect(result.output).toContain("pin=••••••••");
+    expect(result.output).toContain("CPU=20");
+    expect(result.output).toContain("CentOS=••••••••0");
+  });
 });

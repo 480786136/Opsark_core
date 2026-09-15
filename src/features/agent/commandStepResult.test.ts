@@ -96,7 +96,7 @@ describe("command step result", () => {
       }],
     });
 
-    expect(step.validator).toMatchObject({ type: "service", command: "systemctl is-active app" });
+    expect(step.validator).toMatchObject({ type: "command", command: "systemctl is-active app" });
     expect(step.result?.observationStatus).toBe("healthy");
     expect(step.evidence?.[0].id).toBe("evidence-validation");
   });
