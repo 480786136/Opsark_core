@@ -16,13 +16,13 @@ import type { OpsTask, PlanStep, StepReview } from "@/types";
 
 export const LONG_RUNNING_REVIEW_INTERVAL_MS = 30_000;
 export const PROGRESSIVE_ADVISORY_INTERVAL_MS = 120_000;
+export const MAX_IDLE_ADVISORY_INTERVAL_MS = 600_000;
+export const MAX_RUNTIME_RETRY_INTERVAL_MS = 120_000;
 export const BOUNDED_COMMAND_HARD_LIMIT_SECONDS = 90;
 export const STALLED_REVIEW_NOTICE_ROUNDS = 2;
-export const PROGRESSIVE_MAX_STALLED_REVIEW_ROUNDS = 4;
 export const BOUNDED_MAX_CONTINUE_ROUNDS = 2;
-export const PROGRESSIVE_MAX_CONTINUE_ROUNDS = 4;
 
-export type LongRunningWorkload = "bounded" | "progressive";
+export type LongRunningWorkload = "bounded" | "progressive" | "persistent_service";
 
 export interface LongRunningMonitorState {
   decision?: StepReview;
@@ -31,12 +31,18 @@ export interface LongRunningMonitorState {
   workload: LongRunningWorkload;
   outputFingerprint: string;
   lastOutputChangeAt: string;
+  lastProgressAt: string;
+  lastRuntimeProgressAt?: string;
+  lastRuntimeSampleAt?: string;
+  noOutputSeconds: number;
   noProgressSeconds: number;
   noProgressReviewRounds: number;
   consecutiveContinueRounds: number;
   salientEvidence: string[];
   runtimeProgress?: AgentRuntimeProgress;
   runtimeIdleReviewRounds: number;
+  runtimeSamplingStatus: "unavailable" | "healthy" | "failed";
+  consecutiveRuntimeSampleFailures: number;
   modelReviewCount: number;
   skippedModelReviewCount: number;
 }
@@ -60,6 +66,8 @@ export interface StartLongRunningMonitorInput {
   requirement: string;
   validation: string;
   executionId: string;
+  /** Trusted caller-owned absolute deadline, fixed when monitoring starts. Never read from model output. */
+  executionDeadlineAt?: number;
   connection?: RuntimeConnection;
   runtimeModel?: RuntimeModel;
   secretValues: Record<string, string>;
@@ -107,7 +115,8 @@ const PROGRESSIVE_COMMAND_PATTERNS = [
 
 /** Long downloads/builds are allowed to run while their observable output changes. */
 export function classifyLongRunningWorkload(step: Pick<PlanStep, "title" | "description" | "command" | "runtimeClass">): LongRunningWorkload {
-  if (step.runtimeClass === "progressive" || step.runtimeClass === "persistent_service") return "progressive";
+  if (step.runtimeClass === "persistent_service") return "persistent_service";
+  if (step.runtimeClass === "progressive") return "progressive";
   const command = step.command.toLocaleLowerCase();
   return PROGRESSIVE_COMMAND_PATTERNS.some((pattern) => pattern.test(command))
     ? "progressive"
@@ -147,11 +156,15 @@ export function startLongRunningMonitor(
     workload: classifyLongRunningWorkload(input.step),
     outputFingerprint: semanticLongRunningOutputFingerprint(input.getStreamedOutput()),
     lastOutputChangeAt: new Date(scheduler.now()).toISOString(),
+    lastProgressAt: new Date(scheduler.now()).toISOString(),
+    noOutputSeconds: 0,
     noProgressSeconds: 0,
     noProgressReviewRounds: 0,
     consecutiveContinueRounds: 0,
     salientEvidence: mergeLongRunningSalientEvidence([], input.getStreamedOutput()),
     runtimeIdleReviewRounds: 0,
+    runtimeSamplingStatus: "unavailable",
+    consecutiveRuntimeSampleFailures: 0,
     modelReviewCount: 0,
     skippedModelReviewCount: 0,
   };
@@ -162,11 +175,20 @@ export function startLongRunningMonitor(
   let interruptionRequested = false;
   let lastReviewFingerprint = state.outputFingerprint;
   let lastOutputChangeAt = scheduler.now();
+  let lastProgressAt = scheduler.now();
+  let nextRuntimeSampleAt = scheduler.now();
+  let lastMonitoringNotice: "idle" | "failed" | undefined;
   let outputReviewCursor = initialLongRunningOutputCursor();
   const parsedStartedAt = input.step.startedAt
     ? new Date(input.step.startedAt).getTime()
     : scheduler.now();
   const startedAt = Number.isFinite(parsedStartedAt) ? parsedStartedAt : scheduler.now();
+  const callerDeadline = Number.isFinite(input.executionDeadlineAt) ? input.executionDeadlineAt : undefined;
+  // Preserve the existing bounded-command policy; progressive/service commands
+  // only have a hard deadline when the execution owner explicitly supplies one.
+  const executionDeadlineAt = state.workload === "bounded"
+    ? Math.min(callerDeadline ?? Infinity, startedAt + BOUNDED_COMMAND_HARD_LIMIT_SECONDS * 1000)
+    : callerDeadline;
   let lastModelReviewAt = startedAt;
   let lastModelReviewedOutput = "";
 
@@ -174,9 +196,15 @@ export function startLongRunningMonitor(
     0,
     Math.floor((scheduler.now() - startedAt) / 1000),
   );
-  const maxContinueRounds = state.workload === "progressive"
-    ? PROGRESSIVE_MAX_CONTINUE_ROUNDS
-    : BOUNDED_MAX_CONTINUE_ROUNDS;
+  const maxContinueRounds = state.workload === "bounded" ? BOUNDED_MAX_CONTINUE_ROUNDS : undefined;
+  const markProgress = () => {
+    lastProgressAt = scheduler.now();
+    state.lastProgressAt = new Date(lastProgressAt).toISOString();
+    state.noProgressSeconds = 0;
+    state.noProgressReviewRounds = 0;
+    state.consecutiveContinueRounds = 0;
+    lastMonitoringNotice = undefined;
+  };
   const stopForAdjustment = async (review: StepReview, message: string) => {
     if (interruptionRequested || stopped || input.isCancelled()) return;
     interruptionRequested = true;
@@ -205,10 +233,10 @@ export function startLongRunningMonitor(
       state.outputFingerprint = currentFingerprint;
       lastOutputChangeAt = scheduler.now();
       state.lastOutputChangeAt = new Date(lastOutputChangeAt).toISOString();
-      state.noProgressSeconds = 0;
-    } else {
-      state.noProgressSeconds = Math.max(0, Math.floor((scheduler.now() - lastOutputChangeAt) / 1000));
+      markProgress();
     }
+    state.noOutputSeconds = Math.max(0, Math.floor((scheduler.now() - lastOutputChangeAt) / 1000));
+    state.noProgressSeconds = Math.max(0, Math.floor((scheduler.now() - lastProgressAt) / 1000));
     const hasStreamedOutput = currentOutput.trim().length > 0;
     const progressMessage = elapsed >= 10
       ? `远程命令仍在运行（${elapsed} 秒），系统正在等待真实退出，完成后才会进行后置校验${hasStreamedOutput ? "" : "；暂未收到实时输出，可能正在等待网络或输出被管道缓冲"}`
@@ -224,13 +252,13 @@ export function startLongRunningMonitor(
 
     const reviewRound = Math.floor(elapsed * 1000 / LONG_RUNNING_REVIEW_INTERVAL_MS);
     if (
-      state.workload === "bounded"
-      && elapsed >= BOUNDED_COMMAND_HARD_LIMIT_SECONDS
+      executionDeadlineAt !== undefined
+      && scheduler.now() >= executionDeadlineAt
       && !interruptionRequested
     ) {
       const review = ruleAdjustment(
-        `普通命令超过 ${BOUNDED_COMMAND_HARD_LIMIT_SECONDS} 秒仍未返回真实退出标记`,
-        "当前命令疑似卡住，已停止等待；该步骤不会被判定为成功，将根据已保留证据生成调整计划。",
+        `当前命令已达到执行截止时间 ${new Date(executionDeadlineAt).toISOString()}，仍未返回真实退出标记`,
+        "当前命令已达到执行期限，已停止等待；该步骤不会被判定为成功，将根据已保留证据生成调整计划。",
       );
       void stopForAdjustment(review, review.summary);
       return;
@@ -239,15 +267,18 @@ export function startLongRunningMonitor(
     lastReviewRound = reviewRound;
     state.reviewRound = reviewRound;
     const outputChangedSinceLastReview = currentFingerprint !== lastReviewFingerprint;
-    state.noProgressReviewRounds = outputChangedSinceLastReview
-      ? 0
-      : state.noProgressReviewRounds + 1;
-    if (outputChangedSinceLastReview) state.consecutiveContinueRounds = 0;
+    if (outputChangedSinceLastReview) markProgress();
     lastReviewFingerprint = currentFingerprint;
     reviewInFlight = true;
     const priorRuntimeIoBytes = state.runtimeProgress?.ioBytes;
-    const sample = input.sampleRuntimeProgress
-      ? input.sampleRuntimeProgress().catch((error) => {
+    const samplingAttempted = Boolean(input.sampleRuntimeProgress) && scheduler.now() >= nextRuntimeSampleAt;
+    const sample = samplingAttempted
+      ? Promise.resolve().then(() => input.sampleRuntimeProgress!()).catch((error) => {
+          if (stopped || input.isCancelled() || interruptionRequested) return undefined;
+          state.runtimeSamplingStatus = "failed";
+          state.consecutiveRuntimeSampleFailures += 1;
+          nextRuntimeSampleAt = scheduler.now() + Math.min(MAX_RUNTIME_RETRY_INTERVAL_MS,
+            LONG_RUNNING_REVIEW_INTERVAL_MS * 2 ** Math.min(state.consecutiveRuntimeSampleFailures - 1, 2));
           input.onError("长任务运行态采样失败", String(error));
           return undefined;
         })
@@ -259,12 +290,25 @@ export function startLongRunningMonitor(
         && runtimeProgress.ioBytes > priorRuntimeIoBytes;
       if (runtimeProgress) {
         state.runtimeProgress = runtimeProgress;
+        state.runtimeSamplingStatus = "healthy";
+        state.lastRuntimeSampleAt = new Date(scheduler.now()).toISOString();
+        state.consecutiveRuntimeSampleFailures = 0;
+        nextRuntimeSampleAt = scheduler.now() + LONG_RUNNING_REVIEW_INTERVAL_MS;
+        // A live process tree is liveness evidence, not progress evidence. A
+        // blocked network client commonly keeps parent/child processes alive
+        // while doing no CPU or I/O work, which previously kept this counter at
+        // zero forever and caused a model review every 30 seconds.
         const runtimeActivity = runtimeProgress.active && (
           runtimeProgress.cpuPercent >= 0.1
-          || runtimeProgress.processCount > 1
           || runtimeIoChanged
         );
         state.runtimeIdleReviewRounds = runtimeActivity ? 0 : state.runtimeIdleReviewRounds + 1;
+        if (runtimeActivity) {
+          state.lastRuntimeProgressAt = new Date(scheduler.now()).toISOString();
+          markProgress();
+        }
+        // A service may hand off to a supervisor outside this process group.
+        // Its readiness/ownership validator must decide success after exit.
         if (state.workload === "progressive" && !runtimeProgress.active) {
           const review = ruleAdjustment(
             "远程 executionId 对应的进程组已不存在，但执行通道尚未返回真实退出码",
@@ -273,25 +317,44 @@ export function startLongRunningMonitor(
           await stopForAdjustment(review, review.summary);
           return;
         }
-        if (state.workload === "progressive"
-          && state.runtimeIdleReviewRounds >= PROGRESSIVE_MAX_STALLED_REVIEW_ROUNDS
-          && state.noProgressReviewRounds >= PROGRESSIVE_MAX_STALLED_REVIEW_ROUNDS) {
-          const review = ruleAdjustment(
-            `长任务连续 ${state.runtimeIdleReviewRounds} 轮无文本、CPU、I/O 或子进程活动`,
-            "下载、构建或安装过程的文本与运行态证据均连续无变化，当前进程疑似卡住；已中断并进入调整。",
-          );
-          await stopForAdjustment(review, review.summary);
-          return;
-        }
+      } else {
+        // Unknown monitoring state is not an idle sample and cannot extend an
+        // old sequence of confirmed idle observations.
+        state.runtimeIdleReviewRounds = 0;
       }
       const newOutput = currentOutput.startsWith(lastModelReviewedOutput)
         ? currentOutput.slice(lastModelReviewedOutput.length) : currentOutput;
-      const measuredProgress = state.workload === "progressive"
-        && runtimeProgress?.active === true
+      const measuredProgress = runtimeProgress?.active === true
         && (runtimeProgress.cpuPercent >= 0.1 || runtimeIoChanged);
+      state.noProgressReviewRounds = outputChangedSinceLastReview || measuredProgress
+        ? 0
+        : (runtimeProgress || state.workload === "bounded" ? state.noProgressReviewRounds + 1 : 0);
+      const monitoringNotice = state.runtimeSamplingStatus === "failed" ? "failed"
+        : state.noProgressReviewRounds >= STALLED_REVIEW_NOTICE_ROUNDS ? "idle" : undefined;
+      if (state.workload !== "bounded" && monitoringNotice && monitoringNotice !== lastMonitoringNotice) {
+        lastMonitoringNotice = monitoringNotice;
+        input.onEvent("system", monitoringNotice === "failed"
+          ? "运行态采样失败，正在退避重试；监控证据缺失不代表业务失败，执行期限保持不变。"
+          : "暂未观察到新的文本、CPU 或 I/O 进展，已降低重复模型复核频率；继续监控并遵守既定执行期限。");
+      }
+      const advisoryInterval = Math.min(MAX_IDLE_ADVISORY_INTERVAL_MS,
+        PROGRESSIVE_ADVISORY_INTERVAL_MS * 2 ** Math.min(Math.max(state.consecutiveContinueRounds - 1, 0), 3));
+      const repeatedIdleAdvisory = state.workload !== "bounded"
+        && state.modelReviewCount > 0
+        && !outputChangedSinceLastReview
+        && !measuredProgress
+        && !hasCriticalLongRunningEvidence(newOutput)
+        && scheduler.now() - lastModelReviewAt < advisoryInterval;
+      if (repeatedIdleAdvisory) {
+        // The semantic input is unchanged. Keep deterministic runtime sampling
+        // active, but do not pay for the same model decision every 30 seconds.
+        state.skippedModelReviewCount += 1;
+        reviewInFlight = false;
+        return;
+      }
       // Process existence alone is insufficient. Keep sampling and retain a
       // periodic advisory decision even for busy processes to detect bad work.
-      if (measuredProgress && !hasCriticalLongRunningEvidence(newOutput)
+      if (state.workload !== "bounded" && measuredProgress && !hasCriticalLongRunningEvidence(newOutput)
         && scheduler.now() - lastModelReviewAt < PROGRESSIVE_ADVISORY_INTERVAL_MS) {
         state.skippedModelReviewCount += 1;
         return;
@@ -301,22 +364,30 @@ export function startLongRunningMonitor(
         outputFingerprint: state.outputFingerprint,
         outputChangedSinceLastReview,
         lastOutputChangeAt: state.lastOutputChangeAt,
+        lastProgressAt: state.lastProgressAt,
+        lastRuntimeProgressAt: state.lastRuntimeProgressAt,
+        lastRuntimeSampleAt: state.lastRuntimeSampleAt,
+        noOutputSeconds: state.noOutputSeconds,
         noProgressSeconds: state.noProgressSeconds,
         noProgressReviewRounds: state.noProgressReviewRounds,
         consecutiveContinueRounds: state.consecutiveContinueRounds,
         maxConsecutiveContinueRounds: maxContinueRounds,
-        hardLimitSeconds: state.workload === "bounded" ? BOUNDED_COMMAND_HARD_LIMIT_SECONDS : undefined,
+        hardLimitSeconds: executionDeadlineAt === undefined ? undefined : Math.max(0, (executionDeadlineAt - startedAt) / 1000),
+        executionDeadlineAt: executionDeadlineAt === undefined ? undefined : new Date(executionDeadlineAt).toISOString(),
         runtimeActive: runtimeProgress?.active,
         runtimeProcessCount: runtimeProgress?.processCount,
         runtimeCpuPercent: runtimeProgress?.cpuPercent,
         runtimeIoBytes: runtimeProgress?.ioBytes,
         runtimeIoChanged,
         runtimeIdleReviewRounds: state.runtimeIdleReviewRounds,
-        stalledNotice: state.noProgressReviewRounds >= STALLED_REVIEW_NOTICE_ROUNDS
-          ? state.workload === "progressive"
-            ? "文本输出暂时沉默；必须同时参考 executionId 进程组的 CPU、I/O、子进程和存活证据，不得仅凭无日志返回 adjust。"
-            : `已连续 ${state.noProgressSeconds} 秒无进展；若没有能够证明任务仍在推进的证据，应返回 adjust。`
-          : undefined,
+        runtimeSamplingStatus: state.runtimeSamplingStatus,
+        consecutiveRuntimeSampleFailures: state.consecutiveRuntimeSampleFailures,
+        advisoryIntervalMs: advisoryInterval,
+        stalledNotice: state.workload !== "bounded"
+          ? "文本沉默、CPU/I/O 空闲或采样失败均不能单独证明业务失败；没有明确错误证据或执行期限时仅建议继续观察，不得据此中断进程。常驻服务空闲可能是正常状态。"
+          : state.noProgressReviewRounds >= STALLED_REVIEW_NOTICE_ROUNDS
+            ? `已连续 ${state.noProgressSeconds} 秒无进展；若没有能够证明任务仍在推进的证据，应返回 adjust。`
+            : undefined,
       };
       const observation = {
         passed: false,
@@ -348,11 +419,12 @@ export function startLongRunningMonitor(
       if (stopped || input.isCancelled() || interruptionRequested) return;
       outputReviewCursor = nextOutputReviewCursor;
       lastModelReviewedOutput = currentOutput;
-      const runtimeShowsProgress = state.workload === "progressive"
-        && runtimeProgress?.active === true
-        && (runtimeProgress.cpuPercent >= 0.1 || runtimeProgress.processCount > 1 || runtimeIoChanged);
+      // An advisory cannot turn missing/idle telemetry into a hard timeout.
+      // A concrete error in the current output is still actionable immediately.
+      const hasAdjustmentEvidence = state.workload === "bounded"
+        || hasCriticalLongRunningEvidence(newOutput);
       const acceptedDecision = acceptsLongRunningDecision(modelDecision, false)
-        && !(modelDecision.decision === "adjust" && runtimeShowsProgress);
+        && (modelDecision.decision !== "adjust" || hasAdjustmentEvidence);
       input.onAudit({ round: reviewRound, context, modelDecision, acceptedDecision });
       if (acceptedDecision && modelDecision.decision === "adjust") {
         await stopForAdjustment(
@@ -363,11 +435,10 @@ export function startLongRunningMonitor(
       }
       if (acceptedDecision && modelDecision.decision === "continue") {
         state.decision = modelDecision;
-        state.consecutiveContinueRounds = outputChangedSinceLastReview
+        state.consecutiveContinueRounds = outputChangedSinceLastReview || measuredProgress
           ? 0
           : state.consecutiveContinueRounds + 1;
-        if (state.workload === "bounded"
-          && state.consecutiveContinueRounds >= maxContinueRounds
+        if (maxContinueRounds !== undefined && state.consecutiveContinueRounds >= maxContinueRounds
           && state.noProgressReviewRounds > 0) {
           const review = ruleAdjustment(
             `模型已连续 ${state.consecutiveContinueRounds} 轮建议等待，但期间没有足够的输出进展`,

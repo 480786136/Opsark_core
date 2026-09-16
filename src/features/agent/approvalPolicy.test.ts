@@ -26,6 +26,13 @@ describe("approval policy", () => {
     expect(requiresStepApproval("managed", step("low", "rm -rf /tmp/example"))).toBe(true);
   });
 
+  it.each(["observe", "safe", "managed"] as const)("requires concrete-action reapproval in %s without inflating risk", permission => {
+    const pending = { ...step("low", "mkdir -p /var/backups/app"),
+      protocolReplanApproval: { inputFingerprint: "confirmed-1", decisionSummary: "不授权系统变更" } };
+    expect(requiresStepApproval(permission, pending)).toBe(true);
+    expect(pending.risk).toBe("low");
+  });
+
   it("migrates the removed automatic mode to safe mode", () => {
     expect(normalizePermissionLevel("autonomous")).toBe("safe");
     expect(normalizePermissionLevel("managed")).toBe("managed");

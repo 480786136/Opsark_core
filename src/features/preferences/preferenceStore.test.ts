@@ -12,6 +12,14 @@ describe("preferenceStore", () => {
     document.documentElement.removeAttribute("data-accent");
     document.documentElement.removeAttribute("data-surface");
     document.documentElement.removeAttribute("data-terminal-theme");
+    document.documentElement.style.removeProperty("color-scheme");
+    let themeColor = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+    if (!themeColor) {
+      themeColor = document.createElement("meta");
+      themeColor.name = "theme-color";
+      document.head.append(themeColor);
+    }
+    themeColor.content = "#0b0d10";
     setActivePinia(createPinia());
   });
 
@@ -81,5 +89,20 @@ describe("preferenceStore", () => {
     expect(saved.accentTheme).toBeUndefined();
     expect(saved.surfaceTheme).toBeUndefined();
     expect(saved.terminalColorTheme).toBeUndefined();
+    expect(document.documentElement.style.colorScheme).toBe("light");
+    expect(document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.content).toContain("#f3f5f7");
+  });
+
+  it("同步浏览器颜色模式与桌面窗口主题色", () => {
+    const preferences = usePreferenceStore();
+    preferences.hydrate();
+
+    preferences.setSystemTheme("mist");
+    expect(document.documentElement.style.colorScheme).toBe("light");
+    expect(document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.content).toContain("#edf4f3");
+
+    preferences.setSystemTheme("midnight");
+    expect(document.documentElement.style.colorScheme).toBe("dark");
+    expect(document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.content).toContain("#07111c");
   });
 });

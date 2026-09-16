@@ -68,6 +68,8 @@ describe("review coordination", () => {
 
   it("skips remaining work when failed-command review completes the goal", () => {
     const step = createStep("failed", "failed");
+    step.kind = "observe";
+    step.title = "检查服务状态";
     const remaining = [createStep("remaining-1", "pending"), createStep("remaining-2", "pending")];
     const outcome = applyCommandFailureReview(step, remaining, review("complete"));
 
@@ -78,10 +80,58 @@ describe("review coordination", () => {
 
   it("keeps remaining work pending after a continue decision", () => {
     const step = createStep("failed", "failed");
+    step.kind = "observe";
+    step.title = "检查服务状态";
     const remaining = [createStep("remaining", "pending")];
     const outcome = applyCommandFailureReview(step, remaining, review("continue"));
 
     expect(outcome.shouldAdvance).toBe(true);
+    expect(remaining[0].status).toBe("pending");
+  });
+
+  it("does not let a failed change skip unrelated remaining work", () => {
+    const failed = createStep("pull-images", "failed");
+    failed.kind = "change";
+    failed.command = "kubeadm config images pull --kubernetes-version=v1.28.2";
+    failed.result = {
+      executionStatus: "failed",
+      observationStatus: "unhealthy",
+      facts: { category: "network_failure", networkFailure: true },
+      warnings: [],
+      evidenceIds: [],
+    };
+    const remaining = [createStep("deploy-flannel", "pending")];
+    remaining[0].kind = "change";
+    remaining[0].title = "部署 Flannel 网络";
+    remaining[0].command = "kubectl apply -f /root/kube-flannel.yml";
+
+    const outcome = applyCommandFailureReview(failed, remaining, review("complete"));
+
+    expect(outcome).toMatchObject({ taskStatus: "needs_adjustment", shouldAdvance: false });
+    expect(failed.review).toMatchObject({ decision: "adjust", source: "rules" });
+    expect(remaining[0].status).toBe("pending");
+  });
+
+  it("does not continue a failed change without a strictly related recovery step", () => {
+    const failed = createStep("pull-images", "failed");
+    failed.kind = "change";
+    failed.command = "kubeadm config images pull --kubernetes-version=v1.28.2";
+    failed.result = {
+      executionStatus: "failed",
+      observationStatus: "unhealthy",
+      facts: { category: "network_failure" },
+      warnings: [],
+      evidenceIds: [],
+    };
+    const remaining = [createStep("init-control-plane", "pending")];
+    remaining[0].kind = "change";
+    remaining[0].title = "配置并部署 Kubernetes";
+    remaining[0].command = "kubeadm init --config /root/kubeadm.yaml";
+
+    const outcome = applyCommandFailureReview(failed, remaining, review("continue"));
+
+    expect(outcome).toMatchObject({ taskStatus: "needs_adjustment", shouldAdvance: false });
+    expect(failed.review).toMatchObject({ decision: "adjust", source: "rules" });
     expect(remaining[0].status).toBe("pending");
   });
 

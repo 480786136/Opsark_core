@@ -116,7 +116,7 @@ function closeAgentTerminal(taskId: string) {
             <Bot :size="13" :class="['terminal-agent-mark', { running: isAgentBusy(task.id) }]" />
             <span>Agent · {{ task.title }}</span>
           </button>
-          <button type="button" class="terminal-tab-close" title="关闭 Agent 终端" @click.stop="closeAgentTerminal(task.id)"><X :size="12" /></button>
+          <button type="button" class="terminal-tab-close" :title="t('terminal.closeAgentTerminal')" @click.stop="closeAgentTerminal(task.id)"><X :size="12" /></button>
         </div>
       </div>
       <button type="button" class="terminal-add-tab" :title="t('terminal.newTab')" @click="addTerminal"><Plus :size="15" /></button>

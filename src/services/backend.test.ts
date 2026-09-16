@@ -356,7 +356,7 @@ describe("plan normalization repair feedback", () => {
     const withShell = { ...repair, previousModelOutput: [original, { ...malformedStep, command: "pwd" }] };
     expect(() => assertPlanRepairScope(withShell, [repaired, { ...malformedStep, command: "whoami" }])).toThrow("无关命令");
   });
-  it("manual protocol retry invokes only the saved repair and keeps both errors on failure", async () => {
+  it("upgrades a legacy tool repair from the original validator and still rejects business edits", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
     const repair = buildPlanNormalizationRepair(new Error("第 1 个计划步骤的工具参数无效：格式错误"), [malformedStep]);
     vi.mocked(invoke).mockResolvedValue([{ ...malformedStep, description: "重写业务" }]);
@@ -366,8 +366,10 @@ describe("plan normalization repair feedback", () => {
         context: JSON.stringify({ planGenerationRepair: repair }) });
     } catch (caught) { error = caught; }
     expect(error).toBeInstanceOf(PlanProtocolError);
-    expect((error as PlanProtocolError).repair).toEqual(repair);
-    expect((error as Error).message).toContain("格式错误");
+    expect((error as PlanProtocolError).repair.previousModelOutput).toEqual(repair.previousModelOutput);
+    expect((error as PlanProtocolError).repair.diagnostic).toMatchObject({ code: "TOOL_ARGUMENT_INVALID",
+      fieldPath: "steps[0].command.arguments.title" });
+    expect((error as PlanProtocolError).repair.progress?.attemptCount).toBe(1);
     expect((error as Error).message).toContain("description");
     expect(invoke).toHaveBeenCalledOnce();
     expect(invoke).toHaveBeenCalledWith("generate_ai_plan", expect.objectContaining({ requirement: expect.stringContaining("只修复") }));
@@ -401,5 +403,39 @@ describe("plan normalization repair feedback", () => {
     });
     expect(repair.instruction).toContain("只修复");
     expect(repair.instruction).toContain("业务目的");
+  });
+});
+
+describe("disk log queries", () => {
+  it("keeps browser mode on the in-memory log fallback", async () => {
+    await expect(backend.queryTaskLogs({ stream: "developer-events", limit: 50 })).resolves.toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("passes the complete query envelope to the desktop command", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    const result = {
+      items: [{ id: "dev-1" }],
+      nextCursor: "cursor-2",
+      hasMore: true,
+      total: 201,
+      malformedLines: 2,
+      oversizedLines: 1,
+    };
+    vi.mocked(invoke).mockResolvedValueOnce(result);
+    const query = {
+      stream: "developer-events" as const,
+      taskId: "task-1",
+      serverId: "server-1",
+      operation: "model_call",
+      event: "request_failed",
+      level: "error",
+      search: "timeout",
+      cursor: "cursor-1",
+      limit: 100,
+    };
+
+    await expect(backend.queryTaskLogs(query)).resolves.toEqual(result);
+    expect(invoke).toHaveBeenCalledWith("query_task_logs", { query });
   });
 });

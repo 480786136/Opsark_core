@@ -1,0 +1,13 @@
+[
+  {"name":"ordinary observe cannot hide mutation","step":{"id":"next","kind":"observe","command":"mktemp -d"},"code":"OBSERVE_COMMAND_MUTATION","field":"command"},
+  {"name":"historical observe is not reclassified","step":{"id":"next","status":"completed","kind":"observe","command":"mktemp -d"},"code":null,"field":null},
+  {"name":"legal diagnosis","step":{"id":"next","kind":"observe","command":"uname -a","recovery":{"failedStepId":"failed","targetContext":"original","purpose":"diagnose"}},"code":null,"field":null},
+  {"name":"legal repair","step":{"id":"next","kind":"change","command":"touch /tmp/x","recovery":{"failedStepId":"failed","targetContext":"original","purpose":"repair"}},"code":null,"field":null},
+  {"name":"legal verify","step":{"id":"next","kind":"observe","command":"test -f /tmp/x","recovery":{"failedStepId":"failed","targetContext":"original","purpose":"verify"}},"code":null,"field":null},
+  {"name":"missing reference","step":{"id":"next","kind":"observe","command":"true","recovery":{"targetContext":"original","purpose":"diagnose"}},"code":"RECOVERY_INVALID_METADATA","field":"recovery"},
+  {"name":"unknown metadata","step":{"id":"next","kind":"observe","command":"true","recovery":{"failedStepId":"failed","targetContext":"original","purpose":"diagnose","bypass":true}},"code":"RECOVERY_INVALID_METADATA","field":"recovery"},
+  {"name":"self reference","step":{"id":"next","kind":"observe","command":"true","recovery":{"failedStepId":"next","targetContext":"original","purpose":"diagnose"}},"code":"RECOVERY_INVALID_METADATA","field":"recovery"},
+  {"name":"wrong purpose kind","step":{"id":"next","kind":"observe","command":"rm /tmp/x","recovery":{"failedStepId":"failed","targetContext":"original","purpose":"repair"}},"code":"RECOVERY_KIND_MISMATCH","field":"kind"},
+  {"name":"unsupported purpose","step":{"id":"next","kind":"observe","command":"true","recovery":{"failedStepId":"failed","targetContext":"original","purpose":"ignore"}},"code":"RECOVERY_INVALID_METADATA","field":"recovery"},
+  {"name":"wrong version","step":{"id":"next","kind":"observe","command":"true","recoveryRuleVersion":999,"recovery":{"failedStepId":"failed","targetContext":"original","purpose":"diagnose"}},"code":"RECOVERY_RULE_VERSION_MISMATCH","field":"recoveryRuleVersion"}
+]

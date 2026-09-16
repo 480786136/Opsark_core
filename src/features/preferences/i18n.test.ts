@@ -8,6 +8,16 @@ function collectLeafKeys(value: object, prefix = ""): string[] {
   });
 }
 
+function leafValue(value: object, key: string) {
+  return key.split(".").reduce<unknown>((current, segment) => (
+    current as Record<string, unknown>
+  )[segment], value);
+}
+
+function placeholders(value: unknown) {
+  return [...String(value).matchAll(/\{([^{}]+)\}/g)].map((match) => match[1]).sort();
+}
+
 describe("i18n resources", () => {
   it("中英文资源拥有相同且非空的叶子键", () => {
     const zhKeys = collectLeafKeys(messages["zh-CN"]).sort();
@@ -20,6 +30,14 @@ describe("i18n resources", () => {
       const en = segments.reduce<unknown>((value, segment) => (value as Record<string, unknown>)[segment], messages["en-US"]);
       expect(String(zh).trim()).not.toBe("");
       expect(String(en).trim()).not.toBe("");
+    }
+  });
+
+  it("中英文资源的插值参数完全一致", () => {
+    for (const key of collectLeafKeys(messages["zh-CN"])) {
+      expect(placeholders(leafValue(messages["en-US"], key)), key).toEqual(
+        placeholders(leafValue(messages["zh-CN"], key)),
+      );
     }
   });
 

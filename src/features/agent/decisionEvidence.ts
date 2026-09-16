@@ -1,5 +1,6 @@
 import type { ExecutionEvidence } from "@/types";
 import { compactReviewText, textFingerprint } from "./longRunningReviewOutput";
+import { compactReviewOutput } from "./reviewPayload";
 
 export const SHORT_DECISION_OUTPUT_LIMIT = 2_048;
 export const DECISION_OUTPUT_BUDGET = 12_000;
@@ -22,13 +23,25 @@ export function decisionOutput(
   const safe = redactDecisionText(value);
   const available = Math.max(0, limit);
   const complete = safe.length <= available;
+  let content = available ? (complete ? safe : compactReviewText(safe, available)) : undefined;
+  if (!complete && available >= 256) {
+    // Keep critical middle lines inside the same body/budget; duplicating them
+    // in a separate salientLines array used to bypass the global output budget.
+    const salient = compactReviewOutput(safe, available, Math.min(800, Math.floor(available / 3)))
+      ?.salientLines?.filter(line => !content?.includes(line));
+    if (salient?.length) {
+      const appendix = compactReviewText(salient.join("\n"), Math.min(800, Math.floor(available / 3)));
+      const separator = "\n[关键证据行]\n";
+      content = `${compactReviewText(safe, available - appendix.length - separator.length)}${separator}${appendix}`;
+    }
+  }
   const references = evidence.filter(item => item.archive
     && item.archive.fingerprint === textFingerprint(item.rawOutput)).map(item => ({
     source: item.source, sourceEvidenceId: item.id, ...item.archive,
     readTool: allowArchive ? "evidence.read" : undefined,
   }));
   return {
-    content: available ? (complete ? safe : compactReviewText(safe, available)) : undefined,
+    content,
     contentState: complete ? "complete" as const : available ? "excerpt" as const : "omitted" as const,
     totalCharacters: safe.length,
     omittedCharacters: Math.max(0, safe.length - available),

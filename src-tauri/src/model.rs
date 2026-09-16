@@ -143,6 +143,11 @@ pub(crate) async fn post_model_request(
             }
         };
         let status = response.status();
+        let upstream_request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -175,6 +180,7 @@ pub(crate) async fn post_model_request(
                         "contentType": &content_type,
                         "contentEncoding": &content_encoding,
                         "contentLength": content_length,
+                        "upstreamRequestId": &upstream_request_id,
                         "error": &last_retryable_error,
                     }),
                     &log_context,
@@ -205,6 +211,7 @@ pub(crate) async fn post_model_request(
                         "contentType": &content_type,
                         "contentEncoding": &content_encoding,
                         "contentLength": content_length,
+                        "upstreamRequestId": &upstream_request_id,
                         "responseText": String::from_utf8_lossy(&response_bytes),
                         "error": &last_retryable_error,
                     }),
@@ -231,6 +238,7 @@ pub(crate) async fn post_model_request(
                 "contentType": &content_type,
                 "contentEncoding": &content_encoding,
                 "contentLength": content_length,
+                "upstreamRequestId": &upstream_request_id,
                 "response": &payload,
             }),
             &log_context,

@@ -14,6 +14,8 @@ import {
 import type { OpsTask, PlanStep } from "@/types";
 import { modelLogContext } from "./modelLogContext";
 import { authenticationContext } from "./authenticationEvidence";
+import { confirmedUserInputsContext } from "./confirmedUserInputs";
+import { isUserInputStep, modelContextStep } from "./executionContextEvidence";
 
 const REVIEW_HISTORY_STEP_LIMIT = 6;
 const REVIEW_REMAINING_STEP_LIMIT = 6;
@@ -25,15 +27,20 @@ interface PeriodicObservation {
 }
 
 export interface LongRunningProgressStatus {
-  workload: "bounded" | "progressive";
+  workload: "bounded" | "progressive" | "persistent_service";
   outputFingerprint: string;
   outputChangedSinceLastReview: boolean;
   lastOutputChangeAt: string;
+  lastProgressAt?: string;
+  lastRuntimeProgressAt?: string;
+  lastRuntimeSampleAt?: string;
+  noOutputSeconds?: number;
   noProgressSeconds: number;
   noProgressReviewRounds: number;
   consecutiveContinueRounds: number;
-  maxConsecutiveContinueRounds: number;
+  maxConsecutiveContinueRounds?: number;
   hardLimitSeconds?: number;
+  executionDeadlineAt?: string;
   stalledNotice?: string;
   runtimeActive?: boolean;
   runtimeProcessCount?: number;
@@ -41,14 +48,18 @@ export interface LongRunningProgressStatus {
   runtimeIoBytes?: number;
   runtimeIoChanged?: boolean;
   runtimeIdleReviewRounds?: number;
+  runtimeSamplingStatus?: "unavailable" | "healthy" | "failed";
+  consecutiveRuntimeSampleFailures?: number;
+  advisoryIntervalMs?: number;
 }
 
 function taskSnapshot(task: OpsTask) {
-  return { _log: modelLogContext(task), title: task.title, permission: task.permission, status: task.status };
+  return { _log: modelLogContext(task), title: task.title, rootGoal: task.rootGoal ?? task.title,
+    permission: task.permission, status: task.status };
 }
 
 function planSnapshot(step: PlanStep) {
-  return compactReviewPlanStep(step);
+  return compactReviewPlanStep(modelContextStep(step));
 }
 
 function plannedStepSnapshot(step: PlanStep) {
@@ -57,6 +68,7 @@ function plannedStepSnapshot(step: PlanStep) {
 }
 
 function historySnapshot(step: PlanStep) {
+  step = modelContextStep(step);
   return {
     ...compactReviewPlanStep(step, { commandLimit: 420, validationLimit: 320 }),
     result: compactReviewResult(step.result, 1_200),
@@ -84,6 +96,8 @@ export function buildPreconditionReviewContext(
   const stepIndex = task.plan.indexOf(currentStep);
   const history = task.plan.slice(0, stepIndex).map((step) => historySnapshot(step));
   const remaining = task.plan.slice(stepIndex).map(plannedStepSnapshot);
+  currentStep = modelContextStep(currentStep);
+  blockerStep = modelContextStep(blockerStep);
   return {
     trigger: "已发现未解决的阻断条件，即将执行变更操作，需结合用户目标和已有证据决定继续还是调整",
     reviewPolicy: {
@@ -94,6 +108,7 @@ export function buildPreconditionReviewContext(
     },
     executionConstraints: task.executionConstraints,
     authentication: authenticationContext(task),
+    confirmedUserInputs: confirmedUserInputsContext(task),
     task: taskSnapshot(task),
     blockingEvidence: {
       ...compactReviewPlanStep(blockerStep, { commandLimit: 800, validationLimit: 480 }),
@@ -127,9 +142,15 @@ export function buildLongRunningReviewContext(input: {
   salientEvidence?: string[];
 }) {
   const nextStep = input.task.plan.find((step) => step !== input.step && step.status === "pending");
+  const step = modelContextStep(input.step);
+  const userInput = isUserInputStep(input.step);
+  const formOutputReference = "历史表单内容请参照 confirmedUserInputs；仅当前作用域内有效的决定可复用。";
   return {
     trigger: "periodic_long_running",
+    executionConstraints: input.task.executionConstraints,
+    task: taskSnapshot(input.task),
     authentication: authenticationContext(input.task),
+    confirmedUserInputs: confirmedUserInputsContext(input.task),
     _log: modelLogContext(input.task, input.step),
     reviewPolicy: {
       periodicLongRunningReview: true,
@@ -141,21 +162,21 @@ export function buildLongRunningReviewContext(input: {
     reviewRound: input.reviewRound,
     elapsedSeconds: input.elapsedSeconds,
     currentStep: {
-      title: compactReviewText(input.step.title, 180),
-      description: compactReviewText(input.step.description, 360),
-      command: compactReviewText(input.step.command, LONG_RUNNING_COMMAND_CONTEXT_LIMIT),
-      commandFingerprint: textFingerprint(input.step.command),
-      expected: compactReviewText(input.step.expected, 360),
-      risk: input.step.risk,
+      title: compactReviewText(step.title, 180),
+      description: compactReviewText(step.description, 360),
+      command: compactReviewText(step.command, LONG_RUNNING_COMMAND_CONTEXT_LIMIT),
+      commandFingerprint: textFingerprint(step.command),
+      expected: compactReviewText(step.expected, 360),
+      risk: step.risk,
     },
     periodicObservation: {
       passed: input.observation.passed,
       exitCode: input.observation.exitCode,
-      detail: compactReviewText(input.observation.detail, 260),
+      detail: userInput ? formOutputReference : compactReviewText(input.observation.detail, 260),
     },
     progress: input.progress,
-    salientEvidence: input.salientEvidence?.length ? input.salientEvidence : undefined,
-    terminalOutput: input.outputWindow,
+    salientEvidence: !userInput && input.salientEvidence?.length ? input.salientEvidence : undefined,
+    terminalOutput: userInput ? { ...input.outputWindow, content: formOutputReference } : input.outputWindow,
     nextStep: nextStep ? {
       title: compactReviewText(nextStep.title, 180),
       description: compactReviewText(nextStep.description, 280),
@@ -175,9 +196,11 @@ export function buildExecutionFailureReviewContext(
     .filter((item) => item !== step && item.status !== "pending")
     .map((item) => historySnapshot(item));
   const remaining = remainingSteps.map(plannedStepSnapshot);
+  step = modelContextStep(step);
   return {
     trigger: "主命令执行失败，需要判断是否影响用户整体目标和剩余计划",
     authentication: authenticationContext(task),
+    confirmedUserInputs: confirmedUserInputsContext(task),
     reviewPolicy: {
       exceptionalReview: true,
       commandExecutionFailed: true,
@@ -209,6 +232,7 @@ export function buildEvidenceReviewContext(
   remainingSteps: PlanStep[],
   postconditionReview: boolean,
 ) {
+  step = modelContextStep(step);
   const validationProtocolIncomplete = Boolean(step.result?.facts.validationProtocolIncomplete);
   const completed = task.plan
     .filter((item) => item.status === "completed")
@@ -221,6 +245,7 @@ export function buildEvidenceReviewContext(
         : "主命令执行成功，但独立后置校验未通过"
       : "程序发现证据不可解释或相互冲突",
     authentication: authenticationContext(task),
+    confirmedUserInputs: confirmedUserInputsContext(task),
     reviewPolicy: postconditionReview ? {
       exceptionalReview: true,
       mainExecutionSucceeded: true,

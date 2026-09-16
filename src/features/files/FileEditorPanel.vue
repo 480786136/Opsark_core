@@ -7,10 +7,12 @@ import { useOpsStore } from "@/stores/ops";
 import type { FileEntry } from "@/types";
 import { decodeTextFile, encodeTextFile, type LineEnding, type TextFileError } from "./fileEditor";
 import { isConnectionTransportFailure } from "@/features/connection/connectionStore";
+import ParameterSelect from "@/components/ParameterSelect.vue";
+import { localizeCoreText } from "@/features/preferences/coreText";
 
 const props = defineProps<{ serverId: string; entry: FileEntry }>();
 const emit = defineEmits<{ close: []; saved: [] }>();
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const store = useOpsStore();
 const content = ref("");
 const originalContent = ref("");
@@ -28,6 +30,18 @@ let disposed = false;
 const isLive = computed(() => store.isServerConnected(props.serverId));
 
 const dirty = computed(() => content.value !== originalContent.value || lineEnding.value !== originalLineEnding.value);
+const lineEndingOptions = computed(() => [
+  { value: "LF", label: "LF" },
+  { value: "CRLF", label: "CRLF" },
+  { value: "CR", label: "CR" },
+  ...(lineEnding.value === "Mixed" ? [{ value: "Mixed", label: t("files.lineEndingMixed") }] : []),
+  ...(lineEnding.value === "None" ? [{ value: "None", label: t("files.lineEndingNone") }] : []),
+]);
+const coreText = (value?: string | null) => localizeCoreText(value, locale.value);
+
+function updateLineEnding(value: string) {
+  if (["LF", "CRLF", "CR", "Mixed", "None"].includes(value)) lineEnding.value = value as LineEnding;
+}
 
 function translatedDecodeError(value: TextFileError) {
   if (value === "too_large") return t("files.editorTooLarge");
@@ -78,7 +92,7 @@ async function saveFile() {
     await backend.writeSftpFile(connection, props.entry.path, data);
     if (disposed) return;
     if (!isLive.value || generation !== store.serverConnection(props.serverId).generation) {
-      error.value = "连接已变化，保存结果待确认；请核实远程文件后再保存。";
+      error.value = t("files.saveResultUncertain");
       return;
     }
     originalContent.value = savedContent;
@@ -89,7 +103,7 @@ async function saveFile() {
     store.addLog({
       category: "command",
       level: "success",
-      title: "SFTP 保存文本文件",
+      title: t("files.audit.saveTextFile"),
       detail: `${props.entry.path} · ${data.byteLength} bytes`,
       serverId: props.serverId,
     });
@@ -137,20 +151,17 @@ onBeforeUnmount(() => {
       <div class="file-editor-meta">
         <label>{{ t("files.encoding") }}<span>UTF-8</span></label>
         <label>{{ t("files.lineEnding") }}
-          <select v-model="lineEnding" :disabled="!isLive">
-            <option value="LF">LF</option><option value="CRLF">CRLF</option><option value="CR">CR</option>
-            <option v-if="lineEnding === 'Mixed'" value="Mixed">Mixed</option><option v-if="lineEnding === 'None'" value="None">None</option>
-          </select>
+          <ParameterSelect :model-value="lineEnding" :options="lineEndingOptions" :ariaLabel="t('files.lineEnding')" :disabled="!isLive" size="compact" @update:model-value="updateLineEnding"/>
         </label>
-        <label>{{ t("files.bom") }}<span>{{ hasBom ? "Yes" : "No" }}</span></label>
+        <label>{{ t("files.bom") }}<span>{{ hasBom ? t("common.yes") : t("common.no") }}</span></label>
       </div>
       <span :class="['editor-save-state', { dirty, saved: savedVisible }]">{{ saving ? t("files.saving") : savedVisible ? t("files.saved") : dirty ? t("files.unsaved") : "" }}</span>
       <button class="icon-button" type="button" :title="t('common.save')" :disabled="!isLive || !dirty || saving || Boolean(error)" @click="saveFile"><LoaderCircle v-if="saving" class="spin" :size="15" /><Save v-else :size="15" /></button>
       <button class="icon-button" type="button" :title="t('common.close')" @click="requestClose"><X :size="16" /></button>
     </header>
     <div v-if="loading" class="file-editor-state"><LoaderCircle class="spin" :size="19" />{{ t("files.loading") }}</div>
-    <div v-if="!isLive" class="file-directory-state" role="status">{{ t('workspace.connectServer') }} · 远程文件只读，草稿已保留</div>
-    <div v-if="error" class="file-editor-state error"><AlertTriangle :size="20" /><p>{{ error }}</p></div>
+    <div v-if="!isLive" class="file-directory-state" role="status">{{ t('workspace.connectServer') }} · {{ t("files.remoteReadOnlyDraftPreserved") }}</div>
+    <div v-if="error" class="file-editor-state error"><AlertTriangle :size="20" /><p>{{ coreText(error) }}</p></div>
     <textarea v-if="loaded" v-model="content" class="file-editor-textarea" :readonly="!isLive" spellcheck="false" :aria-label="t('files.editorTitle')" />
 
     <div v-if="discardVisible" class="editor-discard-backdrop" @click.self="discardVisible = false">

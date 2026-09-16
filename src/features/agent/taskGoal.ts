@@ -11,6 +11,7 @@ import {
   mergeRoundIntoTaskHistoryCheckpoint,
   refreshTaskHistoryCheckpoint,
 } from "@/features/agent/taskHistoryCheckpoint";
+import { carryForwardRecoveryBlockers } from "./recoveryContract";
 
 function cloneStep(step: PlanStep): PlanStep {
   return {
@@ -103,7 +104,8 @@ export function capturePreviousRound(task: OpsTask, timestamp = new Date().toISO
   const indexed = task.messages
     .map((message, index) => ({ message, index }))
     .reverse()
-    .find(({ message }) => message.role === "user" && message.kind === "message");
+    .find(({ message }) => message.role === "user" && message.kind === "message"
+      && !["side_question", "continue", "cancel_goal"].includes(message.requirementRelation ?? ""));
   if (!indexed) return undefined;
   const steps = activeRoundSteps(task);
   const phases = (task.phaseHistory ?? [])
@@ -113,6 +115,7 @@ export function capturePreviousRound(task: OpsTask, timestamp = new Date().toISO
     roundId: task.currentRoundId,
     history: {
       id: `round-history-${task.id}-${Date.now()}`,
+      roundId: task.currentRoundId,
       requirement: indexed.message.content,
       status: task.status,
       plan: steps.map(cloneStep),
@@ -144,6 +147,13 @@ export function commitPreviousRound(task: OpsTask, snapshot?: PreviousRoundSnaps
   }
 }
 
+/** A user supplement changes the requirement round, never the identity of prior failures. */
+export function beginRequirementRound(task: OpsTask, roundId: string, snapshot?: PreviousRoundSnapshot) {
+  carryForwardRecoveryBlockers(task, roundId);
+  commitPreviousRound(task, snapshot);
+  task.currentRoundId = roundId;
+}
+
 export function normalizeRequirementRelation(
   result: RequirementProcessingResult,
   content: string,
@@ -156,7 +166,9 @@ export function normalizeRequirementRelation(
     return "continue";
   }
   if (/^(?:取消|终止|放弃)(?:当前|这个)?(?:任务|目标)?$/iu.test(normalized)) return "cancel_goal";
-  return result.intent === "answer" ? "side_question" : "new_goal";
+  // Missing classification is not evidence that the user abandoned or created
+  // another business goal. Preserve identity and treat it as a new requirement.
+  return result.intent === "answer" ? "side_question" : "supplement";
 }
 
 export function mergeTaskSkillIds(
@@ -176,6 +188,8 @@ export interface TaskWorkflowSnapshot {
   updatedAt: string;
   permission: OpsTask["permission"];
   modelId: string;
+  cancelRequested?: boolean;
+  currentExecutionId?: string;
 }
 
 export function captureWorkflowState(task: OpsTask): TaskWorkflowSnapshot {
@@ -184,6 +198,8 @@ export function captureWorkflowState(task: OpsTask): TaskWorkflowSnapshot {
     updatedAt: task.updatedAt,
     permission: task.permission,
     modelId: task.modelId,
+    cancelRequested: task.cancelRequested,
+    currentExecutionId: task.currentExecutionId,
   };
 }
 
@@ -192,4 +208,6 @@ export function restoreWorkflowState(task: OpsTask, snapshot: TaskWorkflowSnapsh
   task.updatedAt = snapshot.updatedAt;
   task.permission = snapshot.permission;
   task.modelId = snapshot.modelId;
+  task.cancelRequested = snapshot.cancelRequested;
+  task.currentExecutionId = snapshot.currentExecutionId;
 }

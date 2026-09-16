@@ -1038,6 +1038,117 @@ fn applies_a_focused_plan_step_repair_without_rewriting_other_steps() {
 }
 
 #[test]
+fn focused_plan_repair_context_omits_history_and_unrelated_tool_schemas() {
+    let context = json!({
+        "_log": {"taskId": "task-1", "phaseIndex": 4},
+        "_requestParameters": {"temperature": 0},
+        "taskGoal": {"rootGoal": "deploy app"},
+        "server": {"id": "server-1", "os": "linux"},
+        "executionConstraints": {"changePolicy": "requested_changes_only"},
+        "confirmedUserInputs": {"registry": {"value": "mirror.example"}},
+        "planGenerationRepair": {"originalPlan": [{"id": "step-1"}], "error": "repair only"},
+        "instruction": "repair the original protocol only",
+        "activeSkills": [],
+        "tools": [
+            {"id": "files.read_content", "inputSchema": {"type": "object"}},
+            {"id": "software.check", "inputSchema": {"type": "object"}}
+        ],
+        "baseSnapshot": {"historyCheckpoint": "x".repeat(50_000)},
+        "recentPhases": ["old evidence"],
+        "recoveredEvidence": ["duplicate evidence"]
+    })
+    .to_string();
+    let invalid = AiPlanStep {
+        kind: "observe".into(),
+        title: "read".into(),
+        description: "read".into(),
+        command: r#"opsark-tool files.read_content {"path":"/tmp/a"}"#.into(),
+        expected: "content".into(),
+        validation: "false".into(),
+        risk: Some("low".into()),
+        ..AiPlanStep::default()
+    };
+
+    let compact = focused_plan_repair_context(
+        &context,
+        "第 1 个计划步骤的 validation 必须固定为 true",
+        &invalid,
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_str(&compact).unwrap();
+
+    assert_eq!(parsed["workflowPhase"], "focused_plan_repair");
+    assert_eq!(parsed["_requestParameters"]["temperature"], 0);
+    assert_eq!(
+        parsed["confirmedUserInputs"]["registry"]["value"],
+        "mirror.example"
+    );
+    assert_eq!(parsed["server"]["id"], "server-1");
+    assert_eq!(parsed["planGenerationRepair"]["error"], "repair only");
+    assert_eq!(parsed["instruction"], "repair the original protocol only");
+    assert!(parsed.get("baseSnapshot").is_none());
+    assert!(parsed.get("recentPhases").is_none());
+    assert!(parsed.get("recoveredEvidence").is_none());
+    assert_eq!(parsed["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(parsed["tools"][0]["id"], "files.read_content");
+    assert!(compact.len() < 2_000);
+}
+
+#[test]
+fn malformed_tool_repair_keeps_the_visible_catalog_but_not_history() {
+    let context = json!({
+        "tools": [
+            {"id": "files.read_content", "inputSchema": {"type": "object"}},
+            {"id": "software.check", "inputSchema": {"type": "object"}}
+        ],
+        "baseSnapshot": {"historyCheckpoint": "x".repeat(20_000)}
+    })
+    .to_string();
+    let invalid = AiPlanStep {
+        command: "opsark-tool".into(),
+        ..AiPlanStep::default()
+    };
+    let compact = focused_plan_repair_context(
+        &context,
+        "第 1 个计划步骤的 opsark-tool 协议不完整",
+        &invalid,
+    )
+    .unwrap();
+    let parsed: Value = serde_json::from_str(&compact).unwrap();
+
+    assert_eq!(parsed["tools"].as_array().unwrap().len(), 2);
+    assert!(parsed.get("baseSnapshot").is_none());
+}
+
+#[test]
+fn focused_repair_preserves_nested_authority_without_copying_evidence() {
+    let context = json!({
+        "baseSnapshot": {
+            "task": {"permission": "safe", "title": "read only"},
+            "executionConstraints": {"changePolicy": "read_only", "reason": "no writes"},
+            "rootGoal": "inspect app",
+            "currentPlan": {"output": "PRIVATE_EVIDENCE".repeat(5_000)}
+        }
+    });
+    let invalid = AiPlanStep::default();
+    let compact = focused_plan_repair_context(&context.to_string(), "repair", &invalid).unwrap();
+    let parsed: Value = serde_json::from_str(&compact).unwrap();
+    assert_eq!(parsed["permission"], "safe");
+    assert_eq!(parsed["executionConstraints"]["changePolicy"], "read_only");
+    assert_eq!(parsed["taskGoal"]["rootGoal"], "inspect app");
+    assert!(!compact.contains("PRIVATE_EVIDENCE"));
+    assert!(compact.len() < 1_000);
+
+    let mut current = context;
+    current["permission"] = json!("readonly");
+    current["executionConstraints"] = json!({"changePolicy": "read_only", "reason": "new current restriction"});
+    let compact = focused_plan_repair_context(&current.to_string(), "repair", &invalid).unwrap();
+    let parsed: Value = serde_json::from_str(&compact).unwrap();
+    assert_eq!(parsed["permission"], "readonly");
+    assert_eq!(parsed["executionConstraints"]["reason"], "new current restriction");
+}
+
+#[test]
 fn fingerprints_plan_safety_failures_by_step_field_and_rule() {
     let empty_fallback = plan_failure_fingerprint(
         "第 3 个计划步骤的 command 未通过执行前安全检查（EMPTY_SUCCESS_FALLBACK：以 || true（或等价空操作）结束）；必须修复",
@@ -1536,6 +1647,8 @@ fn omits_absent_optional_plan_fields_from_the_frontend_payload() {
         risk: "low".into(),
         expected: "得到目录状态".into(),
         validation: String::new(),
+        recovery: None,
+        recovery_rule_version: None,
         execution_scope: "isolated_exec".into(),
         validation_scope: None,
         session_context_change: None,
@@ -1548,6 +1661,27 @@ fn omits_absent_optional_plan_fields_from_the_frontend_payload() {
     assert!(value.get("validationScope").is_none());
     assert!(value.get("sessionContextChange").is_none());
     assert!(value.get("output").is_none());
+    assert!(value.get("recovery").is_none());
+}
+
+#[test]
+fn structured_recovery_survives_plan_conversion_and_rejects_invalid_purpose() {
+    let payload = json!({"kind":"observe", "title":"Verify original postcondition", "description":"Recheck",
+        "command":"test -d /opt/project-a/dist", "validation":"", "expected":"Artifact exists", "risk":"low",
+        "recovery":{"failedStepId":"failed-build-a", "targetContext":"target-a", "purpose":"verify"}});
+    let parsed: AiPlanStep = serde_json::from_value(payload.clone()).unwrap();
+    let converted = convert_ai_plan_steps(vec![parsed]).unwrap();
+    assert_eq!(serde_json::to_value(&converted[0]).unwrap()["recovery"], payload["recovery"]);
+    let mut invalid = payload.clone();
+    invalid["recovery"]["purpose"] = json!("complete");
+    assert!(convert_ai_plan_steps(vec![serde_json::from_value(invalid).unwrap()]).unwrap_err().contains("recovery"));
+    let mut invalid = payload;
+    invalid["recovery"]["extra"] = json!(true);
+    let invalid: AiPlanStep = serde_json::from_value(invalid).unwrap();
+    let issue = recovery_rules::decode_issue(&convert_ai_plan_steps(vec![invalid]).unwrap_err()).unwrap();
+    assert_eq!(issue.code, "RECOVERY_INVALID_METADATA");
+    assert!(PLAN_STEP_OUTPUT_CONTRACT.contains("recovery"));
+    assert!(NEXT_STAGE_OUTPUT_CONTRACT.contains("recovery"));
 }
 
 #[test]

@@ -10,6 +10,7 @@ import { useOpsStore } from "@/stores/ops";
 import { useServerWorkspaceTabsStore } from "@/features/workspace/serverWorkspaceTabsStore";
 
 const route = useRoute();
+const showDevelopmentFeatures = import.meta.env.DEV;
 const macWindow = /Mac/i.test(navigator.platform);
 const customFrame = "__TAURI_INTERNALS__" in window && (macWindow || /Win/i.test(navigator.platform));
 const store = useOpsStore();
@@ -67,7 +68,7 @@ onBeforeUnmount(() => {
         <RouterLink to="/skills" :title="t('nav.skills')">
           <Sparkles :size="20" />
         </RouterLink>
-        <RouterLink to="/settings" :title="t('nav.settings')">
+        <RouterLink v-if="showDevelopmentFeatures" to="/settings" :title="t('nav.settings')">
           <Settings :size="20" />
         </RouterLink>
       </nav>

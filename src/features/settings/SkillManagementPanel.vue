@@ -3,6 +3,7 @@ import { computed, ref } from "vue";
 import { Plus, RotateCcw, Search, Sparkles, Trash2 } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import { useOpsStore } from "@/stores/ops";
+import ParameterSelect from "@/components/ParameterSelect.vue";
 import { validateSkillDefinition } from "@/features/skills/skillValidation";
 import {
   SKILL_CATEGORY_IDS,
@@ -15,6 +16,14 @@ const { t } = useI18n();
 const query = ref("");
 const categoryFilter = ref<SkillCategory | "all">("all");
 const selectedSkillId = ref(store.skills[0]?.id ?? "");
+const categoryOptions = computed(() => SKILL_CATEGORY_IDS.map((category) => ({
+  value: category,
+  label: t(`skills.categories.${category}`),
+})));
+const categoryFilterOptions = computed(() => [
+  { value: "all", label: t("skills.allCategories") },
+  ...categoryOptions.value,
+]);
 
 const filteredSkills = computed(() => {
   const keyword = query.value.trim().toLocaleLowerCase();
@@ -66,6 +75,14 @@ function removeSkill() {
   query.value = "";
   selectedSkillId.value = store.skills[0]?.id ?? "";
 }
+
+function updateCategoryFilter(value: string) {
+  categoryFilter.value = value as SkillCategory | "all";
+}
+
+function updateSelectedCategory(value: string) {
+  if (selectedSkill.value) selectedSkill.value.category = value as SkillCategory;
+}
 </script>
 
 <template>
@@ -80,12 +97,14 @@ function removeSkill() {
           <Search :size="14" />
           <input v-model="query" type="search" :placeholder="t('skills.searchPlaceholder')" />
         </label>
-        <select v-model="categoryFilter" class="skill-category-filter" :aria-label="t('skills.categoryFilter')">
-          <option value="all">{{ t("skills.allCategories") }}</option>
-          <option v-for="category in SKILL_CATEGORY_IDS" :key="category" :value="category">
-            {{ t(`skills.categories.${category}`) }}
-          </option>
-        </select>
+        <ParameterSelect
+          :model-value="categoryFilter"
+          class="skill-category-select"
+          size="small"
+          :options="categoryFilterOptions"
+          :ariaLabel="t('skills.categoryFilter')"
+          @update:model-value="updateCategoryFilter"
+        />
         <button class="skill-add-button" type="button" @click="addSkill">
           <Plus :size="13" />{{ t("skills.add") }}
         </button>
@@ -122,15 +141,18 @@ function removeSkill() {
           <input v-model="selectedSkill.name" maxlength="80" />
           <small v-if="fieldError('name')" class="field-error">{{ fieldError("name") }}</small>
         </label>
-        <label class="tool-field">
+        <div class="tool-field">
           <span>{{ t("skills.category") }}</span>
-          <select v-model="selectedSkill.category">
-            <option v-for="category in SKILL_CATEGORY_IDS" :key="category" :value="category">
-              {{ t(`skills.categories.${category}`) }}
-            </option>
-          </select>
+          <ParameterSelect
+            :model-value="selectedSkill.category"
+            class="skill-editor-category-select"
+            size="small"
+            :options="categoryOptions"
+            :ariaLabel="t('skills.category')"
+            @update:model-value="updateSelectedCategory"
+          />
           <small class="tool-field-hint">{{ t("skills.categoryHint") }}</small>
-        </label>
+        </div>
         <label class="tool-field">
           <span>{{ t("skills.description") }}</span>
           <textarea v-model="selectedSkill.description" rows="3" maxlength="1000"></textarea>
@@ -160,3 +182,7 @@ function removeSkill() {
     </div>
   </section>
 </template>
+
+<style scoped>
+.skill-category-select{margin-bottom:8px}.skill-editor-category-select{width:100%}
+</style>

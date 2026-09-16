@@ -8,8 +8,12 @@ import {
   type WorkspacePanel,
 } from "./workspaceLayoutStore";
 
-const { t, locale } = useI18n();
-const panelLabel = (panel: WorkspacePanel) => locale.value.startsWith("zh") ? ({ files: "文件", terminal: "终端", agent: "AI 助手" })[panel] : ({ files: "Files", terminal: "Terminal", agent: "AI assistant" })[panel];
+const { t } = useI18n();
+const panelLabel = (panel: WorkspacePanel) => t(({
+  files: "workspace.panelFiles",
+  terminal: "workspace.panelTerminal",
+  agent: "workspace.panelAgent",
+})[panel]);
 const layout = useWorkspaceLayoutStore();
 const root = ref<HTMLElement>();
 const menuOpen = ref(false);

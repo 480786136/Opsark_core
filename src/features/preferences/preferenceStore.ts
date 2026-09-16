@@ -51,12 +51,16 @@ function boundedNumber(value: unknown, minimum: number, maximum: number, fallbac
 }
 
 function applyPreferences(locale: AppLocale, systemTheme: SystemTheme) {
+  const definition = systemThemes.find(({ id }) => id === systemTheme) ?? systemThemes[0];
+  const root = document.documentElement;
   i18n.global.locale.value = locale;
-  document.documentElement.lang = locale;
-  document.documentElement.dataset.theme = systemTheme;
-  delete document.documentElement.dataset.accent;
-  delete document.documentElement.dataset.surface;
-  delete document.documentElement.dataset.terminalTheme;
+  root.lang = locale;
+  root.dataset.theme = systemTheme;
+  root.style.colorScheme = definition.dark ? "dark" : "light";
+  document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.setAttribute("content", definition.preview[0]);
+  delete root.dataset.accent;
+  delete root.dataset.surface;
+  delete root.dataset.terminalTheme;
 }
 
 export const usePreferenceStore = defineStore("preferences", {
@@ -103,13 +107,17 @@ export const usePreferenceStore = defineStore("preferences", {
     },
     persist() {
       this.apply();
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({
-        locale: this.locale,
-        systemTheme: this.systemTheme,
-        terminalFontSize: this.terminalFontSize,
-        terminalLineHeight: this.terminalLineHeight,
-        terminalShortcutPreset: this.terminalShortcutPreset,
-      }));
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify({
+          locale: this.locale,
+          systemTheme: this.systemTheme,
+          terminalFontSize: this.terminalFontSize,
+          terminalLineHeight: this.terminalLineHeight,
+          terminalShortcutPreset: this.terminalShortcutPreset,
+        }));
+      } catch {
+        // Keep the live preference even when storage is unavailable or full.
+      }
     },
   },
 });

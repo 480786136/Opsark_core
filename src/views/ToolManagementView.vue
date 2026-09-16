@@ -2,11 +2,12 @@
 import { ref } from "vue";
 import { Save } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
+import { localizeCoreText } from "@/features/preferences/coreText";
 import ToolManagementPanel from "@/features/settings/ToolManagementPanel.vue";
 import { useOpsStore } from "@/stores/ops";
 
 const store = useOpsStore();
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const saveState = ref<"idle" | "saving" | "saved" | "error">("idle");
 function saveTools() {
   saveState.value = "saving";
@@ -21,11 +22,11 @@ function saveTools() {
 <template>
   <div class="page management-page">
     <header class="page-header">
-      <div><span class="eyebrow">TOOL REGISTRY</span><h1>{{ t("tools.title") }}</h1><p>{{ t("tools.subtitle") }}</p></div>
+      <div><span class="eyebrow">{{ locale.startsWith("zh") ? "工具管理" : "TOOL REGISTRY" }}</span><h1>{{ t("tools.title") }}</h1><p>{{ t("tools.subtitle") }}</p></div>
       <button class="button primary" :disabled="saveState === 'saving'" @click="saveTools"><Save :size="15" />{{ saveState === "saved" ? t("settings.saved") : t("common.save") }}</button>
     </header>
     <main class="management-layout">
-      <p v-if="saveState === 'error'" class="security-hint">{{ t("settings.saveFailed", { reason: store.toolSaveError || t("settings.invalidSettings") }) }}</p>
+      <p v-if="saveState === 'error'" class="security-hint">{{ t("settings.saveFailed", { reason: localizeCoreText(store.toolSaveError) || t("settings.invalidSettings") }) }}</p>
       <ToolManagementPanel standalone />
     </main>
   </div>

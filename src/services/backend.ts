@@ -8,9 +8,12 @@ import {
   normalizePlanPreconditions,
   normalizeSecretPlaceholders,
   normalizeToolCommandSyntax,
+  planStagePrefix,
+  PlanStageConflictError,
+  READ_BATCH_STAGE_CONFLICT,
 } from "@/features/agent/planNormalizer";
 import { textFingerprint } from "@/features/agent/longRunningReviewOutput";
-import { parseToolCommand } from "@/features/tools/toolExecutor";
+import { decodeToolCommand, parseToolCommand } from "@/features/tools/toolExecutor";
 import { buildExecutionSummary } from "@/features/agent/executionSummary";
 import {
   normalizeFileStructureRequest,
@@ -22,6 +25,12 @@ import {
 import type { PlanStepSafetyAnalysis } from "@/features/agent/planSafety";
 import { isTerminalTransportFailure } from "@/features/agent/adjustmentIncident";
 import { planCommandIdentity } from "@/features/agent/taskProgression";
+import { readRecoveryProtocolError, RecoveryProtocolError } from "./recoveryRules";
+import {
+  compactProtocolRepairContext, mergeProtocolRepairSteps, planSemanticFingerprint,
+  parseRepairContext, protocolFieldValue, protocolRepairAuthority, protocolRepairScopeFingerprint, protocolRepairStopMessage, stableProtocolValue,
+} from "./planProtocolRepair";
+import type { PlanRepairDiagnostic, ProtocolRepairProgress } from "./planProtocolRepair";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -43,6 +52,30 @@ export interface RuntimeModel {
   generationSettings?: AiGenerationSettings;
 }
 
+export interface DiskLogQuery {
+  stream: "events" | "developer-events" | "model-calls";
+  cursor?: string;
+  limit?: number;
+  taskId?: string;
+  serverId?: string;
+  category?: string;
+  operation?: string;
+  event?: string;
+  level?: string;
+  search?: string;
+  from?: string;
+  to?: string;
+}
+
+export interface DiskLogQueryResult<T = unknown> {
+  items: T[];
+  nextCursor?: string;
+  hasMore: boolean;
+  total: number;
+  malformedLines: number;
+  oversizedLines: number;
+}
+
 const MODEL_TRACE_ERROR_PREFIX = "OPSARK_MODEL_TRACE_V1:";
 
 export class ModelInvocationError extends Error {
@@ -56,6 +89,8 @@ export class ModelInvocationError extends Error {
 }
 
 function normalizeModelInvocationError(error: unknown) {
+  const diagnostic = readRecoveryProtocolError(error);
+  if (diagnostic) return new RecoveryProtocolError(diagnostic);
   const raw = error instanceof Error ? error.message : String(error);
   const marker = raw.indexOf(MODEL_TRACE_ERROR_PREFIX);
   if (marker < 0) return error instanceof Error ? error : new Error(raw);
@@ -163,26 +198,85 @@ export interface PlanNormalizationRepair {
   repairStrategy?:
     | { type: "field_local" }
     | { type: "plan_protocol" }
+    | { type: "read_batch_stage_split" }
     | { type: "standalone_stage_split"; standaloneStepIndex: number; toolId: string };
   fieldPath?: string;
   expected?: string;
   validationError: string;
   previousModelOutput: PlanStep[];
   instruction: string;
+  diagnostic?: PlanRepairDiagnostic;
+  progress?: ProtocolRepairProgress;
+  nextStageDecision?: Pick<NextStageDecision, "decision" | "reason" | "summary">;
 }
 
 export class PlanProtocolError extends Error {
   processed?: RequirementProcessingResult;
+  developerTrace?: ModelDeveloperTrace;
   constructor(public repair: PlanNormalizationRepair, public repairError: string) {
-    super(`计划协议校验失败：${repair.validationError}\n协议修复失败：${repairError}。未执行该计划，原始计划已保留；仅允许修复协议，不得重规划业务。`);
+    super(`计划协议校验失败：${repair.validationError}\n协议修复失败：${repairError}。未执行该计划，原始计划已保留；可生成业务调整方案，新的步骤须重新评估风险并按当前授权审批。`);
     this.name = "PlanProtocolError";
   }
+}
+
+/** Preserve rejected Rust output and its consumed budget across the Tauri boundary. */
+function rustProtocolFailure(error: unknown, context: string): PlanProtocolError | undefined {
+  let value: unknown = error instanceof Error ? error.message : error;
+  let trace: ModelDeveloperTrace | undefined;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (typeof value === "string") {
+      const marker = value.indexOf(MODEL_TRACE_ERROR_PREFIX);
+      const json = marker >= 0 ? value.slice(marker + MODEL_TRACE_ERROR_PREFIX.length)
+        : value.slice(Math.max(0, value.indexOf("{")));
+      try { value = JSON.parse(json); } catch { return undefined; }
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const envelope = value as Record<string, unknown>;
+    if (envelope.developerTrace) trace = envelope.developerTrace as ModelDeveloperTrace;
+    if (typeof envelope.message === "string") { value = envelope.message; continue; }
+    const issue = readRecoveryProtocolError(envelope);
+    if (!issue || !Array.isArray(envelope.steps) || !envelope.steps.length) return undefined;
+    const steps = envelope.steps as PlanStep[];
+    if (steps.some(step => !step || typeof step.command !== "string" || typeof step.id !== "string")) return undefined;
+    const repair = buildPlanNormalizationRepair(new RecoveryProtocolError(issue), steps);
+    const decision = envelope.nextStageDecision as Record<string, unknown> | undefined;
+    if (decision && ["continue", "adjust"].includes(String(decision.decision))
+      && typeof decision.reason === "string" && typeof decision.summary === "string") {
+      repair.nextStageDecision = decision as PlanNormalizationRepair["nextStageDecision"];
+    }
+    const count = Number(envelope.focusedRepairCalls);
+    const attempted = envelope.repairAttempted === true;
+    const backendStopCode = typeof envelope.repairStopCode === "string"
+      && envelope.repairStopCode.startsWith("PROTOCOL_REPAIR_")
+      ? envelope.repairStopCode as ProtocolRepairProgress["stopCode"] : undefined;
+    const stopReason = typeof envelope.reason === "string" && envelope.reason.trim()
+      ? envelope.reason : undefined;
+    repair.progress = {
+      scopeFingerprint: protocolRepairScopeFingerprint(context, issue),
+      attemptCount: Number.isFinite(count) ? count : attempted ? 1 : 0,
+      attemptedFingerprints: [], seenPlans: [planSemanticFingerprint(steps)],
+      stopCode: attempted ? backendStopCode ?? "PROTOCOL_REPAIR_FAILED" : undefined,
+      stopReason,
+    };
+    const failure = new PlanProtocolError(repair, repair.progress.stopCode
+      ? protocolRepairStopMessage(repair.progress)
+      : [String(envelope.repairStopCode ?? issue.code), stopReason].filter(Boolean).join("："));
+    failure.developerTrace = trace;
+    return failure;
+  }
+  return undefined;
 }
 
 type StandaloneStageSplitStrategy = Extract<NonNullable<PlanNormalizationRepair["repairStrategy"]>, {
   type: "standalone_stage_split";
 }>;
 const STANDALONE_STAGE_SPLIT_EXPECTED = "当前执行阶段按原顺序确定性拆分：standalone 之前有步骤时只保留未改写的完整连续前缀；standalone 位于首步时只保留该原步骤；其余整体目标步骤延后到后续规划";
+const READ_BATCH_STAGE_SPLIT_EXPECTED = "按工具 planMode 保留原顺序的完整连续合法阶段；只读工具批次、普通步骤及 standalone 分阶段处理，不得混排或修改原字段";
+const READ_BATCH_STAGE_SPLIT_INSTRUCTION = "这是阶段协议修复，不是业务重规划。Core 按工具 planMode 确定性缩小当前执行阶段：只返回原计划开头的完整连续合法前缀，遇到 read_batch/普通步骤/standalone 边界即停止。未进入本阶段的步骤留待真实证据返回后规划，不是删除整体目标。不得新增、重排、改写命令或把 change 改成 observe；阶段拆分无需再次调用模型。";
+
+function isReadBatchStageConflict(error: unknown) {
+  return error instanceof PlanStageConflictError || String(error).includes(READ_BATCH_STAGE_CONFLICT);
+}
 
 function standaloneStageSplitStrategy(validationError: string): StandaloneStageSplitStrategy | undefined {
   if (!validationError.includes("standalone 工具必须是唯一待执行步骤")) return undefined;
@@ -198,6 +292,10 @@ function standaloneStageSplitInstruction(strategy: StandaloneStageSplitStrategy)
 
 /** Upgrades a persisted pre-strategy repair without changing its preserved model output. */
 function normalizePlanRepairStrategy(repair: PlanNormalizationRepair): PlanNormalizationRepair {
+  if (repair.repairStrategy?.type === "read_batch_stage_split" || isReadBatchStageConflict(repair.validationError)) {
+    return { ...repair, repairStrategy: { type: "read_batch_stage_split" }, fieldPath: "steps",
+      expected: READ_BATCH_STAGE_SPLIT_EXPECTED, instruction: READ_BATCH_STAGE_SPLIT_INSTRUCTION };
+  }
   const strategy = repair.repairStrategy?.type === "standalone_stage_split"
     ? repair.repairStrategy
     : standaloneStageSplitStrategy(repair.validationError);
@@ -213,6 +311,18 @@ function normalizePlanRepairStrategy(repair: PlanNormalizationRepair): PlanNorma
 
 /** Builds the bounded, non-secret feedback used for one model protocol-repair attempt. */
 export function buildPlanNormalizationRepair(error: unknown, steps: PlanStep[]): PlanNormalizationRepair {
+  const diagnostic = readRecoveryProtocolError(error);
+  if (diagnostic) {
+    const toolArgument = diagnostic.code === "TOOL_ARGUMENT_INVALID";
+    return {
+      errorCode: toolArgument ? "tool_schema_validation_failed" : "plan_normalization_failed",
+      repairStrategy: { type: toolArgument ? "field_local" : "plan_protocol" },
+      diagnostic, fieldPath: diagnostic.fieldPath, expected: diagnostic.expected,
+      validationError: `${diagnostic.code} / ${diagnostic.fieldPath}${diagnostic.matchedToken ? ` / matchedToken=${diagnostic.matchedToken}` : ""}：${diagnostic.expected}`,
+      previousModelOutput: steps,
+      instruction: `只修复 ${diagnostic.allowedRepairPaths.join("、") || "无可自动修复字段（需要权威上下文）"}。${diagnostic.expected}。保持其余字段与原计划业务含义不变。${toolArgument ? "保持工具身份和其他参数不变，不得改写同一工具内未报错的字段。" : "只读诊断如有临时文件创建、写入和清理，须整体改成无落盘诊断并保留真实退出码；不得改 kind/purpose 绕过规则。"}`,
+    };
+  }
   const validationError = String(error);
   const stepNumber = validationError.match(/第\s*(\d+)\s*个计划步骤/)?.[1];
   const credentialType = validationError.match(/凭据参数\s+([A-Za-z][A-Za-z0-9_]*)\s+必须使用 password 类型/);
@@ -223,6 +333,10 @@ export function buildPlanNormalizationRepair(error: unknown, steps: PlanStep[]):
     : validationError.includes("工具参数无效")
       ? { type: "field_local" }
       : { type: "plan_protocol" };
+  if (isReadBatchStageConflict(error)) {
+    return normalizePlanRepairStrategy({ errorCode: "plan_normalization_failed", validationError,
+      previousModelOutput: steps, instruction: "", repairStrategy: { type: "read_batch_stage_split" } });
+  }
   return {
     errorCode: validationError.includes("工具参数无效")
       ? "tool_schema_validation_failed"
@@ -260,8 +374,43 @@ function contextWithPlanRepair(context: string, repair: PlanNormalizationRepair)
   return JSON.stringify({ originalContext: context, planGenerationRepair: repair });
 }
 
+/** Match the authority Rust used after classification, before creating repair feedback. */
+function classifiedPlanContext(context: string, result: RequirementProcessingResult, definitions: ModelSkillDefinition[]) {
+  const source = parseRepairContext(context);
+  const previous = protocolRepairAuthority(context).executionConstraints;
+  const continuing = result.relation === "continue" && previous;
+  const executionConstraints = continuing ? previous : result.constraints ? {
+    ...result.constraints,
+    ...(["continue", "supplement"].includes(result.relation ?? "") ? {
+      userDirectives: [...new Set([...(previous?.userDirectives ?? []), ...(result.constraints.userDirectives ?? [])])],
+      prohibitedActions: [...new Set([...(previous?.prohibitedActions ?? []), ...(result.constraints.prohibitedActions ?? [])])],
+      requiredConditions: [...new Set([...(previous?.requiredConditions ?? []), ...(result.constraints.requiredConditions ?? [])])],
+    } : {}),
+  } : previous;
+  const selected = result.selectedSkillIds;
+  const activeSkills = selected ? selected.flatMap(id => {
+    const skill = definitions.find(item => item.id === id)
+      ?? (Array.isArray(source.activeSkills) ? source.activeSkills.find((item: ModelSkillDefinition) => item.id === id) : undefined);
+    return skill ? [skill] : [];
+  }) : source.activeSkills;
+  return JSON.stringify({ ...source, executionConstraints, activeSkills,
+    skillSelection: { mode: "model", selectedSkillIds: selected ?? [] } });
+}
+
 export function assertPlanRepairScope(repair: PlanNormalizationRepair, repaired: PlanStep[]) {
   repair = normalizePlanRepairStrategy(repair);
+  if (repair.repairStrategy?.type === "read_batch_stage_split") {
+    const stage = planStagePrefix(repair.previousModelOutput);
+    const immutable = ["id", "kind", "title", "description", "command", "risk", "expected", "validation",
+      "executionScope", "validationScope", "sessionContextChange", "runtimeClass", "status", "recovery"] as const;
+    const stable = (value: unknown) => JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
+      ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item);
+    if (!stage.length || repaired.length !== stage.length || stage.some((step, index) =>
+      immutable.some(field => stable(step[field]) !== stable(repaired[index]?.[field])))) {
+      throw new Error("只读批次阶段修复只能返回未改写的完整连续前缀；不得新增、重排、改写字段或跨越阶段边界");
+    }
+    return;
+  }
   if (repair.repairStrategy?.type === "standalone_stage_split") {
     const { standaloneStepIndex, toolId } = repair.repairStrategy;
     const originalStandalone = repair.previousModelOutput[standaloneStepIndex];
@@ -277,7 +426,7 @@ export function assertPlanRepairScope(repair: PlanNormalizationRepair, repaired:
     if (!repaired.length) throw new Error("standalone 阶段修复必须返回非空的原计划阶段子集");
     const authoredFields = [
       "kind", "title", "description", "command", "risk", "expected", "validation",
-      "executionScope", "validationScope", "sessionContextChange", "runtimeClass", "status",
+      "executionScope", "validationScope", "sessionContextChange", "runtimeClass", "status", "recovery",
     ] as const;
     const stable = (value: unknown) => JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
       ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item);
@@ -297,14 +446,39 @@ export function assertPlanRepairScope(repair: PlanNormalizationRepair, repaired:
     }
     return;
   }
-  if (repair.errorCode !== "tool_schema_validation_failed") return;
+  if (repair.errorCode !== "tool_schema_validation_failed") {
+    const allowed = repair.diagnostic?.allowedRepairPaths ?? [];
+    if (!allowed.length) throw new Error("PROTOCOL_REPAIR_SCOPE_UNKNOWN：没有可验证的局部修复字段，需补充权威上下文或进入业务调整");
+    if (repair.previousModelOutput.length !== repaired.length) throw new Error("协议修复不得改变计划步骤数量");
+    const fields = ["kind", "title", "description", "command", "risk", "expected", "validation", "executionScope",
+      "validationScope", "runtimeClass", "sessionContextChange", "recovery", "status"] as const;
+    repair.previousModelOutput.forEach((previous, index) => {
+      fields.forEach(field => {
+        if (stableProtocolValue(protocolFieldValue(previous, field)) === stableProtocolValue(protocolFieldValue(repaired[index], field))) return;
+        if (!allowed.includes(`steps[${index}].${field}`)) throw new Error(`协议修复不得改写 steps[${index}].${field}`);
+        if (field === "command") {
+          const beforeTool = previous.command.match(/^opsark-tool\s+(\S+)/)?.[1];
+          const afterTool = repaired[index].command.match(/^opsark-tool\s+(\S+)/)?.[1];
+          if (beforeTool !== afterTool) throw new Error("协议修复不得替换工具或在工具和 Shell 之间转换");
+        }
+      });
+    });
+    return;
+  }
   if (repair.previousModelOutput.length !== repaired.length) {
     throw new Error("工具参数格式修复不得改变计划步骤数量");
   }
-  const immutable = ["kind", "title", "description", "risk", "expected", "validation"] as const;
+  const precisePaths = repair.diagnostic?.allowedRepairPaths;
+  const legacyField = repair.fieldPath?.match(/fields\[key=([^\]]+)\]\.(type|credential\.target)$/);
+  if (precisePaths ? !precisePaths.length : !legacyField) {
+    throw new Error("PROTOCOL_REPAIR_SCOPE_UNKNOWN：工具参数缺少可验证的局部修复字段");
+  }
+  const immutable = ["kind", "title", "description", "risk", "expected", "validation", "executionScope",
+    "validationScope", "runtimeClass", "sessionContextChange", "recovery", "status"] as const;
   const errorStep = repair.fieldPath?.match(/^steps\[(\d+)\]/)?.[1];
   repair.previousModelOutput.forEach((previous, index) => {
-    const changed = immutable.find((field) => previous[field] !== repaired[index]?.[field]);
+    const changed = immutable.find((field) => stableProtocolValue(protocolFieldValue(previous, field))
+      !== stableProtocolValue(protocolFieldValue(repaired[index], field)));
     if (changed) throw new Error(`工具参数格式修复不得改写 steps[${index}].${changed}`);
     const originalTool = previous.command.match(/^opsark-tool\s+(\S+)/)?.[1];
     if (originalTool !== repaired[index]?.command.match(/^opsark-tool\s+(\S+)/)?.[1]) {
@@ -313,12 +487,49 @@ export function assertPlanRepairScope(repair: PlanNormalizationRepair, repaired:
     if ((!originalTool || (errorStep !== undefined && index !== Number(errorStep))) && previous.command !== repaired[index].command) {
       throw new Error(`工具参数格式修复不得改写无关命令 steps[${index}].command`);
     }
+    if (originalTool && precisePaths && index === Number(errorStep)) {
+      const prefix = `steps[${index}].command.arguments.`;
+      if (!precisePaths.every(path => path.startsWith(prefix))) throw new Error("协议修复字段不属于报错工具参数");
+      const remainder = (command: string) => {
+        const args = decodeToolCommand(command)?.arguments as Record<string, any> | undefined;
+        if (!args) throw new Error("协议修复必须保留有效的原子工具调用");
+        for (const path of precisePaths) {
+          const local = path.slice(prefix.length);
+          if (!/^[A-Za-z_][A-Za-z0-9_]*(?:(?:\.[A-Za-z_][A-Za-z0-9_]*)|(?:\[\d+\]))*$/.test(local)) {
+            throw new Error("协议修复字段路径无效");
+          }
+          const keys = local.match(/[A-Za-z_][A-Za-z0-9_]*|\d+/g)!;
+          let parent = args;
+          for (const key of keys.slice(0, -1)) {
+            if (!parent || typeof parent !== "object" || !Object.prototype.hasOwnProperty.call(parent, key)) {
+              throw new Error("协议修复不得删除或替换报错字段的父结构");
+            }
+            parent = parent[key];
+          }
+          if (!parent || typeof parent !== "object") throw new Error("协议修复不得替换报错字段的父结构");
+          const leaf = keys[keys.length - 1];
+          if (Array.isArray(parent)) {
+            const position = Number(leaf);
+            if (!Number.isInteger(position) || position < 0 || position >= parent.length
+              || !Object.prototype.hasOwnProperty.call(parent, position)) {
+              throw new Error("协议修复不得删除报错数组元素或改变其位置");
+            }
+            parent[position] = null; // Mask only an existing slot; never restore a deleted tail.
+          } else delete parent[leaf];
+        }
+        return stableProtocolValue(args);
+      };
+      if (remainder(previous.command) !== remainder(repaired[index].command)) {
+        throw new Error("协议修复只能修改报错字段，不能改写其他工具参数");
+      }
+    }
     const localField = repair.fieldPath?.match(/fields\[key=([^\]]+)\]\.(type|credential\.target)$/);
     if (originalTool && localField && index === Number(errorStep)) {
       const stable = (value: unknown): string => JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
         ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item);
       const remainder = (command: string) => {
-        const args = JSON.parse(command.replace(/^opsark-tool\s+\S+\s+/, ""));
+        const args = decodeToolCommand(command)?.arguments as Record<string, any> | undefined;
+        if (!args) throw new Error("协议修复必须保留有效的原子工具调用");
         const field = args.fields?.find((item: { key?: string }) => item.key === localField[1]);
         if (!field) throw new Error("协议修复不得删除报错字段");
         if (localField[2] === "type") delete field.type;
@@ -332,19 +543,19 @@ export function assertPlanRepairScope(repair: PlanNormalizationRepair, repaired:
   });
 }
 
-function normalizeStandaloneRepairStage(
+function normalizeProtocolRepairStage(
   repair: PlanNormalizationRepair,
   requirement: string,
   context: string,
 ): PlanStep[] | undefined {
   repair = normalizePlanRepairStrategy(repair);
-  if (repair.repairStrategy?.type !== "standalone_stage_split") return undefined;
-  const { standaloneStepIndex } = repair.repairStrategy;
-  const originalStandalone = repair.previousModelOutput[standaloneStepIndex];
-  const validationStage = standaloneStepIndex > 0
-    ? repair.previousModelOutput.slice(0, standaloneStepIndex)
-    : originalStandalone ? [originalStandalone] : [];
-  assertPlanRepairScope(repair, validationStage);
+  if (!["standalone_stage_split", "read_batch_stage_split"].includes(repair.repairStrategy?.type ?? "")) return undefined;
+  if (repair.repairStrategy?.type === "standalone_stage_split") {
+    const { standaloneStepIndex } = repair.repairStrategy;
+    const originalStandalone = repair.previousModelOutput[standaloneStepIndex];
+    assertPlanRepairScope(repair, standaloneStepIndex > 0
+      ? repair.previousModelOutput.slice(0, standaloneStepIndex) : originalStandalone ? [originalStandalone] : []);
+  }
 
   const completed = completedPlanEvidence(context);
   let firstRemaining = 0;
@@ -353,7 +564,7 @@ function normalizeStandaloneRepairStage(
     firstRemaining += 1;
   }
   if (firstRemaining >= repair.previousModelOutput.length) {
-    throw new Error("standalone 阶段拆分后没有新的待执行步骤");
+    throw new Error("协议阶段拆分后没有新的待执行步骤");
   }
 
   const remaining = repair.previousModelOutput.slice(firstRemaining);
@@ -361,17 +572,26 @@ function normalizeStandaloneRepairStage(
     return normalizePlanPreconditions(remaining, requirement);
   } catch (error) {
     const remainingRepair = buildPlanNormalizationRepair(error, remaining);
-    if (remainingRepair.repairStrategy?.type !== "standalone_stage_split") {
+    if (!["standalone_stage_split", "read_batch_stage_split"].includes(remainingRepair.repairStrategy?.type ?? "")) {
       throw new PlanProtocolError(
         remainingRepair,
         "确定性拆分后的剩余计划仍未通过协议校验",
       );
     }
-    const nextStandaloneIndex = remainingRepair.repairStrategy.standaloneStepIndex;
-    const nextStandalone = remaining[nextStandaloneIndex];
-    const stage = nextStandaloneIndex > 0
-      ? remaining.slice(0, nextStandaloneIndex)
-      : nextStandalone ? [nextStandalone] : [];
+    // The phase-composition error is reported before later scope validators.
+    // Check every original step independently so splitting cannot hide a bad
+    // field/argument/scope in the deferred suffix. Never use these normalized
+    // copies as replacement business steps.
+    for (let index = 0; index < remaining.length; index += 1) {
+      try {
+        normalizePlanPreconditions([remaining[index]], requirement);
+      } catch (stepError) {
+        const detail = String(stepError).replace(/第\s*1\s*个计划步骤/, `第 ${index + 1} 个计划步骤`);
+        throw new PlanProtocolError(buildPlanNormalizationRepair(detail, remaining),
+          "阶段拆分不能掩盖原计划的字段、工具参数或执行作用域错误");
+      }
+    }
+    const stage = planStagePrefix(remaining);
     assertPlanRepairScope(remainingRepair, stage);
     try {
       return normalizePlanPreconditions(stage, requirement);
@@ -382,6 +602,17 @@ function normalizeStandaloneRepairStage(
         "确定性拆分出的当前阶段仍未通过协议校验",
       );
     }
+  }
+}
+
+/** A field-local repair may expose a phase conflict; compile it without another model call. */
+function normalizeRepairedPlan(steps: PlanStep[], requirement: string, context: string) {
+  try {
+    return normalizePlanPreconditions(steps, requirement);
+  } catch (error) {
+    const stage = normalizeProtocolRepairStage(buildPlanNormalizationRepair(error, steps), requirement, context);
+    if (stage) return stage;
+    throw error;
   }
 }
 
@@ -417,12 +648,167 @@ function completedPlanStep(step: PlanStep, evidence: CompletedPlanEvidence) {
 }
 
 function planProtocolRepairRequirement(repair: PlanNormalizationRepair) {
-  return `只修复 context.planGenerationRepair 中保留的原计划协议。不得改变业务、工具、步骤范围或授权。${repair.instruction}`;
+  return `只修复 context.planGenerationRepair 中的被拒步骤，按 previousModelOutput 顺序返回 steps；其余原计划由 Core 本地合并。不得改变业务、工具、步骤范围或授权。${repair.instruction}`;
+}
+
+function beginProtocolRepair(repair: PlanNormalizationRepair, context: string) {
+  const scopeFingerprint = protocolRepairScopeFingerprint(context, repair.diagnostic);
+  if (!repair.progress || repair.progress.scopeFingerprint !== scopeFingerprint) {
+    repair.progress = { scopeFingerprint, attemptedFingerprints: [], seenPlans: [], attemptCount: 0 };
+  }
+  const progress = repair.progress;
+  const fingerprint = planSemanticFingerprint(repair.previousModelOutput);
+  const attempt = `${repair.diagnostic?.code ?? repair.errorCode}:${repair.fieldPath}:${fingerprint}`;
+  if (progress.stopCode || progress.attemptedFingerprints.includes(attempt)) {
+    progress.stopCode ??= "PROTOCOL_REPAIR_NO_PROGRESS";
+    throw new PlanProtocolError(repair, protocolRepairStopMessage(progress));
+  }
+  if (progress.attemptCount >= 3) {
+    progress.stopCode = "PROTOCOL_REPAIR_BUDGET_EXHAUSTED";
+    throw new PlanProtocolError(repair, "PROTOCOL_REPAIR_BUDGET_EXHAUSTED：同一事故达到协议修复上限");
+  }
+  let knownScope = repair.diagnostic
+    ? Boolean(repair.diagnostic.allowedRepairPaths.length)
+    : repair.errorCode === "tool_schema_validation_failed"
+      && /^steps\[\d+\]\.command\.arguments\.fields\[key=[^\]]+\]\.(type|credential\.target)$/.test(repair.fieldPath ?? "");
+  if (repair.diagnostic?.allowedRepairPaths.some(path => /\.recovery(?:\.|$)/.test(path))) {
+    const recovery = protocolRepairAuthority(context).recovery;
+    knownScope = knownScope && Array.isArray(recovery?.blockers) && recovery.blockers.length > 0;
+  }
+  if (!knownScope) {
+    progress.stopCode = "PROTOCOL_REPAIR_SCOPE_UNKNOWN";
+    throw new PlanProtocolError(repair, "PROTOCOL_REPAIR_SCOPE_UNKNOWN：缺少明确修复字段，需要补充权威上下文或业务调整");
+  }
+  progress.attemptedFingerprints.push(attempt);
+  if (!progress.seenPlans.includes(fingerprint)) progress.seenPlans.push(fingerprint);
+  progress.attemptCount += 1;
+}
+
+function mergeScopedProtocolRepairSteps(repair: PlanNormalizationRepair, response: PlanStep[]) {
+  try {
+    const merged = mergeProtocolRepairSteps(repair.previousModelOutput, response, repair.fieldPath);
+    assertPlanRepairScope(repair, merged);
+    return merged;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (repair.progress) {
+      repair.progress.stopCode = reason.startsWith("PROTOCOL_REPAIR_SCOPE_UNKNOWN")
+        ? "PROTOCOL_REPAIR_SCOPE_UNKNOWN" : "PROTOCOL_REPAIR_SCOPE_VIOLATION";
+      repair.progress.stopReason = reason;
+      throw new PlanProtocolError(repair, protocolRepairStopMessage(repair.progress));
+    }
+    throw error;
+  }
+}
+
+/** One model attempt, one local merge, full validation; progress survives persistence. */
+async function executeProtocolRepair(repair: PlanNormalizationRepair, requirement: string, runtimeModel: RuntimeModel) {
+  repair = normalizePlanRepairStrategy(repair);
+  // Legacy tool feedback named only a step. Re-run the actual validator on
+  // that preserved step; never infer argument authority from its error text.
+  if (!repair.diagnostic && repair.errorCode === "tool_schema_validation_failed") {
+    const index = Number(repair.fieldPath?.match(/^steps\[(\d+)\]/)?.[1] ?? -1);
+    const step = repair.previousModelOutput[index];
+    if (step) {
+      let accepted = false;
+      try { normalizePlanPreconditions([step], requirement); accepted = true; } catch (error) {
+        const issue = readRecoveryProtocolError(error);
+        if (issue) {
+          const remap = (path: string) => path.replace(/^steps\[0\]/, `steps[${index}]`);
+          repair = { ...buildPlanNormalizationRepair(new RecoveryProtocolError({ ...issue, stepIndex: index,
+            fieldPath: remap(issue.fieldPath), allowedRepairPaths: issue.allowedRepairPaths.map(remap) }), repair.previousModelOutput),
+            progress: repair.progress, nextStageDecision: repair.nextStageDecision };
+        }
+      }
+      if (accepted) {
+        try { return normalizeRepairedPlan(repair.previousModelOutput, requirement, runtimeModel.context); } catch (error) {
+          repair = { ...buildPlanNormalizationRepair(error, repair.previousModelOutput),
+            progress: repair.progress, nextStageDecision: repair.nextStageDecision };
+        }
+      }
+    }
+  }
+  // Old saved recovery errors used misleading text. Derive current structured
+  // feedback from preserved source, never from guessed step IDs in that text.
+  if (!repair.diagnostic && repair.errorCode === "plan_normalization_failed"
+    && repair.repairStrategy?.type === "plan_protocol") {
+    try {
+      return normalizePlanPreconditions(repair.previousModelOutput, requirement);
+    } catch (error) {
+      if (readRecoveryProtocolError(error)) {
+        repair = { ...buildPlanNormalizationRepair(error, repair.previousModelOutput), progress: repair.progress };
+      }
+    }
+  }
+  try {
+    const localStage = normalizeProtocolRepairStage(repair, requirement, runtimeModel.context);
+    if (localStage) return localStage;
+    beginProtocolRepair(repair, runtimeModel.context);
+    const response = await invoke<PlanStep[]>("generate_ai_plan", {
+      apiKey: runtimeModel.apiKey, endpoint: runtimeModel.endpoint, model: runtimeModel.model,
+      requirement: planProtocolRepairRequirement(repair),
+      context: parameterContext(compactProtocolRepairContext(runtimeModel.context, repair), runtimeModel.requestParameters),
+      generationSettings: runtimeModel.generationSettings, timeoutSeconds: runtimeModel.timeoutSeconds,
+    });
+    const merged = mergeScopedProtocolRepairSteps(repair, response);
+    const fingerprint = planSemanticFingerprint(merged);
+    if (repair.progress!.seenPlans.includes(fingerprint)) {
+      repair.progress!.stopCode = "PROTOCOL_REPAIR_NO_PROGRESS";
+      throw new PlanProtocolError(repair, "PROTOCOL_REPAIR_NO_PROGRESS：修复未改变执行内容或返回此前被拒的计划，已停止重复请求");
+    }
+    try {
+      return normalizeRepairedPlan(merged, requirement, runtimeModel.context);
+    } catch (error) {
+      if (error instanceof PlanProtocolError) {
+        error.repair.progress = repair.progress;
+        error.repair.nextStageDecision = repair.nextStageDecision;
+        throw error;
+      }
+      throw new PlanProtocolError({ ...buildPlanNormalizationRepair(error, merged), progress: repair.progress,
+        nextStageDecision: repair.nextStageDecision }, String(error));
+    }
+  } catch (error) {
+    if (error instanceof PlanProtocolError) throw error;
+    const rustFailure = rustProtocolFailure(error, runtimeModel.context);
+    if (rustFailure) {
+      // A compact repair response is relative to its one-step request. Keep the
+      // full original plan authoritative and reject all out-of-scope changes.
+      try {
+        const merged = mergeScopedProtocolRepairSteps(repair, rustFailure.repair.previousModelOutput);
+        const issue = rustFailure.repair.diagnostic!;
+        const index = Number(repair.fieldPath?.match(/^steps\[(\d+)\]/)?.[1] ?? issue.stepIndex);
+        const remap = (path: string) => path.replace(/^steps\[\d+\]/, `steps[${index}]`);
+        const current = buildPlanNormalizationRepair(new RecoveryProtocolError({ ...issue, stepIndex: index,
+          fieldPath: remap(issue.fieldPath), allowedRepairPaths: issue.allowedRepairPaths.map(remap),
+        }), merged);
+        current.progress = repair.progress;
+        current.nextStageDecision = repair.nextStageDecision;
+        if (current.progress && rustFailure.repair.progress?.stopCode) {
+          current.progress.stopCode = rustFailure.repair.progress.stopCode;
+          current.progress.stopReason = rustFailure.repair.progress.stopReason;
+        } else if (current.progress?.seenPlans.includes(planSemanticFingerprint(merged))) {
+          current.progress.stopCode = "PROTOCOL_REPAIR_NO_PROGRESS";
+        }
+        const failure = new PlanProtocolError(current, current.progress?.stopCode
+          ? protocolRepairStopMessage(current.progress) : rustFailure.repairError);
+        failure.developerTrace = rustFailure.developerTrace;
+        throw failure;
+      } catch (mergedError) {
+        if (mergedError instanceof PlanProtocolError) throw mergedError;
+        throw new PlanProtocolError(repair, String(mergedError));
+      }
+    }
+    throw new PlanProtocolError(repair, String(normalizeModelInvocationError(error)));
+  }
 }
 
 export const backend = {
   async appendTaskLog(stream: "events" | "developer-events", event: unknown, context: unknown) {
     if (isTauri()) await invoke("append_task_log", { stream, event, context });
+  },
+  async queryTaskLogs<T = unknown>(query: DiskLogQuery): Promise<DiskLogQueryResult<T> | null> {
+    if (!isTauri()) return null;
+    return invoke<DiskLogQueryResult<T>>("query_task_logs", { query });
   },
   async saveTaskEvidence(taskId: string, record: Record<string, unknown>) {
     if (!isTauri()) throw new Error("证据持久化需要桌面存储");
@@ -778,26 +1164,7 @@ export const backend = {
       let pendingRepair: PlanNormalizationRepair | undefined;
       try { pendingRepair = JSON.parse(runtimeModel.context || "{}").planGenerationRepair; } catch { /* legacy context */ }
       if (pendingRepair) {
-        pendingRepair = normalizePlanRepairStrategy(pendingRepair);
-        try {
-          const localStage = normalizeStandaloneRepairStage(pendingRepair, requirement, runtimeModel.context);
-          if (localStage) return localStage;
-        } catch (error) {
-          if (error instanceof PlanProtocolError) throw error;
-          throw new PlanProtocolError(pendingRepair, String(normalizeModelInvocationError(error)));
-        }
-        try {
-          const repaired = await invoke<PlanStep[]>("generate_ai_plan", {
-            apiKey: runtimeModel.apiKey, endpoint: runtimeModel.endpoint, model: runtimeModel.model,
-            requirement: planProtocolRepairRequirement(pendingRepair),
-            context: parameterContext(contextWithPlanRepair(runtimeModel.context, pendingRepair), runtimeModel.requestParameters),
-            generationSettings: runtimeModel.generationSettings, timeoutSeconds: runtimeModel.timeoutSeconds,
-          });
-          assertPlanRepairScope(pendingRepair, repaired);
-          return normalizePlanPreconditions(repaired, requirement);
-        } catch (error) {
-          throw new PlanProtocolError(pendingRepair, String(normalizeModelInvocationError(error)));
-        }
+        return executeProtocolRepair(pendingRepair, requirement, runtimeModel);
       }
       let steps: PlanStep[];
       try {
@@ -811,34 +1178,13 @@ export const backend = {
           timeoutSeconds: runtimeModel.timeoutSeconds,
         });
       } catch (error) {
-        throw normalizeModelInvocationError(error);
+        throw rustProtocolFailure(error, runtimeModel.context) ?? normalizeModelInvocationError(error);
       }
       try {
         return normalizePlanPreconditions(steps, requirement);
       } catch (firstError) {
         const repair = buildPlanNormalizationRepair(firstError, steps);
-        try {
-          const localStage = normalizeStandaloneRepairStage(repair, requirement, runtimeModel.context);
-          if (localStage) return localStage;
-        } catch (repairError) {
-          if (repairError instanceof PlanProtocolError) throw repairError;
-          throw new PlanProtocolError(repair, String(normalizeModelInvocationError(repairError)));
-        }
-        try {
-          const repaired = await invoke<PlanStep[]>("generate_ai_plan", {
-            apiKey: runtimeModel.apiKey,
-            endpoint: runtimeModel.endpoint,
-            model: runtimeModel.model,
-            requirement: `${requirement}\n\n上次计划未通过本地协议校验。${planProtocolRepairRequirement(repair)}`,
-            context: parameterContext(contextWithPlanRepair(runtimeModel.context, repair), runtimeModel.requestParameters),
-            generationSettings: runtimeModel.generationSettings,
-            timeoutSeconds: runtimeModel.timeoutSeconds,
-          });
-          assertPlanRepairScope(repair, repaired);
-          return normalizePlanPreconditions(repaired, requirement);
-        } catch (repairError) {
-          throw new PlanProtocolError(repair, String(normalizeModelInvocationError(repairError)));
-        }
+        return executeProtocolRepair(repair, requirement, runtimeModel);
       }
     }
     if (isTauri()) return Promise.reject(new Error("未配置真实大模型连接，拒绝生成预制计划"));
@@ -879,6 +1225,13 @@ export const backend = {
       } catch (error) {
         throw normalizeModelInvocationError(error);
       }
+      const planContext = classifiedPlanContext(runtimeModel.context, result, skillDefinitions);
+      const rustFailure = result.planError ? rustProtocolFailure(result.planError, planContext) : undefined;
+      if (rustFailure) {
+        rustFailure.processed = result;
+        rustFailure.developerTrace = result.developerTrace;
+        throw rustFailure;
+      }
       try {
         return { ...result, plan: normalizePlanPreconditions(result.plan, requirement) };
       } catch (firstError) {
@@ -886,7 +1239,7 @@ export const backend = {
         try {
           const repaired = await backend.generatePlan(requirement, {
             ...runtimeModel,
-            context: contextWithPlanRepair(runtimeModel.context, repair),
+            context: contextWithPlanRepair(planContext, repair),
           });
           return { ...result, plan: repaired };
         } catch (repairError) {
@@ -897,7 +1250,7 @@ export const backend = {
         }
       }
     }
-    return requireDesktopRuntime("智能需求处理");
+    return requireDesktopRuntime("Opsark Agent");
   },
 
   async checkModel(runtimeModel: Omit<RuntimeModel, "context">): Promise<{ available: boolean; reason: string }> {
@@ -1036,6 +1389,7 @@ export const backend = {
         return { ...decision, steps: normalizePlanPreconditions(decision.steps, requirement), source: "model" };
       } catch (error) {
         const repair = buildPlanNormalizationRepair(error, decision.steps);
+        repair.nextStageDecision = { decision: decision.decision, reason: decision.reason, summary: decision.summary };
         // Preserve the joint decision. Only the invalid plan protocol is retried.
         const steps = await backend.generatePlan(requirement, { ...runtimeModel,
           context: contextWithPlanRepair(runtimeModel.context, repair) });
@@ -1043,7 +1397,12 @@ export const backend = {
       }
     } catch (error) {
       if (error instanceof PlanProtocolError) throw error;
-      throw normalizeModelInvocationError(error);
+      const preserved = rustProtocolFailure(error, runtimeModel.context);
+      if (preserved?.repair.nextStageDecision && !preserved.repair.progress?.stopCode) {
+        const steps = await executeProtocolRepair(preserved.repair, requirement, runtimeModel);
+        return { ...preserved.repair.nextStageDecision, steps, source: "model" };
+      }
+      throw preserved ?? normalizeModelInvocationError(error);
     }
   },
 

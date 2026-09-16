@@ -1,81 +1,177 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onDeactivated, onMounted, ref, useId, watch } from "vue";
 import { Check, ChevronDown } from "lucide-vue-next";
 
-const props = defineProps<{
+export type ParameterSelectOption = {
+  value: string;
+  label: string;
+  disabled?: boolean;
+};
+
+const props = withDefaults(defineProps<{
   modelValue: string;
-  options: Array<{ value: string; label: string }>;
+  options: ReadonlyArray<ParameterSelectOption>;
   ariaLabel: string;
   placeholder?: string;
   disabled?: boolean;
   required?: boolean;
   clearable?: boolean;
   clearLabel?: string;
+  size?: "compact" | "small" | "default";
+}>(), {
+  size: "default",
+});
+const emit = defineEmits<{
+  "update:modelValue": [value: string];
+  change: [value: string];
 }>();
-const emit = defineEmits<{ "update:modelValue": [value: string] }>();
 const root = ref<HTMLDetailsElement>();
 const trigger = ref<HTMLElement>();
+const popup = ref<HTMLElement>();
 const isOpen = ref(false);
+const disabledByFieldset = ref(false);
+const placement = ref<"top" | "bottom">("bottom");
+const popupStyle = ref<Record<string, string>>({});
 const listboxId = useId();
 const selectedOption = computed(() => props.options.find((option) => option.value === props.modelValue));
 const displayLabel = computed(() => selectedOption.value?.label ?? props.placeholder ?? "");
+const effectiveDisabled = computed(() => Boolean(props.disabled || disabledByFieldset.value));
+let fieldsetObserver: MutationObserver | undefined;
+let triggerResizeObserver: ResizeObserver | undefined;
 
-function closeMenu(restoreFocus = false) {
-  isOpen.value = false;
-  if (restoreFocus) trigger.value?.focus();
+function isInsideControl(node: Node | null) {
+  return Boolean(node && (root.value?.contains(node) || popup.value?.contains(node)));
 }
 
-async function focusOption(index: number) {
+function closeMenu(restoreFocus = false) {
+  if (!isOpen.value && !restoreFocus) return;
+  isOpen.value = false;
+  if (restoreFocus && !effectiveDisabled.value) void nextTick(() => trigger.value?.focus());
+}
+
+function optionButtons() {
+  return [...(popup.value?.querySelectorAll<HTMLButtonElement>('[role="option"]') ?? [])];
+}
+
+function firstEnabledIndex(fromEnd = false) {
+  const indexes = props.options
+    .map((option, index) => option.disabled ? -1 : index)
+    .filter((index) => index >= 0);
+  return fromEnd ? indexes[indexes.length - 1] ?? -1 : indexes[0] ?? -1;
+}
+
+function nextEnabledIndex(index: number, direction: -1 | 1) {
+  for (let next = index + direction; next >= 0 && next < props.options.length; next += direction) {
+    if (!props.options[next]?.disabled) return next;
+  }
+  return index;
+}
+
+function focusOption(index: number) {
+  if (!isOpen.value || effectiveDisabled.value || index < 0) return;
+  const button = optionButtons()[index];
+  if (button) button.focus();
+  else void nextTick(() => optionButtons()[index]?.focus());
+}
+
+function selectedOrBoundaryIndex(fromEnd = false) {
+  const selectedIndex = props.options.findIndex((option) => option.value === props.modelValue && !option.disabled);
+  return selectedIndex >= 0 ? selectedIndex : firstEnabledIndex(fromEnd);
+}
+
+async function openMenu(focusIndex?: number) {
+  if (effectiveDisabled.value) return;
+  isOpen.value = true;
   await nextTick();
-  if (!isOpen.value || props.disabled) return;
-  root.value?.querySelectorAll<HTMLButtonElement>('[role="option"]')[index]?.focus();
+  updatePopupPosition();
+  if (focusIndex !== undefined) focusOption(focusIndex);
 }
 
 function toggleMenu() {
-  if (props.disabled) return;
-  isOpen.value = !isOpen.value;
+  if (effectiveDisabled.value) return;
+  if (isOpen.value) closeMenu();
+  else void openMenu();
+}
+
+function focusAfterTrigger(backwards: boolean) {
+  const current = trigger.value;
+  if (!current) return;
+  const scope = current.closest<HTMLElement>('dialog, [role="dialog"]') ?? document;
+  const layoutAvailable = current.getClientRects().length > 0;
+  const candidates = [...scope.querySelectorAll<HTMLElement>(
+    'a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary, [tabindex]:not([tabindex="-1"])',
+  )].filter((element) => !element.hasAttribute("disabled")
+    && element.getAttribute("aria-disabled") !== "true"
+    && !element.closest("[hidden], [inert], [aria-hidden='true']")
+    && !popup.value?.contains(element)
+    && (!element.closest("details:not([open])") || element.matches("details:not([open]) > summary"))
+    && (!layoutAvailable || element.getClientRects().length > 0));
+  const index = candidates.indexOf(current);
+  const target = candidates[index + (backwards ? -1 : 1)];
+  closeMenu();
+  void nextTick(() => target?.focus());
 }
 
 function onTriggerKeydown(event: KeyboardEvent) {
-  if (props.disabled) {
+  if (effectiveDisabled.value) {
     if (event.key !== "Tab") event.preventDefault();
     return;
   }
   if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
     event.preventDefault();
-    isOpen.value = true;
-    const selectedIndex = props.options.findIndex((option) => option.value === props.modelValue);
-    const index = event.key === "Home" ? 0 : event.key === "End" ? props.options.length - 1
-      : selectedIndex >= 0 ? selectedIndex : event.key === "ArrowUp" ? props.options.length - 1 : 0;
-    void focusOption(index);
+    const fromEnd = event.key === "ArrowUp" || event.key === "End";
+    const index = event.key === "Home" ? firstEnabledIndex() : event.key === "End" ? firstEnabledIndex(true) : selectedOrBoundaryIndex(fromEnd);
+    void openMenu(index);
   } else if (event.key === "Enter" || event.key === " ") {
     event.preventDefault();
-    toggleMenu();
-    if (isOpen.value) void focusOption(Math.max(0, props.options.findIndex((option) => option.value === props.modelValue)));
-  } else if (event.key === "Escape") {
+    if (isOpen.value) closeMenu();
+    else void openMenu(selectedOrBoundaryIndex());
+  } else if (event.key === "Escape" && isOpen.value) {
     event.preventDefault();
+    closeMenu(true);
+  } else if (event.key === "Tab" && isOpen.value) {
     closeMenu();
   }
 }
 
 function onOptionKeydown(event: KeyboardEvent, index: number) {
-  if (props.disabled) return;
-  const last = props.options.length - 1;
-  const nextIndex = event.key === "ArrowDown" ? Math.min(last, index + 1)
-    : event.key === "ArrowUp" ? Math.max(0, index - 1)
-    : event.key === "Home" ? 0 : event.key === "End" ? last : undefined;
+  if (effectiveDisabled.value) return;
+  let nextIndex: number | undefined;
+  if (event.key === "ArrowDown") nextIndex = nextEnabledIndex(index, 1);
+  else if (event.key === "ArrowUp") nextIndex = nextEnabledIndex(index, -1);
+  else if (event.key === "Home") nextIndex = firstEnabledIndex();
+  else if (event.key === "End") nextIndex = firstEnabledIndex(true);
   if (nextIndex !== undefined) {
     event.preventDefault();
-    void focusOption(nextIndex);
+    focusOption(nextIndex);
+  } else if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    const option = props.options[index];
+    if (option && !option.disabled) chooseOption(option.value);
   } else if (event.key === "Escape") {
+    event.preventDefault();
+    closeMenu(true);
+  } else if (event.key === "Tab") {
+    event.preventDefault();
+    focusAfterTrigger(event.shiftKey);
+  }
+}
+
+function onPopupKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape") {
     event.preventDefault();
     closeMenu(true);
   }
 }
 
 function chooseOption(value: string) {
-  if (props.disabled) return;
-  emit("update:modelValue", value);
+  if (effectiveDisabled.value) return;
+  const option = props.options.find((item) => item.value === value);
+  if (option?.disabled) return;
+  if (value !== props.modelValue) {
+    emit("update:modelValue", value);
+    emit("change", value);
+  }
   closeMenu(true);
 }
 
@@ -84,67 +180,173 @@ function clearSelection() {
 }
 
 function onFocusOut(event: FocusEvent) {
-  if (!root.value?.contains(event.relatedTarget as Node | null)) closeMenu();
+  if (!isInsideControl(event.relatedTarget as Node | null)) closeMenu();
 }
 
 function onOutsidePointer(event: PointerEvent) {
-  if (!root.value?.contains(event.target as Node | null)) closeMenu();
+  if (!isInsideControl(event.target as Node | null)) closeMenu();
 }
 
-watch(() => props.disabled, (disabled) => { if (disabled) closeMenu(); }, { flush: "sync" });
-onMounted(() => document.addEventListener("pointerdown", onOutsidePointer));
-onBeforeUnmount(() => document.removeEventListener("pointerdown", onOutsidePointer));
+function updatePopupPosition() {
+  if (!isOpen.value || !trigger.value) return;
+  const rect = trigger.value.getBoundingClientRect();
+  const viewport = window.visualViewport;
+  const viewportLeft = viewport?.offsetLeft ?? 0;
+  const viewportTop = viewport?.offsetTop ?? 0;
+  const viewportWidth = viewport?.width && viewport.width > 0 ? viewport.width : window.innerWidth;
+  const viewportHeight = viewport?.height && viewport.height > 0 ? viewport.height : window.innerHeight;
+  const viewportRight = viewportLeft + viewportWidth;
+  const viewportBottom = viewportTop + viewportHeight;
+  if (rect.bottom < viewportTop || rect.top > viewportBottom || rect.right < viewportLeft || rect.left > viewportRight) {
+    closeMenu();
+    return;
+  }
+  const margin = 8;
+  const gap = 5;
+  const availableBelow = Math.max(0, viewportBottom - rect.bottom - gap - margin);
+  const availableAbove = Math.max(0, rect.top - viewportTop - gap - margin);
+  const estimatedHeight = Math.min(240, props.options.length * (props.size === "compact" ? 28 : 34) + (props.clearable ? 38 : 10));
+  placement.value = availableBelow < Math.min(estimatedHeight, 150) && availableAbove > availableBelow ? "top" : "bottom";
+  const availableHeight = placement.value === "top" ? availableAbove : availableBelow;
+  const width = Math.max(0, Math.min(Math.max(rect.width, 160), viewportWidth - margin * 2));
+  const left = Math.min(Math.max(rect.left, viewportLeft + margin), Math.max(viewportLeft + margin, viewportRight - margin - width));
+  popupStyle.value = {
+    left: `${left}px`,
+    top: `${placement.value === "top" ? rect.top - gap : rect.bottom + gap}px`,
+    width: `${width}px`,
+    maxHeight: `${Math.min(240, availableHeight)}px`,
+    transform: placement.value === "top" ? "translateY(-100%)" : "none",
+  };
+}
+
+function isDisabledByAncestorFieldset() {
+  let element = root.value?.parentElement;
+  while (element) {
+    if (element instanceof HTMLFieldSetElement && element.disabled) {
+      const firstLegend = [...element.children].find((child) => child instanceof HTMLLegendElement);
+      if (!firstLegend?.contains(root.value ?? null)) return true;
+    }
+    element = element.parentElement;
+  }
+  return false;
+}
+
+function syncFieldsetDisabled() {
+  disabledByFieldset.value = isDisabledByAncestorFieldset();
+}
+
+function addViewportListeners() {
+  window.addEventListener("resize", updatePopupPosition);
+  window.addEventListener("scroll", updatePopupPosition, true);
+  window.visualViewport?.addEventListener("resize", updatePopupPosition);
+  window.visualViewport?.addEventListener("scroll", updatePopupPosition);
+}
+
+function removeViewportListeners() {
+  window.removeEventListener("resize", updatePopupPosition);
+  window.removeEventListener("scroll", updatePopupPosition, true);
+  window.visualViewport?.removeEventListener("resize", updatePopupPosition);
+  window.visualViewport?.removeEventListener("scroll", updatePopupPosition);
+}
+
+watch(effectiveDisabled, (disabled) => { if (disabled) closeMenu(); }, { flush: "sync" });
+watch(isOpen, async (open) => {
+  removeViewportListeners();
+  if (!open) return;
+  addViewportListeners();
+  await nextTick();
+  updatePopupPosition();
+});
+watch(() => props.options, () => { if (isOpen.value) void nextTick(updatePopupPosition); }, { deep: true });
+
+onMounted(() => {
+  document.addEventListener("pointerdown", onOutsidePointer);
+  syncFieldsetDisabled();
+  const fieldsets: HTMLFieldSetElement[] = [];
+  let element = root.value?.parentElement;
+  while (element) {
+    if (element instanceof HTMLFieldSetElement) fieldsets.push(element);
+    element = element.parentElement;
+  }
+  if (fieldsets.length) {
+    fieldsetObserver = new MutationObserver(syncFieldsetDisabled);
+    fieldsets.forEach((fieldset) => fieldsetObserver?.observe(fieldset, { attributes: true, attributeFilter: ["disabled"] }));
+  }
+  if (trigger.value && typeof ResizeObserver !== "undefined") {
+    triggerResizeObserver = new ResizeObserver(updatePopupPosition);
+    triggerResizeObserver.observe(trigger.value);
+  }
+});
+onBeforeUnmount(() => {
+  document.removeEventListener("pointerdown", onOutsidePointer);
+  removeViewportListeners();
+  fieldsetObserver?.disconnect();
+  triggerResizeObserver?.disconnect();
+});
+onDeactivated(() => closeMenu());
 </script>
 
 <template>
-  <details ref="root" class="parameter-select" :class="{ 'is-disabled': disabled }" :open="isOpen" @focusout="onFocusOut">
+  <details ref="root" :class="['parameter-select', `size-${size}`, { 'is-disabled': effectiveDisabled }]" :open="isOpen" @focusout="onFocusOut">
     <summary
       ref="trigger"
       :aria-label="ariaLabel"
       aria-haspopup="listbox"
       :aria-expanded="isOpen"
       :aria-controls="listboxId"
-      :aria-disabled="Boolean(disabled)"
-      :tabindex="disabled ? -1 : 0"
+      :aria-disabled="effectiveDisabled"
+      :tabindex="effectiveDisabled ? -1 : 0"
       @click.prevent="toggleMenu"
       @keydown="onTriggerKeydown"
     >
       <span :class="{ placeholder: !selectedOption }" :title="displayLabel">{{ displayLabel }}</span>
       <ChevronDown :size="14" />
     </summary>
-    <div class="parameter-options">
-      <div :id="listboxId" role="listbox" :aria-label="ariaLabel" :aria-required="required || undefined">
+    <Teleport to="body">
+      <div
+        v-if="isOpen"
+        ref="popup"
+        :class="['parameter-options', `size-${size}`, `placement-${placement}`]"
+        :style="popupStyle"
+        @focusout="onFocusOut"
+        @keydown="onPopupKeydown"
+      >
+        <div :id="listboxId" role="listbox" :aria-label="ariaLabel" :aria-required="required || undefined">
+          <button
+            v-for="(option, index) in options"
+            :key="option.value"
+            type="button"
+            role="option"
+            tabindex="-1"
+            :data-value="option.value"
+            :disabled="effectiveDisabled || option.disabled"
+            :aria-disabled="option.disabled || undefined"
+            :aria-selected="option.value === modelValue"
+            :title="option.label"
+            @click="chooseOption(option.value)"
+            @keydown="onOptionKeydown($event, index)"
+          >
+            <span>{{ option.label }}</span>
+            <Check v-if="option.value === modelValue" :size="14" />
+          </button>
+        </div>
         <button
-          v-for="(option, index) in options"
-          :key="option.value"
+          v-if="clearable && !required && modelValue !== ''"
+          class="parameter-clear"
           type="button"
-          role="option"
-          tabindex="-1"
-          :disabled="disabled"
-          :aria-selected="option.value === modelValue"
-          :title="option.label"
-          @click="chooseOption(option.value)"
-          @keydown="onOptionKeydown($event, index)"
-        >
-          <span>{{ option.label }}</span>
-          <Check v-if="option.value === modelValue" :size="14" />
-        </button>
+          :aria-label="`${clearLabel ?? 'Clear'} ${ariaLabel}`"
+          :disabled="effectiveDisabled"
+          @click="clearSelection"
+          @keydown.tab.prevent="focusAfterTrigger($event.shiftKey)"
+        >{{ clearLabel ?? 'Clear' }}</button>
       </div>
-      <button
-        v-if="clearable && !required && modelValue !== ''"
-        class="parameter-clear"
-        type="button"
-        :aria-label="`${clearLabel ?? 'Clear'} ${ariaLabel}`"
-        :disabled="disabled"
-        @click="clearSelection"
-        @keydown.esc.prevent="closeMenu(true)"
-      >{{ clearLabel ?? 'Clear' }}</button>
-    </div>
+    </Teleport>
   </details>
 </template>
 
 <style scoped>
-.parameter-select{position:relative;width:100%;margin:0;border:0}.parameter-select summary{display:flex;align-items:center;justify-content:space-between;width:100%;height:38px;padding:0 11px;border:1px solid var(--border);border-radius:7px;background:var(--bg);color:var(--text);cursor:pointer;list-style:none}.parameter-select summary::-webkit-details-marker{display:none}.parameter-select[open] summary{border-color:var(--accent);outline:1px solid var(--accent)}.parameter-select[open] summary svg{transform:rotate(180deg)}.parameter-select summary svg{flex-shrink:0;color:var(--muted);transition:transform .14s}.parameter-options{position:absolute;z-index:20;top:calc(100% + 5px);left:0;width:100%;max-height:220px;padding:5px;overflow:auto;border:1px solid var(--border);border-radius:8px;background:var(--raised);box-shadow:0 14px 34px #0006}.parameter-options button{display:flex;align-items:center;justify-content:space-between;width:100%;min-height:34px;padding:7px 9px;border:0;border-radius:5px;background:transparent;color:var(--text);text-align:left;cursor:pointer}.parameter-options button:hover,.parameter-options button:focus-visible{background:var(--accent-soft);color:var(--accent-strong);outline:0}.parameter-options svg{flex-shrink:0;color:var(--accent)}
-.parameter-select{min-width:0}.parameter-select summary span,.parameter-options button span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.parameter-select summary,.parameter-options button{gap:8px}.parameter-select .placeholder{color:var(--muted)}.parameter-select.is-disabled summary{opacity:.6;cursor:not-allowed}.parameter-select summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.parameter-options .parameter-clear{margin-top:4px;border-top:1px solid var(--border);border-radius:0;color:var(--muted)}
+.parameter-select,.parameter-options{--parameter-select-height:38px;--parameter-select-font-size:12px;--parameter-select-radius:7px;--parameter-option-height:34px}.parameter-select.size-small{--parameter-select-height:35px;--parameter-select-font-size:10px;--parameter-select-radius:5px;--parameter-option-height:32px}.parameter-options.size-small{--parameter-select-font-size:11px;--parameter-select-radius:5px;--parameter-option-height:32px}.parameter-select.size-compact{--parameter-select-height:26px;--parameter-select-font-size:10px;--parameter-select-radius:4px;--parameter-option-height:30px}.parameter-options.size-compact{--parameter-select-font-size:11px;--parameter-select-radius:4px;--parameter-option-height:30px}
+.parameter-select{position:relative;width:100%;min-width:0;margin:0;border:0}.parameter-select summary{display:flex;align-items:center;justify-content:space-between;width:100%;height:var(--parameter-select-height);padding:0 10px;gap:8px;border:1px solid var(--border,#3a414b);border-radius:var(--parameter-select-radius);background:var(--panel,var(--raised,#171b21));color:var(--text,#edf0f3);font-size:var(--parameter-select-font-size);cursor:pointer;list-style:none;transition:border-color .14s ease,background-color .14s ease,box-shadow .14s ease}.parameter-select summary::-webkit-details-marker{display:none}.parameter-select summary:hover{border-color:color-mix(in srgb,var(--accent,#d9f763) 34%,var(--border,#3a414b));background:var(--hover,var(--panel-2,#20252c))}.parameter-select[open] summary{border-color:var(--accent,#d9f763);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent,#d9f763) 16%,transparent)}.parameter-select[open] summary svg{transform:rotate(180deg)}.parameter-select summary svg{flex-shrink:0;color:var(--muted,#929ba7);transition:transform .14s ease}.parameter-select summary span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.parameter-select .placeholder{color:var(--muted,#929ba7)}.parameter-select.is-disabled summary{opacity:.52;cursor:not-allowed}.parameter-select.is-disabled summary:hover{border-color:var(--border,#3a414b);background:var(--panel,var(--raised,#171b21))}.parameter-select summary:focus-visible{outline:2px solid var(--accent,#d9f763);outline-offset:2px}
+.parameter-options{position:fixed;z-index:2000;display:flex;flex-direction:column;min-width:0;padding:5px;overflow:hidden;border:1px solid var(--border,#3a414b);border-radius:calc(var(--parameter-select-radius) + 1px);background:var(--raised,#171b21);color:var(--text,#edf0f3);box-shadow:var(--shadow-popover,0 14px 34px rgba(0,0,0,.36));font-size:var(--parameter-select-font-size)}.parameter-options>div{min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-color:var(--border,#3a414b) transparent}.parameter-options button{display:flex;align-items:center;justify-content:space-between;width:100%;min-height:var(--parameter-option-height);padding:6px 9px;gap:8px;border:0;border-radius:calc(var(--parameter-select-radius) - 2px);background:transparent;color:var(--text,#edf0f3);font-size:inherit;text-align:left;cursor:pointer}.parameter-options button span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.parameter-options button:hover:not(:disabled),.parameter-options button:focus-visible{background:var(--hover,var(--panel-2,#222830));color:var(--text,#edf0f3);outline:0}.parameter-options button[aria-selected="true"]{background:var(--accent-soft,color-mix(in srgb,var(--accent,#d9f763) 12%,transparent));color:var(--accent,#d9f763)}.parameter-options button[aria-selected="true"]:hover,.parameter-options button[aria-selected="true"]:focus-visible{background:color-mix(in srgb,var(--accent,#d9f763) 18%,transparent)}.parameter-options button:focus-visible{box-shadow:inset 0 0 0 1px var(--accent,#d9f763)}.parameter-options button:disabled{opacity:.45;cursor:not-allowed}.parameter-options svg{flex-shrink:0;color:var(--accent,#d9f763)}.parameter-options .parameter-clear{margin-top:4px;border-top:1px solid var(--border,#3a414b);border-radius:0;color:var(--muted,#929ba7)}
+@media(prefers-reduced-motion:reduce){.parameter-select summary,.parameter-select summary svg{transition:none}}
 </style>

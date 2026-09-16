@@ -15,6 +15,8 @@ import {
   type SkillOutputSignals,
 } from "@/features/skills/validationAdapters";
 import { buildStepScopeEvidence } from "@/features/agent/executionScope";
+import { recordedSupplementalAcceptance, validationHasAcceptanceCheck } from "@/features/agent/planSafety";
+import { commandMutation } from "@/services/recoveryRules";
 
 export type NormalizedPlanStep = PlanStep & { validator: StepValidator };
 
@@ -59,8 +61,7 @@ export function analyzeCommandFailure(output: string) {
 }
 
 export function isMutatingStepCommand(command: string) {
-  return /(?:^|[;&|]\s*|\bsudo\s+)(?:apt(?:-get)?|yum|dnf|rpm|dpkg|npm|pnpm|yarn|pip)\s+(?:install|ci|add|remove|upgrade|update|run|build)|\b(?:nvm|fnm|volta|asdf)\s+(?:install|use|global|alias|default)\b|\bcurl\b[\s\S]*\|\s*(?:ba)?sh\b|\bmvn\b.*\b(?:install|deploy)\b|\bsystemctl\s+(?:start|stop|restart|reload|enable|disable)|\bservice\s+\S+\s+(?:start|stop|restart|reload)|\b(?:reboot|shutdown|kill|pkill|killall)\b|\b(?:rm|mv|cp|chmod|chown|ln)\s|\bsed\s+-i\b|\b(?:tee|truncate)\s|\bdocker\s+(?:run|start|stop|restart|rm|compose\s+up)|\b(?:CREATE|ALTER|DROP|TRUNCATE|INSERT|UPDATE|DELETE|GRANT|REVOKE)\b/i
-    .test(command);
+  return commandMutation(command) !== undefined;
 }
 
 export function isReadOnlyStep(step: PlanStep) {
@@ -222,11 +223,25 @@ export function classifyStepResult(
     ...(evidenceConflict ? ["主命令输出与独立校验结果存在冲突。"] : []),
   ];
   const collectedAt = new Date().toISOString();
+  const verificationCommand = commandResultOnly ? step.command : step.validation;
+  const supplemental = step.recovery?.purpose === "verify"
+    ? recordedSupplementalAcceptance(verificationCommand) : undefined;
+  const recoveryAcceptance = supplemental && step.recovery ? {
+    ...supplemental, expected: step.expected,
+    failedStepId: step.recovery.failedStepId, targetContext: step.recovery.targetContext,
+  } : undefined;
+  const acceptanceFacts = step.recovery?.purpose === "verify" ? {
+    acceptanceBasis: supplemental ? "supplemental_original_predicates"
+      : validationHasAcceptanceCheck(verificationCommand) ? "shell_exit_assertion" : "unproven",
+    acceptancePassed: Boolean((supplemental || validationHasAcceptanceCheck(verificationCommand))
+      && (commandResultOnly ? execution.success && execution.exitCode === 0 : validation.passed && validation.exitCode === 0)),
+    recoveryAcceptance,
+  } : {};
   const mainEvidence: ExecutionEvidence = {
     id: evidenceId("main"),
     type: validator.type,
     source: "main",
-    facts: mainParsed.facts,
+    facts: { ...mainParsed.facts, ...(commandResultOnly ? acceptanceFacts : {}) },
     rawOutput: execution.output,
     collectedAt,
     scope: scopeTarget ? buildStepScopeEvidence(step, "main", scopeTarget) : undefined,
@@ -236,6 +251,7 @@ export function classifyStepResult(
     type: validator.type,
     source: "validation",
     facts: {
+      ...acceptanceFacts,
       passed: validation.passed,
       exitCode: validation.exitCode,
       acceptedDiagnosticState: validationAccepted && !validation.passed,
@@ -260,6 +276,7 @@ export function classifyStepResult(
       exitCode: execution.exitCode,
       facts: {
         ...parsed.facts,
+        ...acceptanceFacts,
         interpretation: validator.type === "command" ? "raw" : "structured",
         proves: "command_execution_only",
         mainObservationStatus: mainParsed.status,

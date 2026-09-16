@@ -24,10 +24,13 @@ import type { StepReview } from "@/types";
 import { planningSkills } from "@/features/skills/skillPlanning";
 import { modelLogContext } from "./modelLogContext";
 import { taskAttemptContext } from "@/features/agent/attemptState";
-import { executionContextEvidence, EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION } from "@/features/agent/executionContextEvidence";
+import { executionContextEvidence, modelContextStep, EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION } from "@/features/agent/executionContextEvidence";
 import { DECISION_EVIDENCE_INSTRUCTION } from "./decisionEvidence";
 import { authenticationContext } from "./authenticationEvidence";
 import { completedContinuationCommandFingerprints } from "./taskProgression";
+import { confirmedUserInputsContext } from "./confirmedUserInputs";
+import { recoveryPlanningContext } from "./recoveryContract";
+import { activeProtocolRepair, protocolReplanContext } from "./protocolReplan";
 
 export function trimEvidence(value: string | undefined, limit = 3200) {
   if (!value) return "";
@@ -43,7 +46,7 @@ export function extractKnownExecutionFacts(task: OpsTask, skills = resolveTaskSk
       stepId: step.id,
       title: step.title,
       command: step.command,
-      result: step.result,
+      result: modelContextStep(step).result,
       ...executionContextEvidence(step, trimEvidence),
       targetContext: step.attemptContext,
       executionScope: step.executionScope,
@@ -165,6 +168,8 @@ export function buildAgentContext(input: AgentContextInput) {
     taskGoal: input.taskGoal,
     previousExecution: input.previousExecution,
     knownExecutionFacts: input.knownExecutionFacts,
+    confirmedUserInputs: input.task ? confirmedUserInputsContext(input.task) : undefined,
+    recovery: input.task ? recoveryPlanningContext(input.task) : undefined,
     tools: buildToolContext(input.tools),
     skillSelection: {
       mode: "model",
@@ -192,6 +197,8 @@ export interface AdjustmentContextOptions {
   sharedSnapshot?: Record<string, unknown>;
   reviewDecision?: StepReview;
   adjustmentReason?: string;
+  /** Explicit business planning transition; never inferred by a protocol compiler. */
+  replanAfterProtocolFailure?: boolean;
 }
 
 function boundedPlanningTools(tools: ToolDefinition[], skills: SkillDefinition[]) {
@@ -214,27 +221,40 @@ export function buildAdjustmentContext(
   options: AdjustmentContextOptions = {},
 ) {
   const activeSkills = planningSkills(input.task, input.skills ?? resolveTaskSkills(input.task));
-  const planSafetyRejection = failedStep?.result?.facts.category === "plan_safety_rejection";
+  const planSafetyRejection = !options.replanAfterProtocolFailure
+    && failedStep?.result?.facts.category === "plan_safety_rejection";
   const focusedSafety = planSafetyRejection && failedStep
     ? planSafetyAdjustmentContext(input.task, failedStep)
     : undefined;
+  const protocolReplan = options.replanAfterProtocolFailure ? protocolReplanContext(input.task) : undefined;
+  const protocolRepair = protocolReplan ? undefined : activeProtocolRepair(input.task)?.repair;
   return {
-    workflowPhase: "adjust_after_failure",
+    workflowPhase: protocolReplan ? "business_replan_after_protocol_failure" : "adjust_after_failure",
+    protocolReplan,
+    recovery: planSafetyRejection ? undefined : recoveryPlanningContext(input.task),
+    taskGoal: {
+      rootGoal: taskGoal(input.task),
+      currentInstruction: input.task.currentInstruction,
+      relation: input.task.lastRequirementRelation,
+    },
+    permission: input.task.permission,
+    executionConstraints: input.task.executionConstraints,
     completedCommandFingerprints: completedContinuationCommandFingerprints(
       activeRoundSteps(input.task),
       taskAttemptContext(input.task),
     ),
-    authentication: authenticationContext(input.task),
-    planGenerationRepair: input.task.protocolRepair?.roundId === input.task.currentRoundId
-      && input.task.protocolRepair?.serverId === (input.task.executionTargetServerId || input.task.serverId)
-      ? input.task.protocolRepair.repair : undefined,
+    authentication: protocolRepair ? undefined : authenticationContext(input.task),
+    confirmedUserInputs: confirmedUserInputsContext(input.task),
+    planGenerationRepair: protocolRepair,
     _log: modelLogContext(input.task, failedStep),
     skillEvidence: buildSkillEvidenceContext(activeSkills),
     // Keep policy content ahead of per-attempt evidence so providers can reuse
     // the longest stable request prefix across adjustments for the same goal.
     tools: boundedPlanningTools(input.tools, activeSkills),
     activeSkills: boundedPlanningSkills(activeSkills),
-    instruction: input.task.protocolRepair
+    instruction: protocolReplan
+      ? protocolReplan.instruction
+      : protocolRepair
       ? "只修复 planGenerationRepair 中的原始计划协议；不得重新理解需求、换目标、换工具或改写无关字段。认证和历史证据不是扩大本次修复范围的授权。"
       : planSafetyRejection
       ? "这是执行前确定性安全门禁，不是远端执行失败。命令尚未发送到服务器。只修复 failedStep.offendingFields 列出的字段，必须保留真实失败退出码；不要改写步骤标题、风险、预期结果、其他步骤或用户授权。只返回该步骤的一个完整替代步骤，它仍会重新经过统一安全门禁。"
@@ -245,9 +265,9 @@ export function buildAdjustmentContext(
     // A deterministic safety-gate repair has its own deliberately narrow
     // payload below. Re-attaching the general task snapshot here would leak
     // unrelated commands and outputs into what must be a field-local rewrite.
-    baseSnapshot: planSafetyRejection
+    baseSnapshot: planSafetyRejection || protocolRepair
       ? undefined
-      : options.sharedSnapshot ?? buildTaskDecisionSnapshot(input.task, failedStep,
+      : (!protocolReplan && options.sharedSnapshot) || buildTaskDecisionSnapshot(input.task, failedStep,
         buildPlanningToolContext(input.tools, activeSkills).some(tool => tool.id === "evidence.read")),
     adjustmentTrigger: {
       reason: options.adjustmentReason
@@ -297,6 +317,7 @@ export function nextStagePolicyFingerprint(input: WorkflowContextInput) {
     tools: planningTools,
     secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),
     serverCredentialGroups: credentialGroupContext(input.secretMetadata, input.task.serverId),
+    confirmedUserInputs: confirmedUserInputsContext(input.task),
   }));
 }
 
@@ -310,11 +331,19 @@ export function buildNextStageContext(input: WorkflowContextInput) {
   const policyFingerprint = nextStagePolicyFingerprint(input);
   return {
     workflowPhase: "decide_after_phase",
+    recovery: recoveryPlanningContext(input.task),
+    taskGoal: {
+      rootGoal: taskGoal(input.task),
+      currentInstruction: input.task.currentInstruction,
+      relation: input.task.lastRequirementRelation,
+    },
+    permission: input.task.permission,
     completedCommandFingerprints: completedContinuationCommandFingerprints(
       activeRoundSteps(input.task),
       taskAttemptContext(input.task),
     ),
     authentication: authenticationContext(input.task),
+    confirmedUserInputs: confirmedUserInputsContext(input.task),
     _log: modelLogContext(input.task),
     skillEvidence: buildSkillEvidenceContext(activeSkills),
     tools: buildPlanningToolContext(input.tools, activeSkills),
@@ -335,11 +364,13 @@ export function buildContinuationContext(input: WorkflowContextInput) {
   const activeSkills = planningSkills(input.task, input.skills ?? resolveTaskSkills(input.task));
   return {
     workflowPhase: "continue_after_discovery",
+    recovery: recoveryPlanningContext(input.task),
     completedCommandFingerprints: completedContinuationCommandFingerprints(
       activeRoundSteps(input.task),
       taskAttemptContext(input.task),
     ),
     authentication: authenticationContext(input.task),
+    confirmedUserInputs: confirmedUserInputsContext(input.task),
     _log: modelLogContext(input.task),
     skillEvidence: buildSkillEvidenceContext(activeSkills),
     tools: buildPlanningToolContext(input.tools, activeSkills),
@@ -361,7 +392,7 @@ export function buildContinuationContext(input: WorkflowContextInput) {
       description: step.description,
       command: step.command,
       expected: step.expected,
-      result: step.result,
+      result: modelContextStep(step).result,
       executionScope: step.executionScope,
       validationScope: step.validationScope,
       targetContext: step.attemptContext,

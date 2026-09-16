@@ -5,12 +5,14 @@ import {
   latestTaskRequirement,
   resolveTaskProgression,
   selectAdjustmentSteps,
+  selectBusinessReplanSteps,
   selectContinuationSteps,
 } from "@/features/agent/taskProgression";
 import type { OpsTask, PlanStep } from "@/types";
 import type { ToolDefinition } from "@/features/tools/types";
 import { buildCommandFailure } from "@/features/agent/commandStepResult";
 import { currentEvidenceSteps, taskAttemptContext } from "@/features/agent/attemptState";
+import { validateRecoveryReferences } from "@/features/agent/recoveryContract";
 
 const step = (overrides: Partial<PlanStep> = {}): PlanStep => ({
   id: overrides.id ?? "step-1",
@@ -39,6 +41,74 @@ const task = (plan: PlanStep[], overrides: Partial<OpsTask> = {}): OpsTask => ({
 });
 
 describe("taskProgression", () => {
+  it("keeps a fresh read after a proposed change without rewriting the prior successful observation", () => {
+    const prior = step({ id: "prior-read", kind: "observe", command: "sysctl -n net.ipv4.ip_forward",
+      validation: "", output: "0" });
+    const change = step({ id: "enable-forwarding", kind: "change", command: "sysctl -w net.ipv4.ip_forward=1",
+      validation: 'test "$(sysctl -n net.ipv4.ip_forward)" = 1', status: "pending" });
+    const read = { ...prior, id: "fresh-read", status: "pending" as const, output: undefined };
+    const before = JSON.stringify([prior, change, read]);
+    expect(selectBusinessReplanSteps([prior], [change, read])).toEqual([change, read]);
+    expect(JSON.stringify([prior, change, read])).toBe(before);
+    expect(prior.status).toBe("completed");
+    expect(change.status).toBe("pending");
+    expect(selectBusinessReplanSteps([prior], [read])).toEqual([]);
+    expect(selectBusinessReplanSteps([prior], [read, change])).toEqual([change]);
+  });
+
+  it("deduplicates adjacent reads but keeps a second observation after an intervening proposed change", () => {
+    const read = step({ id: "read-1", kind: "observe", command: "sysctl -n net.ipv4.ip_forward", validation: "", status: "pending" });
+    const repeat = { ...read, id: "read-2" };
+    const change = step({ id: "change", kind: "change", command: "sysctl -w net.ipv4.ip_forward=1", status: "pending" });
+    expect(selectBusinessReplanSteps([], [read, repeat])).toEqual([read]);
+    expect(selectBusinessReplanSteps([], [read, change, repeat, { ...repeat, id: "read-3" }]))
+      .toEqual([read, change, repeat]);
+  });
+
+  it("does not treat a filtered completed change as a new reason to reobserve or repeat writes", () => {
+    const read = step({ id: "old-read", kind: "observe", command: "sysctl -n net.ipv4.ip_forward", validation: "" });
+    const change = step({ id: "old-change", kind: "change", command: "sysctl -w net.ipv4.ip_forward=1" });
+    const repeatedChange = { ...change, id: "new-change", status: "pending" as const };
+    const repeatedRead = { ...read, id: "new-read", status: "pending" as const };
+    expect(selectBusinessReplanSteps([change, read], [repeatedChange, repeatedRead])).toEqual([]);
+    const other = { ...repeatedChange, id: "different-change", command: "sysctl -w net.ipv6.conf.all.forwarding=1" };
+    expect(selectBusinessReplanSteps([change, read], [other, repeatedChange, repeatedRead]))
+      .toEqual([other, repeatedRead]);
+  });
+
+  it("retains recovery verification against full failure history and never changes its acceptance contract", () => {
+    const target = JSON.stringify(["server", "round", "session", 1, 0]);
+    const failed = step({ id: "failed-change", kind: "change", status: "failed", attemptContext: target,
+      command: "sysctl -w net.ipv4.ip_forward=1", validation: 'test "$(sysctl -n net.ipv4.ip_forward)" = 1',
+      expected: "转发必须为 1" });
+    const previousRead = step({ id: "prior-assertion", kind: "observe", command: failed.validation,
+      expected: failed.expected, validation: "", attemptContext: target });
+    const verify = { ...previousRead, id: "fresh-verification", status: "pending" as const,
+      recovery: { failedStepId: failed.id, targetContext: target, purpose: "verify" as const } };
+    // Even a matching completed query cannot stand in for the required,
+    // explicitly linked verification of this unresolved failed attempt.
+    const history = [failed, previousRead];
+    const before = JSON.stringify(history);
+    const selected = selectBusinessReplanSteps(history, [verify], target);
+    expect(selected).toEqual([verify]);
+    expect(() => validateRecoveryReferences(history, selected, target)).not.toThrow();
+    expect(() => validateRecoveryReferences(history, [{ ...verify, expected: "命令能返回即可" }], target))
+      .toThrow("RECOVERY_ACCEPTANCE_MISMATCH");
+    expect(JSON.stringify(history)).toBe(before);
+  });
+
+  it("allows a read_batch state check after a change but does not repeat confirmed inputs or server connections", () => {
+    const software = step({ id: "old-software", kind: "observe", command: 'opsark-tool software.check {"names":["node"]}', validation: "" });
+    const userInput = step({ id: "old-input", kind: "observe", validation: "", command:
+      'opsark-tool user.request_input {"title":"目标","fields":[{"key":"TARGET","label":"目标","description":"选择目标","type":"text","required":true}]}' });
+    const connect = step({ id: "old-connect", kind: "observe", validation: "", command:
+      'opsark-tool server.connect {"host":"10.0.0.2","credentialRef":"managed-server:target"}' });
+    const change = step({ id: "install", kind: "change", command: "dnf install -y nodejs", status: "pending" });
+    const candidates = [change, ...[software, userInput, connect].map(item => ({ ...item, id: `new-${item.id}`, status: "pending" as const }))];
+    expect(selectBusinessReplanSteps([software, userInput, connect], candidates).map(item => item.id))
+      .toEqual([change.id, "new-old-software"]);
+  });
+
   it("invalidates observations after a real failed compound change while preventing its blind retry", () => {
     const current = task([]);
     const context = taskAttemptContext(current);
@@ -299,9 +369,10 @@ describe("taskProgression", () => {
     ]).map((item) => item.id)).toEqual(["fixed-validation"]);
   });
 
-  it("keeps a blocker until a successful mutating repair occurs", () => {
+  it("keeps a blocker after a successful mutation until its original contract is verified", () => {
     const blocker = step({
       id: "blocker",
+      validation: "test -d /opt/app",
       result: {
         executionStatus: "success",
         observationStatus: "warning",
@@ -326,6 +397,15 @@ describe("taskProgression", () => {
       },
     });
     blockedTask.plan.splice(1, 0, repair);
+    expect(findUnresolvedBlockingStep(blockedTask, current)).toBe(blocker);
+    blocker.attemptContext = "target-1";
+    const verify = step({ id: "verify", kind: "observe", command: blocker.validation, validation: "",
+      attemptContext: "target-1", recovery: { failedStepId: blocker.id, targetContext: "target-1", purpose: "verify" },
+      result: { executionStatus: "success", observationStatus: "matched", exitCode: 0,
+        facts: {}, warnings: [], evidenceIds: ["verification"] },
+      evidence: [{ id: "verification", type: "command", source: "main", facts: {}, rawOutput: "ok", collectedAt: "now" }],
+    });
+    blockedTask.plan.splice(2, 0, verify);
     expect(findUnresolvedBlockingStep(blockedTask, current)).toBeUndefined();
   });
 });

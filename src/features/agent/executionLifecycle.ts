@@ -39,6 +39,8 @@ export interface RunCommandLifecycleInput {
   command: string;
   validation: string;
   executionId: string;
+  /** Absolute deadline supplied by the execution owner, independent of model plans. */
+  executionDeadlineAt?: number;
   connection?: RuntimeConnection;
   runtimeModel?: RuntimeModel;
   secretValues: Record<string, string>;
@@ -80,6 +82,7 @@ export async function runCommandLifecycle(
     requirement: input.requirement,
     validation: input.validation,
     executionId: input.executionId,
+    executionDeadlineAt: input.executionDeadlineAt,
     connection: input.connection,
     runtimeModel: input.runtimeModel,
     secretValues: input.secretValues,

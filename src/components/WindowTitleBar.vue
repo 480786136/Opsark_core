@@ -8,12 +8,12 @@ defineProps<{ mac: boolean }>();
 const { locale } = useI18n();
 const maximized = ref(false);
 const focused = ref(true);
-const failure = ref("");
+const failure = ref(false);
 let disposed = false;
 const cleanup: (() => void)[] = [];
 async function action(kind: "minimize" | "toggleMaximize" | "close") {
-  try { failure.value = ""; await getCurrentWindow()[kind](); }
-  catch { failure.value = locale.value.startsWith("zh") ? "窗口操作失败，请重试" : "Window action failed. Please retry."; }
+  try { failure.value = false; await getCurrentWindow()[kind](); }
+  catch { failure.value = true; }
 }
 onMounted(async () => {
   const window = getCurrentWindow();
@@ -33,7 +33,7 @@ onBeforeUnmount(() => { disposed = true; cleanup.forEach(stop => stop()); });
     <div class="window-drag-zone" data-tauri-drag-region>
       <span class="window-brand" data-tauri-drag-region>Opsark</span><span class="window-caption" data-tauri-drag-region>{{ locale.startsWith('zh') ? '智能运维控制台' : 'Operations Console' }}</span>
     </div>
-    <span v-if="failure" class="window-error" role="alert">{{ failure }}</span>
+    <span v-if="failure" class="window-error" role="alert">{{ locale.startsWith("zh") ? "窗口操作失败，请重试" : "Window action failed. Please retry." }}</span>
     <div v-if="!mac" class="window-buttons">
       <button :aria-label="locale.startsWith('zh') ? '最小化窗口' : 'Minimize window'" :title="locale.startsWith('zh') ? '最小化' : 'Minimize'" @click="action('minimize')"><Minus :size="14"/></button>
       <button :aria-label="locale.startsWith('zh') ? (maximized ? '还原窗口' : '最大化窗口') : (maximized ? 'Restore window' : 'Maximize window')" :title="locale.startsWith('zh') ? (maximized ? '还原' : '最大化') : (maximized ? 'Restore' : 'Maximize')" @click="action('toggleMaximize')"><Copy v-if="maximized" :size="12"/><Square v-else :size="12"/></button>

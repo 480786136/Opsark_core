@@ -4,6 +4,7 @@ import { useRouter } from "vue-router";
 import { useI18n } from "vue-i18n";
 import { Boxes, Cpu, HardDrive, MemoryStick, Pencil, Plus, Search, Server, Trash2, X } from "lucide-vue-next";
 import AddServerModal from "@/components/AddServerModal.vue";
+import ParameterSelect from "@/components/ParameterSelect.vue";
 import { useOpsStore } from "@/stores/ops";
 
 const store = useOpsStore();
@@ -13,6 +14,10 @@ const zh = computed(() => locale.value.startsWith("zh"));
 const query = ref("");
 const group = ref("");
 const groups = computed(() => [...new Set(store.servers.map(server => server.group).filter(Boolean))].sort());
+const groupOptions = computed(() => [
+  { value: "", label: zh.value ? "全部分组" : "All groups" },
+  ...groups.value.map((item) => ({ value: item, label: item })),
+]);
 const visibleServers = computed(() => {
   const words = query.value.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
   return store.servers.filter(server => (!group.value || server.group === group.value)
@@ -51,7 +56,7 @@ onMounted(async () => {
     <section class="server-section">
       <div class="server-toolbar">
         <label class="server-search"><Search :size="15"/><input v-model="query" :aria-label="zh ? '搜索服务器' : 'Search servers'" :placeholder="zh ? '搜索名称、地址或系统…' : 'Search name, address or OS…'"/><button v-if="query" :aria-label="zh ? '清除搜索' : 'Clear search'" @click="query = ''"><X :size="14"/></button></label>
-        <select v-model="group" :aria-label="zh ? '筛选分组' : 'Filter group'"><option value="">{{ zh ? '全部分组' : 'All groups' }}</option><option v-for="item in groups" :key="item" :value="item">{{ item }}</option></select>
+        <ParameterSelect v-model="group" class="server-group-filter" size="small" :options="groupOptions" :ariaLabel="zh ? '筛选分组' : 'Filter group'" />
         <span class="server-result-count" role="status">{{ t('dashboard.serverCount', { count: visibleServers.length }) }}</span>
       </div>
       <div class="server-grid">
@@ -90,5 +95,5 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.dashboard-page{padding:20px 28px}.server-page-header{align-items:center;margin-bottom:12px;gap:16px}.server-page-header h1{font-size:22px;margin:0;line-height:1.4}.server-page-header>.button{width:auto;min-height:34px;font-size:12px}.server-summary{max-width:1320px;margin:0 auto 18px;display:flex;align-items:center;gap:24px;color:var(--muted);font-size:12px;flex-wrap:wrap}.server-summary>div,.server-summary span{display:flex;align-items:center;gap:8px}.server-summary strong{color:var(--text);font-size:13px;font-weight:600}.server-summary small{font-size:12px}.server-summary svg{width:14px;height:14px}.server-toolbar{display:flex;align-items:center;gap:10px;margin-bottom:14px;padding-top:14px;border-top:1px solid var(--border-soft)}.server-search{display:flex;align-items:center;gap:8px;width:min(380px,100%);height:34px;padding:0 10px;border:1px solid var(--border);border-radius:7px;color:var(--muted);background:var(--panel)}.server-search:focus-within{border-color:var(--accent)}.server-search input{flex:1;min-width:0;background:transparent;border:0;outline:0;color:var(--text);font-size:12px}.server-search button{display:flex;background:none;border:0;color:var(--muted);padding:3px;cursor:pointer}.server-toolbar select{max-width:200px;height:34px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:0 10px;font-size:12px}.server-result-count{margin-left:auto;white-space:nowrap;font-size:12px;color:var(--muted)}.server-card:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.server-empty{display:flex;flex-direction:column;align-items:center;gap:12px;padding:48px 16px;color:var(--muted);font-size:13px}.server-empty p{margin:0}@media(max-width:600px){.dashboard-page{padding:16px}.server-page-header{flex-wrap:nowrap}.server-page-header h1{font-size:20px}.server-summary{gap:12px;margin-bottom:12px}.server-toolbar{flex-wrap:wrap}.server-search{width:100%}.server-toolbar select{flex:1}.server-result-count{margin-left:auto}}
+.dashboard-page{padding:20px 28px}.server-page-header{align-items:center;margin-bottom:12px;gap:16px}.server-page-header h1{font-size:22px;margin:0;line-height:1.4}.server-page-header>.button{width:auto;min-height:34px;font-size:12px}.server-summary{max-width:1320px;margin:0 auto 18px;display:flex;align-items:center;gap:24px;color:var(--muted);font-size:12px;flex-wrap:wrap}.server-summary>div,.server-summary span{display:flex;align-items:center;gap:8px}.server-summary strong{color:var(--text);font-size:13px;font-weight:600}.server-summary small{font-size:12px}.server-summary svg{width:14px;height:14px}.server-toolbar{display:flex;align-items:center;gap:10px;margin-bottom:14px;padding-top:14px;border-top:1px solid var(--border-soft)}.server-search{display:flex;align-items:center;gap:8px;width:min(380px,100%);height:34px;padding:0 10px;border:1px solid var(--border);border-radius:7px;color:var(--muted);background:var(--panel)}.server-search:focus-within{border-color:var(--accent)}.server-search input{flex:1;min-width:0;background:transparent;border:0;outline:0;color:var(--text);font-size:12px}.server-search button{display:flex;background:none;border:0;color:var(--muted);padding:3px;cursor:pointer}.server-group-filter{width:min(200px,40vw);flex:0 1 200px}.server-result-count{margin-left:auto;white-space:nowrap;font-size:12px;color:var(--muted)}.server-card:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.server-empty{display:flex;flex-direction:column;align-items:center;gap:12px;padding:48px 16px;color:var(--muted);font-size:13px}.server-empty p{margin:0}@media(max-width:600px){.dashboard-page{padding:16px}.server-page-header{flex-wrap:nowrap}.server-page-header h1{font-size:20px}.server-summary{gap:12px;margin-bottom:12px}.server-toolbar{flex-wrap:wrap}.server-search{width:100%}.server-group-filter{width:auto;flex:1}.server-result-count{margin-left:auto}}
 </style>

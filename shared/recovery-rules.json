@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "recoveryFields": ["failedStepId", "targetContext", "purpose"],
+  "purposeRules": {
+    "diagnose": { "kind": "observe", "readonly": true },
+    "repair": { "kind": "change", "readonly": false },
+    "verify": { "readonly": false }
+  },
+  "errors": {
+    "OBSERVE_COMMAND_MUTATION": { "field": "command", "expected": "observe 主命令必须只读，禁止创建/写入/删除文件、缓存刷新或其他目标状态变更；需要变更时应进入业务调整，不能修改 kind 绕过", "repairFields": ["command"] },
+    "RECOVERY_INVALID_METADATA": { "field": "recovery", "expected": "recovery 只能包含非空 failedStepId、targetContext 和合法 purpose；需要权威历史补齐真实失败，禁止模型编造或自引用", "repairFields": [] },
+    "RECOVERY_REFERENCE_MISSING": { "field": "recovery.failedStepId", "expected": "必须引用当前任务权威历史中的真实失败，不能伪造或从会话显示关系推断", "repairFields": [] },
+    "RECOVERY_TARGET_MISMATCH": { "field": "recovery.targetContext", "expected": "必须保留失败的原始目标上下文，跨轮承接须有程序核验的同目标记录", "repairFields": [] },
+    "RECOVERY_ACCEPTANCE_MISMATCH": { "field": "recovery", "expected": "必须保留权威失败验收契约，禁止更换或弱化原始验收要求", "repairFields": [] },
+    "RECOVERY_KIND_MISMATCH": { "field": "kind", "expected": "diagnose 必须为 observe，repair 必须为 change；用途或授权变更需要业务调整", "repairFields": [] },
+    "RECOVERY_DIAGNOSE_MUTATION": { "field": "command", "expected": "diagnose 命令必须无副作用：禁止 mktemp、文件写入、删除、缓存刷新及安装/启停；使用内存捕获或 pipefail 保留真实退出码，整体移除临时文件创建/写入/清理链；不得修改 kind、recovery、验收或业务目标", "repairFields": ["command"] },
+    "RECOVERY_RULE_VERSION_MISMATCH": { "field": "recoveryRuleVersion", "expected": "前后端 recovery 规则版本必须一致，请更新到匹配版本；不能通过模型修改版本绕过", "repairFields": [] }
+  },
+  "shell": {
+    "separators": [";", "|", "&", "\n", "(", ")", "{", "}"],
+    "prefixWords": ["if", "then", "elif", "else", "do", "!", "time", "command", "builtin", "exec", "nohup"],
+    "wrappers": ["sudo", "env"],
+    "wrapperValueOptions": ["-u", "-g", "-h", "-p", "-C", "--user", "--group", "--chdir"],
+    "shells": ["sh", "bash", "zsh", "dash", "ksh"],
+    "opaqueInterpreters": ["eval", "python", "python3", "ruby", "node"],
+    "safeInterpreterOptions": ["--version", "-V", "--help"],
+    "unsupportedShellOperators": ["<<"],
+    "readOnlyCommandRules": [
+      { "commands": ["swapon"], "options": ["--show", "-s", "--summary"] },
+      { "commands": ["mount"], "noArguments": true },
+      { "commands": ["modprobe"], "options": ["--show-depends", "-D", "--dry-run", "-n"] },
+      { "commands": ["kill"], "options": ["-0"] }
+    ],
+    "safeWriteTargets": ["/dev/null", "/dev/stdout", "/dev/stderr"],
+    "mutationCommands": ["rm", "mv", "cp", "chmod", "chown", "chgrp", "ln", "mkdir", "rmdir", "mktemp", "touch", "truncate", "install", "reboot", "shutdown", "kill", "pkill", "killall", "mount", "umount", "swapon", "swapoff", "modprobe", "insmod", "rmmod", "useradd", "userdel", "usermod", "groupadd", "groupdel", "passwd", "chpasswd", "chroot", "dd", "patch"],
+    "commandRules": [
+      { "commands": ["apt", "apt-get", "yum", "dnf", "zypper", "pacman", "rpm", "dpkg", "npm", "pnpm", "yarn", "pip", "pip3"], "words": ["install", "ci", "add", "remove", "erase", "upgrade", "update", "dist-upgrade", "autoremove", "purge", "run", "build", "makecache", "clean", "-i", "-U", "-e", "-S", "-R"] },
+      { "commands": ["nvm", "fnm", "volta", "asdf"], "words": ["install", "use", "global", "alias", "default"] },
+      { "commands": ["mvn"], "words": ["install", "deploy", "package", "clean"] },
+      { "commands": ["systemctl", "service", "supervisorctl"], "words": ["start", "stop", "restart", "reload", "enable", "disable", "mask", "unmask", "daemon-reload"] },
+      { "commands": ["kubeadm"], "words": ["init", "join", "reset", "pull"] },
+      { "commands": ["kubectl"], "words": ["apply", "create", "delete", "edit", "patch", "replace", "scale", "set", "taint", "label", "annotate", "restart", "undo", "exec", "cp"] },
+      { "commands": ["docker", "podman", "nerdctl", "ctr"], "words": ["run", "start", "stop", "restart", "rm", "up", "down", "build", "pull", "push", "exec", "cp"] },
+      { "commands": ["sysctl"], "words": ["-w", "--write", "-p", "--load", "--system"] },
+      { "commands": ["sed", "perl"], "optionPrefixes": ["-i", "--in-place"] },
+      { "commands": ["find"], "words": ["-delete", "-exec", "-execdir", "-ok", "-okdir"] },
+      { "commands": ["git"], "words": ["clone", "checkout", "switch", "reset", "clean", "pull", "fetch", "push", "commit", "add", "restore", "merge", "rebase", "cherry-pick"] },
+      { "commands": ["curl"], "words": ["-O", "--remote-name", "-T", "--upload-file", "-d", "--data", "--data-raw", "--data-binary", "-F", "--form"], "outputOptions": ["-o", "--output"], "writeMethods": ["POST", "PUT", "PATCH", "DELETE"] },
+      { "commands": ["wget"], "always": true }
+    ],
+    "cacheQueryCommands": ["dnf", "yum"],
+    "cacheQueryWords": ["list", "info", "provides", "search", "repoquery", "repolist", "check-update", "deplist"],
+    "cacheOnlyOptions": ["-C", "--cacheonly"],
+    "sqlClients": ["mysql", "mariadb", "psql", "sqlite3", "sqlcmd"],
+    "sqlMutationWords": ["CREATE", "ALTER", "DROP", "TRUNCATE", "INSERT", "UPDATE", "DELETE", "GRANT", "REVOKE"],
+    "maxNestedDepth": 16
+  }
+}

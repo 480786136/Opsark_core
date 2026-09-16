@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { Eye, KeyRound, RefreshCw, Settings2, SquareTerminal, Wifi, WifiOff } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import { useOpsStore } from "@/stores/ops";
+import { localizeCoreText } from "@/features/preferences/coreText";
 
 const props = withDefaults(defineProps<{ serverId: string; active?: boolean }>(), { active: true });
 const emit = defineEmits<{ readonlyChange: [value: boolean]; viewHistory: []; configure: [] }>();
@@ -38,12 +39,12 @@ const heading = computed(() => ({
   disconnected: zh.value ? "服务器已断开" : "Server disconnected",
 })[connection.value.status]);
 const description = computed(() => {
-  if (activeRequest.value) return connection.value.phase || (zh.value ? "等待 SSH 连接验证结果" : "Waiting for SSH verification");
+  if (activeRequest.value) return localizeCoreText(connection.value.phase) || (zh.value ? "等待 SSH 连接验证结果" : "Waiting for SSH verification");
   if (connection.value.status === "auth_failed") return zh.value ? "请检查连接账号和密码后重试。" : "Check your username and password, then try again.";
   if (connection.value.status === "manual") return zh.value ? "自动恢复已停止，请手动重新连接。" : "Automatic recovery has stopped. Reconnect when ready.";
   return zh.value ? "连接成功后可操作远程文件、终端和智能任务。" : "Connect to work with remote files, terminals, and tasks.";
 });
-const error = computed(() => formError.value || connection.value.error || "");
+const error = computed(() => localizeCoreText(formError.value || connection.value.error));
 
 function stopClock() {
   if (timer !== undefined) clearInterval(timer);
@@ -182,8 +183,8 @@ defineExpose({ serverId: props.serverId, reconnect });
 </template>
 
 <style scoped>
-.connection-overlay{position:absolute;inset:0;z-index:5;display:grid;place-items:center;overflow:auto;padding:24px;background:rgba(10,15,20,.85);backdrop-filter:blur(3px);color:var(--text);outline:none}
-.connection-surface{width:min(100%,480px);padding:26px 30px 24px;border:1px solid color-mix(in srgb,var(--accent) 15%,var(--border));border-radius:8px;background:var(--panel,#151a20);box-shadow:0 18px 56px #070d1470,inset 0 1px 0 #e0f4ff08}
+.connection-overlay{position:absolute;inset:0;z-index:5;display:grid;place-items:center;overflow:auto;padding:24px;background:color-mix(in srgb,var(--bg) 88%,transparent);backdrop-filter:blur(3px);color:var(--text);outline:none}
+.connection-surface{width:min(100%,480px);padding:26px 30px 24px;border:1px solid color-mix(in srgb,var(--accent) 15%,var(--border));border-radius:8px;background:var(--panel,#151a20);box-shadow:var(--shadow-dialog)}
 .connection-signal{display:flex;align-items:center;gap:12px;margin-bottom:23px;color:var(--muted)}
 .connection-signal>i{height:1px;flex:1;background:var(--border);position:relative;overflow:hidden}.connection-signal>span{display:grid;place-items:center;width:49px;height:49px;border:1px solid var(--border);border-radius:8px}.is-busy .connection-signal{color:var(--accent)}.is-busy .connection-signal>span{border-color:color-mix(in srgb,var(--accent) 40%,var(--border));animation:connection-breathe 2.4s ease-in-out infinite}.is-busy .connection-signal>i:after{content:"";position:absolute;inset:0;background:var(--accent);transform:translateX(-100%);animation:connection-trace 2s ease-in-out infinite}
 .connection-eyebrow{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:10px;letter-spacing:.06em}.connection-copy h2{margin:9px 0 8px;font-size:21px;font-weight:600;letter-spacing:-.03em;line-height:1.3}.connection-target{margin:0;font-size:12px;font-family:var(--font-mono,monospace);overflow-wrap:anywhere}.connection-target span{color:var(--muted)}.connection-description{margin:15px 0 0;color:var(--muted);font-size:12px;line-height:1.65;text-wrap:pretty}.connection-timing{display:flex;gap:16px;margin-top:9px;color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}.connection-error{margin:13px 0 0;padding:9px 11px;border-left:2px solid var(--orange,#dba766);background:color-mix(in srgb,var(--orange,#dba766) 7%,transparent);color:var(--text);font-size:12px;line-height:1.6;overflow-wrap:anywhere;max-height:130px;overflow:auto}

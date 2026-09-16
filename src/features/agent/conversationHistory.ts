@@ -2,6 +2,12 @@
 import { capturePreviousRound } from "./taskGoal";
 import type { AuditEvent } from "@/types";
 
+/** Execution events are already represented by previousExecution/decision evidence. */
+export function requirementConversationContext(task: OpsTask) {
+  return task.messages.filter(message => message.kind === "message" && message.role !== "system")
+    .slice(-24).map(({ role, kind, content }) => ({ role, kind, content }));
+}
+
 /** Recover legacy links only from explicit task creation audit records. */
 export function restoreConversationLinks(tasks: OpsTask[], events: AuditEvent[]) {
   const byId = new Map(tasks.map(task => [task.id, task]));

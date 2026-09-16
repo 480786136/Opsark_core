@@ -15,6 +15,7 @@ mod knowledge;
 mod metrics;
 mod model;
 mod prompt_layers;
+mod recovery_rules;
 mod sftp;
 mod sftp_transfer;
 mod ssh;
@@ -25,13 +26,15 @@ mod terminal;
 mod live_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod recovery_integration_tests;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -57,6 +60,13 @@ fn normalize_model_timeout(timeout_seconds: Option<u64>) -> u64 {
     timeout_seconds
         .unwrap_or(DEFAULT_MODEL_TIMEOUT_SECONDS)
         .clamp(MIN_MODEL_TIMEOUT_SECONDS, MAX_MODEL_TIMEOUT_SECONDS)
+}
+
+fn next_plan_step_id(prefix: &str, index: usize) -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{timestamp}-{sequence}-{index}")
 }
 use sftp::{
     create_sftp_directory, delete_sftp_entry, list_sftp_directory, read_local_file_for_upload,
@@ -95,6 +105,10 @@ struct PlanStep {
     risk: String,
     expected: String,
     validation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_rule_version: Option<u64>,
     execution_scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     validation_scope: Option<String>,
@@ -139,8 +153,10 @@ struct CommandOutputEvent {
 
 const STRICT_JSON_OUTPUT_RULE: &str = "输出格式是强制协议：必须只返回一个完整、可由标准 JSON 解析器直接解析的对象；禁止 Markdown 代码块、前后说明、注释、尾随逗号、NaN/Infinity 和未转义的反斜杠。必须严格使用系统消息指定的字段、类型和枚举值，不得增加或省略必填字段。返回前请自检 JSON 语法和结构。";
 const PLAN_STEP_OUTPUT_CONTRACT: &str = r#"输出必须是 {"steps":[...]} 对象，steps 必须至少有 1 个元素。
-每个元素必须严格包含：{"kind":"observe|change","title":"非空字符串","description":"非空字符串","command":"非空字符串","expected":"非空字符串","validation":"字符串","risk":"low|medium|high"}。可选字段只允许 executionScope、validationScope、runtimeClass 和 sessionContextChange；省略时程序使用安全默认值。executionScope 可为 agent_session|isolated_exec|managed_service|user_action；validationScope 可为 isolated_exec|fresh_interactive_shell|fresh_login_shell；runtimeClass 可为 bounded|progressive|persistent_service。sessionContextChange 仅能与 agent_session 同时使用，可包含绝对 cwd、非敏感 environment、绝对 sourceFiles 和 bash|sh|zsh shell；禁止放入凭据或 ${secret.NAME}。
+每个元素必须严格包含：{"kind":"observe|change","title":"非空字符串","description":"非空字符串","command":"非空字符串","expected":"非空字符串","validation":"字符串","risk":"low|medium|high"}。可选字段只允许 executionScope、validationScope、runtimeClass、sessionContextChange 和 recovery；省略时程序使用安全默认值。executionScope 可为 agent_session|isolated_exec|managed_service|user_action；validationScope 可为 isolated_exec|fresh_interactive_shell|fresh_login_shell；runtimeClass 可为 bounded|progressive|persistent_service。sessionContextChange 仅能与 agent_session 同时使用，可包含绝对 cwd、非敏感 environment、绝对 sourceFiles 和 bash|sh|zsh shell；禁止放入凭据或 ${secret.NAME}。
+recovery 格式为 {"failedStepId":"上下文中既有失败 ID","targetContext":"该失败的原始目标上下文","purpose":"diagnose|repair|verify"}。存在 recovery.blockers 时，下一步必须先关联诊断、修复或复验，不能先执行依赖业务再把恢复放在后面。diagnose 必须 observe，repair 必须 change。verify 必须执行 blocker.verification.command 原文（change 的原 validation，observe 的原观察命令），expected 保留原值，不得换成更弱检查；默认 observe 且 validation 为空，并保留 verification.executionScope。原 verification.validationScope 为 fresh_* 时使用 change 并保留原 validation 和 validationScope，此选项仍需变更授权。修复命令成功不表示阻断解除，必须以同一目标与轮次上的真实关联复验成功验收，重连或更换凭据后要重新取得实际证据。不得编造关联 ID/上下文，不得用命令名称、共享路径或恢复关键词代替关联；recovery 关系本身不授权变更。
 observe 表示只读查询或诊断：主命令输出和退出状态就是观察证据，validation 必须为空字符串，不得生成第二条重复查询。change 表示会改变目标状态：validation 必须是非空、独立、只读的后置条件。command 和 validation 可以包含换行，但必须按标准 JSON 规则转义。
+diagnose 的 command 必须真正无副作用，禁止 mktemp、写入/删除临时文件和刷新包缓存。不要生成“mktemp→输出落盘→rm”诊断链，修复时需整体移除创建、写入和清理；不能只删 rm，也不能改为 repair 绕过授权。需要截断输出时使用 set -o pipefail，或 out=$(只读命令 2>&1); rc=$?; printf '%s\n' "$out"; exit "$rc"，保留真实退出码。允许 /dev/null 和文件描述符输出；dnf/yum 查询必须使用 --cacheonly/-C，避免刷新缓存。
 模型工具例外：工具命令必须严格写成 opsark-tool <toolId> <JSON参数对象>，toolId 前不得添加 --，且必须按工具 inputSchema 提供必填参数；禁止只输出 opsark-tool、缺少参数或使用数组参数。当 command 以 opsark-tool 开头时，validation 必须固定为 JSON 字符串 "true"，即输出 "validation":"true"；禁止输出 JSON 布尔值 true。该字符串是工具协议占位，不会被当作远端校验命令执行。工具上下文中 planMode=standalone 的工具必须是 steps 中唯一的步骤，完成后系统会依据 completionMode 继续编排。
 planMode=read_batch 的工具可以组成纯只读批次：所有步骤 kind=observe，参数必须已经由用户或真实证据确定，不能依赖本批次尚未返回的结果；不能混入 Shell、变更或 standalone 工具。程序逐项执行，失败即停止，整批结束再分析结果。context.expand 只展开活动 Skill 规则，不证明任何业务目标完成。
 Shell 反斜杠在 JSON 字符串内必须写成双反斜杠，例如 Shell 的 \( 必须输出为 \\( 的 JSON 文本。
@@ -156,7 +172,7 @@ const NEXT_STAGE_DECISION_SYSTEM: &str = r#"本调用把阶段结束后的整体
 - 缺少必须由用户作出的决定时返回 adjust，steps 中只能有一个 user.request_input 步骤；已有未回答问题时复用原问题，reason 和 summary 说明具体待决事项与等待原因。等待用户不是业务执行失败，不得据此改换目标或生成绕过问题的恢复方案；用户回答只解决对应决定，不证明整体目标完成。"#;
 const NEXT_STAGE_OUTPUT_CONTRACT: &str = r#"输出必须严格为 {"decision":"complete|continue|adjust","reason":"非空字符串","summary":"非空字符串","steps":[]}，顶层不得增加其他字段。
 decision=complete 时 steps 必须严格为空数组。decision=continue 或 adjust 时 steps 必须至少有 1 个元素。
-每个步骤必须严格包含：{"kind":"observe|change","title":"非空字符串","description":"非空字符串","command":"非空字符串","expected":"非空字符串","validation":"字符串","risk":"low|medium|high"}。可选字段只允许 executionScope、validationScope、runtimeClass 和 sessionContextChange；其枚举、作用域、独立校验、长任务和进程跟踪要求与 GENERAL_PLAN_SYSTEM 相同。
+每个步骤必须严格包含：{"kind":"observe|change","title":"非空字符串","description":"非空字符串","command":"非空字符串","expected":"非空字符串","validation":"字符串","risk":"low|medium|high"}。可选字段只允许 executionScope、validationScope、runtimeClass、sessionContextChange 和 recovery；其枚举、作用域、独立校验、恢复关系、长任务和进程跟踪要求与 GENERAL_PLAN_SYSTEM 相同。
 observe 的 validation 必须为空字符串；change 的 validation 必须是非空、独立、只读的后置条件。工具命令必须严格写成 opsark-tool <toolId> <JSON参数对象> 并符合 context.tools 的 inputSchema。当 command 以 opsark-tool 开头时，validation 必须固定为 JSON 字符串 "true"，即输出 "validation":"true"；禁止输出 JSON 布尔值 true。context.activeSkills 禁止的工具不得出现在 steps 中。工具上下文中 planMode=standalone 的工具必须是 steps 中唯一的步骤。
 planMode=read_batch 允许参数已经确定的纯 observe 工具批次；不能混入 Shell、变更或 standalone，也不能预设前一步工具输出。整批结束后再判断下一阶段。planMode、completionMode、executionMode 是工具目录元数据，由编排器读取，禁止复制到 steps 的对象字段中；步骤只能使用输出协议声明的字段。
 command 和 validation 中的换行及反斜杠必须按标准 JSON 规则转义。返回前必须同时自检决策分支、所有计划字段和完整 JSON 结构。"#;
@@ -210,7 +226,7 @@ const GENERAL_REVIEW_SYSTEM: &str = r#"你是运维执行复核员。根据用�
 本复核协议没有 steps 字段，只返回包含 decision、reason、summary 的 JSON；不得额外输出问题、命令或计划字段，也不得因无法在此输出提问步骤而谎称 complete。"#;
 const LONG_RUNNING_REVIEW_SYSTEM: &str = "你是长任务运行状态复核员。输入只包含压缩后的用户目标、当前步骤、下一步骤提示、跨轮关键证据、进度状态和本轮新增终端输出。只判断当前命令应 continue 还是 adjust：语义输出或可验证进度仍在变化时返回 continue；仅旋转图标、时间戳或重复行变化不算进展。连续无进展、出现认证或交互等待、明确错误、达到等待上限时返回 adjust。continue 仅表示继续等待当前命令，不能进入下一步；主命令未返回真实退出且 periodicObservation.passed=false 时不得 complete。terminalOutput.omittedCharacters 仅表示旧输出被压缩，不代表失败；salientEvidence 是前轮已保留的关键错误、警告或里程碑，不得忽略。不得虚构输出、退出码、命令或授权。只返回 decision、reason、summary 三个字段的简短 JSON，reason 和 summary 各不超过 60 个字。";
 const STRUCTURED_OUTPUT_ATTEMPTS: usize = 2;
-const REQUIREMENT_RELATION_RULE: &str = "关系自检：句式是提问不等于 side_question。例如新任务‘现在有哪些 Java 服务在运行’需要查询真实服务器，应返回 intent=execute、relation=new_goal、changePolicy=read_only、answer=空字符串、selectedSkillIds=[]。只有无需读取真实环境的咨询才使用 answer + side_question；已有整体目标时依据实际关系选择 continue/supplement/new_goal，不得自动替换原目标。";
+const REQUIREMENT_RELATION_RULE: &str = "关系自检：Task 管业务目标，Round 管需求轮次，阶段和尝试推进计划。任务 status 为 completed/failed/cancelled、执行停止、暂停或重连本身都不代表新目标。continue 表示同一业务目标和需求边界内继续、重试、补验或纠正；supplement 表示同一目标新增或调整需求/约束；只有明确独立业务实例使用 new_goal，明确替换原目标使用 replace_goal。句式是提问不等于 side_question。例如首次查询‘现在有哪些 Java 服务在运行’需要读取真实服务器，应返回 intent=execute、relation=new_goal、changePolicy=read_only、answer=空字符串、selectedSkillIds=[]。只有不推进业务的咨询才使用 answer + side_question；已有整体目标时依据实际关系选择 continue/supplement/new_goal，不得自动替换原目标。";
 const PLAN_MAX_TOTAL_MODEL_CALLS: usize = 6;
 const PLAN_MAX_FULL_GENERATION_CALLS: usize = 2;
 const PLAN_MAX_FOCUSED_REPAIR_CALLS: usize = 4;
@@ -283,6 +299,8 @@ struct AiPlanStep {
     runtime_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_context_change: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -466,6 +484,23 @@ fn append_task_log(
         .app_data_dir()
         .map_err(|error| error.to_string())?;
     task_logs::append(&root, &stream, event, &context)
+}
+
+#[tauri::command]
+async fn query_task_logs(
+    app: AppHandle,
+    query: task_logs::TaskLogQuery,
+) -> Result<task_logs::TaskLogQueryResult, String> {
+    let root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    // JSONL history queries may scan many task files. Keep that blocking I/O
+    // and parsing off Tauri's async command executor so the UI and live
+    // terminal commands stay responsive while a historical search runs.
+    tauri::async_runtime::spawn_blocking(move || task_logs::query(&root, query))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -1064,8 +1099,11 @@ fn convert_ai_plan_steps(raw_steps: Vec<AiPlanStep>) -> Result<Vec<PlanStep>, St
                     index + 1
                 ));
             }
+            if let Some(issue) = recovery_rules::metadata_issue(&serde_json::to_value(&item).unwrap(), index) {
+                return Err(recovery_rules::encode_issue(&issue));
+            }
             Ok(PlanStep {
-                id: format!("ai-step-{}-{index}", unix_seconds()),
+                id: next_plan_step_id("ai-step", index),
                 kind,
                 title,
                 description,
@@ -1073,6 +1111,8 @@ fn convert_ai_plan_steps(raw_steps: Vec<AiPlanStep>) -> Result<Vec<PlanStep>, St
                 risk: risk.into(),
                 expected,
                 validation,
+                recovery_rule_version: item.recovery.as_ref().map(|_| recovery_rules::version()),
+                recovery: item.recovery,
                 execution_scope,
                 validation_scope,
                 session_context_change: item.session_context_change,
@@ -1098,6 +1138,9 @@ fn validate_ai_plan_contract(
         ));
     }
     for (index, item) in raw_steps.iter().enumerate() {
+        if let Some(issue) = recovery_rules::metadata_issue(&serde_json::to_value(item).unwrap(), index) {
+            return Err(recovery_rules::encode_issue(&issue));
+        }
         let mut missing = Vec::new();
         if item.title.trim().is_empty() {
             missing.push("title");
@@ -1365,6 +1408,9 @@ fn validate_and_convert_ai_next_stage(
 }
 
 fn plan_repair_instruction(error: &str, previous_steps: Option<&[AiPlanStep]>) -> String {
+    if let Some(issue) = recovery_rules::decode_issue(error) {
+        return format!("\n\n上次计划违反共享 recovery 规则：{}。仅允许修改 {}。{}。禁止改变步骤数量、顺序、kind、risk、expected、validation、recovery 和其他无关字段；禁止把诊断改成repair来绕过只读限制。修复后仍必须返回完整的 {{\"steps\":[...]}} JSON 对象。", recovery_rules::encode_issue(&issue), issue.allowed_repair_paths.join("、"), issue.expected);
+    }
     let targeted = if error.contains("当前规划上下文未开放工具") {
         "上次计划调用了 context.tools 未开放的工具。只修复命中的工具步骤：只能从当前 context.tools 选择真实可用工具；若当前阶段不需要工具则改用真实可执行的 Shell 流程，不得猜测隐藏工具或重新扩大工具目录。"
     } else if error.contains("active Skill 禁止工具") {
@@ -1419,6 +1465,9 @@ fn plan_repair_instruction(error: &str, previous_steps: Option<&[AiPlanStep]>) -
 }
 
 fn plan_error_step_index(error: &str, step_count: usize) -> Option<usize> {
+    if let Some(issue) = recovery_rules::decode_issue(error) {
+        return (issue.step_index < step_count && !issue.allowed_repair_paths.is_empty()).then_some(issue.step_index + 1);
+    }
     let rest = error.strip_prefix("第 ")?;
     let digits = rest
         .chars()
@@ -1436,6 +1485,9 @@ struct PlanFailureFingerprint {
 }
 
 fn plan_failure_fingerprint(error: &str, step_count: usize) -> Option<PlanFailureFingerprint> {
+    if let Some(issue) = recovery_rules::decode_issue(error) {
+        return Some(PlanFailureFingerprint { step_index: issue.step_index + 1, field: "command", failure_id: issue.code });
+    }
     let step_index = plan_error_step_index(error, step_count)?;
     let field = if error.contains("计划步骤的 command ") {
         "command"
@@ -1535,6 +1587,9 @@ fn focused_plan_repair_instruction(
         .get(one_based_index.saturating_sub(1))
         .and_then(|step| serde_json::to_string(step).ok())
         .unwrap_or_else(|| "{}".to_string());
+    if let Some(issue) = recovery_rules::decode_issue(error) {
+        return format!("{}\n本轮只修复索引 {} 的原步骤：{}\n严格返回 {{\"repair\":{{\"stepIndex\":{},\"replacementSteps\":[原步骤的完整字段对象]}}}}；replacementSteps 必须恰好一个，只有 {} 可以变化，其他字段逐字保留。", plan_repair_instruction(error, None), issue.step_index, invalid_step, one_based_index, issue.allowed_repair_paths.join("、"));
+    }
     let nearby_titles = previous_steps
         .iter()
         .enumerate()
@@ -1551,6 +1606,102 @@ fn focused_plan_repair_instruction(
     format!(
         "{targeted}\n\n本轮仅修复第 {one_based_index} 步，不要重返整份计划。原步骤：\n{invalid_step}\n相邻步骤标题：\n{nearby_titles}\n严格返回 {{\"repair\":{{\"stepIndex\":{one_based_index},\"replacementSteps\":[{{\"kind\":\"observe|change\",\"title\":\"...\",\"description\":\"...\",\"command\":\"...\",\"expected\":\"...\",\"validation\":\"...\",\"risk\":\"low|medium|high\"}}]}}}}。replacementSteps 可用一个或多个最小步骤替换原步骤，不得返回其他未修改步骤。"
     )
+}
+
+/// Builds the smallest authoritative context needed to repair one rejected
+/// plan step. The original plan remains in memory and is merged locally, so
+/// resending execution history and evidence snapshots only adds cost and gives
+/// stale observations another chance to influence a field-local correction.
+fn focused_plan_repair_context(
+    context: &str,
+    error: &str,
+    invalid_step: &AiPlanStep,
+) -> Result<String, String> {
+    let source: Value = serde_json::from_str(context)
+        .map_err(|parse_error| format!("局部计划修复上下文无效：{parse_error}"))?;
+    let source = source
+        .as_object()
+        .ok_or_else(|| "局部计划修复上下文必须是 JSON 对象".to_string())?;
+    let mut focused = Map::new();
+    focused.insert("workflowPhase".into(), json!("focused_plan_repair"));
+    focused.insert(
+        "repairPolicy".into(),
+        json!({
+            "scope": "single_rejected_step",
+            "originalPlanMergedLocally": true,
+            "historyIntentionallyOmitted": true,
+            "failureEvidenceCannotBeRewritten": true,
+        }),
+    );
+    for key in [
+        "_log",
+        "_requestParameters",
+        "taskGoal",
+        "task",
+        "server",
+        "permission",
+        "executionConstraints",
+        "authentication",
+        "confirmedUserInputs",
+        "completedCommandFingerprints",
+        "recovery",
+        "planGenerationRepair",
+        "adjustmentTrigger",
+        "instruction",
+        "secretVariables",
+        "serverCredentialGroups",
+        "activeSkills",
+        "skillEvidence",
+    ] {
+        if let Some(value) = source.get(key) {
+            focused.insert(key.into(), value.clone());
+        }
+    }
+
+    // Older adjustment payloads put authority inside baseSnapshot. Omitting
+    // evidence must never omit these restrictions along with it. Explicit
+    // current top-level values win over a cached snapshot (null is not a value).
+    if let Some(snapshot) = source.get("baseSnapshot").and_then(Value::as_object) {
+        for (key, nested) in [
+            ("permission", snapshot.get("task").and_then(|task| task.get("permission"))),
+            ("executionConstraints", snapshot.get("executionConstraints")),
+            ("taskGoal", snapshot.get("taskGoal")),
+        ] {
+            if focused.get(key).is_none_or(Value::is_null) {
+                if let Some(value) = nested.filter(|value| !value.is_null()) {
+                    focused.insert(key.into(), value.clone());
+                }
+            }
+        }
+        if focused.get("taskGoal").is_none_or(Value::is_null) {
+            if let Some(goal) = snapshot.get("rootGoal").filter(|value| !value.is_null()) {
+                focused.insert("taskGoal".into(), json!({"rootGoal": goal}));
+            }
+        }
+    }
+
+    if let Some(tools) = source.get("tools").and_then(Value::as_array) {
+        let referenced_tool = model_tool_id(invalid_step.command.trim());
+        let needs_catalog = error.contains("opsark-tool 协议不完整")
+            || error.contains("当前规划上下文未开放工具")
+            || error.contains("active Skill 禁止工具");
+        let selected = tools
+            .iter()
+            .filter(|tool| {
+                needs_catalog
+                    || referenced_tool.is_some_and(|tool_id| {
+                        tool.get("id").and_then(Value::as_str) == Some(tool_id)
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !selected.is_empty() || needs_catalog {
+            focused.insert("tools".into(), Value::Array(selected));
+        }
+    }
+
+    serde_json::to_string(&Value::Object(focused))
+        .map_err(|serialize_error| format!("局部计划修复上下文序列化失败：{serialize_error}"))
 }
 
 fn apply_plan_step_repair(
@@ -1570,6 +1721,74 @@ fn apply_plan_step_repair(
     let index = repair.step_index - 1;
     steps.splice(index..=index, repair.replacement_steps);
     Ok(())
+}
+
+/// Recovery repairs are field patches, never permission to replace the business step.
+fn apply_recovery_step_repair(
+    steps: &mut Vec<AiPlanStep>, repair: AiPlanStepRepair,
+    issue: &recovery_rules::RecoveryProtocolIssue,
+) -> Result<(), String> {
+    let rejection = |code: &str, reason: &str| json!({"issue":issue,"repairStopCode":code,"reason":reason}).to_string();
+    if repair.step_index != issue.step_index + 1 || repair.replacement_steps.len() != 1 {
+        return Err(rejection("PROTOCOL_REPAIR_SCOPE_VIOLATION", "恢复协议修复必须只返回原始单步"));
+    }
+    let original = steps.get(issue.step_index).ok_or_else(|| rejection("PROTOCOL_REPAIR_SCOPE_VIOLATION", "原始步骤不存在"))?;
+    let mut old = serde_json::to_value(original).unwrap();
+    let mut new = serde_json::to_value(&repair.replacement_steps[0]).unwrap();
+    for path in &issue.allowed_repair_paths {
+        let prefix = format!("steps[{}].", issue.step_index);
+        if let Some(field) = path.strip_prefix(&prefix).filter(|field| !field.contains('.')) {
+            old.as_object_mut().unwrap().remove(field); new.as_object_mut().unwrap().remove(field);
+        }
+    }
+    if old != new { return Err(rejection("PROTOCOL_REPAIR_SCOPE_VIOLATION", "修复改变了字段白名单之外的步骤内容")); }
+    if plan_behavior_fingerprint(steps) == plan_behavior_fingerprint(&{
+        let mut next = steps.clone(); next[issue.step_index] = repair.replacement_steps[0].clone(); next
+    }) { return Err(rejection("PROTOCOL_REPAIR_NO_PROGRESS", "修复计划执行内容与被拒计划完全相同")); }
+    apply_plan_step_repair(steps, repair)
+}
+
+fn plan_behavior_fingerprint(steps: &[AiPlanStep]) -> String {
+    let values: Vec<Value> = steps.iter().map(|step| {
+        let mut value = serde_json::to_value(step).unwrap();
+        let object = value.as_object_mut().unwrap(); object.remove("title"); object.remove("description");
+        value
+    }).collect();
+    serde_json::to_string(&values).unwrap()
+}
+
+fn recovery_failure_envelope(error: &str, steps: &[AiPlanStep], budget: &PlanRepairBudget) -> Option<String> {
+    let issue = recovery_rules::decode_issue(error)?;
+    let previous: Value = serde_json::from_str(error).ok()?;
+    let output: Vec<Value> = steps.iter().enumerate().map(|(index, step)| {
+        let mut value = serde_json::to_value(step).unwrap();
+        value["id"] = json!(next_plan_step_id("rejected-step", index));
+        value["status"] = json!("pending"); value["recoveryRuleVersion"] = json!(recovery_rules::version()); value
+    }).collect();
+    Some(json!({"issue":issue,"steps":output,"repairAttempted":budget.focused_repair_calls > 0,
+        "repairStopCode":previous.get("repairStopCode").cloned().unwrap_or(json!("PROTOCOL_REPAIR_BUDGET_EXHAUSTED")),
+        "reason":previous.get("reason"),
+        "modelCalls":budget.total_model_calls,"focusedRepairCalls":budget.focused_repair_calls}).to_string())
+}
+
+fn validate_next_stage_preserving_recovery(
+    decision: AiNextStageDecision, settings: &AiGenerationSettings,
+    forbidden_tool_ids: &HashSet<String>, visible_tool_ids: Option<&HashSet<String>>,
+) -> Result<AiNextStageResult, String> {
+    let original = decision.clone();
+    validate_and_convert_ai_next_stage(decision, settings, forbidden_tool_ids, visible_tool_ids).map_err(|error| {
+        let budget = PlanRepairBudget { total_model_calls: 1, ..Default::default() };
+        let Some(envelope) = recovery_failure_envelope(&error, &original.steps, &budget) else { return error; };
+        let mut preserved: Value = serde_json::from_str(&envelope).unwrap();
+        preserved["nextStageDecision"] = json!({"decision":original.decision,"reason":original.reason,"summary":original.summary});
+        preserved.to_string()
+    })
+}
+
+fn external_plan_call_limit(context: &str) -> Option<usize> {
+    serde_json::from_str::<Value>(context).ok()
+        .and_then(|value| value.pointer("/protocolRepairBudget/remainingModelCalls").and_then(Value::as_u64))
+        .map(|limit| (limit as usize).min(PLAN_MAX_TOTAL_MODEL_CALLS))
 }
 
 fn detaches_untracked_process(command: &str) -> bool {
@@ -2559,13 +2778,27 @@ async fn generate_ai_plan_with_trace(
     let deployment_rules = GENERAL_DISCOVERY_RULES;
     let mut last_error = "模型未返回计划".to_string();
     let mut last_repairable_steps = None;
+    let mut original_recovery_rejection = None;
     let mut repair_budget = PlanRepairBudget::default();
+    let external_call_limit = external_plan_call_limit(&context);
+    let mut recovery_repair_attempted = false;
     loop {
+        if external_call_limit.is_some_and(|limit| repair_budget.total_model_calls >= limit) {
+            repair_budget.stop_reason = Some("上层协议修复总预算已耗尽".into()); break;
+        }
+        if let Some(issue) = recovery_rules::decode_issue(&last_error) {
+            let terminal = serde_json::from_str::<Value>(&last_error).ok().is_some_and(|value| value.get("repairStopCode").is_some());
+            if issue.allowed_repair_paths.is_empty() || recovery_repair_attempted || terminal {
+                repair_budget.stop_reason = Some("恢复协议局部修复已停止，保留原计划及结构化错误".into()); break;
+            }
+        }
         let had_previous_attempt = repair_budget.total_model_calls > 0;
         let focused_repair_index = last_repairable_steps
             .as_ref()
             .and_then(|steps: &Vec<AiPlanStep>| plan_error_step_index(&last_error, steps.len()));
         let focused_repair = focused_repair_index.is_some();
+        let active_recovery_issue = if focused_repair { recovery_rules::decode_issue(&last_error) } else { None };
+        if focused_repair && recovery_rules::decode_issue(&last_error).is_some() { recovery_repair_attempted = true; }
         if !repair_budget.try_start_call(focused_repair) {
             break;
         }
@@ -2584,12 +2817,22 @@ async fn generate_ai_plan_with_trace(
         } else {
             PLAN_STEP_OUTPUT_CONTRACT
         };
+        let request_context = match (focused_repair_index, last_repairable_steps.as_deref()) {
+            (Some(index), Some(steps)) => focused_plan_repair_context(
+                &context,
+                &last_error,
+                steps
+                    .get(index.saturating_sub(1))
+                    .ok_or_else(|| format!("局部计划修复步骤 {index} 超出上一版计划范围"))?,
+            )?,
+            _ => context.clone(),
+        };
         let mut body = json!({
-            "_opsarkContext": context,
+            "_opsarkContext": request_context.clone(),
             "model": model,
             "messages": [
                 {"role": "system", "content": format!("{system}\n{deployment_rules}\n{response_contract}\n{limit_rule}\n{SECRET_PLACEHOLDER_RULE}\n{STRICT_JSON_OUTPUT_RULE}")},
-                {"role": "user", "content": format!("服务器上下文：\n{context}\n\n用户需求：\n{requirement}\n\n严格按系统消息中的计划契约返回。{correction}")}
+                {"role": "user", "content": format!("服务器上下文：\n{request_context}\n\n用户需求：\n{requirement}\n\n严格按系统消息中的计划契约返回。{correction}")}
             ],
             "thinking": {"type": "disabled"},
             "response_format": {"type": "json_object"}
@@ -2666,7 +2909,11 @@ async fn generate_ai_plan_with_trace(
                     ));
                 }
                 let mut repaired = previous_steps.clone();
-                apply_plan_step_repair(&mut repaired, envelope.repair)?;
+                if let Some(issue) = recovery_rules::decode_issue(&last_error) {
+                    apply_recovery_step_repair(&mut repaired, envelope.repair, &issue)?;
+                } else {
+                    apply_plan_step_repair(&mut repaired, envelope.repair)?;
+                }
                 Ok(repaired)
             } else {
                 parse_model_array_field(content, "steps")
@@ -2701,7 +2948,12 @@ async fn generate_ai_plan_with_trace(
                         return Ok(plan);
                     }
                     Err(error) => {
-                        last_error = error;
+                        if recovery_rules::decode_issue(&error).is_some() && original_recovery_rejection.is_none() {
+                            original_recovery_rejection = last_repairable_steps.clone();
+                        }
+                        last_error = if let Some(issue) = &active_recovery_issue {
+                            json!({"issue":issue,"repairStopCode":"PROTOCOL_REPAIR_BUDGET_EXHAUSTED","reason":error}).to_string()
+                        } else { error };
                         record_model_attempt(
                             developer_trace,
                             "plan_generation",
@@ -2719,7 +2971,10 @@ async fn generate_ai_plan_with_trace(
                 }
             }
             Err(error) => {
-                last_error = error;
+                last_error = if let Some(issue) = &active_recovery_issue {
+                    if recovery_rules::decode_issue(&error).is_some() { error }
+                    else { json!({"issue":issue,"repairStopCode":"PROTOCOL_REPAIR_SCOPE_VIOLATION","reason":error}).to_string() }
+                } else { error };
                 record_model_attempt(
                     developer_trace,
                     "plan_generation",
@@ -2738,6 +2993,7 @@ async fn generate_ai_plan_with_trace(
         }
     }
     if let Some(raw_steps) = last_repairable_steps {
+        if let Some(error) = recovery_failure_envelope(&last_error, original_recovery_rejection.as_ref().unwrap_or(&raw_steps), &repair_budget) { return Err(error); }
         let only_presentational_fields_missing = raw_steps.iter().all(|item| {
             !item.command.trim().is_empty()
                 && matches!(item.kind.trim(), "observe" | "change")
@@ -2864,7 +3120,7 @@ async fn decide_ai_next_stage(
                 .map_err(|error| format!("阶段联合决策结构解析失败：{error}"))
         })
         .and_then(|decision| {
-            validate_and_convert_ai_next_stage(
+            validate_next_stage_preserving_recovery(
                 decision,
                 &generation_settings,
                 &forbidden_tool_ids,
@@ -3277,6 +3533,7 @@ pub fn run() {
             local_terminal::resize_local_terminal,
             local_terminal::close_local_terminal,
             append_task_log,
+            query_task_logs,
             save_task_evidence,
             read_task_evidence,
             get_realtime_metrics,

@@ -4,6 +4,7 @@ import {
   runValidationLifecycle,
 } from "@/features/agent/executionLifecycle";
 import type { ExecuteStepCommandInput } from "@/features/agent/executionRunner";
+import { startLongRunningMonitor } from "@/features/agent/longRunningMonitor";
 import type { OpsTask, PlanStep } from "@/types";
 
 function createStep(overrides: Partial<PlanStep> = {}): PlanStep {
@@ -38,6 +39,30 @@ function createTask(step: PlanStep): OpsTask {
 const noop = () => undefined;
 
 describe("execution lifecycle", () => {
+  it("propagates the caller deadline and preserves failure when deadline cancellation returns exit 130", async () => {
+    const step = createStep({ runtimeClass: "progressive" });
+    let now = 0;
+    let tick = () => {};
+    let finishExecution = () => {};
+    const cancelExecution = vi.fn(() => finishExecution());
+    const pending = runCommandLifecycle({
+      task: createTask(step), step, requirement: "download", command: step.command,
+      validation: step.validation, executionId: "exec-deadline", executionDeadlineAt: 95_000,
+      secretValues: {}, isCancelled: () => false, onExecutionChange: noop, onProgress: noop,
+      onHeartbeat: noop, onEvent: noop, onAudit: noop, onError: noop, cancelExecution,
+    }, () => new Promise((resolve) => {
+      finishExecution = () => resolve({ output: "[exit: 130]", success: false, simulated: false, exitCode: 130 });
+    }), input => startLongRunningMonitor({ ...input, scheduler: {
+      now: () => now, setInterval: callback => { tick = callback; return 1; }, clearInterval: vi.fn(),
+    } }));
+    now = 100_000;
+    tick();
+    const result = await pending;
+    expect(cancelExecution).toHaveBeenCalledOnce();
+    expect(result.result).toMatchObject({ success: false, exitCode: 130 });
+    expect(result.monitorState).toMatchObject({ decision: { decision: "adjust", source: "rules" }, validationPassed: false });
+  });
+
   const handshakeError = new Error("SSH 握手失败：[Session(-8)] Unable to exchange encryption keys");
   function transportValidationInput(overrides = {}) {
     return {
@@ -136,11 +161,15 @@ describe("execution lifecycle", () => {
         workload: "progressive",
         outputFingerprint: "3:12345678",
         lastOutputChangeAt: "2026-08-14T00:00:00.000Z",
+        lastProgressAt: "2026-08-14T00:00:00.000Z",
+        noOutputSeconds: 0,
         noProgressSeconds: 0,
         noProgressReviewRounds: 0,
         consecutiveContinueRounds: 0,
         salientEvidence: [],
         runtimeIdleReviewRounds: 0,
+        runtimeSamplingStatus: "unavailable",
+        consecutiveRuntimeSampleFailures: 0,
         modelReviewCount: 1,
         skippedModelReviewCount: 0,
       }),
@@ -187,11 +216,15 @@ describe("execution lifecycle", () => {
         workload: "bounded",
         outputFingerprint: "",
         lastOutputChangeAt: "2026-08-14T00:00:00.000Z",
+        lastProgressAt: "2026-08-14T00:00:00.000Z",
+        noOutputSeconds: 0,
         noProgressSeconds: 0,
         noProgressReviewRounds: 0,
         consecutiveContinueRounds: 0,
         salientEvidence: [],
         runtimeIdleReviewRounds: 0,
+        runtimeSamplingStatus: "unavailable",
+        consecutiveRuntimeSampleFailures: 0,
         modelReviewCount: 0,
         skippedModelReviewCount: 0,
       }),
@@ -229,11 +262,15 @@ describe("execution lifecycle", () => {
         workload: "bounded",
         outputFingerprint: "0:811c9dc5",
         lastOutputChangeAt: "2026-08-14T00:00:00.000Z",
+        lastProgressAt: "2026-08-14T00:00:00.000Z",
+        noOutputSeconds: 0,
         noProgressSeconds: 0,
         noProgressReviewRounds: 0,
         consecutiveContinueRounds: 0,
         salientEvidence: [],
         runtimeIdleReviewRounds: 0,
+        runtimeSamplingStatus: "unavailable",
+        consecutiveRuntimeSampleFailures: 0,
         modelReviewCount: 0,
         skippedModelReviewCount: 0,
       }),

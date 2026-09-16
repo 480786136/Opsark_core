@@ -30,6 +30,20 @@ export function observationIdentity(step: PlanStep) {
   }));
 }
 
+function isConfirmedUserDecision(step: PlanStep) {
+  return step.status === "completed"
+    && step.result?.executionStatus === "success"
+    && step.result.facts.toolId === "user.request_input"
+    && Boolean(step.output);
+}
+
+function isDispatchedChangeAttempt(step: PlanStep) {
+  return step.kind === "change"
+    && Boolean(step.result)
+    && step.result?.facts.commandDispatched !== false
+    && ["completed", "failed"].includes(step.status);
+}
+
 /** A round-wide guard, independent of per-incident command fingerprints. */
 export function workflowProgress(task: OpsTask) {
   const phases = (task.phaseHistory ?? []).filter(phase => phase.roundId === task.currentRoundId).map(phase => phase.plan);
@@ -47,7 +61,13 @@ export function workflowProgress(task: OpsTask) {
     completedPhases += 1;
     const changed = steps.some(step => step.kind === "change" && step.status === "completed"
       && step.result?.executionStatus === "success");
-    if (changed) seen.clear();
+    const decisionConfirmed = steps.some(isConfirmedUserDecision);
+    const changeAttempted = steps.some(isDispatchedChangeAttempt);
+    // A confirmed user decision starts a new semantic incident and invalidates
+    // the old observation loop. A dispatched (even failed) change breaks a run
+    // of observation-only phases, but does not clear evidence identities so a
+    // repeated failing change is still caught by the stagnation guard.
+    if (changed || decisionConfirmed) seen.clear();
     let added = false;
     for (const step of steps) {
       if (!step.result || !step.output && !step.evidence?.length) continue;
@@ -55,8 +75,8 @@ export function workflowProgress(task: OpsTask) {
       if (!seen.has(identity)) added = true;
       seen.add(identity);
     }
-    stagnantPhases = added || changed ? 0 : stagnantPhases + 1;
-    observationPhases = changed ? 0 : observationPhases + 1;
+    stagnantPhases = added || changed || decisionConfirmed ? 0 : stagnantPhases + 1;
+    observationPhases = changed || decisionConfirmed || changeAttempted ? 0 : observationPhases + 1;
   }
   return { completedPhases, stagnantPhases, observationPhases,
     evidenceCount: seen.size, rereadEvidence: stagnantPhases > 0 || observationPhases >= 3 };

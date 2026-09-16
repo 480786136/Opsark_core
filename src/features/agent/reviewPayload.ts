@@ -174,6 +174,10 @@ export function compactReviewPlanStep(
   options: { commandLimit?: number; validationLimit?: number; includeStatus?: boolean } = {},
 ) {
   return {
+    id: step.id,
+    kind: step.kind,
+    recovery: step.recovery,
+    targetContext: step.attemptContext,
     title: compactReviewText(step.title, 180),
     description: compactReviewText(step.description, 320),
     command: compactReviewText(step.command, options.commandLimit ?? 640),

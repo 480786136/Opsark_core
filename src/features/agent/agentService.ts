@@ -1,6 +1,9 @@
 import { backend, PlanProtocolError } from "@/services/backend";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { workflowLifetime, StaleWorkflowError } from "./workflowLifetime";
+import { activeProtocolRepair, freshProtocolReplanSteps } from "./protocolReplan";
+import { markProtocolReplanApprovals } from "./protocolReplanApproval";
+import { normalizePlanPreconditions } from "./planNormalizer";
 import { DECISION_EVIDENCE_INSTRUCTION } from "./decisionEvidence";
 import type { RuntimeModel } from "@/services/backend";
 import { createRuntimeModel } from "@/features/agent/modelRuntime";
@@ -12,10 +15,12 @@ import {
 } from "@/features/agent/agentContext";
 import {
   latestTaskRequirement,
+  selectBusinessReplanSteps,
   selectAdjustmentSteps,
   selectContinuationSteps,
 } from "@/features/agent/taskProgression";
 import { activeRoundSteps } from "@/features/agent/taskGoal";
+import { assertTaskPlanAuthorization, ExecutionPolicyError, recoveryHistory, validateRecoveryReferences } from "./recoveryContract";
 import { buildGoalCompletedSummary, completionSummaryContradictsGoal } from "@/features/agent/executionSummary";
 import { buildSkillContext } from "@/features/skills/skillRegistry";
 import { compactReviewText } from "@/features/agent/longRunningReviewOutput";
@@ -79,6 +84,7 @@ export interface PlanTaskAdjustmentInput {
   adjustmentReason?: string;
   /** An explicit user-directed retry may replay an unchanged failed attempt. */
   allowUnchangedFailureRetry?: boolean;
+  replanAfterProtocolFailure?: boolean;
 }
 
 export interface CompletionSummaryRequest {
@@ -362,7 +368,9 @@ export async function decideTaskNextStage(
         policyFingerprint: context.policyFingerprint,
       };
     }
-    const nextPlan = selectContinuationSteps(activeRoundSteps(input.task), decision.steps, taskAttemptContext(input.task));
+    const nextPlan = selectContinuationSteps(recoveryHistory(input.task), decision.steps, taskAttemptContext(input.task));
+    assertTaskPlanAuthorization(input.task, nextPlan);
+    validateRecoveryReferences(recoveryHistory(input.task), nextPlan, taskAttemptContext(input.task));
     if (!nextPlan.length) throw new Error("下一阶段联合决策没有返回新的可执行步骤");
     return {
       requirement,
@@ -375,7 +383,7 @@ export async function decideTaskNextStage(
     };
   } catch (combinedError) {
     assertCurrent();
-    if (combinedError instanceof PlanProtocolError) throw combinedError;
+    if (combinedError instanceof PlanProtocolError || combinedError instanceof ExecutionPolicyError) throw combinedError;
     const fallback = await reviewTaskGoal(input, fallbackReview);
     return {
       ...fallback,
@@ -414,7 +422,9 @@ export async function planDiscoveryContinuation(
       : createRuntimeModel(input.model, input.apiKey, context, input.generationSettings),
   );
   lifetime.assertCurrent();
-  const continuation = selectContinuationSteps(activeRoundSteps(input.task), candidates, taskAttemptContext(input.task));
+  const continuation = selectContinuationSteps(recoveryHistory(input.task), candidates, taskAttemptContext(input.task));
+  assertTaskPlanAuthorization(input.task, continuation);
+  validateRecoveryReferences(recoveryHistory(input.task), continuation, taskAttemptContext(input.task));
   if (!continuation.length) throw new Error("模型未返回可执行的后续步骤");
   return continuation;
 }
@@ -429,6 +439,10 @@ export async function planTaskAdjustment(
   generatePlan: PlanGenerator = backend.generatePlan.bind(backend),
 ) {
   const lifetime = workflowLifetime(input.task);
+  const businessReplan = input.replanAfterProtocolFailure === true;
+  if (businessReplan && !activeProtocolRepair(input.task)) {
+    throw new Error("原协议事故已不属于当前目标或轮次，请基于当前任务重新规划");
+  }
   const requirement = latestTaskRequirement(input.task);
   const context = buildAdjustmentContext({
     server: input.server,
@@ -441,8 +455,9 @@ export async function planTaskAdjustment(
     sharedSnapshot: input.sharedSnapshot,
     reviewDecision: input.reviewDecision,
     adjustmentReason: input.adjustmentReason,
+    replanAfterProtocolFailure: businessReplan,
   });
-  const safetyFacts = input.failedStep?.result?.facts.category === "plan_safety_rejection"
+  const safetyFacts = !businessReplan && input.failedStep?.result?.facts.category === "plan_safety_rejection"
     ? input.failedStep.result.facts
     : undefined;
   const safetyFields = safetyFacts
@@ -450,18 +465,24 @@ export async function planTaskAdjustment(
       .map((finding) => (finding as Record<string, unknown>)?.field)
       .filter((field): field is "command" | "validation" => field === "command" || field === "validation"))]
     : [];
-  const adjustmentInstruction = safetyFields.length
+  const adjustmentInstruction = businessReplan
+    ? "原方案在执行前被拒绝，用户要求生成新的业务调整方案，而非修补旧计划字段。依据真实证据规划剩余目标，重新评估每个新步骤的操作类型、风险和验收；不继承旧步骤批准，不扩大用户授权。"
+    : safetyFields.length
     ? `上一步在发送服务器前被安全门禁拦截。只修复该步骤的 ${safetyFields.join("、")} 字段并且只返回一个完整替代步骤；不得改写其他字段或扩大任务范围。`
     : input.failedStep
     ? "上次执行未达到预期，请仅为未完成目标生成安全的调整计划。"
     : "当前阶段已成功完成，但整体目标尚未验收；请仅规划剩余目标，不得将已成功步骤改写为失败或重复执行。";
-  const replacement = await generatePlan(
+  let replacement = await generatePlan(
     `${requirement}\n\n${adjustmentInstruction}`,
     input.model.provider === "Built-in"
       ? undefined
       : createRuntimeModel(input.model, input.apiKey, JSON.stringify(context), input.generationSettings),
   );
   lifetime.assertCurrent();
+  if (businessReplan) {
+    replacement = markProtocolReplanApprovals(input.task,
+      normalizePlanPreconditions(freshProtocolReplanSteps(replacement), requirement, input.tools));
+  }
   if (safetyFields.length && input.failedStep) {
     if (replacement.length !== 1) {
       throw new Error("安全门禁局部调整只能返回一个替代步骤");
@@ -478,13 +499,17 @@ export async function planTaskAdjustment(
       }
     }
   }
-  const selected = input.allowUnchangedFailureRetry
+  const selected = businessReplan
+    ? selectBusinessReplanSteps(recoveryHistory(input.task), replacement, taskAttemptContext(input.task))
+    : input.allowUnchangedFailureRetry
     ? selectContinuationSteps(
-      activeRoundSteps(input.task).filter((step) => step.status === "completed"),
+      recoveryHistory(input.task).filter((step) => step.status === "completed"),
       replacement,
       taskAttemptContext(input.task),
     )
-    : selectAdjustmentSteps(activeRoundSteps(input.task), replacement, taskAttemptContext(input.task));
+    : selectAdjustmentSteps(recoveryHistory(input.task), replacement, taskAttemptContext(input.task));
+  validateRecoveryReferences(recoveryHistory(input.task), selected, taskAttemptContext(input.task));
+  assertTaskPlanAuthorization(input.task, selected);
   if (!selected.length) throw new Error("模型未返回新的可执行调整步骤");
   return {
     requirement,

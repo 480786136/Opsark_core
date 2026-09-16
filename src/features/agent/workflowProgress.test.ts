@@ -45,6 +45,36 @@ describe("generic workflow progress", () => {
     expect(automaticContinuationBlocker(task(Array.from({ length: MAX_AUTOMATIC_PHASES }, (_, i) =>
       observed(`${i}`, `done-${i}`, { kind: "change" }))))).toContain("自动阶段上限");
   });
+  it("starts a fresh observation budget after a confirmed user decision", () => {
+    const decision = observed("decision", JSON.stringify({ values: { registry: "mirror.example" } }), {
+      result: { executionStatus: "success", observationStatus: "matched",
+        facts: { toolId: "user.request_input" }, warnings: [], evidenceIds: [] },
+    });
+    const current = task([
+      ...Array.from({ length: MAX_OBSERVATION_PHASES }, (_, i) => observed(`before-${i}`, `sample-${i}`)),
+      decision,
+      observed("after", "new-state"),
+    ]);
+
+    expect(workflowProgress(current)).toMatchObject({ observationPhases: 1, stagnantPhases: 0 });
+    expect(automaticContinuationBlocker(current)).toBeUndefined();
+  });
+  it("does not count a dispatched failed change as another observation-only phase", () => {
+    const failedChange = observed("change-failed", "network timeout", {
+      kind: "change",
+      status: "failed",
+      result: { executionStatus: "failed", observationStatus: "unknown", exitCode: 1,
+        facts: { commandDispatched: true, category: "network_failure" }, warnings: [], evidenceIds: [] },
+    });
+    const current = task([
+      ...Array.from({ length: MAX_OBSERVATION_PHASES }, (_, i) => observed(`before-${i}`, `sample-${i}`)),
+      failedChange,
+      observed("diagnose-new-failure", "registry timeout"),
+    ]);
+
+    expect(workflowProgress(current).observationPhases).toBe(1);
+    expect(automaticContinuationBlocker(current)).toBeUndefined();
+  });
   it("does not count phases from another round or transport recovery", () => {
     const current = task([observed("a"), observed("b"), observed("c")]);
     current.phaseHistory!.forEach(phase => { phase.roundId = "old"; });

@@ -49,6 +49,24 @@ function button(text: string) {
 }
 
 describe("ConnectionOverlay", () => {
+  it("updates persisted connection phases and known errors when the UI language changes", async () => {
+    const { state } = setup();
+    Object.assign(state, {
+      status: "connecting", phase: "正在验证 SSH 连接",
+      error: "SSH 身份认证失败，请检查用户名、密码或服务器认证设置",
+    });
+    await nextTick();
+    expect(host.querySelector(".connection-description")?.textContent).toBe("正在验证 SSH 连接");
+    i18n.global.locale.value = "en-US";
+    await nextTick();
+    expect(host.querySelector(".connection-description")?.textContent).toBe("Verifying the SSH connection");
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain("SSH authentication failed.");
+    expect(state.phase).toBe("正在验证 SSH 连接");
+    i18n.global.locale.value = "zh-CN";
+    await nextTick();
+    expect(host.querySelector(".connection-description")?.textContent).toBe(state.phase);
+  });
+
   it("keeps the same mask through retries, ignores backdrop/Escape, and shows the failure inline", async () => {
     const { ops, state } = setup();
     ops.serverPasswords.alpha = "saved-test-password";

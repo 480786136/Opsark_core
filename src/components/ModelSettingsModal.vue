@@ -4,11 +4,12 @@ import { ref } from "vue";
 import { KeyRound, Plus, RefreshCw, Save, Shield, SlidersHorizontal, Trash2, X } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import { useOpsStore } from "@/stores/ops";
+import { localizeCoreText } from "@/features/preferences/coreText";
 
 defineProps<{ open: boolean }>();
 const emit = defineEmits<{ close: []; saved: [] }>();
 const store = useOpsStore();
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const saveError = ref("");
 const saveState = ref<"idle" | "saving" | "saved" | "error">("idle");
 
@@ -50,7 +51,7 @@ async function removeModel(modelId: string) {
       <div class="modal-card model-settings-modal">
       <div class="modal-title">
         <div><h2>{{ t("settings.modalTitle") }}</h2><p>{{ t("settings.modalSubtitle") }}</p></div>
-        <button class="icon-button" type="button" @click="emit('close')"><X :size="18" /></button>
+        <button class="icon-button" type="button" :aria-label="t('common.close')" @click="emit('close')"><X :size="18" /></button>
       </div>
 
       <div class="modal-section-title">
@@ -58,7 +59,7 @@ async function removeModel(modelId: string) {
         <div><strong>{{ t("settings.modelTitle") }}</strong><small>{{ t("settings.modelCheckHint") }}</small></div>
       </div>
       <div v-for="model in store.models" :key="model.id" class="model-row modal-model-row">
-        <label class="toggle"><input v-model="model.enabled" type="checkbox" /><i></i></label>
+        <label class="toggle"><input v-model="model.enabled" type="checkbox" :aria-label="locale.startsWith('zh') ? '启用模型' : 'Enable model'" /><i></i></label>
         <div class="model-fields">
           <input v-model="model.name" :aria-label="t('settings.configName')" />
           <div>
@@ -74,12 +75,13 @@ async function removeModel(modelId: string) {
             type="password"
             autocomplete="off"
             placeholder="API Key"
+            aria-label="API Key"
             @input="model.hasApiKey = Boolean(store.modelApiKeys[model.id])"
           />
         </label>
         <button class="icon-button danger" type="button" :title="t('settings.removeModel')" @click="removeModel(model.id)"><Trash2 :size="14" /></button>
         <span :class="['model-check-state', store.modelAvailability[model.id]?.status ?? 'unknown']">
-          {{ store.modelAvailability[model.id]?.reason ?? t("settings.unchecked") }}
+          {{ localizeCoreText(store.modelAvailability[model.id]?.reason) || t("settings.unchecked") }}
         </span>
         <ModelAdvancedParameters :model="model" />
       </div>
@@ -91,7 +93,7 @@ async function removeModel(modelId: string) {
       </div>
       <div class="generation-limit-head compact">
         <div><strong>{{ t("settings.enableCompactLimits") }}</strong><small>{{ t("settings.compactLimitsHint") }}</small></div>
-        <label class="toggle"><input v-model="store.aiGenerationSettings.limitOutput" type="checkbox" /><i></i></label>
+        <label class="toggle"><input v-model="store.aiGenerationSettings.limitOutput" type="checkbox" :aria-label="t('settings.enableCompactLimits')" /><i></i></label>
       </div>
       <div v-if="store.aiGenerationSettings.limitOutput" class="generation-limit-grid modal-limit-grid">
         <label><span>{{ t("settings.compactMaxSteps") }}</span><input v-model.number="store.aiGenerationSettings.maxPlanSteps" type="number" min="1" /></label>
@@ -101,7 +103,7 @@ async function removeModel(modelId: string) {
       </div>
 
       <p class="security-hint"><Shield :size="14" />{{ t("settings.modelSecurityHint") }}</p>
-      <p v-if="saveState === 'error'" class="settings-error">{{ t("settings.saveFailed", { reason: saveError || store.credentialError }) }}</p>
+      <p v-if="saveState === 'error'" class="settings-error">{{ t("settings.saveFailed", { reason: localizeCoreText(saveError || store.credentialError) }) }}</p>
       <div class="modal-actions">
         <button class="button secondary" type="button" :disabled="saveState === 'saving'" @click="recheck">
           <RefreshCw :class="{ spin: saveState === 'saving' }" :size="14" />{{ t("settings.recheck") }}

@@ -8,7 +8,8 @@ import type { ModelProfile } from "@/types";
 it("renders Chinese labels and keeps API enum values intact", async () => {
   const model = reactive({ id: "chinese" } as ModelProfile);
   const host = document.createElement("div");
-  const app = createApp(ModelAdvancedParameters, { model }).use(createI18n({ legacy: false, locale: "zh-CN", messages: { "zh-CN": {} } }));
+  const localI18n = createI18n({ legacy: false, locale: "zh-CN", messages: { "zh-CN": {}, "en-US": {} } });
+  const app = createApp(ModelAdvancedParameters, { model }).use(localI18n);
   app.mount(host);
   try {
     expect(host.textContent).toContain("高级请求参数");
@@ -16,10 +17,16 @@ it("renders Chinese labels and keeps API enum values intact", async () => {
     expect(host.textContent).toContain("恢复默认");
     expect(host.textContent).not.toMatch(/\?{2,}|\uFFFD|&#x30;/);
     expect(host.querySelector("input")?.placeholder).toBe("默认");
-    const select = host.querySelector("select")!;
-    expect(select.querySelector('[value="high"]')?.textContent).toBe("高");
-    select.value = "high"; select.dispatchEvent(new Event("change")); await nextTick();
+    const trigger = host.querySelector<HTMLElement>('summary[aria-label="reasoning_effort"]')!;
+    trigger.click(); await nextTick();
+    const high = document.querySelector<HTMLButtonElement>('.parameter-options [data-value="high"]')!;
+    expect(high.textContent).toContain("高");
+    high.click(); await nextTick();
     expect(model.requestParameters?.reasoning_effort).toBe("high");
+    localI18n.global.locale.value = "en-US";
+    await nextTick();
+    expect(host.textContent).toContain("Advanced request parameters");
+    expect(trigger.textContent).toContain("High");
   } finally { app.unmount(); }
 });
 

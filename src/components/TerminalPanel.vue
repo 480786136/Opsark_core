@@ -5,7 +5,7 @@ import { useI18n } from "vue-i18n";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import { Terminal, type IDisposable, type ITheme } from "@xterm/xterm";
+import { Terminal, type IDisposable } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { appendTranscriptChunk, type TerminalTranscriptState } from "@/features/terminal/terminalTranscript";
 import {
@@ -21,6 +21,11 @@ import {
 import { shouldHandleTerminalGeneration } from "@/features/terminal/terminalReconnect";
 import { backend, type TerminalOutputEvent, type TerminalStatusEvent } from "@/services/backend";
 import { usePreferenceStore } from "@/features/preferences/preferenceStore";
+import {
+  readTerminalFontFamily,
+  readTerminalTheme,
+  TERMINAL_THEME_ATTRIBUTE_FILTER,
+} from "@/features/preferences/terminalTheme";
 import { useOpsStore } from "@/stores/ops";
 import type { TerminalPaneStatus } from "@/features/terminal/terminalSessionStore";
 import {
@@ -83,39 +88,6 @@ let lifecycleQueue: Promise<unknown> = Promise.resolve();
 let pendingStatusEvent: TerminalStatusEvent | undefined;
 let commandDraft: TerminalCommandDraft = { value: "", recordable: false };
 let osc7Buffer = "";
-
-function readTerminalTheme(): ITheme {
-  const styles = getComputedStyle(document.documentElement);
-  const color = (name: string, fallback: string) => styles.getPropertyValue(name).trim() || fallback;
-  return {
-    background: color("--terminal-bg", "#0b0e11"),
-    foreground: color("--terminal-text", "#c5cbd3"),
-    cursor: color("--terminal-cursor", color("--accent", "#d8ff5f")),
-    cursorAccent: color("--terminal-bg", "#0b0e11"),
-    selectionBackground: color("--terminal-selection", "#394128"),
-    black: color("--terminal-black", "#171b20"),
-    red: color("--terminal-red", "#ff7b82"),
-    green: color("--terminal-green", "#71db9b"),
-    yellow: color("--terminal-yellow", "#eab866"),
-    blue: color("--terminal-blue", "#77a9ff"),
-    magenta: color("--terminal-magenta", "#c69cff"),
-    cyan: color("--terminal-cyan", "#65d9e8"),
-    white: color("--terminal-white", "#d9dde2"),
-    brightBlack: color("--terminal-bright-black", "#6b7480"),
-    brightRed: color("--terminal-bright-red", "#ff9ca1"),
-    brightGreen: color("--terminal-bright-green", "#9ce8b7"),
-    brightYellow: color("--terminal-bright-yellow", "#f3ca83"),
-    brightBlue: color("--terminal-bright-blue", "#9abfff"),
-    brightMagenta: color("--terminal-bright-magenta", "#d8bcff"),
-    brightCyan: color("--terminal-bright-cyan", "#96e8f2"),
-    brightWhite: color("--terminal-bright-white", "#f5f7f9"),
-  };
-}
-
-function readTerminalFontFamily() {
-  return getComputedStyle(document.documentElement).getPropertyValue("--font-mono").trim()
-    || 'ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace';
-}
 
 function currentTerminalLine() {
   if (!terminal) return "";
@@ -269,7 +241,7 @@ async function openLiveTerminal(requestedLifecycle: number) {
   const serverGeneration = store.serverConnection(props.serverId).generation;
   starting = true;
   sessionServerGeneration = serverGeneration;
-  if (openedBefore) terminal?.writeln("\r\n[Opsark] ── 新的终端会话（不会恢复之前的远程进程）──\r\n");
+  if (openedBefore) terminal?.writeln(`\r\n${t("terminal.newSessionBanner")}\r\n`);
   openedBefore = true;
   statusMessage.value = "";
   connectionState.value = "connecting";
@@ -457,7 +429,7 @@ onMounted(async () => {
     terminal.options.theme = readTerminalTheme();
     terminal.options.fontFamily = readTerminalFontFamily();
   });
-  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: [...TERMINAL_THEME_ATTRIBUTE_FILTER] });
   if (isLive.value) await startLiveTerminal();
   if (disposed) return;
   scheduleFit();

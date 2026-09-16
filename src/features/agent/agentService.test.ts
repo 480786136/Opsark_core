@@ -12,6 +12,7 @@ import {
 import type { ModelProfile, OpsTask, PlanStep } from "@/types";
 import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 import { PlanProtocolError } from "@/services/backend";
+import { confirmedInputScope } from "@/features/agent/confirmedUserInputs";
 
 const model: ModelProfile = {
   id: "model-1",
@@ -168,6 +169,11 @@ describe("agentService", () => {
   ])("allows %s after user input without requiring changes", async (_scenario, command, validation) => {
     const currentTask = task();
     currentTask.rootGoal = "检查指定目标的状态";
+    currentTask.submittedInputs = { target: {
+      value: "/opt/resource", type: "text", label: "目标", description: "请指定检查目标。",
+      groupId: "target-input", groupTitle: "确认目标", submittedAt: "2026-09-15T00:00:00Z",
+      scope: confirmedInputScope(currentTask, "target-input"),
+    } };
     currentTask.executionConstraints = {
       changePolicy: "read_only", environmentPolicy: "unspecified", failurePolicy: "unspecified",
       prohibitedActions: [], requiredConditions: [], userDirectives: [],
@@ -194,7 +200,10 @@ describe("agentService", () => {
     expect(requirement).not.toContain("仅规划尚未完成的变更与最终验收");
     const context = JSON.parse(runtimeModel.context);
     expect(context.executionConstraints.changePolicy).toBe("read_only");
-    expect(context.completedDiscovery[0].output).toMatchObject({ values: { target: "/opt/resource" } });
+    expect(context.completedDiscovery[0].output).toMatchObject({ contentRef: "confirmedUserInputs" });
+    expect(context.confirmedUserInputs.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: "target", value: "/opt/resource" }),
+    ]));
     expect(context.instruction).toContain("read_only 目标只能进行只读操作");
     expect(context.instruction).toContain("已完成且仍有效的步骤");
   });
@@ -674,7 +683,7 @@ describe("agentService", () => {
     expect(successful.output).toMatchObject({ content: "successful raw output 0", contentState: "complete" });
     expect(failed.title).toBe("step-30");
     expect(failed.output.content).toContain("fatal: deployment artifact is missing");
-    expect(failed.output.salientLines).toContain("fatal: deployment artifact is missing");
+    expect(failed.output.salientLines).toBeUndefined(); // The canonical body already contains this evidence.
     expect(context.activeSkillAcceptance[0].instructions).toBe(`final acceptance ${"long rule ".repeat(1_000)}`);
     expect(serialized).not.toContain("GOAL_REVIEW_MIDDLE_TOKEN_MUST_BE_OMITTED");
     expect(serialized).not.toContain("deploy --token secret-");

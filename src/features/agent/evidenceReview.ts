@@ -1,5 +1,6 @@
-import { isReadOnlyStep } from "@/services/validation";
+import { isMutatingStepCommand, isReadOnlyStep } from "@/services/validation";
 import type { PlanStep } from "@/types";
+import { isRelatedRecoveryStep } from "./recoveryContract";
 
 export {
   analyzeCommandFailure,
@@ -9,26 +10,39 @@ export {
 } from "@/services/validation";
 export { isReadOnlyStep };
 
+/**
+ * Treat the authored effect as authoritative while retaining command inference
+ * for legacy persisted plans that predate PlanStep.kind.
+ */
+export function isMutatingReviewStep(step: PlanStep) {
+  return step.kind === "change" || isMutatingStepCommand(step.command);
+}
+
 export function isReadOnlyDiagnosticStep(step: PlanStep) {
+  if (isMutatingReviewStep(step)) return false;
   return step.kind === "observe" || (isReadOnlyStep(step)
     && /检查|查看|查询|诊断|查找|获取|扫描|结构|确认|验证|复查|状态|日志|端口|进程|访问/.test(
       `${step.title} ${step.description}`,
     ));
 }
 
-export function remainingPlanCanRepairPostcondition(remainingSteps: PlanStep[]) {
-  return remainingSteps.some((item) =>
-    /修复|解决|恢复|替代|调整|准备|应用|变更|重试|重新|安装|升级|创建|配置|设置|授权|启动|部署|加载/.test(
-      `${item.title}\n${item.description}`,
-    ),
-  );
+function nextStepCanRecover(remainingSteps: PlanStep[], failedStep?: PlanStep) {
+  const next = remainingSteps.find(step => step.status === "pending");
+  return Boolean(failedStep && next && isRelatedRecoveryStep(failedStep, next));
+}
+
+export function remainingPlanCanRepairPostcondition(
+  remainingSteps: PlanStep[],
+  failedStep?: PlanStep,
+) {
+  return nextStepCanRecover(remainingSteps, failedStep);
 }
 
 export function remainingPlanResolvesBlockingSignal(
-  _step: PlanStep,
+  step: PlanStep,
   remainingSteps: PlanStep[],
 ) {
-  return remainingPlanCanRepairPostcondition(remainingSteps);
+  return nextStepCanRecover(remainingSteps, step);
 }
 
 export function postconditionHasHardBlocker(
@@ -57,6 +71,7 @@ export function postconditionHasHardBlocker(
 export function remainingPlanCanRecoverExecutionFailure(
   _category: unknown,
   remainingSteps: PlanStep[],
+  failedStep?: PlanStep,
 ) {
-  return remainingPlanCanRepairPostcondition(remainingSteps);
+  return nextStepCanRecover(remainingSteps, failedStep);
 }

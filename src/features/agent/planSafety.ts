@@ -39,6 +39,7 @@ const SECRET_PLACEHOLDER = /\$\{secret\.[A-Z0-9_]+\}/i;
 const URL_CANDIDATE = /[a-z][a-z0-9+.-]*:\/\/[^\s'"`<>]+/gi;
 const SENSITIVE_QUERY_PARAMETER = /[?&](?:password|passwd|pwd|token|access[_-]?token|api[_-]?key|secret|credential)=[^&#\s]+/i;
 const SHELL_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const SUCCESS_NOOP = /^(?:(?:\/[\w.+-]+)*\/)?true(?:\s|$)|^:(?:\s|$)|^exit\s+\+?0+(?:\s|$)/;
 
 function urlCredentialIssue(script: string) {
   for (const match of script.matchAll(URL_CANDIDATE)) {
@@ -286,10 +287,10 @@ export function analyzeFailureMask(script: string, field: PlanSafetyField): Plan
   if (credentialIssue) return credentialIssue;
   const visible = shellOperatorsOnly(script.trim()).toLowerCase();
   const tail = visible.replace(/[;\s]+$/g, "");
-  if (/\|\|\s*(?:true|\/bin\/true|:)$/.test(tail)) {
+  if (unquotedDoublePipeOffsets(tail).some(offset => SUCCESS_NOOP.test(tail.slice(offset + 2).trim()))) {
     return issue(field, "EMPTY_SUCCESS_FALLBACK", "以成功空操作覆盖了前序失败状态", "|| true（或等价空操作）");
   }
-  if (/(?:;|\n)\s*true$/.test(tail)) {
+  if (unquotedStatements(tail).length > 1 && SUCCESS_NOOP.test(unquotedStatements(tail).slice(-1)[0] ?? "")) {
     return issue(field, "UNCONDITIONAL_SUCCESS_TAIL", "以无条件 true 覆盖了前序失败状态", "; true");
   }
   const statements = unquotedStatements(script);
@@ -341,6 +342,134 @@ export function analyzePlanStepSafety(
     issues,
     issue: issues[0],
   };
+}
+
+function acceptanceCommand(statement: string) {
+  const visible = shellOperatorsOnly(statement);
+  const comment = visible.search(/(?:^|\s)#/);
+  let command = (comment < 0 ? statement : statement.slice(0, comment)).trim();
+  command = command.replace(/^(['"])([\w/.:+-]+)\1(?=\s|$)/, "$2");
+  return command.replace(/^(?:(?:sudo|builtin|exec)\s+|[A-Za-z_]\w*=\S+\s+)*/, "");
+}
+
+/** Exit 0 from a printer/query is transport evidence, not a postcondition. */
+function isAcceptancePredicate(statement: string) {
+  const command = acceptanceCommand(statement).replace(/^(?:\/[\w.+-]+)*\//, "");
+  if (/^(?:test\s+|\[\[?\s+)(?:![ \t]+)?-(?:[bcdefghkLprsSuwxOGN])\s+\S/.test(command)) return true;
+  if (/^(?:test\s+|\[\[?\s+)/.test(command) && /\$/.test(command)
+    && /(?:\s(?:=|==|!=|=~|-[a-z]{2})\s|\s-[nz]\s)/.test(command)) return true;
+  return /^command\s+-v\s+\S/.test(command)
+    || /^systemctl\s+(?:--[\w-]+\s+)*(?:is-active|is-enabled)\s+\S/.test(command)
+    || /^(?:grep|rg|cmp|diff)\s+(?:-[\w-]*q[\w-]*|--quiet|--silent)\s+\S/.test(command)
+    || /^(?:rpm\s+-q\s+|dpkg\s+-s\s+|dpkg-query\s+-W\s+)\S/.test(command)
+    || /^git\s+(?:rev-parse\s+--verify|cat-file\s+-e)\s+\S/.test(command);
+}
+
+function andCommands(statement: string) {
+  const visible = shellOperatorsOnly(statement);
+  const offsets = [...visible.matchAll(/&&/g)].map(match => match.index!);
+  let start = 0;
+  return [...offsets, statement.length].map(offset => {
+    const command = statement.slice(start, offset).trim();
+    start = offset + 2;
+    return command;
+  });
+}
+
+/** Conservatively recognize explicit assertions whose failure reaches the caller. */
+export function validationHasAcceptanceCheck(script: string) {
+  if (!script.trim() || analyzeFailureMask(script, "validation")) return false;
+  const statements = unquotedStatements(script).map(acceptanceCommand).filter(Boolean);
+  let failFast = false;
+  let assertion = false;
+  for (let index = 0; index < statements.length; index += 1) {
+    const statement = statements[index];
+    if (/^set\s+-[a-z]*e(?:\s|$)/.test(statement) || /^set\s+-o\s+errexit$/.test(statement)) {
+      failFast = true;
+      continue;
+    }
+    if (/^set\s+-/.test(statement)) continue;
+    const visible = shellOperatorsOnly(statement);
+    const guarded = /\|\|\s*exit\s+[1-9]\d*\s*$/.test(visible);
+    const core = guarded ? statement.slice(0, visible.lastIndexOf("||")).trim() : statement;
+    if (/[|{}]/.test(shellOperatorsOnly(core).replace(/&&/g, ""))
+      || /^(?:if|for|while|until|case|function|return|exit|source|eval|\.)(?:\s|$)/.test(core)) return false;
+    const commands = andCommands(core);
+    const predicates = commands.map(isAcceptancePredicate);
+    if (predicates.some(Boolean)) {
+      // A later printer in an && chain cannot hide failure, but a later
+      // semicolon-separated command can unless errexit/explicit exit guards it.
+      if (!guarded && index < statements.length - 1 && (!failFast || commands.length > 1)) return false;
+      assertion = true;
+    } else if (!/^\s*(?:echo|printf)(?:\s|$)/.test(core)
+      && !/^[A-Za-z_]\w*=/.test(core) && !/^cd\s+/.test(core)) return false;
+  }
+  return assertion;
+}
+
+const RECOVERY_QUERY_MARKER = "# OPSARK_RECOVERY_ORIGINAL_QUERY_V1";
+const RECOVERY_ASSERTION_MARKER = "# OPSARK_RECOVERY_REQUIRED_ASSERTIONS_V1";
+
+/**
+ * A bounded legacy upgrade: retain every original query byte and repeat only
+ * predicates already present there. No new target, expected state or model-
+ * authored predicate is admitted. Complex scripts require a real contract.
+ */
+export function supplementalRecoveryAcceptance(originalCommand: string) {
+  const original = originalCommand.trim();
+  if (!original || validationHasAcceptanceCheck(original)
+    || original.includes(RECOVERY_QUERY_MARKER) || original.includes(RECOVERY_ASSERTION_MARKER)) return undefined;
+  const assertions: string[] = [];
+  let sawWeakFallback = false;
+  let sawMaskedPrinter = false;
+  for (let statement of unquotedStatements(original).map(acceptanceCommand).filter(Boolean)) {
+    if (/^set\s+-[eu]+$/.test(statement)) continue;
+    if (/^(?:echo|printf)(?:\s|$)/.test(statement)) {
+      // The incident used printf 'KEY=%s\n' "$(probe || echo absent)".
+      // Accept one simple substitution only; nested commands, additional
+      // substitutions and variables require a richer acceptance contract.
+      const printer = statement.match(/^(?:printf\s+(?:'[^']*'|"[^"$`]*")|echo)\s+"\$\(([^$`()\n]+)\)"$/);
+      if (!printer) {
+        if (/[$`]/.test(statement)) return undefined;
+        continue;
+      }
+      sawMaskedPrinter = true;
+      statement = printer[1].trim();
+    }
+    const visible = shellOperatorsOnly(statement);
+    const offset = visible.indexOf("||");
+    const core = (offset < 0 ? statement : statement.slice(0, offset)).trim();
+    const fallback = offset < 0 ? "" : statement.slice(offset + 2).trim();
+    if (fallback && !/^(?:echo|printf)(?:\s|$)/.test(fallback)) return undefined;
+    if (fallback) sawWeakFallback = true;
+    if (/[&|{}()]/.test(shellOperatorsOnly(core))) return undefined;
+    if (isAcceptancePredicate(core)) assertions.push(core);
+    else if (/^[\w./+-]+\s+(?:--version|-V|version)(?:\s|$)/.test(core)
+      && !/[`$]/.test(core)) {
+      // A version query must both succeed and return a value. Capture in a
+      // shell variable so the check creates no temporary files.
+      assertions.push(`__opsark_acceptance_output="$(${core})" && test -n "$__opsark_acceptance_output"`);
+    } else return undefined;
+  }
+  if (!assertions.length || (!sawWeakFallback && !sawMaskedPrinter && assertions.length < 2)) return undefined;
+  const assertionCommand = assertions.join(" &&\n");
+  return {
+    source: "original_read_only_predicates" as const,
+    originalCommand: original,
+    assertions,
+    command: `${RECOVERY_QUERY_MARKER}\n(\n${original}\n)\n${RECOVERY_ASSERTION_MARKER}\n(\n${assertionCommand}\n)`,
+  };
+}
+
+/** Recompute the program-authored projection; marker text alone proves nothing. */
+export function recordedSupplementalAcceptance(command: string) {
+  const prefix = `${RECOVERY_QUERY_MARKER}\n(\n`;
+  const boundary = `\n)\n${RECOVERY_ASSERTION_MARKER}\n`;
+  if (!command.startsWith(prefix)) return undefined;
+  const end = command.indexOf(boundary, prefix.length);
+  if (end < 0) return undefined;
+  const supplemental = supplementalRecoveryAcceptance(command.slice(prefix.length, end));
+  return supplemental?.command === command.trim() ? supplemental : undefined;
 }
 
 export function normalizePlanStepSafety(step: PlanStep) {

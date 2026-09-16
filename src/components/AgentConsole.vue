@@ -37,8 +37,10 @@ import { isAdjustmentProgressMessage, isPlanProgressMessage } from "@/features/a
 import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
 import { useWorkspaceLinkStore } from "@/features/workspace/workspaceLinkStore";
 import { conversationHistoryRounds } from "@/features/agent/conversationHistory";
+import { localizeCoreText } from "@/features/preferences/coreText";
 
 const props = defineProps<{ serverId: string; active?: boolean }>();
+const showDevelopmentFeatures = import.meta.env.DEV;
 const store = useOpsStore();
 const connectionReady = computed(() => store.isServerConnected(props.serverId));
 const agentWorkspaces = useAgentWorkspaceStore();
@@ -73,6 +75,23 @@ const submittingUserInputs = ref(new Set<PendingUserInput>());
 const submittingApprovals = ref(new Set<string>());
 const timeline = ref<HTMLElement>();
 const pendingFreshRequirement = ref("");
+const modelOptions = computed(() => [
+  ...store.models.map((model) => ({
+    value: model.id,
+    label: modelOptionText(model.id, model.name),
+    disabled: store.modelAvailability[model.id]?.status !== "available",
+  })),
+  { value: "__manage_models__", label: t("agent.manageModels") },
+]);
+const modelPlaceholder = computed(() => checkingModels.value
+  ? t("agent.checkingModels")
+  : !store.availableModels.length ? t("agent.noModels") : t("agent.modelSelectPlaceholder"));
+const permissionOptions = computed(() => [
+  { value: "observe", label: t("agent.permissionObserve") },
+  { value: "safe", label: t("agent.permissionSafe") },
+  { value: "managed", label: t("agent.permissionManaged") },
+]);
+const coreText = (value?: string | null) => localizeCoreText(value, locale.value);
 
 const serverTasks = computed(() => store.tasks.filter((task) => task.serverId === props.serverId));
 const task = computed(() => serverTasks.value.find((item) => item.id === workspaceState.activeTaskId));
@@ -125,7 +144,7 @@ const approvalKey = computed(() => task.value && (canApprovePlan.value || pendin
   : undefined);
 const isSubmittingApproval = computed(() => Boolean(approvalKey.value && submittingApprovals.value.has(approvalKey.value)));
 const isBusy = computed(() => task.value && (
-  task.value.adjustmentInProgress
+  task.value.requirementProcessing || task.value.adjustmentInProgress
   || ["planning", "running", "validating"].includes(task.value.status)
 ));
 const canTerminate = computed(() =>
@@ -134,10 +153,50 @@ const canTerminate = computed(() =>
     || ["planning", "running", "validating", "awaiting_input"].includes(task.value.status)
   )),
 );
+// Persisted incidents describe why a task paused, not whether a recovery worker
+// is still running. Only live recovery work should keep the console spinning.
+const hasTransportRecovery = computed(() => Boolean(task.value && (
+  task.value.adjustmentIncident?.kind === "transport"
+  || task.value.managedAdjustmentPhase === "waiting_transport"
+  || task.value.managedStopReason === "transport_recovery"
+)));
+const isWaitingForTerminalRecovery = computed(() => Boolean(task.value
+  && hasTransportRecovery.value
+  && task.value.managedAdjustmentPhase !== "manual_required"
+  && store.transportRecoveryTaskIds.includes(task.value.id)));
+const needsTransportRecoveryCheck = computed(() => hasTransportRecovery.value
+  && !isWaitingForTerminalRecovery.value
+  && !task.value?.adjustmentInProgress
+  && task.value?.managedAdjustmentPhase !== "generating");
 const showManualAdjustmentButton = computed(() => Boolean(task.value && (
   task.value.permission !== "managed"
   || task.value.managedAdjustmentPhase === "manual_required"
+  || needsTransportRecoveryCheck.value
 )));
+const canRequestAdjustment = computed(() => Boolean(task.value
+  && ["needs_adjustment", "awaiting_continuation"].includes(task.value.status)
+  && showManualAdjustmentButton.value
+  && (!task.value.autoAdjustmentSeconds || needsTransportRecoveryCheck.value)
+  && !task.value.adjustmentInProgress
+  && task.value.managedAdjustmentPhase !== "generating"
+  && !isWaitingForTerminalRecovery.value));
+const needsUserAction = computed(() => Boolean(
+  canApprovePlan.value
+  || pendingApproval.value
+  || pendingUserInputRequest.value
+  || pendingSecretRequest.value
+  || task.value?.status === "planning_failed"
+  || canRequestAdjustment.value
+));
+
+async function requestTaskAdjustment() {
+  if (!task.value || !canRequestAdjustment.value) return;
+  if (needsTransportRecoveryCheck.value) {
+    await store.routeAutomaticAdjustment(task.value.id, { transportRecovery: true });
+  } else {
+    await store.requestAdjustment(task.value.id);
+  }
+}
 
 function planProgressText(current: OpsTask) {
   const completed = current.plan.filter((step) => step.status === "completed").length;
@@ -269,9 +328,9 @@ function summaryBlocks(value?: string): SummaryBlock[] {
   return blocks.length ? blocks : [{ type: "paragraph", text: value || "-" }];
 }
 
-watch(isBusy, (busy) => {
-  if (busy && !expandedRecords.value.includes("current")) {
-    expandedRecords.value = [...expandedRecords.value, "current"];
+watch(needsUserAction, (awaitingUser) => {
+  if (awaitingUser) {
+    expandedRecords.value = expandedRecords.value.filter((id) => id !== "current");
   }
 }, { immediate: true });
 
@@ -312,7 +371,6 @@ async function submit() {
   submissionError.value = "";
   showTasks.value = false;
   let selectedTask = task.value;
-  let contextTaskId = "";
   if (!selectedTask) {
     selectedTask = store.createTask(props.serverId, permission.value, modelId.value);
     agentWorkspaces.updateServer(props.serverId, { activeTaskId: selectedTask.id });
@@ -320,12 +378,6 @@ async function submit() {
   const startsAfterFinishedTask = ["completed", "failed", "cancelled"].includes(selectedTask.status);
   if (startsAfterFinishedTask) {
     pendingFreshRequirement.value = value;
-    contextTaskId = selectedTask.id;
-    const previousTask = selectedTask;
-    selectedTask = store.createTask(props.serverId, permission.value, modelId.value);
-    selectedTask.title = value;
-    selectedTask.conversationId = previousTask.conversationId ?? previousTask.id;
-    agentWorkspaces.updateServer(props.serverId, { activeTaskId: selectedTask.id });
   }
   input.value = "";
   try {
@@ -336,7 +388,6 @@ async function submit() {
       modelId.value,
       terminalReference.value,
       selectedTask.id,
-      contextTaskId,
     );
     if (store.activeTaskId && store.activeTaskId !== workspaceState.activeTaskId) {
       agentWorkspaces.updateServer(props.serverId, { activeTaskId: store.activeTaskId });
@@ -383,18 +434,26 @@ async function restoreAutomation() {
   checkingModels.value = false;
 }
 
-function handleModelSelection(event: Event) {
-  const value = (event.target as HTMLSelectElement).value;
-  if (value !== "__manage_models__") return;
+function handleModelSelection(value: string) {
+  if (value !== "__manage_models__") {
+    modelId.value = value;
+    return;
+  }
   showModelSettings.value = true;
   selectFirstAvailableModel();
+}
+
+function handlePermissionSelection(value: string) {
+  if (["observe", "safe", "managed"].includes(value)) {
+    permission.value = value as "observe" | "safe" | "managed";
+  }
 }
 
 function modelOptionText(modelIdValue: string, name: string) {
   const availability = store.modelAvailability[modelIdValue];
   if (availability?.status === "available") return `${name} · ${t("agent.modelAvailable")}`;
   if (availability?.status === "checking") return `${name} · ${t("agent.modelChecking")}`;
-  return `${name} · ${availability?.reason ?? t("agent.modelUnavailable")}`;
+  return `${name} · ${availability?.reason ? coreText(availability.reason) : t("agent.modelUnavailable")}`;
 }
 
 function handleModelsSaved() {
@@ -525,7 +584,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
     <header class="agent-header">
       <div class="agent-title">
         <span class="agent-title-icon"><Bot :size="17" /></span>
-        <span class="agent-title-copy"><strong>{{ t("agent.title") }}</strong><small v-if="pendingFreshRequirement" :title="pendingFreshRequirement">正在识别新需求：{{ pendingFreshRequirement }}</small><small v-else-if="task" :title="task.title">{{ task.title }}</small></span>
+        <span class="agent-title-copy"><strong>{{ t("agent.title") }}</strong><small v-if="pendingFreshRequirement" :title="pendingFreshRequirement">{{ t("agent.recognizingRequirement", { requirement: pendingFreshRequirement }) }}</small><small v-else-if="task" :title="task.title">{{ task.title }}</small></span>
         <span class="beta">CORE</span>
         <span v-if="isBusy" class="agent-activity"><i></i>{{ statusText(task?.status) }}</span>
       </div>
@@ -561,9 +620,9 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
         <header class="task-strip-head">
           <span class="task-strip-heading"><History :size="14" /><span><strong>{{ t("agent.taskListTitle") }}</strong><small>{{ t("agent.taskListHint") }}</small></span></span>
           <strong>{{ serverTasks.length }}</strong>
-          <button class="icon-button" type="button" aria-label="关闭任务列表" @click="showTasks = false"><X :size="14"/></button>
+          <button class="icon-button" type="button" :aria-label="t('agent.closeTaskList')" @click="showTasks = false"><X :size="14"/></button>
         </header>
-        <label class="task-menu-search"><Search :size="14"/><input v-model="taskQuery" aria-label="搜索任务" placeholder="搜索任务"/></label>
+        <label class="task-menu-search"><Search :size="14"/><input v-model="taskQuery" :aria-label="t('agent.searchTasks')" :placeholder="t('agent.searchTasks')"/></label>
         <div class="task-strip-list">
         <TransitionGroup name="task-list">
         <div v-for="item in filteredTasks" :key="item.id" :class="['task-strip-item', item.status, { active: item.id === task?.id }]">
@@ -581,14 +640,14 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
         </div>
         </TransitionGroup>
         <div v-if="!serverTasks.length" class="task-strip-empty">{{ t("agent.emptyTitle") }}</div>
-        <div v-else-if="!filteredTasks.length" class="task-strip-empty">没有匹配的任务</div>
+        <div v-else-if="!filteredTasks.length" class="task-strip-empty">{{ t("agent.noMatchingTasks") }}</div>
         </div>
         <button class="new-task" @click="startNewTask"><MessageSquarePlus :size="14" />{{ t("agent.newTask") }}</button>
       </div>
       </Transition>
 
       <div ref="timeline" class="agent-timeline">
-        <TaskKnowledgeUpload v-if="task && !pendingFreshRequirement" :key="task.id" :task="task" />
+        <TaskKnowledgeUpload v-if="showDevelopmentFeatures && task && !pendingFreshRequirement" :key="task.id" :task="task" />
         <div v-if="!task" class="empty-agent">
           <div class="mini-orb"><Bot :size="22" /></div>
           <h3>{{ t("agent.emptyTitle") }}</h3>
@@ -735,7 +794,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
             :index="phaseIndex + 1"
           />
 
-          <div v-if="task.plan.length && !pendingFreshRequirement" :class="['plan-card', 'current-plan-card', `task-card-${task.status}`]">
+          <div v-if="(task.plan.length || hasTransportRecovery || canRequestAdjustment) && !pendingFreshRequirement" :class="['plan-card', 'current-plan-card', `task-card-${task.status}`]">
             <div class="plan-card-head">
               <span class="plan-title-block">
                 <span class="plan-title-line">
@@ -776,6 +835,11 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                 <div v-if="expandedSteps.includes(step.id)" class="step-detail">
                   <label>{{ t("agent.willExecute") }}</label><code>{{ step.command }}</code>
                   <label>{{ t("agent.expectedValidation") }}</label><p>{{ step.expected }} · {{ step.kind === "observe" ? t("agent.commandResultEvidence") : step.validation }}</p>
+                  <template v-if="step.protocolReplanApproval">
+                    <label>{{ t('agent.replanDecisionReview') }}</label>
+                    <p>{{ step.protocolReplanApproval.decisionSummary }}</p>
+                    <p class="evidence-warning">{{ t('agent.replanApprovalNotice') }}</p>
+                  </template>
                   <template v-if="step.result">
                     <label>{{ t("agent.executionObservation") }}</label>
                     <div class="step-result-line">
@@ -787,9 +851,9 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                   </template>
                   <template v-if="step.output"><label>{{ t("agent.output") }}</label><pre>{{ step.output }}</pre></template>
                   <p v-if="step.status === 'running' && step.progressMessage" class="step-progress">
-                    <LoaderCircle class="spin" :size="13" />{{ step.progressMessage }}
+                    <LoaderCircle class="spin" :size="13" />{{ coreText(step.progressMessage) }}
                   </p>
-                  <template v-if="step.review"><label>{{ t("agent.review") }}</label><p class="review-result">{{ step.review.summary }}（{{ step.review.reason }}）</p></template>
+                  <template v-if="step.review"><label>{{ t("agent.review") }}</label><p class="review-result">{{ t("agent.reviewDetails", { summary: step.review.summary, reason: step.review.reason }) }}</p></template>
                 </div>
               </div>
             </div>
@@ -798,7 +862,8 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
               <button class="button primary" :disabled="isSubmittingApproval" @click="submitApproval"><Play :size="13" />{{ t("agent.approvePlan") }}</button>
             </div>
             <div v-else-if="pendingApproval" class="approval-bar warning">
-              <span><ShieldAlert :size="15" />{{ pendingApproval.authenticationGate?.reason || t("agent.stepApproval") }}</span>
+              <span><ShieldAlert :size="15" />{{ pendingApproval.authenticationGate?.reason ? coreText(pendingApproval.authenticationGate.reason) : t(pendingApproval.protocolReplanApproval ? 'agent.replanApprovalNotice' : 'agent.stepApproval') }}</span>
+              <span v-if="pendingApproval.protocolReplanApproval">{{ pendingApproval.protocolReplanApproval.decisionSummary }}</span>
               <button class="button secondary" @click="store.rejectTask(task.id)">{{ t("agent.stop") }}</button>
               <button class="button primary" :disabled="isSubmittingApproval" @click="submitApproval">{{ t("agent.executeStep") }}</button>
             </div>
@@ -846,7 +911,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                   <em v-if="field.type === 'password'"><KeyRound :size="11" />{{ t('agent.passwordParameterHint') }}</em>
                 </component>
               </div>
-              <p v-if="pendingUserInputRequest.error" class="user-input-error">{{ pendingUserInputRequest.error }}</p>
+              <p v-if="pendingUserInputRequest.error" class="user-input-error">{{ coreText(pendingUserInputRequest.error) }}</p>
               <div class="user-input-actions">
                 <span v-if="hasCredentialUserInput">{{ t('agent.userInputSecurityHint') }}</span>
                 <button class="button primary" type="submit" :disabled="isSubmittingUserInput || isUserInputIncomplete">{{ t('agent.confirmParameters') }}</button>
@@ -865,7 +930,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                 <span>{{ t('agent.secretValueLabel') }}</span>
                 <input v-model="secretInput" type="password" autocomplete="new-password" :placeholder="t('agent.secretPlaceholder')" autofocus />
               </label>
-              <p v-if="pendingSecretRequest.error" class="user-input-error">{{ pendingSecretRequest.error }}</p>
+              <p v-if="pendingSecretRequest.error" class="user-input-error">{{ coreText(pendingSecretRequest.error) }}</p>
               <div class="secret-unlock-actions">
                 <span><ShieldAlert :size="13" />{{ pendingSecretRequest.unlockDescription }}</span>
                 <button class="button primary" type="submit" :disabled="!secretInput">{{ t("agent.submitSecret") }}</button>
@@ -874,7 +939,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
             <div v-else-if="task.status === 'planning_failed'" class="approval-bar warning">
               <span class="adjustment-copy">
                 <ShieldAlert :size="15" />
-                <span><strong>{{ t("agent.summaryPlanningFailed") }}</strong><small v-if="task.pauseReason">{{ task.pauseReason }}</small></span>
+                <span><strong>{{ t("agent.summaryPlanningFailed") }}</strong><small v-if="task.pauseReason">{{ coreText(task.pauseReason) }}</small></span>
               </span>
               <button class="button secondary" @click="store.rejectTask(task.id)">{{ t("agent.endTask") }}</button>
               <button class="button primary" @click="retryPlanning">{{ t("agent.retryPlanning") }}</button>
@@ -882,13 +947,13 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
             <div v-else-if="['needs_adjustment', 'awaiting_continuation'].includes(task.status)" class="approval-bar warning">
               <span class="adjustment-copy">
                 <ShieldAlert :size="15" />
-                <span><strong>{{ adjustmentLabel }}</strong><small v-if="task.pauseReason">{{ task.pauseReason }}</small></span>
+                <span><strong>{{ adjustmentLabel }}</strong><small v-if="task.pauseReason">{{ coreText(task.pauseReason) }}</small></span>
               </span>
               <button class="button secondary" @click="store.rejectTask(task.id)">{{ t("agent.endTask") }}</button>
-              <span v-if="(task.adjustmentIncident?.kind === 'transport' || task.managedAdjustmentPhase === 'waiting_transport') && task.managedAdjustmentPhase !== 'manual_required'" class="managed-approval-countdown">
+              <span v-if="isWaitingForTerminalRecovery" class="managed-approval-countdown">
                 <LoaderCircle class="spin" :size="13" />{{ t('agent.waitingTerminalRecovery') }}
               </span>
-              <span v-else-if="task.autoAdjustmentSeconds" class="managed-approval-countdown">
+              <span v-else-if="task.autoAdjustmentSeconds && !needsTransportRecoveryCheck" class="managed-approval-countdown">
                 <LoaderCircle class="spin" :size="13" />{{ t('agent.managedAdjustmentCountdown', { seconds: task.autoAdjustmentSeconds }) }}
               </span>
               <span v-else-if="task.adjustmentInProgress || task.managedAdjustmentPhase === 'generating'" class="managed-approval-countdown">
@@ -897,8 +962,8 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
               <span v-else-if="task.permission === 'managed' && !showManualAdjustmentButton" class="managed-approval-countdown">
                 <LoaderCircle class="spin" :size="13" />{{ t('agent.managedAutoContinuing') }}
               </span>
-              <button v-else-if="showManualAdjustmentButton" class="button primary" @click="store.requestAdjustment(task.id)">
-                {{ t(task.managedStopReason === 'transport_recovery' ? 'agent.checkTerminalRecovery' : 'agent.generateAdjustment') }}
+              <button v-else-if="canRequestAdjustment" class="button primary" @click="requestTaskAdjustment">
+                {{ t(needsTransportRecoveryCheck ? 'agent.checkTerminalRecovery' : task.protocolRepair ? 'agent.generateBusinessReplan' : 'agent.generateAdjustment') }}
               </button>
             </div>
           </div>
@@ -910,13 +975,13 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
             </button>
             <div v-if="!expandedRecords.includes('current') && currentRecordPreview.length" class="execution-record-preview">
               <div v-for="record in currentRecordPreview" :key="`preview-${record.id}`" :class="['execution-preview-row', { active: record.id === activeRecordId }]">
-                <i></i><span>{{ record.content }}</span><time>{{ new Date(record.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
+                <i></i><span>{{ coreText(record.content) }}</span><time>{{ new Date(record.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
               </div>
             </div>
             <div v-if="expandedRecords.includes('current')" class="execution-record-body">
               <div v-for="record in currentRecords" :key="record.id" :class="['execution-event-row', { active: record.id === activeRecordId }]">
                 <time>{{ new Date(record.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
-                <span><i v-if="record.id === activeRecordId" class="execution-event-pulse" />{{ record.content }}</span>
+                <span><i v-if="record.id === activeRecordId" class="execution-event-pulse" />{{ coreText(record.content) }}</span>
               </div>
               <div v-for="step in task.plan.filter((item) => item.output)" :key="`current-output-${step.id}`" class="execution-output">
                 <strong>{{ step.title }}</strong><code>{{ step.command }}</code><pre>{{ step.output }}</pre>
@@ -937,7 +1002,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
             <div class="summary-card-content">
               <span class="summary-eyebrow">{{ summaryTitle(task.status) }}</span>
               <div class="summary-content">
-                <template v-for="(block, index) in summaryBlocks(task.summary ?? task.pauseReason)" :key="index">
+                <template v-for="(block, index) in summaryBlocks(task.summary ?? coreText(task.pauseReason))" :key="index">
                   <h4 v-if="block.type === 'heading'">{{ block.text }}</h4>
                   <ul v-else-if="block.type === 'list'"><li v-for="item in block.items" :key="item">{{ item }}</li></ul>
                   <p v-else>{{ block.text }}</p>
@@ -949,7 +1014,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
       </div>
 
       <form class="composer" @submit.prevent="submit">
-        <p v-if="submissionError" class="agent-connection-hint" role="alert">{{ submissionError }} · 草稿已保留</p>
+        <p v-if="submissionError" class="agent-connection-hint" role="alert">{{ coreText(submissionError) }} · {{ t("agent.draftPreserved") }}</p>
         <div v-if="terminalReference" class="context-chip">
           <Quote :size="12" /><span>{{ t("agent.referencedTerminal", { count: terminalReference.split('\n').length }) }}</span>
           <button type="button" @click="terminalReference = ''">×</button>
@@ -962,23 +1027,24 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
         ></textarea>
         <div class="composer-tools">
           <button class="context-button" type="button" :title="t('agent.referenceTerminal')" @click="referenceTerminal"><Quote :size="13" />{{ t("agent.terminal") }}</button>
-          <select v-model="modelId" :title="t('agent.model')" :class="{ 'model-select-empty': !modelId }" @change="handleModelSelection">
-            <option v-if="checkingModels" value="" disabled>{{ t("agent.checkingModels") }}</option>
-            <option v-else-if="!store.availableModels.length" value="" disabled>{{ t("agent.noModels") }}</option>
-            <option
-              v-for="model in store.models"
-              :key="model.id"
-              :value="model.id"
-              :disabled="store.modelAvailability[model.id]?.status !== 'available'"
-            >{{ modelOptionText(model.id, model.name) }}</option>
-            <option value="__manage_models__">{{ t("agent.manageModels") }}</option>
-          </select>
-          <select v-model="permission" :title="t('agent.permission')">
-            <option value="observe">{{ t("agent.permissionObserve") }}</option>
-            <option value="safe">{{ t("agent.permissionSafe") }}</option>
-            <option value="managed">{{ t("agent.permissionManaged") }}</option>
-          </select>
-          <button class="send-button" type="submit" :disabled="!input.trim() || Boolean(isBusy) || !modelId || !connectionReady" :title="connectionReady ? undefined : 'SSH 未连接，请先重连'"><Send :size="16" /></button>
+          <ParameterSelect
+            :model-value="modelId"
+            :options="modelOptions"
+            :ariaLabel="t('agent.model')"
+            :title="t('agent.model')"
+            :placeholder="modelPlaceholder"
+            size="compact"
+            @update:model-value="handleModelSelection"
+          />
+          <ParameterSelect
+            :model-value="permission"
+            :options="permissionOptions"
+            :ariaLabel="t('agent.permission')"
+            :title="t('agent.permission')"
+            size="compact"
+            @update:model-value="handlePermissionSelection"
+          />
+          <button class="send-button" type="submit" :disabled="!input.trim() || Boolean(isBusy) || !modelId || !connectionReady" :title="connectionReady ? undefined : t('agent.sshReconnectRequired')"><Send :size="16" /></button>
         </div>
       </form>
     </template>

@@ -21,6 +21,7 @@ import FileEditorPanel from "@/features/files/FileEditorPanel.vue";
 import { useFileWorkspaceStore } from "@/features/files/fileWorkspaceStore";
 import type { FileEntry } from "@/types";
 import { useServerWorkspaceTabsStore } from "@/features/workspace/serverWorkspaceTabsStore";
+import { localizeCoreText } from "@/features/preferences/coreText";
 
 defineOptions({ name: "WorkspaceView" });
 
@@ -32,7 +33,6 @@ const files = useFileWorkspaceStore();
 const windowTabs = useServerWorkspaceTabsStore();
 layout.hydrate();
 const { t, locale } = useI18n();
-const zh = computed(() => locale.value.startsWith("zh"));
 // KeepAlive views still observe the global route while hidden. Retain the last
 // server so switching to Local cannot unmount its terminal/Agent subtree.
 const serverId = ref(typeof route.params.id === "string" ? route.params.id : "");
@@ -51,16 +51,20 @@ const connectionBusy = computed(() => ["connecting", "reconnecting", "suspect"].
 const readOnlyServers = ref<Record<string, boolean>>({});
 const editingServer = ref(false);
 const connectionLabel = computed(() => ({
-  idle: zh.value ? "未连接" : "Not connected",
-  connecting: zh.value ? "正在连接" : "Connecting",
-  connected: zh.value ? "SSH 已连接" : "SSH connected",
-  suspect: zh.value ? "正在确认连接" : "Checking connection",
-  reconnecting: zh.value ? "正在重连" : "Reconnecting",
-  manual: zh.value ? "需要手动重连" : "Reconnect required",
-  auth_failed: zh.value ? "身份验证失败" : "Authentication failed",
-  disconnected: zh.value ? "已断开" : "Disconnected",
+  idle: t("workspace.connectionIdle"),
+  connecting: t("workspace.connectionConnecting"),
+  connected: t("workspace.connectionConnected"),
+  suspect: t("workspace.connectionSuspect"),
+  reconnecting: t("workspace.connectionReconnecting"),
+  manual: t("workspace.connectionManual"),
+  auth_failed: t("workspace.connectionAuthFailed"),
+  disconnected: t("workspace.connectionDisconnected"),
 })[connection.value.status]);
-const connectionDetail = computed(() => [connectionLabel.value, connection.value.phase, connection.value.error].filter(Boolean).join(" · "));
+const connectionDetail = computed(() => [
+  connectionLabel.value,
+  localizeCoreText(connection.value.phase, locale.value),
+  localizeCoreText(connection.value.error, locale.value),
+].filter(Boolean).join(" · "));
 const editorEntry = ref<FileEntry>();
 const workspaceGrid = ref<HTMLElement>();
 const connectionOverlays = ref<InstanceType<typeof ConnectionOverlay>[]>([]);
@@ -160,9 +164,9 @@ watch(serverId, (nextServerId) => {
     <WorkspaceNavigation>
       <div :class="['workspace-env', 'workspace-connection-status', connection.status]" :title="connectionDetail" tabindex="0"><Wifi v-if="isLive || connectionBusy" :size="13"/><WifiOff v-else :size="13"/><span>{{ connectionLabel }}</span></div>
       <WorkspaceToolbar />
-      <button class="refresh-button" :title="isLive ? t('workspace.refreshEnvironment') : connectionBusy ? connectionLabel : (zh ? '重新连接' : 'Reconnect')" :aria-label="isLive ? t('workspace.refreshEnvironment') : connectionBusy ? connectionLabel : (zh ? '重新连接' : 'Reconnect')" :disabled="store.isCollecting || connectionBusy" @click="refreshOrConnect">
+      <button class="refresh-button" :title="isLive ? t('workspace.refreshEnvironment') : connectionBusy ? connectionLabel : t('common.reconnect')" :aria-label="isLive ? t('workspace.refreshEnvironment') : connectionBusy ? connectionLabel : t('common.reconnect')" :disabled="store.isCollecting || connectionBusy" @click="refreshOrConnect">
         <RefreshCw v-if="isLive" :class="{ spin: store.isCollecting }" :size="15" />
-        <RefreshCw v-else :size="14" /><span class="refresh-button-copy">{{ isLive ? t("workspace.refreshEnvironment") : connectionBusy ? (zh ? '正在连接' : 'Connecting') : (zh ? '重新连接' : 'Reconnect') }}</span>
+        <RefreshCw v-else :size="14" /><span class="refresh-button-copy">{{ isLive ? t("workspace.refreshEnvironment") : connectionBusy ? t("workspace.connectionConnecting") : t("common.reconnect") }}</span>
       </button>
     </WorkspaceNavigation>
     <div class="workspace-content">
@@ -221,7 +225,7 @@ watch(serverId, (nextServerId) => {
           :active="viewActive && option.id === server.id"
         />
       </section>
-      <p v-if="!Object.values(layout.visiblePanels).some(Boolean)" class="workspace-panels-empty">点击顶部文件、终端或 AI 图标显示对应区域</p>
+      <p v-if="!Object.values(layout.visiblePanels).some(Boolean)" class="workspace-panels-empty">{{ t("workspace.emptyPanels") }}</p>
     </div>
     </div>
     <MetricsBar :server-id="server.id" />

@@ -28,3 +28,19 @@ export function transitionTask(task: OpsTask, nextStatus: TaskStatus, timestamp 
   task.updatedAt = timestamp;
   return task;
 }
+
+/** Only a classified, user-submitted execution requirement can replace a waiting workflow. */
+export function beginRequirementPlanning(task: OpsTask, relation: import("@/types").RequirementRelation) {
+  if (!["continue", "supplement", "new_goal", "replace_goal"].includes(relation)) {
+    throw new Error("旁问或取消目标不能启动执行规划");
+  }
+  if (task.status === "awaiting_input" && relation === "continue") {
+    throw new Error("继续不能代替当前步骤必须由用户确认的输入");
+  }
+  if (["awaiting_input", "awaiting_step_approval", "awaiting_plan_approval"].includes(task.status)) {
+    task.status = "planning";
+    task.updatedAt = new Date().toISOString();
+    return;
+  }
+  transitionTask(task, "planning");
+}

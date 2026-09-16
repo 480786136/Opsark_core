@@ -6,7 +6,7 @@ import { useOpsStore } from "@/stores/ops";
 import KnowledgeSettings from "@/features/knowledge/KnowledgeSettings.vue";
 
 const store = useOpsStore();
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const saved = ref(false);
 function saveSettings() {
   store.persist(true);
@@ -18,7 +18,7 @@ function saveSettings() {
 <template>
   <div class="page settings-page">
     <header class="page-header">
-      <div><span class="eyebrow">CONFIGURATION</span><h1>{{ t("settings.title") }}</h1><p>{{ t("settings.subtitle") }}</p></div>
+      <div><span class="eyebrow">{{ locale.startsWith("zh") ? "系统配置" : "CONFIGURATION" }}</span><h1>{{ t("settings.title") }}</h1><p>{{ t("settings.subtitle") }}</p></div>
       <button class="button primary" @click="saveSettings">
         <Save :size="15" />{{ saved ? t("settings.saved") : t("settings.save") }}
       </button>
@@ -29,7 +29,7 @@ function saveSettings() {
         <div class="settings-title"><SlidersHorizontal :size="18" /><div><h2>{{ t("settings.limitsTitle") }}</h2><p>{{ t("settings.limitsSubtitle") }}</p></div></div>
         <div class="generation-limit-head">
           <div><strong>{{ t("settings.enableLimits") }}</strong><small>{{ t("settings.limitsHint") }}</small></div>
-          <label class="toggle"><input v-model="store.aiGenerationSettings.limitOutput" type="checkbox" /><i></i></label>
+          <label class="toggle"><input v-model="store.aiGenerationSettings.limitOutput" type="checkbox" :aria-label="t('settings.enableLimits')" /><i></i></label>
         </div>
         <div v-if="store.aiGenerationSettings.limitOutput" class="generation-limit-grid">
           <label><span>{{ t("settings.maxSteps") }}</span><input v-model.number="store.aiGenerationSettings.maxPlanSteps" type="number" min="1" /></label>

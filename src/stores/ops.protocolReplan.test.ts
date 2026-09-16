@@ -1,0 +1,364 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createPinia, setActivePinia } from "pinia";
+import { useConnectionStore } from "@/features/connection/connectionStore";
+import { confirmedInputScope } from "@/features/agent/confirmedUserInputs";
+import { backend, PlanProtocolError, type PlanNormalizationRepair } from "@/services/backend";
+import type { OpsTask, PermissionLevel, PlanStep, ServerProfile } from "@/types";
+import { useOpsStore } from "./ops";
+
+const server: ServerProfile = {
+  id: "protocol-server", name: "协议重规划测试", host: "protocol.example.invalid", port: 22,
+  username: "tester", group: "test", status: "offline", environment: [], createdAt: "2026-09-16T00:00:00Z",
+  info: { os: "test", kernel: "test", cpu: "test", cores: 1, memoryGb: 1, diskGb: 1, uptime: "test" },
+};
+
+const step = (overrides: Partial<PlanStep> = {}): PlanStep => ({
+  id: "replacement-check", title: "复核转发配置", description: "读取实际生效的内核转发状态",
+  kind: "observe", command: "sysctl -n net.ipv4.ip_forward", validation: "", expected: "转发已启用",
+  risk: "low", status: "pending", executionScope: "isolated_exec", ...overrides,
+});
+
+const change = (risk: PlanStep["risk"] = "medium") => step({
+  id: "replacement-change", title: "启用内核转发", description: "按授权调整转发参数并独立验证",
+  kind: "change", command: "sysctl -w net.ipv4.ip_forward=1",
+  validation: "test \"$(sysctl -n net.ipv4.ip_forward)\" = 1", risk,
+});
+
+const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+
+function fixture(permission: PermissionLevel = "safe"): { store: ReturnType<typeof useOpsStore>; task: OpsTask } {
+  const store = useOpsStore();
+  const task = store.createTask(server.id, permission, "protocol-model");
+  task.rootGoal = "部署 Kubernetes 并完成控制平面验收";
+  task.currentInstruction = "根据检查证据继续部署";
+  task.currentRoundId = "protocol-round";
+  task.status = "needs_adjustment";
+  task.pauseReason = "OBSERVE_COMMAND_MUTATION；PROTOCOL_REPAIR_NO_PROGRESS";
+  task.plan = [step({
+    id: "completed-inspection", command: "uname -a", status: "completed", output: "Linux fixture 6.12.0",
+    result: { executionStatus: "success", observationStatus: "matched", exitCode: 0,
+      facts: { kernel: "6.12.0" }, warnings: [], evidenceIds: ["inspection-evidence"] },
+    evidence: [{ id: "inspection-evidence", type: "command-output", source: "main",
+      rawOutput: "Linux fixture 6.12.0", facts: { kernel: "6.12.0" }, collectedAt: "2026-09-16T00:00:00Z" }],
+  })];
+  const repair: PlanNormalizationRepair = {
+    errorCode: "plan_normalization_failed", repairStrategy: { type: "plan_protocol" },
+    fieldPath: "steps[0].command", expected: "observe 主命令必须只读",
+    validationError: "OBSERVE_COMMAND_MUTATION / steps[0].command / matchedToken=kubeadm",
+    previousModelOutput: [step({ id: "rejected-dry-run", command: "kubeadm init --dry-run --kubernetes-version v1.31.14" })],
+    instruction: "仅修复命令表达，不得扩大原计划业务范围",
+    diagnostic: { code: "OBSERVE_COMMAND_MUTATION", stepIndex: 0, stepId: "rejected-dry-run",
+      fieldPath: "steps[0].command", matchedToken: "kubeadm", expected: "observe 主命令必须只读",
+      allowedRepairPaths: ["steps[0].command"], ruleVersion: 1 },
+    progress: { scopeFingerprint: "original-scope", attemptedFingerprints: ["original-attempt"],
+      seenPlans: ["original-plan"], attemptCount: 1, stopCode: "PROTOCOL_REPAIR_NO_PROGRESS" },
+  };
+  task.protocolRepair = { roundId: task.currentRoundId, serverId: task.serverId,
+    repair, repairError: "PROTOCOL_REPAIR_NO_PROGRESS" };
+  task.submittedInputs = {
+    k8s_version: { value: "1.31", type: "text", label: "Kubernetes 版本", description: "沿用现有组件",
+      groupId: "deployment-scope", groupTitle: "部署范围", submittedAt: "2026-09-16T00:00:00Z",
+      scope: confirmedInputScope(task, "completed-input") },
+  };
+  store.pushMessage(task, { role: "user", kind: "message", content: task.rootGoal });
+  return { store, task };
+}
+
+function generatedContext(index = 0) {
+  const call = vi.mocked(backend.generatePlan).mock.calls[index];
+  return JSON.parse(call?.[1]?.context || "{}");
+}
+
+describe("协议阻断后的人工业务重规划与重新审批", () => {
+  beforeEach(async () => {
+    vi.restoreAllMocks();
+    localStorage.clear();
+    Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+    setActivePinia(createPinia());
+    const store = useOpsStore();
+    store.servers = [clone(server)];
+    store.models = [{ id: "protocol-model", name: "测试模型", provider: "Test", model: "test-model",
+      endpoint: "https://model.example.invalid", enabled: true, hasApiKey: true }];
+    store.modelApiKeys["protocol-model"] = "fixture-api-key";
+    vi.spyOn(backend, "loadCredential").mockResolvedValue(null);
+    vi.spyOn(backend, "saveCredential").mockResolvedValue(undefined);
+    vi.spyOn(backend, "deleteCredential").mockResolvedValue(undefined);
+    vi.spyOn(backend, "checkSshConnection").mockResolvedValue(undefined);
+    vi.spyOn(backend, "generatePlan").mockResolvedValue([change(), step()]);
+    vi.spyOn(backend, "executeCommand").mockRejectedValue(new Error("unexpected command dispatch"));
+    vi.spyOn(backend, "executeAgentCommand").mockRejectedValue(new Error("unexpected Agent command dispatch"));
+    await useConnectionStore().connect(server.id, {
+      host: server.host, port: server.port, username: server.username, password: "fixture-password",
+    });
+  });
+
+  afterEach(() => {
+    useOpsStore().tasks.forEach(task => { task.cancelRequested = true; });
+    vi.restoreAllMocks();
+  });
+
+  it("人工调整创建新的变更与验证步骤，保留原轮次、目标、输入及已完成证据并等待计划审批", async () => {
+    const { store, task } = fixture();
+    const originalRepair = clone(task.protocolRepair);
+    const completed = clone(task.plan[0]);
+    const rootGoal = task.rootGoal;
+
+    await store.requestAdjustment(task.id);
+
+    expect(backend.generatePlan).toHaveBeenCalledTimes(1);
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(task.currentRoundId).toBe("protocol-round");
+    expect(task.rootGoal).toBe(rootGoal);
+    expect(task.plan.map(item => item.kind)).toEqual(["change", "observe"]);
+    expect(task.plan.every(item => item.id.startsWith("replan-step-"))).toBe(true);
+    expect(new Set(task.plan.map(item => item.id)).size).toBe(2);
+    expect(task.phaseHistory?.flatMap(phase => phase.plan)).toContainEqual(completed);
+    expect(task.phaseHistory?.flatMap(phase => phase.plan).some(item => item.id === "rejected-dry-run")).toBe(false);
+    expect(task.protocolRepair).toBeUndefined();
+    expect(task.protocolRepairHistory).toHaveLength(1);
+    expect(task.protocolRepairHistory?.[0]).toMatchObject({
+      ...originalRepair, status: "accepted", requestedAt: expect.any(String),
+      replacementStepIds: task.plan.map(item => item.id),
+    });
+    const context = generatedContext();
+    expect(context.workflowPhase).toBe("business_replan_after_protocol_failure");
+    expect(context.planGenerationRepair).toBeUndefined();
+    expect(context.protocolReplan).toMatchObject({ rejectedPlanExecuted: false });
+    expect(context.baseSnapshot).toBeDefined();
+    expect(context.taskGoal.rootGoal).toBe(rootGoal);
+    expect(context.confirmedUserInputs.items).toContainEqual(expect.objectContaining({ key: "k8s_version", value: "1.31" }));
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it("托管模式按新步骤的高风险等待逐步审批，不继承旧 observe 的低风险", async () => {
+    const { store, task } = fixture("managed");
+    vi.mocked(backend.generatePlan).mockResolvedValueOnce([change("high"), step()]);
+
+    await store.requestAdjustment(task.id);
+
+    expect(task.status, task.pauseReason ?? JSON.stringify(task.messages)).toBe("awaiting_step_approval");
+    expect(task.plan[0]).toMatchObject({ kind: "change", risk: "high", status: "awaiting_approval" });
+    expect(task.protocolRepair).toBeUndefined();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it("原查询执行成功但配置未达标时，新变更后保留相同查询作复验", async () => {
+    const { store, task } = fixture();
+    task.plan[0].command = step().command;
+    task.plan[0].output = "0";
+    const original = clone(task.plan[0]);
+
+    await store.requestAdjustment(task.id);
+
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(task.plan.map(item => item.command)).toEqual([change().command, step().command]);
+    expect(task.phaseHistory?.flatMap(phase => phase.plan)).toContainEqual(original);
+    expect(task.plan[1].status).toBe("pending");
+    expect(task.plan[1].result).toBeUndefined();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("模型夹带的旧完成证据、身份和审批快照不会成为新步骤的运行状态", async () => {
+    const { store, task } = fixture();
+    const candidate = change("high");
+    const approval = { command: candidate.command, validation: candidate.validation, risk: candidate.risk,
+      executionScope: candidate.executionScope };
+    vi.mocked(backend.generatePlan).mockResolvedValueOnce([{
+      ...candidate, id: "completed-inspection", status: "completed", output: "model claimed success",
+      result: clone(task.plan[0].result), evidence: clone(task.plan[0].evidence),
+      attemptContext: "old-context", startedAt: "2026-09-15T00:00:00Z", elapsedSeconds: 300,
+      approvedSafetySnapshot: approval, safetyApprovalSnapshot: approval,
+      authenticationGate: { fingerprint: "old-authentication", reason: "old permission", approved: true },
+    }]);
+
+    await store.requestAdjustment(task.id);
+
+    expect(task.status).toBe("awaiting_plan_approval");
+    const replacement = task.plan[0];
+    expect(replacement.id).not.toBe("completed-inspection");
+    expect(replacement.status).toBe("pending");
+    for (const key of ["output", "result", "evidence", "attemptContext", "startedAt", "elapsedSeconds",
+      "approvedSafetySnapshot", "safetyApprovalSnapshot", "authenticationGate"] as const) {
+      expect(replacement[key], key).toBeUndefined();
+    }
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("已确认输入包含拒绝系统变更时，托管低风险新变更也要针对具体操作复核授权", async () => {
+    const { store, task } = fixture("managed");
+    task.submittedInputs!.prerequisite_mode = {
+      value: "no-system-changes", type: "select", label: "系统前置调整授权", description: "暂不授权系统变更，仅报告现状",
+      groupId: "deployment-scope", groupTitle: "部署范围", submittedAt: "2026-09-16T00:00:00Z",
+      scope: confirmedInputScope(task, "completed-input"),
+    };
+    vi.mocked(backend.generatePlan).mockResolvedValueOnce([change("low")]);
+
+    await store.requestAdjustment(task.id);
+
+    expect(task.status, task.pauseReason ?? JSON.stringify(task.messages)).toBe("awaiting_step_approval");
+    expect(task.plan[0].risk).toBe("low");
+    expect(task.plan[0].protocolReplanApproval?.decisionSummary).toContain("no-system-changes");
+    expect(task.messages.some(message => message.content.includes("no-system-changes"))).toBe(true);
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it("新计划即便标为低风险也不能覆盖明确的 read_only 授权", async () => {
+    const { store, task } = fixture("managed");
+    const originalPlan = clone(task.plan);
+    const originalRepair = clone(task.protocolRepair);
+    task.executionConstraints = { changePolicy: "read_only", environmentPolicy: "preserve", failurePolicy: "strict",
+      prohibitedActions: ["不得修改系统配置"], requiredConditions: [], userDirectives: ["仅检查现状"] };
+    vi.mocked(backend.generatePlan).mockResolvedValueOnce([change("low")]);
+
+    await store.requestAdjustment(task.id);
+
+    expect(backend.generatePlan).toHaveBeenCalledTimes(1);
+    expect(generatedContext().executionConstraints.changePolicy).toBe("read_only");
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.pauseReason).toContain("只读授权");
+    expect(task.plan).toEqual(originalPlan);
+    expect(task.protocolRepair).toEqual(originalRepair);
+    expect(task.protocolRepairHistory?.[0].status).toBe("failed");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it("自动调整不将同一协议事故扩展为无限业务重规划", async () => {
+    const { store, task } = fixture("managed");
+    const originalRepair = clone(task.protocolRepair);
+
+    await store.requestAdjustment(task.id, true);
+    await store.beginAdjustment(task.id, true);
+    await store.queueManagedAdjustment(task.id);
+
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(task.protocolRepair).toEqual(originalRepair);
+    expect(task.protocolRepairHistory ?? []).toHaveLength(0);
+    expect(task.status).toBe("needs_adjustment");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("模型请求失败不丢失旧方案和协议事故，人工重试仍进入新计划而不是局部修复", async () => {
+    const { store, task } = fixture();
+    const originalPlan = clone(task.plan);
+    const originalRepair = clone(task.protocolRepair);
+    vi.mocked(backend.generatePlan).mockRejectedValueOnce(new Error("fixture planner unavailable"));
+
+    await store.requestAdjustment(task.id);
+
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.plan).toEqual(originalPlan);
+    expect(task.protocolRepair).toEqual(originalRepair);
+    expect(task.protocolRepairHistory?.[0]).toMatchObject({ status: "failed", repair: originalRepair?.repair });
+    expect(task.adjustmentInProgress).toBe(false);
+
+    await store.requestAdjustment(task.id);
+
+    expect(backend.generatePlan).toHaveBeenCalledTimes(2);
+    expect(generatedContext(1).workflowPhase).toBe("business_replan_after_protocol_failure");
+    expect(generatedContext(1).planGenerationRepair).toBeUndefined();
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(task.protocolRepair).toBeUndefined();
+    expect(task.protocolRepairHistory?.map(item => item.status)).toEqual(["failed", "accepted"]);
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("人工重复点击只产生一个在途新计划和一条协议审计记录", async () => {
+    const { store, task } = fixture();
+    let finish!: (steps: PlanStep[]) => void;
+    vi.mocked(backend.generatePlan).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const first = store.requestAdjustment(task.id);
+    await vi.waitFor(() => expect(backend.generatePlan).toHaveBeenCalledTimes(1));
+    expect(task.protocolRepairHistory?.[0].status).toBe("planning");
+
+    await store.requestAdjustment(task.id);
+    finish([change(), step()]);
+    await first;
+
+    expect(backend.generatePlan).toHaveBeenCalledTimes(1);
+    expect(task.protocolRepairHistory).toHaveLength(1);
+    expect(task.protocolRepairHistory?.[0].status).toBe("accepted");
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("模型生成期间用户修改已确认输入，迟到的新计划不能覆盖旧计划或取得新授权", async () => {
+    const { store, task } = fixture();
+    const originalPlan = clone(task.plan);
+    const originalRepair = clone(task.protocolRepair);
+    let finish!: (steps: PlanStep[]) => void;
+    vi.mocked(backend.generatePlan).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const pending = store.requestAdjustment(task.id);
+    await vi.waitFor(() => expect(backend.generatePlan).toHaveBeenCalledTimes(1));
+
+    task.submittedInputs!.k8s_version.value = "1.32";
+    finish([change(), step()]);
+    await pending;
+
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.pauseReason).toContain("已确认输入发生变化");
+    expect(task.plan).toEqual(originalPlan);
+    expect(task.protocolRepair).toEqual(originalRepair);
+    expect(task.protocolRepairHistory?.[0].status).toBe("failed");
+    expect(task.protocolRepairHistory?.[0].replacementStepIds).toBeUndefined();
+    expect(task.submittedInputs!.k8s_version.value).toBe("1.32");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("模型生成期间切换执行目标，迟到的协议错误不能绑定新服务器或覆盖原事故", async () => {
+    const { store, task } = fixture();
+    const originalPlan = clone(task.plan);
+    const originalRepair = clone(task.protocolRepair)!;
+    let reject!: (reason: unknown) => void;
+    vi.mocked(backend.generatePlan).mockImplementationOnce(() => new Promise((_resolve, no) => { reject = no; }));
+    const pending = store.requestAdjustment(task.id);
+    await vi.waitFor(() => expect(backend.generatePlan).toHaveBeenCalledTimes(1));
+
+    task.executionTargetServerId = "different-server";
+    reject(new PlanProtocolError({ ...originalRepair.repair, validationError: "new response from old target" }, "late failure"));
+    await pending;
+
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.pauseReason).toContain("原协议事故保持原目标绑定");
+    expect(task.executionTargetServerId).toBe("different-server");
+    expect(task.plan).toEqual(originalPlan);
+    expect(task.protocolRepair).toEqual(originalRepair);
+    expect(task.protocolRepair?.serverId).toBe(server.id);
+    expect(task.protocolRepairHistory?.[0]).toMatchObject({ serverId: server.id, status: "failed" });
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it("重启时中断的协议业务重规划恢复为人工可重试，不保留无人处理的生成状态", () => {
+    const { store, task } = fixture("managed");
+    const originalPlan = clone(task.plan);
+    const originalRepair = clone(task.protocolRepair)!;
+    task.status = "planning";
+    task.adjustmentInProgress = true;
+    task.managedAdjustmentPhase = "generating";
+    task.autoAdjustmentSeconds = 3;
+    task.protocolRepairHistory = [{ ...originalRepair, requestedAt: "2026-09-16T00:01:00Z", status: "planning" }];
+    store.persist(true);
+
+    setActivePinia(createPinia());
+    const restored = useOpsStore().tasks.find(item => item.id === task.id)!;
+
+    expect(restored.status).toBe("needs_adjustment");
+    expect(restored.managedAdjustmentPhase).toBe("manual_required");
+    expect(restored.adjustmentInProgress).toBe(false);
+    expect(restored.autoAdjustmentSeconds).toBeUndefined();
+    expect(restored.pauseReason).toContain("重启中断");
+    expect(restored.plan).toHaveLength(1);
+    expect(restored.plan[0]).toMatchObject(originalPlan[0]);
+    expect(restored.protocolRepair).toEqual(originalRepair);
+    expect(restored.protocolRepairHistory?.[0]).toMatchObject({
+      ...originalRepair, status: "failed", outcome: expect.stringContaining("应用重启中断规划"),
+    });
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+});

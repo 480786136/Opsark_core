@@ -87,4 +87,28 @@ describe("step approval", () => {
     waiting.sessionContextChange.cwd = "/opt/other";
     expect(hasCurrentStepApproval(waiting)).toBe(false);
   });
+
+  it("explains concrete-action approval after protocol replanning and binds the confirmed decisions", () => {
+    const pending = { ...step("low"), protocolReplanApproval: {
+      inputFingerprint: "confirmed-1", decisionSummary: "系统前置调整授权：no-system-changes",
+    } };
+    const request = requestStepApproval("managed", pending);
+    expect(request?.eventMessage).toContain("no-system-changes");
+    expect(request?.eventMessage).toContain("仅授权本步骤展示的具体变更");
+    expect(request?.eventMessage).toContain("不撤销任务级禁止事项");
+    acceptStepApproval(pending);
+    expect(hasCurrentStepApproval(pending)).toBe(true);
+    pending.protocolReplanApproval.inputFingerprint = "confirmed-2";
+    expect(hasCurrentStepApproval(pending)).toBe(false);
+  });
+
+  it("cannot retain approval by dropping the concrete-action reminder", () => {
+    const pending = { ...step("low"), protocolReplanApproval: {
+      inputFingerprint: "confirmed-1", decisionSummary: "原决定",
+    } } as PlanStep;
+    requestStepApproval("managed", pending);
+    acceptStepApproval(pending);
+    pending.protocolReplanApproval = undefined;
+    expect(hasCurrentStepApproval(pending)).toBe(false);
+  });
 });

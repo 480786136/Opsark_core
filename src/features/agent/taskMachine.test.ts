@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canTransitionTask, transitionTask } from "@/features/agent/taskMachine";
+import { beginRequirementPlanning, canTransitionTask, transitionTask } from "@/features/agent/taskMachine";
 import type { OpsTask } from "@/types";
 
 function task(status: OpsTask["status"]): OpsTask {
@@ -39,6 +39,15 @@ describe("task machine", () => {
     for (const status of ["planning", "validating", "completed", "needs_adjustment"] as const) {
       expect(canTransitionTask("awaiting_input", status)).toBe(false);
     }
+  });
+
+  it("only a classified execution requirement can replace an input/approval wait", () => {
+    const current = task("awaiting_input");
+    expect(() => beginRequirementPlanning(current, "side_question")).toThrow();
+    expect(() => beginRequirementPlanning(current, "continue")).toThrow("必须由用户确认");
+    expect(current.status).toBe("awaiting_input");
+    beginRequirementPlanning(current, "supplement");
+    expect(current.status).toBe("planning");
   });
 
   it("updates status and audit timestamp together", () => {

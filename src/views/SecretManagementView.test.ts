@@ -14,6 +14,7 @@ describe("SecretManagementView", () => {
 
   beforeEach(() => {
     localStorage.clear();
+    i18n.global.locale.value = "zh-CN";
     host = document.createElement("div");
     document.body.append(host);
     vi.spyOn(backend, "loadCredential").mockResolvedValue(null);
@@ -45,7 +46,7 @@ describe("SecretManagementView", () => {
     app.use(pinia).use(i18n).mount(host);
     await nextTick();
 
-    expect(host.querySelector<HTMLSelectElement>(".secret-server-picker select")?.value).toBe("server-b");
+    expect(host.querySelector(".secret-server-picker summary")?.textContent).toContain("Beta · 10.0.0.2 · 1");
     expect(host.querySelector(".secret-row-copy strong")?.textContent).toBe("GIT_HTTP_CREDENTIAL");
     expect(host.textContent).toContain("Beta · 10.0.0.2 · 1");
     expect(host.querySelector(".secret-empty-state")).toBeNull();
@@ -99,21 +100,22 @@ describe("SecretManagementView", () => {
     const app = createApp(SecretManagementView);
     app.use(pinia).use(i18n).mount(host);
     await nextTick();
-    const select = host.querySelector<HTMLSelectElement>(".secret-server-picker select")!;
+    const select = host.querySelector<HTMLElement>(".secret-server-picker summary")!;
 
     workspaceTabs.open("server-b");
     await nextTick();
-    expect(select.value).toBe("server-b");
+    expect(select.textContent).toContain("Beta · 10.0.0.2");
 
-    select.value = "server-a";
-    select.dispatchEvent(new Event("change", { bubbles: true }));
+    select.click();
+    await nextTick();
+    document.querySelector<HTMLButtonElement>('.parameter-options [data-value="server-a"]')!.click();
     await nextTick();
     workspaceTabs.open("server-a");
     await nextTick();
     workspaceTabs.open("server-b");
     await nextTick();
 
-    expect(select.value).toBe("server-a");
+    expect(select.textContent).toContain("Alpha · 10.0.0.1");
     app.unmount();
   });
 });

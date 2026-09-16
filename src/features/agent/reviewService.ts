@@ -6,7 +6,7 @@ import {
   buildPreconditionReviewContext,
 } from "@/features/agent/reviewContext";
 import {
-  isMutatingStepCommand,
+  isMutatingReviewStep,
   isReadOnlyDiagnosticStep,
   postconditionHasHardBlocker,
   remainingPlanCanRecoverExecutionFailure,
@@ -15,6 +15,8 @@ import {
 } from "@/features/agent/evidenceReview";
 import { latestTaskRequirement } from "@/features/agent/taskProgression";
 import type { ModelProfile, OpsTask, PlanStep, StepReview } from "@/types";
+import { attemptAuthorizationFingerprint, authorizeRiskAttempt, executionPolicyBlocker, isRelatedRecoveryStep, permitsBestEffortRiskReview, unresolvedRecoveryBlockers } from "./recoveryContract";
+import { taskAttemptContext } from "./attemptState";
 
 type StepReviewer = (
   requirement: string,
@@ -45,7 +47,7 @@ export interface ReviewEvidenceInput extends ReviewStepInput {
   validationExitCode?: number;
 }
 
-/** Reviews an unresolved precondition and fails closed without an explicit model approval. */
+/** A model cannot waive an unresolved prerequisite; only its explicit recovery may run. */
 export async function reviewPrecondition(
   input: ReviewPreconditionInput,
   reviewStep: StepReviewer = backend.reviewStep.bind(backend),
@@ -56,24 +58,32 @@ export async function reviewPrecondition(
     input.step,
     input.blockerStep,
   );
-  const modelDecision = await reviewStep(
-    requirement,
-    JSON.stringify(context),
-    true,
-    createRuntimeModel(input.model, input.apiKey, ""),
-  );
-  const allowed = modelDecision.source === "model" && modelDecision.decision === "continue";
-  const finalDecision: StepReview = allowed
-    ? modelDecision
-    : {
-        decision: "adjust",
-        reason: modelDecision.source !== "model"
-          ? "前置条件尚未满足且模型复核不可用，不能自动继续变更操作。"
-          : modelDecision.reason,
-        summary: modelDecision.summary,
-        source: modelDecision.source === "model" ? "model" : "rules",
-      };
-  return { requirement, context, modelDecision, finalDecision, allowed };
+  const policyBlocker = executionPolicyBlocker(input.task, input.step);
+  let allowed = !policyBlocker && isRelatedRecoveryStep(input.blockerStep, input.step, taskAttemptContext(input.task));
+  const mayAttempt = !allowed && input.blockerStep.status === "completed"
+    && !policyBlocker && permitsBestEffortRiskReview(input.task, input.blockerStep)
+    && unresolvedRecoveryBlockers(input.task, input.step).every(blocker =>
+      blocker.status === "completed" && permitsBestEffortRiskReview(input.task, blocker));
+  let modelDecision: StepReview | undefined;
+  if (mayAttempt) {
+    const fingerprint = attemptAuthorizationFingerprint(input.task, input.step, input.blockerStep);
+    modelDecision = await reviewStep(requirement, JSON.stringify(context), true,
+      createRuntimeModel(input.model, input.apiKey, ""));
+    allowed = modelDecision.source === "model" && modelDecision.decision === "continue"
+      && fingerprint === attemptAuthorizationFingerprint(input.task, input.step, input.blockerStep);
+    if (allowed) authorizeRiskAttempt(input.task, input.step, input.blockerStep);
+  }
+  const failureDetail = input.blockerStep.result?.failureReason || input.blockerStep.result?.warnings[0]
+    || input.blockerStep.title;
+  const finalDecision: StepReview = {
+    decision: allowed ? "continue" : "adjust",
+    reason: allowed ? (mayAttempt ? "用户明确允许 best_effort 尝试，模型已核验当前操作仍在授权范围；风险未解除。"
+      : "当前步骤明确关联失败及相同执行上下文，仅允许执行恢复阶段。")
+      : policyBlocker ?? `${failureDetail}；前置条件未解决：下一步骤缺少有效恢复关系或原始验收契约，不能由模型批准跳过。`,
+    summary: allowed ? "原阻断仍保留，真实执行结果不自动代替原始验收。" : "请生成关联诊断、修复和复验步骤。",
+    source: "rules",
+  };
+  return { requirement, context, modelDecision: modelDecision ?? finalDecision, finalDecision, allowed };
 }
 
 /** Reviews a failed command while preserving deterministic failure and recovery rules. */
@@ -88,11 +98,12 @@ export async function reviewExecutionFailure(
     input.step,
     remainingSteps,
   );
-  const mutatingStep = isMutatingStepCommand(input.step.command);
+  const mutatingStep = isMutatingReviewStep(input.step);
   const diagnosticStep = isReadOnlyDiagnosticStep(input.step) && !mutatingStep;
   const recoveryStepFound = remainingPlanCanRecoverExecutionFailure(
     input.failureCategory,
     remainingSteps,
+    input.step,
   );
   // Every possible review outcome is already constrained to adjustment here.
   // Send the failure evidence directly to the adjustment planner once instead
@@ -185,8 +196,8 @@ export async function reviewExecutionEvidence(
         remainingSteps,
         input.validationExitCode,
       );
-      mutatingStep = isMutatingStepCommand(input.step.command);
-      repairStepFound = remainingPlanCanRepairPostcondition(remainingSteps);
+      mutatingStep = isMutatingReviewStep(input.step);
+      repairStepFound = remainingPlanCanRepairPostcondition(remainingSteps, input.step);
       if (modelDecision.source !== "model") {
         finalDecision = {
           decision: "adjust",
@@ -229,17 +240,17 @@ export async function reviewExecutionEvidence(
   let blockingSignalResolved: boolean | undefined;
   if (input.step.result?.facts.blockingSignal && !input.postconditionReview) {
     blockingSignalResolved = remainingPlanResolvesBlockingSignal(input.step, remainingSteps);
-    finalDecision = blockingSignalResolved
+    finalDecision = blockingSignalResolved || (remainingSteps.length > 0 && permitsBestEffortRiskReview(input.task, input.step))
       ? {
           decision: "continue",
-          reason: "程序识别到运行时兼容性阻断，但剩余计划包含对应升级或切换步骤。",
-          summary: "当前运行时不兼容，继续执行计划中的环境修复步骤。",
+          reason: "程序识别到阻断，下一步骤已显式关联当前失败与执行上下文。",
+          summary: "仅继续关联恢复阶段，阻断仍需真实复验解除。",
           source: "rules",
         }
       : {
           decision: "adjust",
-          reason: "程序识别到运行时兼容性阻断，剩余计划没有升级或切换运行时的步骤，禁止继续安装或构建。",
-          summary: "当前运行时版本不满足项目要求，计划必须先修复环境。",
+          reason: "程序识别到阻断，下一步骤没有有效的关联恢复关系，禁止继续业务。",
+          summary: "计划必须先诊断、修复并复验阻断条件。",
           source: "rules",
         };
   }

@@ -15,6 +15,7 @@ describe("FileExplorer", () => {
 
   beforeEach(() => {
     localStorage.clear();
+    i18n.global.locale.value = "zh-CN";
     host = document.createElement("div");
     document.body.append(host);
   });
@@ -90,7 +91,7 @@ describe("FileExplorer", () => {
     await nextTick();
     expect(host.textContent).toContain("cached.txt");
     expect(host.textContent).toContain("离线缓存／非实时");
-    expect(host.textContent).toContain(new Date(state.lastSuccessAt).toLocaleString());
+    expect(host.textContent).toContain(new Date(state.lastSuccessAt).toLocaleString(i18n.global.locale.value));
     expect(host.textContent).not.toContain(state.lastSuccessAt);
     expect(host.querySelector<HTMLButtonElement>('button[title="上传文件"]')?.disabled).toBe(true);
     expect(ops.isServerConnected("server-a")).toBe(false);

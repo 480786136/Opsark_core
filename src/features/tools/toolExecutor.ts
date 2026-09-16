@@ -2,6 +2,7 @@ import { normalizeFileStructureRequest } from "@/features/tools/fileStructure";
 import { normalizeAuthenticationTarget } from "@/features/agent/authenticationTarget";
 import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 import { normalizeSoftwareCheckRequest } from "@/features/tools/softwareCheck";
+import { argumentPropertyPath, ToolArgumentValidationError } from "@/features/tools/toolArgumentProtocol";
 import type {
   FileContentRequest,
   FileContentResult,
@@ -88,11 +89,8 @@ function parseServerConnectArguments(value: Record<string, unknown>): ServerConn
   };
 }
 
-export function parseToolCommand(
-  command: string,
-  callId: string,
-  tools: ToolDefinition[] = defaultToolCatalog,
-): ToolCall | undefined {
+/** Decode atomic syntax only; repair scope must inspect invalid arguments without normalizing them. */
+export function decodeToolCommand(command: string): Pick<ToolCall, "toolId" | "arguments"> | undefined {
   const trimmed = command.trim();
   if (!/^opsark-tool(?:\s|$)/i.test(trimmed)) return undefined;
   if (/[\r\n]/.test(command)) throw new Error(TOOL_COMMAND_ATOMICITY_ERROR);
@@ -122,6 +120,17 @@ export function parseToolCommand(
   // treating the tool id like an option. Accept that one recoverable typo while
   // keeping unknown tool ids and malformed arguments strict.
   const toolId = match[1].replace(/^--(?=[a-z0-9])/, "");
+  return { toolId, arguments: parsed };
+}
+
+export function parseToolCommand(
+  command: string,
+  callId: string,
+  tools: ToolDefinition[] = defaultToolCatalog,
+): ToolCall | undefined {
+  const decoded = decodeToolCommand(command);
+  if (!decoded) return undefined;
+  const { toolId, arguments: parsed } = decoded;
   const definition = tools.find((tool) => tool.id === toolId);
   if (!definition) throw new Error(`工具不存在或未注册：${toolId}`);
   validateToolArguments(definition, parsed);
@@ -159,10 +168,10 @@ function hasUnquotedToolInvocation(value: string) {
 }
 
 function validateToolArguments(tool: ToolDefinition, value: Record<string, unknown>) {
-  validateSchemaValue(tool.inputSchema, value, `工具 ${tool.id} 参数`);
+  validateSchemaValue(tool.inputSchema, value, `工具 ${tool.id} 参数`, "");
 }
 
-function validateSchemaValue(schema: Record<string, unknown>, value: unknown, path: string) {
+function validateSchemaValue(schema: Record<string, unknown>, value: unknown, path: string, argumentPath: string | undefined) {
   const properties = isRecord(schema.properties) ? schema.properties : {};
   const required = Array.isArray(schema.required) ? schema.required.filter((key): key is string => typeof key === "string") : [];
   const type = schema.type;
@@ -173,33 +182,34 @@ function validateSchemaValue(schema: Record<string, unknown>, value: unknown, pa
           : type === "array" ? Array.isArray(value)
             : type === "object" ? isRecord(value)
               : true;
-  if (!validType) throw new Error(`${path} 类型必须为 ${String(type)}`);
+  if (!validType) throw new ToolArgumentValidationError(`${path} 类型必须为 ${String(type)}`, argumentPath);
   if (isRecord(value) && schema.additionalProperties === false) {
     const unknown = Object.keys(value).find((key) => !(key in properties));
-    if (unknown) throw new Error(`${path} 不支持字段：${unknown}`);
+    if (unknown) throw new ToolArgumentValidationError(`${path} 不支持字段：${unknown}`, argumentPropertyPath(argumentPath, unknown));
   }
   if (isRecord(value)) {
     const missing = required.find((key) => value[key] === undefined);
-    if (missing) throw new Error(`${path} 缺少必填字段：${missing}`);
+    if (missing) throw new ToolArgumentValidationError(`${path} 缺少必填字段：${missing}`, argumentPropertyPath(argumentPath, missing));
     for (const [key, rawRule] of Object.entries(properties)) {
-      if (value[key] !== undefined && isRecord(rawRule)) validateSchemaValue(rawRule, value[key], `${path}.${key}`);
+      if (value[key] !== undefined && isRecord(rawRule)) validateSchemaValue(rawRule, value[key], `${path}.${key}`, argumentPropertyPath(argumentPath, key));
     }
   }
   if (typeof value === "number") {
-    if (typeof schema.minimum === "number" && value < schema.minimum) throw new Error(`${path} 小于最小值`);
-    if (typeof schema.maximum === "number" && value > schema.maximum) throw new Error(`${path} 超过最大值`);
+    if (typeof schema.minimum === "number" && value < schema.minimum) throw new ToolArgumentValidationError(`${path} 小于最小值 ${schema.minimum}`, argumentPath);
+    if (typeof schema.maximum === "number" && value > schema.maximum) throw new ToolArgumentValidationError(`${path} 超过最大值 ${schema.maximum}`, argumentPath);
   }
   if (typeof value === "string" && typeof schema.pattern === "string" && !new RegExp(schema.pattern).test(value)) {
-    throw new Error(`${path} 格式无效`);
+    throw new ToolArgumentValidationError(`${path} 格式无效，应匹配 ${schema.pattern}`, argumentPath);
   }
   if (Array.isArray(value)) {
-    if (typeof schema.minItems === "number" && value.length < schema.minItems) throw new Error(`${path} 数量不足`);
-    if (typeof schema.maxItems === "number" && value.length > schema.maxItems) throw new Error(`${path} 数量过多`);
+    if (typeof schema.minItems === "number" && value.length < schema.minItems) throw new ToolArgumentValidationError(`${path} 数量不足，至少 ${schema.minItems} 项`, argumentPath);
+    if (typeof schema.maxItems === "number" && value.length > schema.maxItems) throw new ToolArgumentValidationError(`${path} 数量过多，最多 ${schema.maxItems} 项`, argumentPath);
     const itemRule = isRecord(schema.items) ? schema.items : undefined;
-    if (itemRule) value.forEach((item, index) => validateSchemaValue(itemRule, item, `${path}[${index}]`));
+    if (itemRule) value.forEach((item, index) => validateSchemaValue(itemRule, item, `${path}[${index}]`,
+      argumentPath === undefined ? undefined : `${argumentPath}[${index}]`));
   }
   if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
-    throw new Error(`${path} 不在允许范围内`);
+    throw new ToolArgumentValidationError(`${path} 不在允许范围内：${schema.enum.join("、")}`, argumentPath);
   }
 }
 
@@ -283,60 +293,62 @@ function isAuthenticationHost(value: string) {
   ));
 }
 
-function assertUserInputProperties(value: Record<string, unknown>, allowed: string[], path: string) {
+function assertUserInputProperties(value: Record<string, unknown>, allowed: string[], path: string, argumentPath?: string) {
   const unknown = Object.keys(value).find((key) => !allowed.includes(key));
-  if (unknown) throw new Error(`${path} 不支持字段：${unknown}`);
+  if (unknown) throw new ToolArgumentValidationError(`${path} 不支持字段：${unknown}`, argumentPropertyPath(argumentPath, unknown));
 }
 
 export function parseUserInputArguments(value: Record<string, unknown>): UserInputRequest {
   if (!isRecord(value)) throw new Error("用户输入参数必须是对象");
-  assertUserInputProperties(value, ["title", "description", "fields"], "用户输入参数");
+  assertUserInputProperties(value, ["title", "description", "fields"], "用户输入参数", "");
   const title = typeof value.title === "string" ? value.title.trim() : "";
   const description = typeof value.description === "string" ? value.description.trim() : undefined;
-  if (!title) throw new Error("title 必须说明需要用户补充什么信息");
-  if (value.description !== undefined && typeof value.description !== "string") throw new Error("表单 description 必须是字符串");
-  if (!Array.isArray(value.fields) || value.fields.length === 0) throw new Error("fields 至少需要一个参数");
-  if (value.fields.length > 8) throw new Error("单次最多请求 8 个参数");
+  if (!title) throw new ToolArgumentValidationError("title 必须说明需要用户补充什么信息", "title");
+  if (value.description !== undefined && typeof value.description !== "string") throw new ToolArgumentValidationError("表单 description 必须是字符串", "description");
+  if (!Array.isArray(value.fields) || value.fields.length === 0) throw new ToolArgumentValidationError("fields 至少需要一个参数", "fields");
+  if (value.fields.length > 8) throw new ToolArgumentValidationError("单次最多请求 8 个参数", "fields");
   const fields = value.fields.map((field, index) => {
-    if (!isRecord(field)) throw new Error(`第 ${index + 1} 个参数定义无效`);
-    assertUserInputProperties(field, ["key", "label", "description", "type", "placeholder", "options", "required", "credential"], `第 ${index + 1} 个参数`);
+    const fieldPath = `fields[${index}]`;
+    if (!isRecord(field)) throw new ToolArgumentValidationError(`第 ${index + 1} 个参数定义无效`, fieldPath);
+    assertUserInputProperties(field, ["key", "label", "description", "type", "placeholder", "options", "required", "credential"], `第 ${index + 1} 个参数`, fieldPath);
     const key = typeof field.key === "string" ? field.key.trim() : "";
     const label = typeof field.label === "string" ? field.label.trim() : "";
     const fieldDescription = typeof field.description === "string" ? field.description.trim() : "";
-    if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(key)) throw new Error(`第 ${index + 1} 个参数 key 格式无效`);
-    if (!label) throw new Error(`参数 ${key} 缺少显示名称`);
-    if (!fieldDescription) throw new Error(`参数 ${key} 缺少用途说明`);
-    if (typeof field.type !== "string" || !["text", "password", "number", "select"].includes(field.type)) throw new Error(`参数 ${key} 的类型无效`);
+    if (!/^[A-Za-z][A-Za-z0-9_]*$/.test(key)) throw new ToolArgumentValidationError(`第 ${index + 1} 个参数 key 格式无效`, `${fieldPath}.key`);
+    if (!label) throw new ToolArgumentValidationError(`参数 ${key} 缺少显示名称`, `${fieldPath}.label`);
+    if (!fieldDescription) throw new ToolArgumentValidationError(`参数 ${key} 缺少用途说明`, `${fieldPath}.description`);
+    if (typeof field.type !== "string" || !["text", "password", "number", "select"].includes(field.type)) throw new ToolArgumentValidationError(`参数 ${key} 的类型无效`, `${fieldPath}.type`);
     if (/(?:PASSWORD|PASSWD|TOKEN|API_?KEY|SECRET|CREDENTIAL)$/i.test(key) && field.type !== "password") {
-      throw new Error(`敏感参数 ${key} 必须使用 password 类型`);
+      throw new ToolArgumentValidationError(`敏感参数 ${key} 必须使用 password 类型`, `${fieldPath}.type`);
     }
-    if (typeof field.required !== "boolean") throw new Error(`参数 ${key} 必须明确是否必填`);
-    if (field.placeholder !== undefined && typeof field.placeholder !== "string") throw new Error(`参数 ${key} 的输入提示无效`);
+    if (typeof field.required !== "boolean") throw new ToolArgumentValidationError(`参数 ${key} 必须明确是否必填`, `${fieldPath}.required`);
+    if (field.placeholder !== undefined && typeof field.placeholder !== "string") throw new ToolArgumentValidationError(`参数 ${key} 的输入提示无效`, `${fieldPath}.placeholder`);
     let options: UserInputField["options"];
     if (field.type === "select") {
       if (!Array.isArray(field.options) || field.options.length < 1 || field.options.length > 100) {
-        throw new Error(`参数 ${key} 的 options 必须包含 1 至 100 个候选`);
+        throw new ToolArgumentValidationError(`参数 ${key} 的 options 必须包含 1 至 100 个候选`, `${fieldPath}.options`);
       }
       const seenValues = new Set<string>();
       options = Array.from(field.options, (option, optionIndex) => {
         const path = `参数 ${key} 的第 ${optionIndex + 1} 个候选`;
-        if (!isRecord(option)) throw new Error(`${path} 必须是对象`);
-        assertUserInputProperties(option, ["value", "label"], path);
-        if (typeof option.value !== "string" || !option.value.trim()) throw new Error(`${path} 的 value 必须是非空字符串`);
-        if (typeof option.label !== "string" || !option.label.trim()) throw new Error(`${path} 的 label 必须是非空字符串`);
-        if (seenValues.has(option.value)) throw new Error(`参数 ${key} 的 options.value 不能重复`);
+        const optionPath = `${fieldPath}.options[${optionIndex}]`;
+        if (!isRecord(option)) throw new ToolArgumentValidationError(`${path} 必须是对象`, optionPath);
+        assertUserInputProperties(option, ["value", "label"], path, optionPath);
+        if (typeof option.value !== "string" || !option.value.trim()) throw new ToolArgumentValidationError(`${path} 的 value 必须是非空字符串`, `${optionPath}.value`);
+        if (typeof option.label !== "string" || !option.label.trim()) throw new ToolArgumentValidationError(`${path} 的 label 必须是非空字符串`, `${optionPath}.label`);
+        if (seenValues.has(option.value)) throw new ToolArgumentValidationError(`参数 ${key} 的 options.value 不能重复`, `${optionPath}.value`);
         seenValues.add(option.value);
         // Check blank strings without changing an option's exact identity.
         return { value: option.value, label: option.label };
       });
     } else if (Object.prototype.hasOwnProperty.call(field, "options")) {
-      throw new Error(`参数 ${key} 只有 select 类型允许 options`);
+      throw new ToolArgumentValidationError(`参数 ${key} 只有 select 类型允许 options`, `${fieldPath}.options`);
     }
     let credential: UserInputField["credential"];
     if (field.credential !== undefined) {
-      if (field.type === "select") throw new Error(`参数 ${key} 的 select 类型不允许 credential`);
-      if (!isRecord(field.credential)) throw new Error(`参数 ${key} 的 credential 必须是对象`);
-      assertUserInputProperties(field.credential, ["group", "kind", "role", "target"], `参数 ${key} 的 credential`);
+      if (field.type === "select") throw new ToolArgumentValidationError(`参数 ${key} 的 select 类型不允许 credential`, `${fieldPath}.credential`);
+      if (!isRecord(field.credential)) throw new ToolArgumentValidationError(`参数 ${key} 的 credential 必须是对象`, `${fieldPath}.credential`);
+      assertUserInputProperties(field.credential, ["group", "kind", "role", "target"], `参数 ${key} 的 credential`, `${fieldPath}.credential`);
       const group = typeof field.credential.group === "string" ? field.credential.group.trim() : "";
       const kind = String(field.credential.kind ?? "");
       const role = String(field.credential.role ?? "");
@@ -344,18 +356,18 @@ export function parseUserInputArguments(value: Record<string, unknown>): UserInp
       try {
         target = normalizeAuthenticationTarget(kind, typeof field.credential.target === "string" ? field.credential.target : "");
       } catch (error) {
-        throw new Error(`参数 ${key} 的 credential.target 无效：${String(error)}`);
+        throw new ToolArgumentValidationError(`参数 ${key} 的 credential.target 无效：${String(error)}`, `${fieldPath}.credential.target`);
       }
-      if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(group)) throw new Error(`参数 ${key} 的 credential.group 格式无效`);
+      if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(group)) throw new ToolArgumentValidationError(`参数 ${key} 的 credential.group 格式无效`, `${fieldPath}.credential.group`);
       if (!["git-https", "ssh-password", "database", "service"].includes(kind)) {
-        throw new Error(`参数 ${key} 的 credential.kind 无效`);
+        throw new ToolArgumentValidationError(`参数 ${key} 的 credential.kind 无效`, `${fieldPath}.credential.kind`);
       }
-      if (!["username", "secret"].includes(role)) throw new Error(`参数 ${key} 的 credential.role 无效`);
+      if (!["username", "secret"].includes(role)) throw new ToolArgumentValidationError(`参数 ${key} 的 credential.role 无效`, `${fieldPath}.credential.role`);
       if (["git-https", "ssh-password"].includes(kind) && !isAuthenticationHost(target)) {
-        throw new Error(`参数 ${key} 的 credential.target 必须是精确主机名或 IP 地址`);
+        throw new ToolArgumentValidationError(`参数 ${key} 的 credential.target 必须是精确主机名或 IP 地址`, `${fieldPath}.credential.target`);
       }
-      if (field.type !== "password") throw new Error(`凭据参数 ${key} 必须使用 password 类型`);
-      if (field.required !== true) throw new Error(`凭据参数 ${key} 必须设为必填`);
+      if (field.type !== "password") throw new ToolArgumentValidationError(`凭据参数 ${key} 必须使用 password 类型`, `${fieldPath}.type`);
+      if (field.required !== true) throw new ToolArgumentValidationError(`凭据参数 ${key} 必须设为必填`, `${fieldPath}.required`);
       credential = {
         group,
         kind: kind as NonNullable<UserInputField["credential"]>["kind"],

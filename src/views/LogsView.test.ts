@@ -1,22 +1,53 @@
 // @vitest-environment happy-dom
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp, nextTick } from "vue";
 import { createPinia } from "pinia";
 import { i18n } from "@/features/preferences/i18n";
 import { useOpsStore } from "@/stores/ops";
 import LogsView from "./LogsView.vue";
 
+const { queryTaskLogsMock } = vi.hoisted(() => ({ queryTaskLogsMock: vi.fn() }));
+
+vi.mock("@/services/backend", async () => {
+  const actual = await vi.importActual<typeof import("@/services/backend")>("@/services/backend");
+  return { ...actual, backend: { ...actual.backend, queryTaskLogs: queryTaskLogsMock } };
+});
+
+async function flushView() {
+  await Promise.resolve();
+  await nextTick();
+  await Promise.resolve();
+  await nextTick();
+}
+
+async function chooseParameterOption(host: HTMLElement, ariaLabel: string, value: string) {
+  const trigger = host.querySelector<HTMLElement>(`.parameter-select summary[aria-label="${ariaLabel}"]`);
+  expect(trigger).not.toBeNull();
+  trigger!.click();
+  await nextTick();
+  const option = [...document.querySelectorAll<HTMLButtonElement>(".parameter-options [role='option']")]
+    .find((candidate) => candidate.dataset.value === value);
+  expect(option).not.toBeUndefined();
+  option!.click();
+  await nextTick();
+}
+
 describe("LogsView", () => {
   let host: HTMLElement;
 
   beforeEach(() => {
     localStorage.clear();
+    queryTaskLogsMock.mockReset();
+    queryTaskLogsMock.mockResolvedValue(null);
     host = document.createElement("div");
     document.body.append(host);
   });
 
-  afterEach(() => host.remove());
+  afterEach(() => {
+    vi.useRealTimers();
+    host.remove();
+  });
 
   it("switches from audit logs to complete developer diagnostics", async () => {
     const pinia = createPinia();
@@ -91,5 +122,197 @@ describe("LogsView", () => {
     expect(host.querySelector(".task-process-heading")?.textContent).toContain("服务器级事件");
     expect(host.querySelector(".task-process-heading")?.textContent).not.toContain("无任务 ID");
     app.unmount();
+  });
+
+  it("loads paged audit history from disk and merges live records by id", async () => {
+    queryTaskLogsMock
+      .mockResolvedValueOnce({
+        items: [
+          {
+            id: "log-live",
+            category: "task",
+            level: "info",
+            title: "stale disk snapshot",
+            detail: "",
+            serverId: "srv-1",
+            serverName: "生产服务器",
+            taskId: "task-live",
+            taskTitle: "实时任务",
+            createdAt: "2026-09-15T08:00:00.000Z",
+          },
+          {
+            id: "log-disk-1",
+            category: "system",
+            level: "warning",
+            title: "历史记录一",
+            detail: "from disk",
+            serverId: "srv-1",
+            serverName: "生产服务器",
+            createdAt: "2026-09-14T08:00:00.000Z",
+          },
+        ],
+        nextCursor: "page-2",
+        hasMore: true,
+        total: 3,
+        malformedLines: 1,
+        oversizedLines: 2,
+      })
+      .mockResolvedValueOnce({
+        items: [{
+          id: "log-disk-2",
+          category: "command",
+          level: "success",
+          title: "历史记录二",
+          detail: "uptime\nup 10 days",
+          serverId: "srv-1",
+          serverName: "生产服务器",
+          taskId: "task-old",
+          taskTitle: "历史任务",
+          createdAt: "2026-09-13T08:00:00.000Z",
+        }],
+        hasMore: false,
+        total: 3,
+        malformedLines: 1,
+        oversizedLines: 2,
+      });
+    const pinia = createPinia();
+    const store = useOpsStore(pinia);
+    store.logs = [{
+      id: "log-live",
+      category: "task",
+      level: "success",
+      title: "fresh live snapshot",
+      detail: "",
+      serverId: "srv-1",
+      serverName: "生产服务器",
+      taskId: "task-live",
+      taskTitle: "实时任务",
+      createdAt: "2026-09-15T08:00:00.000Z",
+    }];
+
+    const app = createApp(LogsView).use(pinia).use(i18n);
+    app.mount(host);
+    await flushView();
+
+    expect(queryTaskLogsMock).toHaveBeenCalledWith(expect.objectContaining({ stream: "events", limit: 100 }));
+    expect(host.querySelector(".log-summary strong")?.textContent).toBe("2");
+    expect(host.querySelector(".audit-log-history-status")?.textContent).toContain("已从磁盘加载 2 / 3 条");
+    expect(host.querySelector(".audit-log-history-warning")?.textContent).toContain("1 条损坏日志、2 条超大日志");
+
+    host.querySelector<HTMLButtonElement>(".audit-log-load-more")!.click();
+    await flushView();
+
+    expect(queryTaskLogsMock).toHaveBeenLastCalledWith(expect.objectContaining({ cursor: "page-2" }));
+    expect(host.querySelector(".log-summary strong")?.textContent).toBe("3");
+    expect(host.querySelector(".audit-log-history-status")?.textContent).toContain("已从磁盘加载 3 / 3 条");
+    expect(host.querySelector(".audit-log-load-more")).toBeNull();
+    app.unmount();
+  });
+
+  it("queries filters and date range, debounces search, and applies a client-side fallback", async () => {
+    vi.useFakeTimers();
+    queryTaskLogsMock.mockResolvedValue({
+      items: [{
+        id: "wrong-category",
+        category: "system",
+        level: "info",
+        title: "needle in an unfiltered backend result",
+        detail: "",
+        createdAt: "2026-09-15T08:00:00.000Z",
+      }],
+      hasMore: false,
+      total: 1,
+      malformedLines: 0,
+      oversizedLines: 0,
+    });
+    const pinia = createPinia();
+    const app = createApp(LogsView).use(pinia).use(i18n);
+    app.mount(host);
+    await flushView();
+
+    await chooseParameterOption(host, "按类别筛选", "command");
+    const from = host.querySelector<HTMLInputElement>("[aria-label='开始日期']")!;
+    const to = host.querySelector<HTMLInputElement>("[aria-label='结束日期']")!;
+    from.value = "2026-09-01";
+    from.dispatchEvent(new Event("input"));
+    to.value = "2026-09-30";
+    to.dispatchEvent(new Event("input"));
+    await flushView();
+
+    expect(queryTaskLogsMock).toHaveBeenLastCalledWith(expect.objectContaining({
+      category: "command",
+      from: new Date("2026-09-01T00:00:00.000").toISOString(),
+      to: new Date("2026-09-30T23:59:59.999").toISOString(),
+    }));
+    expect(host.querySelector(".log-summary strong")?.textContent).toBe("0");
+
+    const callsBeforeSearch = queryTaskLogsMock.mock.calls.length;
+    const search = host.querySelector<HTMLInputElement>(".log-filters .search-box input")!;
+    search.value = "needle";
+    search.dispatchEvent(new Event("input"));
+    await nextTick();
+    vi.advanceTimersByTime(299);
+    await flushView();
+    expect(queryTaskLogsMock).toHaveBeenCalledTimes(callsBeforeSearch);
+    vi.advanceTimersByTime(1);
+    await flushView();
+    expect(queryTaskLogsMock).toHaveBeenCalledTimes(callsBeforeSearch + 1);
+    expect(queryTaskLogsMock).toHaveBeenLastCalledWith(expect.objectContaining({ search: "needle" }));
+    app.unmount();
+  });
+
+  it("counts schema-invalid audit records instead of silently dropping them", async () => {
+    queryTaskLogsMock.mockResolvedValue({
+      items: [
+        {
+          id: "valid-audit",
+          category: "system",
+          level: "info",
+          title: "valid history",
+          detail: "safe",
+          createdAt: "2026-09-15T08:00:00.000Z",
+        },
+        { id: "invalid-audit", category: "unknown", level: "info", title: "invalid history" },
+      ],
+      hasMore: false,
+      total: 2,
+      malformedLines: 0,
+      oversizedLines: 0,
+    });
+    const app = createApp(LogsView).use(createPinia()).use(i18n);
+    app.mount(host);
+    await flushView();
+
+    expect(host.querySelector(".log-summary strong")?.textContent).toBe("1");
+    expect(host.querySelector(".audit-log-history-warning")?.textContent).toContain("1 条结构无效记录");
+    app.unmount();
+  });
+
+  it("keeps live logs usable when disk history is unavailable and reports query failures", async () => {
+    const pinia = createPinia();
+    const store = useOpsStore(pinia);
+    store.logs = [{
+      id: "browser-live",
+      category: "system",
+      level: "info",
+      title: "browser fallback log",
+      detail: "",
+      createdAt: "2026-09-15T08:00:00.000Z",
+    }];
+    const app = createApp(LogsView).use(pinia).use(i18n);
+    app.mount(host);
+    await flushView();
+
+    expect(host.querySelector(".log-summary strong")?.textContent).toBe("1");
+    expect(host.querySelector(".audit-log-history-status")).toBeNull();
+    app.unmount();
+
+    queryTaskLogsMock.mockRejectedValueOnce(new Error("disk unavailable"));
+    const failedApp = createApp(LogsView).use(createPinia()).use(i18n);
+    failedApp.mount(host);
+    await flushView();
+    expect(host.querySelector(".audit-log-history-error")?.textContent).toContain("历史日志加载失败：disk unavailable");
+    expect(host.querySelector(".audit-log-retry")).not.toBeNull();
+    failedApp.unmount();
   });
 });

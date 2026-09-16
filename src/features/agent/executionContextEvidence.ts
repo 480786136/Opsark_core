@@ -2,8 +2,31 @@ import type { PlanStep } from "@/types";
 
 import { textFingerprint } from "./longRunningReviewOutput";
 
+export function isUserInputStep(step: PlanStep) {
+  return step.result?.facts.toolId === "user.request_input"
+    || /^\s*opsark-tool\s+user\.request_input(?:\s|$)/u.test(step.command);
+}
+
+/** Historical form bodies/facts must not bypass the scoped decision store. */
+export function modelContextStep(step: PlanStep): PlanStep {
+  if (!isUserInputStep(step)) return step;
+  const facts = { toolId: "user.request_input" };
+  return {
+    ...step,
+    output: undefined,
+    result: step.result ? { ...step.result, facts } : undefined,
+    evidence: step.evidence?.map(item => ({ ...item, facts, rawOutput: "" })),
+  };
+}
+
 /** Preserve tool JSON as data; archived results can be read by task-scoped reference. */
 export function modelToolOutput(step: PlanStep, value: string | undefined, allowArchive = false): unknown {
+  if (isUserInputStep(step)) {
+    // Raw form output is historical evidence, not a scope-aware user decision.
+    // Values enter model requests only through confirmedUserInputs.
+    return { contentRef: "confirmedUserInputs", sourceStepId: step.id,
+      instruction: "仅复用 confirmedUserInputs 中当前目标/服务器有效的完整输入；历史表单输出不扩大适用范围。" };
+  }
   const archive = allowArchive && value && step.evidence?.find(item => item.rawOutput === value
     && item.archive?.fingerprint === textFingerprint(value))?.archive;
   if (archive && value) {
@@ -27,6 +50,7 @@ export function executionContextEvidence(
   projectOutput: (value: string | undefined) => string | undefined,
   allowArchive = false,
 ) {
+  step = modelContextStep(step);
   const output = projectOutput(step.output);
   const resultFacts = step.result?.facts;
   return {

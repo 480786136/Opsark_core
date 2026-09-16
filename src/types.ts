@@ -165,7 +165,16 @@ export interface Metrics {
 }
 
 export interface PlanStep {
+  recoveryRuleVersion?: number;
+  /** Explicit recovery relationship; never inferred from command names or prose. */
+  recovery?: {
+    failedStepId: string;
+    targetContext: string;
+    purpose: "diagnose" | "repair" | "verify";
+  };
   authenticationGate?: { fingerprint: string; reason: string; approved?: boolean };
+  /** Executor-owned, scoped review of earlier user decisions for a new business plan. */
+  protocolReplanApproval?: { inputFingerprint: string; decisionSummary: string };
   id: string;
   /** Executor-owned target/session/credential identity at attempt start. */
   attemptContext?: string;
@@ -193,15 +202,17 @@ export interface PlanStep {
   progressMessage?: string;
   /** Exact non-secret template shown when per-step approval was requested. */
   safetyApprovalSnapshot?: Pick<PlanStep,
-    "command" | "validation" | "risk" | "executionScope" | "validationScope" | "sessionContextChange" | "runtimeClass"
+    "command" | "validation" | "risk" | "executionScope" | "validationScope" | "sessionContextChange" | "runtimeClass" | "protocolReplanApproval"
   >;
   /** Exact template explicitly accepted by the user; any later change invalidates it. */
   approvedSafetySnapshot?: Pick<PlanStep,
-    "command" | "validation" | "risk" | "executionScope" | "validationScope" | "sessionContextChange" | "runtimeClass"
+    "command" | "validation" | "risk" | "executionScope" | "validationScope" | "sessionContextChange" | "runtimeClass" | "protocolReplanApproval"
   >;
 }
 
 export interface TaskMessage {
+  /** Classification belongs to this message; side questions never start an execution round. */
+  requirementRelation?: RequirementRelation;
   id: string;
   role: "user" | "assistant" | "system";
   kind: "message" | "event" | "summary";
@@ -220,6 +231,7 @@ export interface ExecutionConstraints {
 
 export interface TaskPlanHistory {
   id: string;
+  roundId?: string;
   requirement: string;
   status: TaskStatus;
   plan: PlanStep[];
@@ -246,6 +258,9 @@ export interface TaskExecutionPhase {
 }
 
 export interface TaskHistoryVerifiedFact {
+  sourceToolId?: string;
+  evidenceKey?: string;
+  sourcePhaseId?: string;
   targetContext?: string;
   output?: Record<string, unknown>;
   stepId: string;
@@ -256,6 +271,11 @@ export interface TaskHistoryVerifiedFact {
 }
 
 export interface TaskHistoryIssue {
+  /** Executor-owned minimal acceptance contract survives detailed phase trimming. */
+  recoveryContract?: { roundId: string; step: PlanStep };
+  sourceRoundId?: string;
+  blocksExecution?: boolean;
+  issueId?: string;
   stepId: string;
   title: string;
   category?: string;
@@ -263,7 +283,12 @@ export interface TaskHistoryIssue {
   status: PlanStep["status"];
   commandFingerprint: string;
   attemptCount: number;
+  countedAttemptKeys?: string[];
   attemptContext?: string;
+  sourcePhaseId?: string;
+  evidenceIds?: string[];
+  archiveReferences?: { evidenceId: string; fingerprint: string; characters: number; capturedPartial: boolean }[];
+  verificationState?: "recorded" | "needs_review";
 }
 
 export interface TaskHistoryPhaseSummary {
@@ -274,9 +299,9 @@ export interface TaskHistoryPhaseSummary {
   statusCounts: Record<string, number>;
 }
 
-/** Bounded rolling checkpoint for model context; raw plans remain in the task audit ledger. */
+/** Complete issue index with bounded fact/detail summaries; raw plans remain in the audit ledger. */
 export interface TaskHistoryCheckpoint {
-  version: 1;
+  version: 1 | 2;
   sourceRoundCount: number;
   sourcePhaseCount: number;
   sourceStepCount: number;
@@ -285,6 +310,16 @@ export interface TaskHistoryCheckpoint {
   unresolvedIssues: TaskHistoryIssue[];
   phaseSummaries: TaskHistoryPhaseSummary[];
   throughPhaseId?: string;
+  /** Internal replay index, omitted from model projections. Archived phases are immutable. */
+  sourcePhaseFingerprints?: Record<string, string>;
+  migration?: {
+    fromVersion: 1;
+    ledgerCoverage: "complete" | "partial";
+    missingPhaseCount: number;
+    missingStepCount: number;
+    countsExact: boolean;
+    requiresReview: boolean;
+  };
   sourceHistoryFingerprint: string;
   updatedAt: string;
 }
@@ -339,6 +374,20 @@ export type ManagedStopReason =
   | "cancelled";
 
 export interface OpsTask {
+  /** Ephemeral classification work does not replace the execution/approval state. */
+  requirementProcessing?: boolean;
+  /** Only explicit goal cancellation/replacement sets this; stopping an attempt does not. */
+  goalCancellation?: { reason: "user_cancelled" | "replaced"; at: string };
+  /** Executor-authored handoffs preserve original failed attempts across requirement rounds. */
+  recoveryCarryForwards?: Array<{
+    taskId: string;
+    failedStepId: string;
+    targetContext: string;
+    sourceRoundId: string;
+    destinationRoundId: string;
+    targetServerId: string;
+    contractFingerprint: string;
+  }>;
   /** Invalidates async results when a user cancels or starts another request. */
   workflowEpoch?: number;
   /** UI conversation identity; never merges task goals or execution evidence. */
@@ -383,6 +432,13 @@ export interface OpsTask {
     repair: import("@/services/backend").PlanNormalizationRepair;
     repairError: string;
   };
+  /** Rejected plans are audit records, never executed attempts or recovery evidence. */
+  protocolRepairHistory?: Array<NonNullable<OpsTask["protocolRepair"]> & {
+    requestedAt: string;
+    status: "planning" | "accepted" | "failed";
+    replacementStepIds?: string[];
+    outcome?: string;
+  }>;
   /** Remaining delay before managed mode automatically requests an adjustment plan. */
   autoAdjustmentSeconds?: number;
   /** Ephemeral UI state while adjustment prerequisites or a replacement plan are being prepared. */
@@ -436,6 +492,13 @@ export interface SubmittedTaskInput {
   groupId: string;
   groupTitle: string;
   submittedAt: string;
+  /** Captured by the input handler, never inferred from model text or rebound on reconnect. */
+  scope?: {
+    taskId: string;
+    serverId: string;
+    goalFingerprint: string;
+    sourceStepId: string;
+  };
 }
 
 export interface SubmittedSecretBinding {
@@ -537,6 +600,60 @@ export interface DeveloperLogEntry {
     source: "api" | "estimated";
   };
   createdAt: string;
+}
+
+export type ModelTransportEventName =
+  | "request_sent"
+  | "response_received"
+  | "request_failed"
+  | "response_failed"
+  | "unknown";
+
+/**
+ * Safe metadata projection of a raw model-calls JSONL record.
+ * Request, response, responseText, error, URL and file contents never cross the IPC boundary.
+ */
+export interface ModelTransportEvent {
+  recordId: string;
+  event: ModelTransportEventName;
+  timestampMs: number;
+  callId?: string;
+  requestId?: string;
+  upstreamRequestId?: string;
+  requestName?: string;
+  modelName?: string;
+  taskId?: string;
+  serverId?: string;
+  roundId?: string;
+  stepId?: string;
+  attempt?: number;
+  status?: number;
+  durationMs?: number;
+  timeoutSeconds?: number;
+  contentLength?: number;
+  contentType?: string;
+  contentEncoding?: string;
+  phaseIndex?: number;
+  contextMetrics?: {
+    requestBytes?: number;
+    estimatedInputTokens?: number;
+    stablePrefixBytes?: number;
+    stablePrefixFingerprint?: string;
+    sections?: Array<{
+      messageIndex?: number;
+      role?: string;
+      characters?: number;
+      utf8Bytes?: number;
+    }>;
+  };
+  tokenUsage?: {
+    input: number;
+    output: number;
+    total: number;
+    source: "api";
+    cacheHit?: number;
+    cacheMiss?: number;
+  };
 }
 
 export interface AuditEvent {

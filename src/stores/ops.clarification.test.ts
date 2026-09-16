@@ -4,6 +4,7 @@ import { useConnectionStore } from "@/features/connection/connectionStore";
 import { backend, buildPlanNormalizationRepair, PlanProtocolError } from "@/services/backend";
 import type { OpsTask, PlanStep, ServerProfile } from "@/types";
 import { useOpsStore } from "./ops";
+import { confirmedInputScope, confirmedUserInputsContext } from "@/features/agent/confirmedUserInputs";
 
 const server: ServerProfile = {
   id: "clarification-server", host: "clarification.example.invalid", port: 22,
@@ -524,6 +525,9 @@ describe("通用澄清与审批的单次恢复", () => {
     expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(await store.provideUserInput(task.id, { TARGET: "target-b", CONFIRMATION: "只读检查" }, request.callId)).toBe(true);
     expect(task.submittedInputs?.TARGET).toMatchObject({ type: "select", value: "target-b" });
+    const recordedScope = task.submittedInputs?.TARGET.scope;
+    expect(recordedScope).toMatchObject({ taskId: task.id, serverId: task.serverId, sourceStepId: "clarification-step" });
+    expect(confirmedUserInputsContext(task)?.items.some(item => item.value === "target-b")).toBe(true);
     expect(task.plan[0].output).toContain("target-b");
     expect(task.plan[0].evidence).toHaveLength(1);
     expect(backend.generatePlan).toHaveBeenCalledOnce();
@@ -531,7 +535,7 @@ describe("通用澄清与审批的单次恢复", () => {
     store.persist(true);
     setActivePinia(createPinia());
     expect(useOpsStore().tasks.find(item => item.id === task.id)?.submittedInputs?.TARGET)
-      .toMatchObject({ type: "select", value: "target-b" });
+      .toMatchObject({ type: "select", value: "target-b", scope: recordedScope });
   });
 
   it("选择值按候选身份精确保留，不在保存时去除字符", async () => {
@@ -563,5 +567,25 @@ describe("通用澄清与审批的单次恢复", () => {
     expect(task.plan[0].output).not.toContain("target-a");
     expect(backend.generatePlan).toHaveBeenCalledOnce();
     expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it.each(["text", "number"] as const)("可选 %s 清空会撤销同 key 旧决定", async type => {
+    const { store, task } = createTask();
+    task.plan = [inputStep({ command: `opsark-tool user.request_input ${JSON.stringify({
+      title: "更新参数", fields: [{ key: "OPTIONAL", label: "可选参数", description: "留空表示不指定", type, required: false }],
+    })}` })];
+    task.submittedInputs = { OPTIONAL: { type, value: type === "number" ? 65432 : "OLD_OPTIONAL_VALUE",
+      label: "可选参数", description: "原值", groupId: "old", groupTitle: "旧表单", submittedAt: "now",
+      scope: confirmedInputScope(task, "old-input"),
+    } };
+    expect(confirmedUserInputsContext(task)?.items).toHaveLength(1);
+    store.presentTaskUserInput(task.id);
+    const request = store.pendingUserInputs[0];
+    expect(await store.provideUserInput(task.id, { OPTIONAL: "" }, request.callId)).toBe(true);
+    expect(task.submittedInputs?.OPTIONAL).toBeUndefined();
+    expect(confirmedUserInputsContext(task)).toBeUndefined();
+    const sent = JSON.stringify(vi.mocked(backend.generatePlan).mock.calls);
+    expect(sent).not.toContain("OLD_OPTIONAL_VALUE");
+    expect(sent).not.toContain("65432");
   });
 });

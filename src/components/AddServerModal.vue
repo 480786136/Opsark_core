@@ -35,7 +35,7 @@ function submit() {
           <h2>{{ t(props.server ? "serverForm.editTitle" : "serverForm.title") }}</h2>
           <p>{{ t(props.server ? "serverForm.editSubtitle" : "serverForm.subtitle") }}</p>
         </div>
-        <button class="icon-button" type="button" @click="emit('close')"><X :size="18" /></button>
+        <button class="icon-button" type="button" :aria-label="t('common.close')" @click="emit('close')"><X :size="18" /></button>
       </div>
       <label>{{ t("serverForm.name") }}<input v-model="form.name" :placeholder="t('serverForm.namePlaceholder')" autofocus /></label>
       <label>{{ t("serverForm.host") }}<input v-model="form.host" :placeholder="t('serverForm.hostPlaceholder')" /></label>

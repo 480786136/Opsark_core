@@ -7,16 +7,17 @@ import { useKnowledgeStore } from "./knowledgeStore";
 import TaskKnowledgeUpload from "./TaskKnowledgeUpload.vue";
 import KnowledgeSettings from "./KnowledgeSettings.vue";
 import { knowledgeRequest } from "./service";
+import { i18n } from "@/features/preferences/i18n";
 
 vi.mock("./service",async(original)=>({...await original<typeof import("./service")>(),knowledgeRequest:vi.fn()}));
 let app: App,host:HTMLElement;
-beforeEach(()=>{localStorage.clear();vi.clearAllMocks();host=document.createElement("div");document.body.append(host);});
-afterEach(()=>{app?.unmount();host.remove();});
+beforeEach(()=>{localStorage.clear();i18n.global.locale.value="zh-CN";vi.clearAllMocks();host=document.createElement("div");document.body.append(host);});
+afterEach(()=>{app?.unmount();i18n.global.locale.value="zh-CN";host.remove();});
 async function mountTask(){
   const pinia=createPinia();setActivePinia(pinia);const ops=useOpsStore();const task=ops.createTask("server-a","safe","model-a");task.title="检查服务";
   task.plan=[{id:"step-1",title:"检查服务",description:"读取状态",command:"echo ok",validation:"",risk:"low",kind:"observe",status:"completed",expected:"返回 ok",result:{executionStatus:"success",observationStatus:"matched",exitCode:0,facts:{},warnings:[],evidenceIds:[]}}];
   const knowledge=useKnowledgeStore();knowledge.config={...knowledge.config,hasApiKey:true,uploadEnabled:true,knowledgeBaseId:"kb-1"};
-  app=createApp(TaskKnowledgeUpload,{task}).use(pinia);app.mount(host);await nextTick();return knowledge;
+  app=createApp(TaskKnowledgeUpload,{task}).use(pinia).use(i18n);app.mount(host);await nextTick();return knowledge;
 }
 const button=(text:string)=>Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(b=>b.textContent?.includes(text))!;
 it("requires preview and explicit consent before any request",async()=>{
@@ -32,8 +33,10 @@ it("keeps the preview destination visible and blocks upload after configuration 
   expect(document.querySelector('[role="dialog"]')?.textContent).toContain("http://127.0.0.1:8002/api/v1");expect(document.body.textContent).toContain("目标接口已变化");expect(knowledgeRequest).not.toHaveBeenCalled();
 });
 it("renders safe defaults and the browser-only warning on the settings page",async()=>{
-  const pinia=createPinia();app=createApp(KnowledgeSettings).use(pinia);app.mount(host);await nextTick();
+  const pinia=createPinia();app=createApp(KnowledgeSettings).use(pinia).use(i18n);app.mount(host);await nextTick();
   expect(host.textContent).toContain("当前为浏览器预览");expect(host.textContent).toContain("尚未接入 Agent");
   expect(Array.from(host.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')).every(i=>!i.checked)).toBe(true);
   expect(knowledgeRequest).not.toHaveBeenCalled();
+  i18n.global.locale.value="en-US";await nextTick();
+  expect(host.textContent).toContain("Browser preview");expect(host.textContent).toContain("Agent retrieval and document sending are not connected yet");
 });

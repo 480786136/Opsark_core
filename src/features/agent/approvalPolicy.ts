@@ -9,6 +9,7 @@ export function normalizePermissionLevel(value: unknown): PermissionLevel {
 }
 
 export function requiresStepApproval(permission: PermissionLevel, step: PlanStep): boolean {
+  if (step.protocolReplanApproval) return true;
   if (DESTRUCTIVE_COMMAND.test(step.command)) return true;
   if (step.risk === "high") return true;
   if (permission === "observe") return true;

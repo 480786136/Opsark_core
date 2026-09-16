@@ -1,6 +1,7 @@
 import { ensureStepValidator } from "@/services/validation";
 import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 import { parseToolCommand } from "@/features/tools/toolExecutor";
+import { ToolArgumentProtocolError } from "@/features/tools/toolArgumentProtocol";
 import type { ToolDefinition } from "@/features/tools/types";
 import type { PlanStep, RiskLevel } from "@/types";
 import { normalizePlanStepSafety } from "@/features/agent/planSafety";
@@ -10,6 +11,7 @@ import {
 } from "@/features/agent/executionScope";
 import { validateShellStartupTransaction } from "@/features/agent/shellStartupConfig";
 import { semanticRiskForCommand, validateAuthorizedChangeOperations } from "@/features/agent/changeOperation";
+import { validateRecoveryMetadata } from "./recoveryContract";
 
 export function normalizeSecretPlaceholders(value: string) {
   return value.replace(/\\+\$\{secret\.([A-Z0-9_]+)\}/g, "\${secret.$1}");
@@ -17,6 +19,29 @@ export function normalizeSecretPlaceholders(value: string) {
 
 const PACKAGE_MANAGER_COMMAND = /^\s*(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S+)\s+)*(?:sudo(?:\s+-\S+)*\s+)?(?:dnf|yum|apt-get|apt|zypper|pacman)\b/;
 const BUFFERING_TAIL_PIPE = /\s+(2>&1\s*)?\|\s*tail\s+(?:-\d+|-n\s*\d+|--lines(?:=|\s+)\d+)\s*$/;
+
+export const READ_BATCH_STAGE_CONFLICT = "只读批次不能混入变更、Shell 或 standalone 工具；全部步骤必须为 observe 且参数已确定";
+
+export class PlanStageConflictError extends Error {
+  readonly conflict = "read_batch";
+  constructor() { super(READ_BATCH_STAGE_CONFLICT); this.name = "PlanStageConflictError"; }
+}
+
+/** Select an unchanged, contiguous execution stage from tool policy, never business keywords. */
+export function planStagePrefix(steps: PlanStep[], tools: ToolDefinition[] = defaultToolCatalog) {
+  let mode: "read_batch" | "ordinary" | undefined;
+  for (let index = 0; index < steps.length; index += 1) {
+    const step = steps[index];
+    if (step.status !== "pending") continue;
+    const call = parseToolCommand(normalizeToolCommandSyntax(step.command), `stage-${index}`, tools);
+    const planMode = call ? tools.find(tool => tool.id === call.toolId)?.planMode : undefined;
+    if (planMode === "standalone") return steps.slice(0, mode ? index : index + 1);
+    const nextMode = planMode === "read_batch" ? "read_batch" : "ordinary";
+    if (mode && mode !== nextMode) return steps.slice(0, index);
+    mode = nextMode;
+  }
+  return steps.slice();
+}
 
 /** 包管理器的整段 tail 管道会吞掉实时输出并遮蔽真实退出码。 */
 export function normalizeLongRunningCommandOutput(command: string) {
@@ -60,6 +85,7 @@ export function normalizePlanPreconditions(
   const toolById = new Map(tools.map((tool) => [tool.id, tool]));
   const pendingToolCalls: Array<{ index: number; toolId: string }> = [];
   normalized.forEach((step, index) => {
+    validateRecoveryMetadata(step, index);
     if (step.status === "pending" && /^opsark-tool(?:\s|$)/i.test(step.command.trim())) {
       try {
         const call = parseToolCommand(step.command, `normalize-strict-${index}`, tools);
@@ -68,10 +94,15 @@ export function normalizePlanPreconditions(
         }
         if (call) pendingToolCalls.push({ index, toolId: call.toolId });
       } catch (error) {
-        throw new Error(`第 ${index + 1} 个计划步骤的工具参数无效：${String(error)}`);
+        throw new ToolArgumentProtocolError(error, index, step.id);
       }
     }
   });
+  for (const { index, toolId } of pendingToolCalls) {
+    if (toolById.get(toolId)?.planMode === "read_batch" && normalized[index].kind !== "observe") {
+      throw new Error(`第 ${index + 1} 个计划步骤调用 read_batch 工具 ${toolId}；只读批次工具的 kind 必须为 observe`);
+    }
+  }
   const standaloneCall = pendingToolCalls.find(({ toolId }) => toolById.get(toolId)?.planMode === "standalone");
   const pendingStepCount = normalized.filter((step) => step.status === "pending").length;
   const readBatch = pendingToolCalls.some(({ toolId }) => toolById.get(toolId)?.planMode === "read_batch");
@@ -80,7 +111,7 @@ export function normalizePlanPreconditions(
     || pendingToolCalls.some(({ toolId, index }) =>
       toolById.get(toolId)?.planMode !== "read_batch" || normalized[index].kind !== "observe")
   )) {
-    throw new Error("只读批次不能混入变更、Shell 或 standalone 工具；全部步骤必须为 observe 且参数已确定");
+    throw new PlanStageConflictError();
   }
   if (standaloneCall && pendingStepCount > 1) {
     throw new Error(

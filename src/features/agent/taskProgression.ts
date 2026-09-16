@@ -1,7 +1,5 @@
 import {
-  isMutatingStepCommand,
   isReadOnlyDiagnosticStep,
-  isReadOnlyStep,
 } from "@/features/agent/evidenceReview";
 import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 import { parseToolCommand } from "@/features/tools/toolExecutor";
@@ -10,10 +8,12 @@ import type { OpsTask, PlanStep } from "@/types";
 import { taskGoal } from "@/features/agent/taskGoal";
 import { mayHaveChangedState } from "@/features/agent/attemptState";
 import { textFingerprint } from "@/features/agent/longRunningReviewOutput";
+import { isNecessaryRecoveryVerification, unresolvedRecoveryBlockers } from "./recoveryContract";
 
 export type TaskProgression =
   | { kind: "wait"; step: PlanStep }
   | { kind: "execute-step"; step: PlanStep }
+  | { kind: "recovery-required"; step: PlanStep }
   | { kind: "refine-discovery"; afterUserInput?: true }
   | { kind: "complete" };
 
@@ -42,6 +42,9 @@ export function resolveTaskProgression(
 
   const pendingStep = task.plan.find((step) => step.status === "pending");
   if (pendingStep) return { kind: "execute-step", step: pendingStep };
+  const blockers = unresolvedRecoveryBlockers(task);
+  const blocker = blockers[blockers.length - 1];
+  if (blocker) return { kind: "recovery-required", step: blocker };
 
   const latestCompletedStep = [...task.plan].reverse().find((step) => step.status === "completed");
   if (latestCompletedStep) {
@@ -78,13 +81,56 @@ export function selectContinuationSteps(existingPlan: PlanStep[], candidates: Pl
   const existingCommands = new Set(existingPlan.filter((step, index) =>
     !continuationAttemptInvalidated(step, index, existingPlan, context),
   ).map((step) => planCommandIdentity(step.command)));
-  const selectedCommands = new Set<string>();
+  const selected: PlanStep[] = [];
   return candidates.filter((step) => {
     const command = planCommandIdentity(step.command);
-    if (!command || existingCommands.has(command) || selectedCommands.has(command)) return false;
-    selectedCommands.add(command);
+    const necessaryVerification = isNecessaryRecoveryVerification([...existingPlan, ...selected], step, context);
+    if (!command || (existingCommands.has(command) && !necessaryVerification)
+      || duplicateWithoutInterveningRepair(selected, step, necessaryVerification, candidate => planCommandIdentity(candidate.command))) return false;
+    selected.push(step);
     return true;
   });
+}
+
+/**
+ * A new business proposal may inspect state again after a preceding proposed
+ * change. Retaining that verification is not evidence the change has run: the
+ * executor still owns ordering, authorization and the original recovery gate.
+ * Completed writes, repeated user decisions and unchanged observations remain
+ * de-duplicated, and the complete real history stays available for recovery.
+ */
+export function selectBusinessReplanSteps(existingPlan: PlanStep[], candidates: PlanStep[], context?: string) {
+  const completedCommands = new Set(existingPlan.filter((step, index) => step.status === "completed"
+    && !continuationAttemptInvalidated(step, index, existingPlan, context))
+    .map(step => planCommandIdentity(step.command)));
+  const selected: PlanStep[] = [];
+  return candidates.filter(step => {
+    const command = planCommandIdentity(step.command);
+    const necessaryVerification = isNecessaryRecoveryVerification([...existingPlan, ...selected], step, context);
+    const reobservable = isReobservableState(step);
+    const afterProposedChange = reobservable && selected.some(candidate => candidate.kind === "change");
+    let duplicateIndex = -1;
+    selected.forEach((candidate, index) => {
+      if (planCommandIdentity(candidate.command) === command) duplicateIndex = index;
+    });
+    const repeatAfterProposedChange = reobservable && duplicateIndex >= 0
+      && selected.slice(duplicateIndex + 1).some(candidate => candidate.kind === "change");
+    if (!command || (completedCommands.has(command) && !necessaryVerification && !afterProposedChange)
+      || (duplicateWithoutInterveningRepair(selected, step, necessaryVerification,
+        candidate => planCommandIdentity(candidate.command)) && !repeatAfterProposedChange)) return false;
+    selected.push(step);
+    return true;
+  });
+}
+
+function isReobservableState(step: PlanStep) {
+  if (!isReadOnlyDiagnosticStep(step) || step.sessionContextChange) return false;
+  try {
+    const call = parseToolCommand(step.command, `replan-observation-${step.id}`);
+    // Terminal/user-input boundaries are not environment observations. A
+    // proposed write must not invalidate an already answered form or SSH login.
+    return !call || defaultToolCatalog.some(tool => tool.id === call.toolId && tool.planMode === "read_batch");
+  } catch { return false; }
 }
 
 /**
@@ -109,6 +155,7 @@ export function completedContinuationCommandFingerprints(
  * validation-only repair for an ordinary shell step remains possible.
  */
 export function selectAdjustmentSteps(existingPlan: PlanStep[], candidates: PlanStep[], context?: string) {
+  const recoveryHistory = existingPlan;
   existingPlan = existingPlan.filter((step, index, steps) => !attemptInvalidated(step, index, steps, context));
   const completedCommands = new Set(
     existingPlan
@@ -120,18 +167,31 @@ export function selectAdjustmentSteps(existingPlan: PlanStep[], candidates: Plan
       .filter((step) => step.status === "failed")
       .map((step) => `${planCommandIdentity(step.command)}\n${step.validation.trim()}`),
   );
-  const selectedAttempts = new Set<string>();
+  const selected: PlanStep[] = [];
 
   return candidates.filter((step) => {
     const command = planCommandIdentity(step.command);
     const attempt = `${command}\n${step.validation.trim()}`;
+    const necessaryVerification = isNecessaryRecoveryVerification([...recoveryHistory, ...selected], step, context);
     if (!command
-      || completedCommands.has(command)
-      || failedAttempts.has(attempt)
-      || selectedAttempts.has(attempt)) return false;
-    selectedAttempts.add(attempt);
+      || (completedCommands.has(command) && !necessaryVerification)
+      || (failedAttempts.has(attempt) && !necessaryVerification)
+      || duplicateWithoutInterveningRepair(selected, step, necessaryVerification,
+        candidate => `${planCommandIdentity(candidate.command)}\n${candidate.validation.trim()}`)) return false;
+    selected.push(step);
     return true;
   });
+}
+
+function duplicateWithoutInterveningRepair(
+  selected: PlanStep[], candidate: PlanStep, necessaryVerification: boolean, identity: (step: PlanStep) => string,
+) {
+  let duplicateIndex = -1;
+  selected.forEach((step, index) => { if (identity(step) === identity(candidate)) duplicateIndex = index; });
+  if (duplicateIndex < 0) return false;
+  return !necessaryVerification || !selected.slice(duplicateIndex + 1).some(step => step.recovery?.purpose === "repair"
+    && step.recovery.failedStepId === candidate.recovery?.failedStepId
+    && step.recovery.targetContext === candidate.recovery?.targetContext);
 }
 
 function attemptInvalidated(step: PlanStep, index: number, history: PlanStep[], context?: string) {
@@ -196,31 +256,8 @@ export function planCommandIdentity(command: string) {
   return command.trim();
 }
 
-/**
- * Returns the latest unresolved blocking step before a mutating step. A successful
- * intervening mutation clears the blocker only when it did not produce another signal.
- */
+/** No business step crosses a failed prerequisite until its original contract is rechecked. */
 export function findUnresolvedBlockingStep(task: OpsTask, currentStep: PlanStep) {
-  if (!isMutatingStepCommand(currentStep.command)) return undefined;
-  const stepIndex = task.plan.indexOf(currentStep);
-  if (stepIndex <= 0) return undefined;
-
-  let blockerIndex = -1;
-  for (let index = 0; index < stepIndex; index += 1) {
-    const candidate = task.plan[index];
-    if (candidate.status === "completed" && candidate.result?.facts.blockingSignal) {
-      blockerIndex = index;
-    }
-  }
-  if (blockerIndex < 0) return undefined;
-
-  const blockerResolved = task.plan
-    .slice(blockerIndex + 1, stepIndex)
-    .some((candidate) =>
-      candidate.status === "completed"
-      && !isReadOnlyStep(candidate)
-      && !candidate.result?.facts.blockingSignal
-      && candidate.result?.executionStatus === "success",
-    );
-  return blockerResolved ? undefined : task.plan[blockerIndex];
+  const blockers = unresolvedRecoveryBlockers(task, currentStep);
+  return blockers.find(step => step.id === currentStep.recovery?.failedStepId) ?? blockers[blockers.length - 1];
 }

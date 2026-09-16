@@ -19,7 +19,7 @@ const RISK_LABEL: Record<PlanStep["risk"], string> = {
 };
 
 export function planSafetySnapshot(step: Pick<PlanStep,
-  "command" | "validation" | "risk" | "executionScope" | "validationScope" | "sessionContextChange" | "runtimeClass"
+  "command" | "validation" | "risk" | "executionScope" | "validationScope" | "sessionContextChange" | "runtimeClass" | "protocolReplanApproval"
 >) {
   return {
     risk: step.risk,
@@ -31,6 +31,7 @@ export function planSafetySnapshot(step: Pick<PlanStep,
       ? structuredClone(step.sessionContextChange)
       : undefined,
     runtimeClass: step.runtimeClass,
+    protocolReplanApproval: step.protocolReplanApproval ? { ...step.protocolReplanApproval } : undefined,
   } satisfies NonNullable<PlanStep["safetyApprovalSnapshot"]>;
 }
 
@@ -43,6 +44,8 @@ export function hasCurrentStepApproval(step: PlanStep) {
     && approved.executionScope === step.executionScope
     && approved.validationScope === step.validationScope
     && approved.runtimeClass === step.runtimeClass
+    && JSON.stringify(approved.protocolReplanApproval ?? undefined)
+      === JSON.stringify(step.protocolReplanApproval ?? undefined)
     && JSON.stringify(approved.sessionContextChange ?? undefined)
       === JSON.stringify(step.sessionContextChange ?? undefined));
 }
@@ -59,7 +62,9 @@ export function requestStepApproval(
   step.approvedSafetySnapshot = undefined;
   return {
     taskStatus: "awaiting_step_approval",
-    eventMessage: `步骤“${step.title}”为${RISK_LABEL[step.risk]}风险，需要单独确认。`,
+    eventMessage: step.protocolReplanApproval
+      ? `协议修复已转为新的业务调整。步骤“${step.title}”将修改目标状态，请核对已确认决定：${step.protocolReplanApproval.decisionSummary}。本次确认仅授权本步骤展示的具体变更，不撤销任务级禁止事项；如与原决定冲突，请先补充授权或调整方案。`
+      : `步骤“${step.title}”为${RISK_LABEL[step.risk]}风险，需要单独确认。`,
   };
 }
 

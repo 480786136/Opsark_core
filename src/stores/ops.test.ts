@@ -21,6 +21,9 @@ import {
 } from "@/services/validation";
 import { useTerminalSessionStore } from "@/features/terminal/terminalSessionStore";
 import { useAgentTerminalStore } from "@/features/terminal/agentTerminalStore";
+import { automaticContinuationBlocker } from "@/features/agent/workflowProgress";
+import { taskAttemptContext } from "@/features/agent/attemptState";
+import { recoveryHistory, unresolvedRecoveryBlockers, validateRecoveryReferences } from "@/features/agent/recoveryContract";
 
 const plan: PlanStep[] = [
   {
@@ -252,12 +255,26 @@ describe("智能任务状态机", () => {
       plan: [{ ...original, id: `old-${index}`, title: `query-${index}`, command: `query-state-${index}` }],
       createdAt: "now", completedAt: "now",
     }));
+    // Legacy tasks may already contain the user-facing stop message without a
+    // structured timeline audit record; the audit must still be backfilled.
+    task.messages.push({ id: "legacy-stop", role: "system", kind: "event",
+      content: automaticContinuationBlocker(task)!, createdAt: "now" });
     await store.queueManagedAdjustment(task.id);
     await store.requestAdjustment(task.id, true);
     expect(task.managedStopReason).toBe("no_progress");
     expect(task.managedAdjustmentPhase).toBe("manual_required");
     expect(task.autoAdjustmentSeconds).toBeUndefined();
     expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(store.logs).toContainEqual(expect.objectContaining({
+      taskId: task.id,
+      title: "自动编排已停止：缺少新进展",
+      level: "warning",
+    }));
+    expect(store.logs.filter(log => log.taskId === task.id
+      && log.title === "自动编排已停止：缺少新进展")).toHaveLength(1);
+    expect(store.stopAutomaticLoop(task)).toBe(true);
+    expect(store.logs.filter(log => log.taskId === task.id
+      && log.title === "自动编排已停止：缺少新进展")).toHaveLength(1);
     const begin = vi.spyOn(store, "beginAdjustment").mockResolvedValue(undefined);
     await store.requestAdjustment(task.id, false);
     expect(begin).toHaveBeenCalledOnce();
@@ -417,7 +434,7 @@ describe("智能任务状态机", () => {
     expect(store.advanceTask).toHaveBeenCalledOnce();
   });
 
-  it("持续校验握手失败后释放 busy、有限等待并停止倒计时与模型重拟", async () => {
+  it("校验握手失败后通道恢复为 ready 时停止等待，不重放主命令或调用模型", async () => {
     const { store, task, terminals } = setupAgentClone();
     const execute = vi.spyOn(backend, "executeAgentCommand").mockImplementation(async (input) => {
       if (input.command === task.plan[0].command) return {
@@ -433,8 +450,11 @@ describe("智能任务状态机", () => {
     expect(execute).toHaveBeenCalledTimes(4);
     expect(task.plan[0].result?.facts).toMatchObject({ commandCompleted: true, validationCompleted: false });
     expect(task.plan[0].output).toContain("Cloning into");
-    expect(terminals.sessionsByTask[task.id].state).toBe("recovering");
-    expect(task.managedAdjustmentPhase).toBe("waiting_transport");
+    // This fixture reports verified SSH and a ready backend Agent session.
+    // Recovery clears loading, but the missing validation result stays failed.
+    expect(terminals.sessionsByTask[task.id].state).toBe("ready");
+    expect(task.managedAdjustmentPhase).toBe("manual_required");
+    expect(task.plan[0].status).toBe("failed");
     await store.queueManagedAdjustment(task.id);
     await store.queueManagedAdjustment(task.id);
     await vi.advanceTimersByTimeAsync(31_000);
@@ -443,6 +463,7 @@ describe("智能任务状态机", () => {
     expect(task.messages.filter(({ content }) => content.includes("倒计时结束"))).toHaveLength(0);
     expect(backend.reviewStep).not.toHaveBeenCalled();
     expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(execute).toHaveBeenCalledTimes(4);
   });
 
   it("恢复识别 Agent ready，且无发送前证据时不重放主命令", async () => {
@@ -1379,7 +1400,7 @@ describe("智能任务状态机", () => {
     expect(legacy?.submittedSecretBindings).toEqual({});
   });
 
-  it("启动时修复已持久化旁问仍挂载上一轮计划的显示状态", () => {
+  it("启动时旁问不会清空已持久化执行计划与整体目标状态", () => {
     const previousPlan = structuredClone(plan).map((step) => ({ ...step, status: "completed" }));
     localStorage.setItem("opsark.tasks", JSON.stringify([{
       id: "legacy-side-question",
@@ -1428,15 +1449,11 @@ describe("智能任务状态机", () => {
 
     const migrated = useOpsStore().tasks[0];
 
-    expect(migrated.plan).toEqual([]);
-    expect(migrated.summary).toBeUndefined();
-    expect(migrated.currentInstruction).toBe("其他机器访问什么地址？");
-    expect(migrated.planHistory).toHaveLength(1);
-    expect(migrated.planHistory?.[0]).toMatchObject({
-      requirement: "部署静态站点",
-      summary: "静态站点部署完成",
-    });
-    expect(migrated.planHistory?.[0].plan).toHaveLength(3);
+    expect(migrated.plan).toHaveLength(3);
+    expect(migrated.summary).toBe("静态站点部署完成");
+    expect(migrated.currentInstruction).toBe("部署静态站点");
+    expect(migrated.currentRoundId).toBe("old-round");
+    expect(migrated.planHistory).toHaveLength(0);
   });
 
   it("启动时将旧任务的 Git 用户名与服务器令牌迁移为长期凭据组", async () => {
@@ -1966,7 +1983,29 @@ describe("智能任务状态机", () => {
       facts: { cancelled: true },
       failureReason: "用户终止",
     });
-    expect(task.summary).toContain("用户终止");
+    expect(task.summary).toContain("执行已停止");
+    expect(task.goalCancellation).toBeUndefined();
+  });
+
+  it("停止请求迟到返回不会取消同 Task 同 Round 的新执行", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    task.status = "running";
+    task.currentExecutionId = "old-execution";
+    task.plan = [{ ...structuredClone(plan[0]), status: "running" }];
+    let finishCancellation;
+    vi.spyOn(backend, "cancelCommand").mockImplementationOnce(() => new Promise(resolve => { finishCancellation = resolve; }));
+    const stopping = store.terminateTask(task.id);
+    await vi.waitFor(() => expect(finishCancellation).toBeTypeOf("function"));
+    task.workflowEpoch += 1;
+    task.cancelRequested = false;
+    task.currentExecutionId = "new-execution";
+    task.plan = [{ ...structuredClone(plan[0]), id: "new-attempt", status: "running" }];
+    finishCancellation(true);
+    await stopping;
+    expect(task.status).toBe("running");
+    expect(task.currentExecutionId).toBe("new-execution");
+    expect(task.plan[0].status).toBe("running");
   });
 
   it.skip("终止绑定 PTY 时等待真实结束，超时则隔离且保留命令槽位", async () => {
@@ -2103,6 +2142,7 @@ describe("智能任务状态机", () => {
 
   it("相同阻塞事件无新证据时只生成一次调整计划", async () => {
     const store = useOpsStore();
+    vi.mocked(backend.generatePlan).mockResolvedValueOnce(structuredClone(plan).map(step => ({ ...step, id: `new-${step.id}` })));
     const task = store.createTask("srv-production-01", "safe", "model-deepseek");
     task.status = "needs_adjustment";
     const failedPlan = [{
@@ -2863,9 +2903,10 @@ describe("智能任务状态机", () => {
     expect(store.getServerSecretValues("srv-production-01").DEPLOY_TOKEN).toBe("prod-token");
   });
 
-  it("选中已有任务后可继续多轮需求，不会强制创建新任务", async () => {
+  it("选中已有任务继续执行时保留 Task 和 Round 并归档旧阶段", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    task.currentRoundId = "stable-round";
     task.status = "completed";
     task.plan = structuredClone(plan);
     task.plan.forEach((step) => { step.status = "completed"; });
@@ -2882,12 +2923,11 @@ describe("智能任务状态机", () => {
 
     expect(store.tasks).toHaveLength(1);
     expect(store.activeTaskId).toBe(task.id);
-    expect(task.planHistory).toHaveLength(1);
-    expect(task.planHistory?.[0].requirement).toBe("第一轮需求");
-    expect(task.planHistory?.[0].plan).toHaveLength(3);
-    expect(task.planHistory?.[0].response?.content).toBe("已生成 3 个执行步骤");
+    expect(task.planHistory).toHaveLength(0);
+    expect(task.currentRoundId).toBe("stable-round");
+    expect(task.phaseHistory?.[0].requirement).toBe("第一轮需求");
+    expect(task.phaseHistory?.[0].plan).toHaveLength(3);
     expect(task.messages.filter((message) => message.role === "user")).toHaveLength(2);
-    expect(task.messages.some((message) => message.content.includes("上一轮执行记录已保留"))).toBe(true);
     expect(task.status).toBe("awaiting_plan_approval");
     expect(task.adjustmentCount).toBe(0);
     expect(task.discoveryRefined).toBe(false);
@@ -2896,8 +2936,37 @@ describe("智能任务状态机", () => {
     expect(runtimeContext.previousExecution.requirement).toBe("第一轮需求");
     expect(runtimeContext.previousExecution.summary).toContain("PID 5149");
     expect(runtimeContext.previousExecution.steps[0].output).toContain("/opt/O2OA");
-    expect(runtimeContext.knownExecutionFacts.completedSteps[0].result).toEqual(task.planHistory?.[0].plan[0].result);
+    expect(runtimeContext.knownExecutionFacts.completedSteps).toEqual([]);
+    expect(runtimeContext.knownExecutionFacts.currentRoundEvidenceRef).toBe("previousExecution.steps");
+    expect(runtimeContext.previousExecution.steps[0].result).toEqual(task.phaseHistory?.[0].plan[0].result);
+    expect(JSON.stringify(runtimeContext).match(/root 5149 \/opt\/O2OA\/o2server\/start\.sh/g)).toHaveLength(1);
     expect(runtimeContext.knownExecutionFacts.instruction).toContain("必须优先复用");
+  });
+
+  it("需求入口不会从上一轮表单原文或旧 facts 绕过输入适用范围", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    task.status = "completed";
+    task.rootGoal = "检查目标";
+    task.plan = [{ ...structuredClone(plan[0]), id: "old-input", kind: "observe", status: "completed",
+      command: 'opsark-tool user.request_input {"title":"确认目标","fields":[]}',
+      output: '{"values":{"TARGET":"OLD_FORM_TARGET"}}',
+      result: { executionStatus: "success", observationStatus: "matched", warnings: [], evidenceIds: ["input-evidence"],
+        facts: { toolId: "user.request_input", values: { TARGET: "OLD_FACT_TARGET" } } },
+      evidence: [{ id: "input-evidence", type: "command-output", source: "main", collectedAt: "now",
+        rawOutput: '{"values":{"TARGET":"OLD_FORM_TARGET"}}', facts: { TARGET: "OLD_EVIDENCE_TARGET" } }],
+    }];
+    task.submittedInputs = { TARGET: { type: "text", value: "OLD_FORM_TARGET", label: "目标", description: "旧输入",
+      groupId: "old-input", groupTitle: "确认目标", submittedAt: "now" } };
+    store.pushMessage(task, { role: "user", kind: "message", content: "检查目标" });
+    await store.submitRequirement("srv-production-01", "继续检查目标", "safe", "model-deepseek");
+    const context = JSON.parse(vi.mocked(backend.processRequirement).mock.calls[0][1].context);
+    const serialized = JSON.stringify(context);
+    expect(context.previousExecution.steps[0].output.contentRef).toBe("confirmedUserInputs");
+    expect(context.confirmedUserInputs.index[0].status).toBe("unverified_legacy");
+    expect(serialized).not.toContain("OLD_FORM_TARGET");
+    expect(serialized).not.toContain("OLD_FACT_TARGET");
+    expect(serialized).not.toContain("OLD_EVIDENCE_TARGET");
   });
 
   it("独立的新执行目标会创建新任务，不会覆盖原任务", async () => {
@@ -2931,6 +3000,167 @@ describe("智能任务状态机", () => {
     expect(store.activeTask?.rootGoal).toBe("检查 Redis 内存使用");
   });
 
+  it.each(["continue", "supplement"])("停止后 %s 保持 Task、失败契约和约束，只有补充需求换 Round", async relation => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    task.rootGoal = "部署 Kubernetes";
+    task.currentInstruction = task.rootGoal;
+    task.currentRoundId = "original-round";
+    task.status = "needs_adjustment";
+    task.executionConstraints = { changePolicy: "read_only", environmentPolicy: "preserve", failurePolicy: "strict",
+      prohibitedActions: ["不能忽略最低资源要求"], requiredConditions: ["保留原验收"], userDirectives: ["先诊断资源"] };
+    const constraints = JSON.parse(JSON.stringify(task.executionConstraints));
+    const context = taskAttemptContext(task);
+    const failed = { ...structuredClone(plan[1]), id: "failed-init", kind: "change", status: "failed",
+      command: "kubeadm init", validation: "test -f /etc/kubernetes/admin.conf", expected: "控制平面可用",
+      attemptContext: context, result: { executionStatus: "failed", observationStatus: "unknown", exitCode: 1,
+        facts: { blockingSignal: true }, warnings: [], evidenceIds: [] } };
+    task.plan = [failed];
+    store.pushMessage(task, { role: "user", kind: "message", content: task.rootGoal });
+    store.pushMessage(task, { role: "assistant", kind: "event", content: "重复大执行正文".repeat(2000) });
+    store.rejectTask(task.id);
+    expect(task.goalCancellation).toBeUndefined();
+    const oldEpoch = task.workflowEpoch;
+    const diagnostic = { ...structuredClone(plan[0]), id: "diagnose-init", kind: "observe", command: "uname -a", validation: "",
+      recovery: { failedStepId: failed.id, targetContext: context, purpose: "diagnose" } };
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({ intent: "execute", relation, plan: [diagnostic] });
+
+    await store.submitRequirement(task.serverId, relation === "continue" ? "继续完成" : "补充：检查最低资源配置",
+      "safe", task.modelId, "", task.id);
+
+    expect(store.tasks).toHaveLength(1);
+    expect(store.activeTaskId).toBe(task.id);
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(task.workflowEpoch).toBeGreaterThan(oldEpoch);
+    expect(task.executionConstraints).toEqual(constraints);
+    expect(unresolvedRecoveryBlockers(task).map(step => step.id)).toContain("failed-init");
+    expect(() => validateRecoveryReferences(recoveryHistory(task), task.plan, taskAttemptContext(task))).not.toThrow();
+    expect(task.plan[0].recovery.targetContext).toBe(context);
+    expect(JSON.stringify(JSON.parse(vi.mocked(backend.processRequirement).mock.calls[0][1].context).conversationHistory))
+      .not.toContain("重复大执行正文");
+    if (relation === "continue") {
+      expect(task.currentRoundId).toBe("original-round");
+      expect(task.planHistory).toHaveLength(0);
+      expect(task.phaseHistory[0].plan[0].attemptContext).toBe(context);
+    } else {
+      expect(task.currentRoundId).not.toBe("original-round");
+      expect(task.planHistory[0].roundId).toBe("original-round");
+      expect(task.recoveryCarryForwards[0]).toMatchObject({ taskId: task.id, failedStepId: failed.id,
+        targetContext: context, sourceRoundId: "original-round", destinationRoundId: task.currentRoundId });
+      store.persist(true);
+      setActivePinia(createPinia());
+      const restored = useOpsStore().tasks.find(item => item.id === task.id);
+      expect(() => validateRecoveryReferences(recoveryHistory(restored), restored.plan, taskAttemptContext(restored))).not.toThrow();
+    }
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("初始入口拒绝会话上下文中的跨 Task recovery，直接派发也拒绝悬空引用", async () => {
+    const store = useOpsStore();
+    const previous = store.createTask("srv-production-01", "safe", "model-deepseek");
+    previous.currentRoundId = "old-round";
+    previous.rootGoal = "部署旧集群";
+    previous.status = "failed";
+    previous.plan = [{ ...structuredClone(plan[1]), id: "old-failure", status: "failed", attemptContext: taskAttemptContext(previous) }];
+    const next = store.createTask(previous.serverId, "safe", previous.modelId);
+    const diagnostic = { ...structuredClone(plan[0]), id: "diagnose-cross-task", kind: "observe", command: "uname -a", validation: "",
+      recovery: { failedStepId: "old-failure", targetContext: taskAttemptContext(previous), purpose: "diagnose" } };
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({ intent: "execute", relation: "continue", plan: [diagnostic] });
+    await store.submitRequirement(next.serverId, "继续完成", "safe", next.modelId, "", next.id, previous.id);
+    expect(next.status).toBe("planning_failed");
+    expect(next.pauseReason).toContain("RECOVERY_REFERENCE_MISSING");
+    expect(next.plan).toEqual([]);
+    next.plan = [diagnostic];
+    next.status = "running";
+    expect(await store.validateRecoveryDispatch(next.id, diagnostic.id, () => false)).toBe(false);
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(previous.plan[0].id).toBe("old-failure");
+  });
+
+  it("待必填表单时输入继续不会代替用户选择或重新规划", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    task.rootGoal = "部署集群";
+    task.currentRoundId = "input-round";
+    task.status = "awaiting_input";
+    task.plan = [{ ...structuredClone(plan[0]), id: "choose-network", status: "awaiting_input", kind: "observe",
+      command: 'opsark-tool user.request_input {"title":"确认网段","fields":[]}', validation: "" }];
+    store.pendingUserInputs = [{ taskId: task.id, stepId: "choose-network", callId: "input-call", title: "确认网段",
+      fields: [{ key: "CIDR", label: "Pod 网段", type: "text", required: true, description: "选择不冲突的网段" }] }];
+    const pending = JSON.parse(JSON.stringify(store.pendingUserInputs));
+    await store.submitRequirement(task.serverId, "继续完成", "safe", task.modelId, "", task.id);
+    expect(task.status).toBe("awaiting_input");
+    expect(task.currentRoundId).toBe("input-round");
+    expect(task.plan[0].status).toBe("awaiting_input");
+    expect(store.pendingUserInputs).toEqual(pending);
+    expect(backend.processRequirement).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("协议阻断时纯继续交给当前任务的人工调整入口，不重新分类或丢弃原事故", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    task.rootGoal = "部署集群";
+    task.currentRoundId = "protocol-round";
+    task.status = "needs_adjustment";
+    task.protocolRepair = { serverId: task.serverId, roundId: task.currentRoundId,
+      repair: { errorCode: "plan_normalization_failed", repairStrategy: "plan_protocol", validationError: "rule",
+        originalPlan: [], instruction: "局部修复", progress: { stopCode: "PROTOCOL_REPAIR_NO_PROGRESS" } }, repairError: "无进展" };
+    const repair = task.protocolRepair;
+    const requestAdjustment = vi.spyOn(store, "requestAdjustment").mockResolvedValue(undefined);
+    await store.submitRequirement(task.serverId, "继续完成", "safe", task.modelId, "", task.id);
+    expect(requestAdjustment).toHaveBeenCalledWith(task.id);
+    expect(task.protocolRepair).toBe(repair);
+    expect(task.currentRoundId).toBe("protocol-round");
+    expect(backend.processRequirement).not.toHaveBeenCalled();
+  });
+
+  it.each(["side_question", "continue"])("待输入时分类为 %s 后表单仍可校验提交，epoch 隔离不会使表单失效", async relation => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    task.rootGoal = "部署集群";
+    task.status = "awaiting_input";
+    task.workflowEpoch = 4;
+    task.currentRoundId = "round-input";
+    task.plan = [{ ...structuredClone(plan[0]), id: "form-step", kind: "observe", status: "awaiting_input", command: "request-form", validation: "" }];
+    store.pendingUserInputs = [{ taskId: task.id, stepId: "form-step", callId: "form-call", title: "确认网段",
+      serverId: task.serverId, roundId: task.currentRoundId, workflowEpoch: task.workflowEpoch, command: "request-form",
+      fields: [{ key: "CIDR", label: "Pod 网段", type: "text", required: true, description: "选择不冲突的网段" }] }];
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({ intent: relation === "side_question" ? "answer" : "execute",
+      relation, plan: [], answer: "需要指定不冲突的 Pod 网段" });
+    await store.submitRequirement(task.serverId, "请接着完成剩余流程", "safe", task.modelId, "", task.id);
+    expect(task.status).toBe("awaiting_input");
+    expect(task.requirementProcessing).toBe(false);
+    expect(task.workflowEpoch).toBe(5);
+    expect(store.pendingUserInputs[0].workflowEpoch).toBe(5);
+    expect(store.pendingUserInputs[0].callId).toBe("form-call");
+    expect(await store.provideUserInput(task.id, {}, "form-call")).toBe(false);
+    expect(store.pendingUserInputs[0].error).toContain("Pod 网段");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("取消后的旁问保留执行停止状态、Round 和未解决计划", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    task.rootGoal = "部署集群";
+    task.currentInstruction = task.rootGoal;
+    task.currentRoundId = "round-paused";
+    task.status = "cancelled";
+    task.cancelRequested = true;
+    task.plan = [{ ...structuredClone(plan[1]), status: "failed" }];
+    task.pauseReason = "资源不足";
+    store.pushMessage(task, { role: "user", kind: "message", content: task.rootGoal });
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({ intent: "answer", relation: "side_question", plan: [], answer: "内存不足" });
+    await store.submitRequirement(task.serverId, "哪里失败了？", "safe", task.modelId, "", task.id);
+    expect(task.status).toBe("cancelled");
+    expect(task.cancelRequested).toBe(true);
+    expect(task.currentRoundId).toBe("round-paused");
+    expect(task.currentInstruction).toBe("部署集群");
+    expect(task.pauseReason).toBe("资源不足");
+    expect(task.plan).toHaveLength(1);
+    expect(task.planHistory).toHaveLength(0);
+  });
+
   it("临时旁问只追加回答，不改变整体目标和原状态", async () => {
     const store = useOpsStore();
     const original = store.createTask("srv-production-01", "safe", "model-deepseek");
@@ -2960,15 +3190,10 @@ describe("智能任务状态机", () => {
     expect(store.tasks).toHaveLength(1);
     expect(original.status).toBe("completed");
     expect(original.rootGoal).toBe("部署 office 项目");
-    expect(original.currentInstruction).toBe("Composer 是做什么的？");
-    expect(original.plan).toEqual([]);
-    expect(original.summary).toBeUndefined();
-    expect(original.planHistory).toHaveLength(1);
-    expect(original.planHistory?.[0]).toMatchObject({
-      requirement: "部署 office 项目",
-      summary: "office 项目部署完成",
-    });
-    expect(original.planHistory?.[0].plan).toHaveLength(3);
+    expect(original.currentInstruction).toBe("部署 office 项目");
+    expect(original.plan).toHaveLength(3);
+    expect(original.summary).toBe("office 项目部署完成");
+    expect(original.planHistory).toHaveLength(0);
     expect(original.messages[original.messages.length - 1]?.content).toContain("PHP");
   });
 
@@ -3164,7 +3389,7 @@ describe("智能任务状态机", () => {
     expect(store.activeTask?.id).toBe(taskId);
     expect(store.activeTask?.activeSkillIds).toEqual([]);
     expect(store.activeTask?.plan).toHaveLength(1);
-    expect(store.activeTask?.planHistory?.[0].plan).toEqual([]);
+    expect(store.activeTask?.planHistory).toEqual([]);
   });
 
   it("暂停后输入进行调整会直接触发本轮调整而不是交给模型当咨询", async () => {
@@ -3468,6 +3693,7 @@ describe("智能任务状态机", () => {
   it("会把误写成命令行选项的工具 ID 规范化为注册 ID", () => {
     const normalized = normalizePlanPreconditions([{
       ...structuredClone(plan[0]),
+      kind: "observe",
       command: 'opsark-tool --files.get_structure {"rootPath":"/opt/app"}',
       validation: "true",
     }]);
@@ -3497,7 +3723,7 @@ describe("智能任务状态机", () => {
     };
     expect(() => normalizePlanPreconditions([read, shell])).toThrow("只读批次不能混入");
     expect(() => normalizePlanPreconditions([read, { ...read, id: "change", kind: "change" }]))
-      .toThrow("只读批次不能混入");
+      .toThrow("kind 必须为 observe");
   });
 
   it("拒绝 standalone 工具与其他待执行步骤共存", () => {
@@ -3713,7 +3939,7 @@ describe("智能任务状态机", () => {
     expect(store.activeTask?.plan.some((step) => step.command.includes("restart"))).toBe(false);
   });
 
-  it("模型确认整体目标已达成时跳过剩余步骤并完成任务", async () => {
+  it("模型宣称完成不能覆盖未通过的真实后置校验", async () => {
     vi.mocked(backend.validateStep).mockResolvedValueOnce({ passed: false, exitCode: 2, detail: "独立校验与主输出冲突，需要复核" });
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
@@ -3737,9 +3963,9 @@ describe("智能任务状态机", () => {
 
     await store.runStep(task.id, task.plan[0].id);
 
-    expect(task.plan[0].status).toBe("completed");
-    expect(task.plan[1].status).toBe("skipped");
-    expect(task.status).toBe("completed");
+    expect(task.plan[0].status).toBe("failed");
+    expect(task.plan[1].status).toBe("pending");
+    expect(task.status).toBe("needs_adjustment");
     expect(backend.executeCommand).toHaveBeenCalledTimes(1);
   });
 
@@ -3789,8 +4015,8 @@ describe("智能任务状态机", () => {
     await running;
 
     expect(backend.reviewStep).toHaveBeenCalledTimes(1);
-    expect(task.plan[0].status).toBe("completed");
-    expect(task.status).toBe("completed");
+    expect(task.plan[0].status).toBe("failed");
+    expect(task.status).toBe("needs_adjustment");
     expect(task.messages.some((message) =>
       message.content.includes("后置状态尚未稳定")
       && message.content.includes("有界窗口"),
@@ -3823,8 +4049,9 @@ describe("智能任务状态机", () => {
     expect(task.pauseReason).toContain("模型复核不可用");
   });
 
-  it("变更步骤后置校验失败时仅在剩余计划可修复的情况下允许继续", async () => {
+  it("变更后置失败依次执行关联修复和原契约复验，保留原始失败状态", async () => {
     vi.useFakeTimers();
+    vi.mocked(backend.executeCommand).mockResolvedValue({ output: "command completed", success: true, simulated: false, exitCode: 0 });
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
@@ -3832,6 +4059,7 @@ describe("智能任务状态机", () => {
       {
         ...structuredClone(plan[1]),
         id: "install-nvm",
+        kind: "change",
         title: "安装 nvm",
         command: "curl -fsSL https://example.com/install.sh | bash",
         validation: "test -s ~/.nvm/nvm.sh",
@@ -3839,9 +4067,17 @@ describe("智能任务状态机", () => {
       {
         ...structuredClone(plan[1]),
         id: "load-nvm",
+        kind: "change",
         title: "加载 nvm 环境",
         command: "source ~/.nvm/nvm.sh && nvm --version",
         validation: "source ~/.nvm/nvm.sh && command -v nvm",
+        recovery: { failedStepId: "install-nvm", targetContext: taskAttemptContext(task), purpose: "repair" },
+      },
+      {
+        ...structuredClone(plan[0]), id: "verify-nvm", kind: "observe",
+        expected: "服务正常",
+        title: "复验 nvm 原后置条件", command: "test -s ~/.nvm/nvm.sh", validation: "",
+        recovery: { failedStepId: "install-nvm", targetContext: taskAttemptContext(task), purpose: "verify" },
       },
     ];
     vi.mocked(backend.validateStep)
@@ -3864,8 +4100,9 @@ describe("智能任务状态机", () => {
     await running;
 
     expect(backend.reviewStep).toHaveBeenCalledTimes(1);
-    expect(task.plan[0].status).toBe("completed");
+    expect(task.plan[0].status).toBe("failed");
     expect(task.plan[1].status).toBe("completed");
+    expect(task.plan[2].status).toBe("completed");
     expect(task.status).toBe("completed");
     vi.useRealTimers();
   });
@@ -3907,7 +4144,7 @@ describe("智能任务状态机", () => {
     expect(task.pauseReason).toContain("ABI 不兼容");
   });
 
-  it("只读 HTTP 主结果明确时独立校验冲突会重试并进入复核而不直接失败", async () => {
+  it("旧 HTTP 计划的独立校验冲突保留主命令成功事实并要求调整", async () => {
     vi.useFakeTimers();
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
@@ -3944,10 +4181,10 @@ describe("智能任务状态机", () => {
 
     expect(backend.validateStep).toHaveBeenCalledTimes(4);
     expect(backend.reviewStep).toHaveBeenCalledTimes(1);
-    expect(task.plan[0].status).toBe("completed");
+    expect(task.plan[0].status).toBe("failed");
     expect(task.plan[0].result?.executionStatus).toBe("success");
     expect(task.plan[0].result?.facts.evidenceConflict).toBe(true);
-    expect(task.status).toBe("completed");
+    expect(task.status).toBe("needs_adjustment");
     expect(task.plan[0].output).toContain("首次未通过");
     expect(task.currentExecutionId).toBeUndefined();
     vi.useRealTimers();
@@ -4331,7 +4568,7 @@ describe("智能任务状态机", () => {
     expect(backend.executeCommand).not.toHaveBeenCalled();
   });
 
-  it("用户明确要求使用当前版本尝试时由模型复核后继续执行", async () => {
+  it("best_effort 允许模型复核后的真实尝试但不自动消除原阻断", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     store.pushMessage(task, {
@@ -4395,9 +4632,9 @@ describe("智能任务状态机", () => {
     expect(reviewContext).not.toHaveProperty("userRequirement");
     expect(backend.executeCommand).toHaveBeenCalledTimes(1);
     expect(task.plan[1].status).toBe("completed");
-    expect(task.status).toBe("completed");
+    expect(task.status).toBe("needs_adjustment");
     expect(task.messages.some((message) =>
-      message.content.includes("模型结合用户需求、执行约束"),
+      message.content.includes("用户明确允许 best_effort 尝试"),
     )).toBe(true);
   });
 
@@ -4440,6 +4677,22 @@ describe("智能任务状态机", () => {
     expect(task.plan[0].review?.decision).toBe("continue");
     expect(task.plan[1].status).toBe("awaiting_approval");
     expect(task.status).toBe("awaiting_step_approval");
+  });
+
+  it("直接 runStep 也不能绕过失败前序去执行后续业务", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
+    task.status = "running";
+    task.plan = [{ ...structuredClone(plan[1]), id: "images-failed", kind: "change", status: "failed",
+      command: "kubeadm config images pull", attemptContext: taskAttemptContext(task),
+      result: { executionStatus: "failed", observationStatus: "unknown", exitCode: 1,
+        facts: { category: "network_failure" }, warnings: [], evidenceIds: [], failureReason: "registry unreachable" } },
+    { ...structuredClone(plan[1]), id: "init-pending", kind: "change", command: "kubeadm init" }];
+    await store.runStep(task.id, "init-pending");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(task.plan[1].status).toBe("pending");
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.pauseReason).toContain("registry unreachable");
   });
 
   it("未安装领域 Skill 时未知工具失败保留为通用失败", () => {
@@ -4488,7 +4741,7 @@ describe("智能任务状态机", () => {
     expect(task.plan[0].review).toMatchObject({ decision: "adjust", source: "rules" });
   });
 
-  it("主命令失败后模型会结合用户约束和剩余恢复步骤决定继续", async () => {
+  it("主命令失败后只执行关联恢复，未真实复验时保留待验收状态", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     store.pushMessage(task, {
@@ -4508,9 +4761,11 @@ describe("智能任务状态机", () => {
       {
         ...structuredClone(plan[1]),
         id: "container-recovery",
+        kind: "change",
         title: "使用兼容容器构建",
         command: "docker run --rm -v /opt/app:/app node:20 bash -lc 'cd /app && npm run build'",
         validation: "test -f /opt/app/dist/index.html",
+        recovery: { failedStepId: "failed-build-with-recovery", targetContext: taskAttemptContext(task), purpose: "repair" },
       },
     ];
     vi.mocked(backend.executeCommand)
@@ -4548,6 +4803,6 @@ describe("智能任务状态机", () => {
     expect(reviewContext.remainingSteps.items[0].title).toBe("使用兼容容器构建");
     expect(task.plan[0].status).toBe("failed");
     expect(task.plan[1].status).toBe("completed");
-    expect(task.status).toBe("completed");
+    expect(task.status).toBe("needs_adjustment");
   });
 });

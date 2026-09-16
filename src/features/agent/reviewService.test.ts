@@ -81,6 +81,7 @@ describe("review service", () => {
   it("does not let a model mark a failed mutating command complete", async () => {
     const task = createTask();
     const failed = createStep("deploy", "systemctl restart app", "failed");
+    failed.attemptContext = "target-1";
     failed.result = {
       executionStatus: "failed",
       observationStatus: "unknown",
@@ -89,7 +90,8 @@ describe("review service", () => {
       evidenceIds: [],
       failureReason: "command failed",
     };
-    task.plan = [failed, createStep("修复服务", "systemctl start app", "pending")];
+    task.plan = [failed, { ...createStep("修复服务", "systemctl start app", "pending"),
+      kind: "change", recovery: { failedStepId: failed.id, targetContext: "target-1", purpose: "repair" } }];
     const result = await reviewExecutionFailure({
       task,
       step: failed,
@@ -132,6 +134,48 @@ describe("review service", () => {
     expect(JSON.stringify(result.context)).toContain("Cannot find module autoprefixer");
     expect(failed.status).toBe("failed");
     expect(task.plan[1].status).toBe("pending");
+  });
+
+  it("does not treat pending kubeadm init or Flannel deployment as image-pull recovery", async () => {
+    const task = createTask();
+    const failed = createStep(
+      "pull-images",
+      "timeout 600 kubeadm config images pull --kubernetes-version=v1.28.2",
+      "failed",
+    );
+    failed.kind = "change";
+    failed.title = "拉取 Kubernetes 镜像";
+    failed.result = {
+      executionStatus: "failed",
+      observationStatus: "unhealthy",
+      exitCode: 1,
+      facts: { category: "network_failure", networkFailure: true },
+      warnings: [],
+      evidenceIds: [],
+      failureReason: "registry.k8s.io connection timed out",
+    };
+    const init = createStep("init-control-plane", "kubeadm init --config /root/kubeadm.yaml", "pending");
+    init.kind = "change";
+    init.title = "初始化 Kubernetes 控制平面";
+    init.description = "配置并部署主节点";
+    const flannel = createStep("install-flannel", "kubectl apply -f /root/kube-flannel.yml", "pending");
+    flannel.kind = "change";
+    flannel.title = "部署 Flannel 网络";
+    flannel.description = "应用 CNI 配置";
+    task.plan = [failed, init, flannel];
+    const reviewer = vi.fn();
+
+    const result = await reviewExecutionFailure({
+      task,
+      step: failed,
+      failureReason: failed.result.failureReason!,
+      failureCategory: "network_failure",
+      model,
+    }, reviewer);
+
+    expect(reviewer).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ mutatingStep: true, recoveryStepFound: false });
+    expect(result.finalDecision).toMatchObject({ decision: "adjust", source: "rules" });
   });
 
   it("still asks the model to interpret a failed read-only diagnostic", async () => {
@@ -208,4 +252,3 @@ describe("review service", () => {
     expect(result.finalDecision).toMatchObject({ decision: "continue", source: "rules" });
   });
 });
-

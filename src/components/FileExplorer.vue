@@ -65,7 +65,7 @@ const store = useOpsStore();
 const transferQueue = useTransferQueueStore();
 const fileWorkspace = useFileWorkspaceStore();
 const workspaceLinks = useWorkspaceLinkStore();
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const fileInput = ref<HTMLInputElement>();
 const nameInput = ref<HTMLInputElement>();
 const pathInput = ref<HTMLInputElement>();
@@ -96,14 +96,16 @@ const isLive = computed(() => store.isServerConnected(props.serverId));
 const hasSnapshot = computed(() => Boolean(fileState.value.lastSuccessAt));
 const directoryStateMessage = computed(() => {
   const status = store.serverConnection(props.serverId).status;
-  const label = status === "suspect" ? "连接待确认"
-    : isLive.value ? (fileState.value.loading ? "正在刷新目录" : "目录刷新失败／非实时")
-    : status === "connecting" || status === "reconnecting" ? "正在连接"
-    : "离线缓存／非实时";
-  if (!hasSnapshot.value) return isLive.value ? "正在读取目录" : `${label} · 等待连接成功后读取目录`;
+  const label = status === "suspect" ? t("files.connectionPending")
+    : isLive.value ? (fileState.value.loading ? t("files.refreshingDirectory") : t("files.refreshFailedStale"))
+    : status === "connecting" || status === "reconnecting" ? t("files.connectingDirectory")
+    : t("files.offlineCache");
+  if (!hasSnapshot.value) return isLive.value
+    ? t("files.readingDirectory")
+    : t("files.waitingForDirectoryConnection", { status: label });
   const date = new Date(fileState.value.lastSuccessAt!);
-  const updated = Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString();
-  return `${label} · 最后更新于 ${updated}`;
+  const updated = Number.isNaN(date.getTime()) ? t("files.unknownTime") : date.toLocaleString(locale.value);
+  return t("files.directoryLastUpdated", { status: label, time: updated });
 });
 const showFiles = computed(() => hasSnapshot.value && (isLive.value || showOfflineCache.value));
 const draggingUpload = computed(() => isLive.value && uploadDragDepth.value > 0);
@@ -175,7 +177,7 @@ async function loadDirectory(path: string) {
     store.addLog({
       category: "system",
       level: "error",
-      title: "SFTP 目录读取失败",
+      title: t("files.audit.readDirectoryFailed"),
       detail: String(result.error),
       serverId,
     });
@@ -302,7 +304,7 @@ async function queueUpload(file: File, remoteName = file.name) {
     store.addLog({
       category: "command",
       level: "success",
-      title: "SFTP 上传文件",
+      title: t("files.audit.uploadFile"),
       detail: `${remotePath} · ${data.byteLength} bytes`,
       serverId: props.serverId,
     });
@@ -483,7 +485,7 @@ async function download(entry: FileEntry) {
       store.addLog({
         category: "command",
         level: "info",
-        title: "SFTP 下载文件",
+        title: t("files.audit.downloadFile"),
         detail: `${entry.path} · ${data.byteLength} bytes`,
         serverId: props.serverId,
       });
@@ -607,7 +609,7 @@ onBeforeUnmount(() => {
     <div v-if="!isLive || fileState.stale || fileState.loading" class="file-directory-state" role="status">
       <TriangleAlert :size="14" />
       <span>{{ directoryStateMessage }}</span>
-      <button v-if="!isLive && hasSnapshot" type="button" @click="showOfflineCache = !showOfflineCache">{{ showOfflineCache ? '收起缓存' : '查看离线缓存' }}</button>
+      <button v-if="!isLive && hasSnapshot" type="button" @click="showOfflineCache = !showOfflineCache">{{ showOfflineCache ? t('files.hideOfflineCache') : t('files.showOfflineCache') }}</button>
     </div>
     <div class="file-table-viewport" :style="fileTableStyle">
     <div class="file-table-head">

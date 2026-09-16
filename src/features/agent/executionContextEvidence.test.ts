@@ -1,8 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { executionContextEvidence, modelToolOutput } from "./executionContextEvidence";
+import { executionContextEvidence, modelContextStep, modelToolOutput } from "./executionContextEvidence";
 import type { PlanStep } from "@/types";
 
 describe("execution evidence in model context", () => {
+  it("does not bypass scoped decisions through historical form output", () => {
+    const step = { id: "form-1", output: '{"values":{"TARGET":"old-server-value"}}',
+      result: { facts: { toolId: "user.request_input", values: { TARGET: "legacy-fact-value" } } },
+      evidence: [{ id: "form-evidence", rawOutput: '{"values":{"TARGET":"old-server-value"}}', facts: { TARGET: "legacy-fact-value" } }],
+    } as unknown as PlanStep;
+    const projected = executionContextEvidence(step, value => value);
+    expect(projected.output).toMatchObject({ contentRef: "confirmedUserInputs", sourceStepId: "form-1" });
+    expect(JSON.stringify(projected)).not.toContain("old-server-value");
+    expect(JSON.stringify(projected)).not.toContain("legacy-fact-value");
+    expect(JSON.stringify(modelContextStep(step))).not.toContain("legacy-fact-value");
+    expect(step.output).toContain("old-server-value");
+  });
+
   it("reconstructs every shared fact and output without modifying the original ledger", () => {
     const output = "完整结果\n".repeat(1000);
     const step = {

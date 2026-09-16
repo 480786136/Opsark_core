@@ -13,8 +13,99 @@ import { resolveSkillRegistry } from "@/features/skills/skillRegistry";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { planCommandIdentity } from "@/features/agent/taskProgression";
 import { textFingerprint } from "@/features/agent/longRunningReviewOutput";
+import { confirmedInputScope } from "@/features/agent/confirmedUserInputs";
 
 describe("agent context", () => {
+  it("does not rebuild the general decision snapshot for a persisted protocol repair", () => {
+    const task = createTask();
+    task.protocolRepair = { roundId: task.currentRoundId, serverId: task.serverId,
+      repair: { errorCode: "plan_normalization_failed", validationError: "recovery command mutation",
+        previousModelOutput: task.plan, instruction: "只修复command", fieldPath: "steps[0].command" },
+      repairError: "no progress" };
+    const input = { task, server: createServer(), tools: [], secretMetadata: [] };
+    const context = buildAdjustmentContext(input, task.plan[0], { sharedSnapshot: { rawHistory: "must-not-return".repeat(30000) } });
+    expect(context.baseSnapshot).toBeUndefined();
+    expect(context.authentication).toBeUndefined();
+    expect(context.planGenerationRepair).toBe(task.protocolRepair.repair);
+    expect(context.permission).toBe(task.permission);
+    expect(JSON.stringify(context)).not.toContain("must-not-return");
+  });
+
+  it("keeps current authority at the top level even when adjustment evidence uses a cached snapshot", () => {
+    const current = createTask();
+    current.rootGoal = "只读检查应用";
+    current.permission = "safe";
+    current.executionConstraints = { changePolicy: "read_only", environmentPolicy: "preserve", failurePolicy: "strict",
+      prohibitedActions: ["修改"], requiredConditions: [], userDirectives: ["用户未授权修改"] };
+    const input = { server: createServer(), task: current, metrics: undefined, tools: [], secretMetadata: [] };
+    const context = buildAdjustmentContext(input, undefined, {
+      sharedSnapshot: { task: { permission: "managed" }, executionConstraints: { changePolicy: "requested_changes_only" } },
+    });
+    expect(context.permission).toBe("safe");
+    expect(context.executionConstraints?.changePolicy).toBe("read_only");
+    expect(context.taskGoal.rootGoal).toBe("只读检查应用");
+    expect(buildNextStageContext(input).permission).toBe("safe");
+  });
+
+  it("carries confirmed non-sensitive inputs through every planning context and cache identity", () => {
+    const current = createTask();
+    current.submittedInputs = {
+      image_registry: {
+        value: "registry.aliyuncs.com/google_containers",
+        type: "select",
+        label: "镜像仓库",
+        description: "kubeadm 镜像仓库",
+        groupId: "input-1",
+        scope: confirmedInputScope(current, "input-1"),
+        groupTitle: "部署源选择",
+        submittedAt: "2026-09-15T07:50:52.000Z",
+      },
+    };
+    current.submittedSecretBindings = {
+      REGISTRY_TOKEN: {
+        key: "REGISTRY_TOKEN",
+        label: "SECRET_BINDING_MUST_NOT_LEAK",
+        description: "SECRET_BINDING_MUST_NOT_LEAK",
+        groupId: "secret-1",
+        groupTitle: "secret",
+        submittedAt: "2026-09-15T07:50:52.000Z",
+      },
+    };
+    const workflowInput = {
+      server: createServer(),
+      metrics: { cpu: 1, memory: 2, disk: 3, networkIn: 4, networkOut: 5, sampledAt: "now" },
+      task: current,
+      tools: resolveToolRegistry([]),
+      secretMetadata: [],
+    };
+    const initial = buildAgentContext({
+      ...workflowInput,
+      permission: current.permission,
+      conversationHistory: [],
+      knownExecutionFacts: {},
+      serverId: current.serverId,
+    });
+    const contexts = [
+      initial,
+      buildAdjustmentContext(workflowInput, current.plan[0]),
+      buildContinuationContext(workflowInput),
+      buildNextStageContext(workflowInput),
+    ];
+
+    for (const context of contexts) {
+      expect(context.confirmedUserInputs?.items[0]).toMatchObject({
+        key: "image_registry",
+        value: "registry.aliyuncs.com/google_containers",
+      });
+      expect(JSON.stringify(context)).not.toContain("SECRET_BINDING_MUST_NOT_LEAK");
+    }
+
+    const changed = structuredClone(current);
+    changed.submittedInputs!.image_registry.value = "registry.example.invalid/k8s";
+    expect(nextStagePolicyFingerprint({ ...workflowInput, task: changed }))
+      .not.toBe(nextStagePolicyFingerprint(workflowInput));
+  });
+
   it("contains enabled tools and secret metadata without values", () => {
     const context = buildAgentContext({
       metrics: { cpu: 1, memory: 2, disk: 3, networkIn: 4, networkOut: 5, sampledAt: "now" },
@@ -159,6 +250,8 @@ describe("agent context", () => {
 
   it("安全门禁调整上下文只携带命中字段、结构化规则和相邻标题", () => {
     const task = createTask();
+    task.executionConstraints = { changePolicy: "read_only", environmentPolicy: "preserve", failurePolicy: "strict",
+      prohibitedActions: ["修改"], requiredConditions: [], userDirectives: ["只允许检查"] };
     const failed = {
       ...task.plan[0],
       id: "blocked",
@@ -205,6 +298,9 @@ describe("agent context", () => {
     }, failed);
     const serialized = JSON.stringify(context);
 
+    expect(context.permission).toBe(task.permission);
+    expect(context.executionConstraints?.changePolicy).toBe("read_only");
+    expect(context.taskGoal.rootGoal).toBeTruthy();
     expect(context.failedStep).toMatchObject({
       stepIndex: 2,
       title: "验收数据库",
