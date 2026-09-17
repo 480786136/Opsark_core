@@ -371,6 +371,9 @@ describe("plan normalization repair feedback", () => {
       fieldPath: "steps[0].command.arguments.title" });
     expect((error as PlanProtocolError).repair.progress?.attemptCount).toBe(1);
     expect((error as Error).message).toContain("description");
+    expect((error as PlanProtocolError).userMessage).toContain("未执行任何新的服务器操作");
+    expect((error as PlanProtocolError).userMessage).not.toContain("description");
+    expect((error as PlanProtocolError).developerMessage).toContain("description");
     expect(invoke).toHaveBeenCalledOnce();
     expect(invoke).toHaveBeenCalledWith("generate_ai_plan", expect.objectContaining({ requirement: expect.stringContaining("只修复") }));
   });

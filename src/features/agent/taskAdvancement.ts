@@ -51,9 +51,14 @@ export async function runDiscoveryRefinement(
     return { kind: "success" as const, pending, autoApprove, eventMessage };
   } catch (error) {
     if (input.isCancelled()) return { kind: "cancelled" as const };
-    const pauseReason = `后续计划生成失败：${String(error)}`;
+    const protocolError = error instanceof PlanProtocolError ? error : undefined;
+    const pauseReason = protocolError
+      ? "当前检查已完成，系统正在根据已有结果完善后续方案。需要确认的操作会在执行前提示。"
+      : "当前检查结果已保留，但暂时无法形成可执行的后续方案。可以稍后重试生成。";
+    const technicalDetail = protocolError?.developerMessage
+      ?? (error instanceof Error ? error.stack || `${error.name}: ${error.message}` : String(error));
     return { kind: "failed" as const, pauseReason, eventMessage: pauseReason,
-      protocolError: error instanceof PlanProtocolError ? error : undefined };
+      protocolError, technicalDetail };
   }
 }
 

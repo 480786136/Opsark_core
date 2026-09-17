@@ -19,6 +19,8 @@ describe("SkillManagementPanel", () => {
     app.mount(host);
     await nextTick();
 
+    expect(host.querySelector(".tool-list-panel > .tool-search")).not.toBeNull();
+    expect(host.querySelector(".tool-list-panel > .tool-list-scroll")).not.toBeNull();
     expect(host.textContent).toContain("终端 SSH 跳转");
     expect(host.textContent).toContain("连接与访问");
     expect(host.textContent).toContain("源码与版本控制");

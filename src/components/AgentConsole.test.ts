@@ -382,13 +382,13 @@ describe("AgentConsole 服务器工作区隔离", () => {
     } finally { app.unmount(); }
   });
 
-  it.each(["safe", "managed"] as const)("%s 模式协议阻断显示重新规划并评估风险，点击进入业务调整入口", async permission => {
+  it.each(["safe", "managed"] as const)("%s 模式仅在自动协议恢复耗尽后显示中性重试入口", async permission => {
     const pinia = createPinia();
     const ops = useOpsStore(pinia);
     const task = ops.createTask("server-a", permission, "model-deepseek");
     task.status = "needs_adjustment";
     task.managedAdjustmentPhase = "manual_required";
-    task.pauseReason = "OBSERVE_COMMAND_MUTATION：协议修复失败，原计划未执行";
+    task.pauseReason = "PlanProtocolError：OBSERVE_COMMAND_MUTATION；PROTOCOL_REPAIR_SCOPE_VIOLATION";
     task.plan = [{ id: "inspect", kind: "observe", title: "检查组件", description: "读取组件版本",
       command: "uname -a", validation: "", expected: "获取真实版本", risk: "low", status: "completed" }];
     task.protocolRepair = { serverId: task.serverId, roundId: task.currentRoundId,
@@ -402,7 +402,14 @@ describe("AgentConsole 服务器工作区隔离", () => {
     try {
       await nextTick();
       const button = host.querySelector<HTMLButtonElement>(".approval-bar.warning .button.primary")!;
-      expect(button.textContent).toBe("重新规划并评估风险");
+      expect(host.textContent).toContain("当前检查结果已保留，后续方案待完善");
+      expect(host.textContent).toContain("当前检查结果和已完成步骤已保留");
+      expect(host.textContent).not.toContain("PlanProtocolError");
+      expect(host.textContent).not.toContain("OBSERVE_COMMAND_MUTATION");
+      expect(host.textContent).not.toContain("PROTOCOL_REPAIR_SCOPE_VIOLATION");
+      expect(host.querySelector<HTMLButtonElement>(".approval-bar.warning .button.secondary")?.textContent)
+        .toBe("保留结果并结束");
+      expect(button.textContent).toBe("重试生成后续方案");
       expect(host.querySelector(".managed-approval-countdown")).toBeNull();
       button.click();
       await nextTick();
@@ -749,8 +756,60 @@ describe("AgentConsole 服务器工作区隔离", () => {
     app.mount(host);
     await nextTick();
 
-    expect(host.textContent).toContain("当前步骤已完成，后续计划生成失败");
+    expect(host.textContent).toContain("当前检查结果已保留，后续方案待完善");
+    expect(host.textContent).toContain("当前检查结果和已完成步骤已保留");
+    expect(host.textContent).not.toContain("生成失败");
     expect(host.textContent).not.toContain("证据校验未通过，任务已暂停");
+    app.unmount();
+  });
+
+  it("旧协议详情不会从阶段、归档总结或归档记录重新显示", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    const task = ops.createTask("server-a", "safe", "model-deepseek");
+    task.status = "awaiting_plan_approval";
+    task.currentRoundId ||= "current-round";
+    const diagnostic = "PlanProtocolError: OBSERVE_COMMAND_MUTATION / steps[3].command / PROTOCOL_REPAIR_SCOPE_VIOLATION";
+    task.plan = [{
+      id: "current-step", kind: "observe", title: "继续检查", description: "读取状态",
+      command: "uptime", expected: "返回运行时间", validation: "", risk: "low", status: "pending",
+    }];
+    task.phaseHistory = [{
+      id: "legacy-phase", roundId: task.currentRoundId, requirement: "检查运行状态", reason: "replan",
+      plan: [], summary: diagnostic, createdAt: "2026-09-16T23:58:00.000Z", completedAt: "2026-09-16T23:59:00.000Z",
+    }];
+    task.planHistory = [{
+      id: "legacy-round", roundId: "legacy-round-id", requirement: "检查运行状态", status: "needs_adjustment",
+      plan: [{
+        id: "legacy-step", kind: "observe", title: "检查系统", description: "读取状态",
+        command: "hostname", expected: "返回主机名", validation: "", risk: "low", status: "completed",
+      }],
+      response: { id: "legacy-response", role: "assistant", kind: "summary", content: diagnostic,
+        createdAt: "2026-09-16T23:57:00.000Z" },
+      records: [{ id: "legacy-record", role: "system", kind: "event", content: diagnostic,
+        createdAt: "2026-09-16T23:57:30.000Z" }],
+      summary: diagnostic,
+      createdAt: "2026-09-16T23:50:00.000Z", completedAt: "2026-09-16T23:59:00.000Z",
+    }];
+    useAgentWorkspaceStore(pinia).updateServer("server-a", { activeTaskId: task.id, automationEnabled: true });
+
+    const app = createApp(AgentConsole, { serverId: "server-a" }).use(pinia).use(i18n);
+    app.mount(host);
+    await nextTick();
+    expect(host.textContent).toContain("当前检查结果和已完成步骤已保留");
+    expect(host.textContent).not.toContain("OBSERVE_COMMAND_MUTATION");
+
+    host.querySelector<HTMLButtonElement>(".phase-history-head")!.click();
+    host.querySelector<HTMLButtonElement>(".archived-plan .archived-head")!.click();
+    await nextTick();
+    host.querySelector<HTMLButtonElement>(".execution-record-card .archived-head")!.click();
+    await nextTick();
+
+    expect(host.textContent).not.toContain("PlanProtocolError");
+    expect(host.textContent).not.toContain("OBSERVE_COMMAND_MUTATION");
+    expect(host.textContent).not.toContain("steps[3].command");
+    expect(host.textContent).not.toContain("PROTOCOL_REPAIR_SCOPE_VIOLATION");
     app.unmount();
   });
 
@@ -846,8 +905,9 @@ describe("AgentConsole 服务器工作区隔离", () => {
     app.mount(host);
     await nextTick();
 
-    expect(host.textContent).toContain("计划编译失败");
-    expect(host.textContent).toContain("可直接重试规划");
+    expect(host.textContent).toContain("执行方案待完善");
+    expect(host.textContent).toContain("当前检查结果和已完成步骤已保留");
+    expect(host.textContent).not.toContain("协议校验");
     expect(host.textContent).toContain("重试规划");
     expect([...host.querySelectorAll("button")].some((button) => button.textContent?.includes("生成调整方案"))).toBe(false);
     expect(host.querySelector(".managed-approval-countdown")).toBeNull();

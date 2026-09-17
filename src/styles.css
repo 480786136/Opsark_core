@@ -526,7 +526,10 @@ button:disabled, input:disabled, textarea:disabled, select:disabled { opacity: v
 .context-chip span { flex: 1; }
 .context-chip button { border: 0; color: var(--accent); background: transparent; cursor: pointer; }
 .composer textarea { width: 100%; min-height: 62px; padding: 11px; border: 0; outline: 0; resize: none; color: var(--text); background: transparent; font-size: 10.5px; line-height: 1.55; }
-.composer-tools { display: flex; flex-wrap: wrap; align-items: center; padding: 5px 6px; border-top: 1px solid var(--border-soft); gap: 5px; }
+.composer-tools { display: flex; flex-wrap: nowrap; align-items: center; min-width: 0; padding: 5px 6px; border-top: 1px solid var(--border-soft); gap: 5px; }
+.composer-tools > .composer-model-select { width: 0; min-width: 0; flex: 1 1 0; }
+.composer-tools > .composer-permission-select { width: 112px; min-width: 0; flex: 0 1 112px; }
+.composer-tools > .context-button, .composer-tools > .send-button { flex-shrink: 0; white-space: nowrap; }
 .context-button { height: 25px; padding: 0 6px; display: flex; align-items: center; gap: 4px; border: 0; border-radius: 3px; color: var(--muted); background: var(--panel-3); font-size: 7.5px; cursor: pointer; }
 .composer select, .filter-bar select { height: 25px; min-width: 0; max-width: 140px; border: 0; border-radius: 3px; padding: 0 26px 0 6px; color: var(--muted); background-color: var(--panel-3); font-size: 7.5px; }
 .composer select { flex: 1 1 92px; }
@@ -633,9 +636,10 @@ button:disabled, input:disabled, textarea:disabled, select:disabled { opacity: v
 .info-card h3 { margin: 0 0 6px; color: var(--text); font-size: 11px; }
 .info-card p { margin: 0; font-size: 9px; line-height: 1.6; }
 .tool-management-layout { min-height: 520px; display: grid; grid-template-columns: 250px minmax(0, 1fr); border-top: 1px solid var(--border-soft); }
-.tool-list-panel { min-width: 0; padding: 12px 12px 0 0; border-right: 1px solid var(--border-soft); }
+.tool-list-panel { min-width: 0; min-height: 0; padding: 12px 12px 0 0; display: flex; flex-direction: column; overflow: hidden; border-right: 1px solid var(--border-soft); }
 .tool-search { height: 34px; margin-bottom: 10px; padding: 0 9px; display: flex; align-items: center; gap: 7px; border: 1px solid var(--border); border-radius: 5px; color: var(--dim); background: var(--surface-input); }
 .tool-search input { min-width: 0; flex: 1; border: 0; outline: 0; color: var(--text); background: transparent; font-size: 9px; }
+.tool-list-scroll { min-height: 0; padding: 0 5px 12px 0; flex: 1 1 auto; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .skill-category-filter { width: 100%; height: 32px; margin-bottom: 8px; padding: 0 28px 0 8px; border: 1px solid var(--border); border-radius: 5px; color: var(--muted); background-color: var(--surface-input); font-size: 9px; }
 .skill-add-button { width: 100%; min-height: 32px; margin-bottom: 8px; display: flex; align-items: center; justify-content: center; gap: 6px; border: 1px dashed var(--border); border-radius: 5px; color: var(--accent); background: transparent; cursor: pointer; font-size: 9px; }
 .skill-add-button:hover { border-color: var(--accent); background: var(--accent-soft); }
@@ -650,7 +654,7 @@ button:disabled, input:disabled, textarea:disabled, select:disabled { opacity: v
 .tool-list-item > i { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); }
 .tool-list-item > i.enabled { background: var(--green); }
 .tool-empty { padding: 18px 8px; color: var(--dim); font-size: 9px; text-align: center; }
-.tool-editor { min-width: 0; padding: 14px 0 0 18px; }
+.tool-editor { min-width: 0; min-height: 0; padding: 14px 8px 20px 18px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .tool-editor-head { min-height: 38px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .tool-editor-head > div { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .tool-editor-head strong { color: var(--accent); font: 10px DM Mono, monospace; }
@@ -1399,6 +1403,7 @@ button:disabled, input:disabled, textarea:disabled, select:disabled { opacity: v
   .summary-card-icon { width: 30px; height: 30px; margin: 11px 0 0 11px; flex-basis: 30px; border-radius: 8px; }
   .summary-card-content { padding: 11px 11px 14px 9px; }
   .composer-tools { gap: 4px; }
+  .composer-tools > .composer-permission-select { width: 92px; flex-basis: 92px; }
   .composer select { flex-basis: 76px; max-width: 105px; }
 }
 .task-process-empty { min-height: 360px; background: transparent; }
@@ -1461,6 +1466,12 @@ button:disabled, input:disabled, textarea:disabled, select:disabled { opacity: v
 /* 全局自适应：视口宽度、视口高度与可滚动边界 */
 .app-main, .page, .management-layout, .settings-layout, .settings-card,
 .modal-card, .file-editor-panel, .server-log-workspace { min-width: 0; }
+.registry-management-page { height: 100%; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.registry-management-page .page-header { flex: 0 0 auto; }
+.registry-management-page .management-layout { min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; overflow: hidden; }
+.registry-management-page .management-layout > .security-hint { margin: 0 0 10px; flex: 0 0 auto; }
+.registry-management-page .management-layout > :is(.tool-management-card, .skill-management-card) { min-height: 0; flex: 1 1 auto; display: flex; flex-direction: column; overflow: hidden; }
+.registry-management-page .tool-management-layout { min-height: 0; flex: 1 1 auto; overflow: hidden; }
 .modal-backdrop { padding: clamp(10px, 3vw, 24px); overflow: auto; overscroll-behavior: contain; }
 .modal-card { width: min(100%, 470px); max-height: calc(100dvh - 2 * clamp(10px, 3vw, 24px)); overflow: auto; }
 .connection-card { width: min(100%, 420px); }
@@ -1530,6 +1541,8 @@ button:disabled, input:disabled, textarea:disabled, select:disabled { opacity: v
   .management-page .tool-management-card, .management-page .skill-management-card, .tool-management-layout { min-height: 0; }
   .tool-management-layout { grid-template-rows: auto minmax(280px, 1fr); }
   .tool-list-panel { max-height: 240px; overflow-y: auto; }
+  .registry-management-page .tool-management-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: clamp(150px, 34%, 220px) minmax(0, 1fr); }
+  .registry-management-page .tool-list-panel { max-height: none; overflow: hidden; }
   .settings-card { border-radius: 7px; }
   .info-card { align-items: flex-start; }
   .file-editor-toolbar > div:first-child { min-width: 0; flex: 1; }

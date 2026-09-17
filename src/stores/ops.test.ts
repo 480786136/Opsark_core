@@ -557,16 +557,15 @@ describe("智能任务状态机", () => {
     await store.submitRequirement("srv-production-01", "再次尝试", "safe", "model-deepseek");
 
     expect(store.activeTask?.status).toBe("planning_failed");
-    expect(store.developerLogs[0]).toMatchObject({
+    expect(store.developerLogs.find(entry => entry.title === "需求处理模型调用失败")).toMatchObject({
       level: "error",
       title: "需求处理模型调用失败",
     });
-    expect(store.developerLogs[0].error).toContain("模型响应缺少需求理解结果");
-    expect(store.developerLogs.slice(1, 3).map((entry) => entry.operation)).toEqual([
-      "requirement_classification",
-      "requirement_classification",
-    ]);
-    expect(store.developerLogs.slice(1, 3).every((entry) => entry.response?.includes('"choices": []'))).toBe(true);
+    expect(store.developerLogs.find(entry => entry.title === "需求处理模型调用失败")?.error)
+      .toContain("模型响应缺少需求理解结果");
+    const attempts = store.developerLogs.filter(entry => entry.operation === "requirement_classification");
+    expect(attempts).toHaveLength(2);
+    expect(attempts.every((entry) => entry.response?.includes('"choices": []'))).toBe(true);
   });
 
   it("安全模式自动执行低风险步骤，并在中风险步骤前暂停确认", async () => {
@@ -2255,8 +2254,13 @@ describe("智能任务状态机", () => {
 
     expect(task.status).toBe("needs_adjustment");
     expect(task.summary).toBeUndefined();
-    expect(task.pauseReason).toContain("调整计划生成失败");
-    expect(task.pauseReason).toContain("可生成调整方案");
+    expect(task.pauseReason).toContain("后续方案暂未就绪");
+    expect(task.pauseReason).toContain("可以稍后重试生成");
+    expect(task.pauseReason).not.toContain("模型计划结构解析失败");
+    expect(store.developerLogs).toContainEqual(expect.objectContaining({
+      operation: "adjustment_planning",
+      error: expect.stringContaining("模型计划结构解析失败"),
+    }));
     expect(task.plan[0].review?.summary).toContain("HTTP 虽返回 200");
     expect(task.adjustmentIncident?.generationFailureCount).toBe(1);
     expect(task.adjustmentIncident?.executionAttemptCount).toBe(0);
@@ -2370,7 +2374,7 @@ describe("智能任务状态机", () => {
 
     expect(task.adjustmentInProgress).toBe(false);
     expect(task.status).toBe("needs_adjustment");
-    expect(task.pauseReason).toContain("调整计划生成失败");
+    expect(task.pauseReason).toContain("后续方案暂未就绪");
   });
 
   it("完全托管自动批准调整计划，但在高风险步骤前暂停", async () => {
@@ -3068,7 +3072,12 @@ describe("智能任务状态机", () => {
     vi.mocked(backend.processRequirement).mockResolvedValueOnce({ intent: "execute", relation: "continue", plan: [diagnostic] });
     await store.submitRequirement(next.serverId, "继续完成", "safe", next.modelId, "", next.id, previous.id);
     expect(next.status).toBe("planning_failed");
-    expect(next.pauseReason).toContain("RECOVERY_REFERENCE_MISSING");
+    expect(next.pauseReason).toContain("执行方案尚未就绪");
+    expect(next.pauseReason).not.toContain("RECOVERY_REFERENCE_MISSING");
+    expect(store.developerLogs).toContainEqual(expect.objectContaining({
+      operation: "requirement_planning",
+      error: expect.stringContaining("RECOVERY_REFERENCE_MISSING"),
+    }));
     expect(next.plan).toEqual([]);
     next.plan = [diagnostic];
     next.status = "running";
@@ -3335,7 +3344,8 @@ describe("智能任务状态机", () => {
     expect(store.activeTask?.activeSkillIds).toEqual(["ssh-terminal-jump"]);
     expect(store.activeTask?.status).toBe("planning_failed");
     expect(store.activeTask?.summary).toBeUndefined();
-    expect(store.activeTask?.pauseReason).toContain("无业务意义的 validation");
+    expect(store.activeTask?.pauseReason).not.toContain("无业务意义的 validation");
+    expect(store.activeTask?.pauseReason).toContain("后续方案待完善");
     expect(store.activeTask?.pauseReason).toContain("整体目标");
     expect(store.activeTask?.autoAdjustmentSeconds).toBeUndefined();
     expect(store.activeTask?.messages).toEqual(expect.arrayContaining([
@@ -3345,8 +3355,12 @@ describe("智能任务状态机", () => {
       }),
     ]));
     expect(store.logs).toEqual(expect.arrayContaining([
-      expect.objectContaining({ title: "Skill 选择已保留，计划生成失败" }),
+      expect.objectContaining({ title: "Skill 选择已保留，后续方案待完善" }),
     ]));
+    expect(store.developerLogs).toContainEqual(expect.objectContaining({
+      operation: "requirement_processing",
+      summary: expect.stringContaining("无业务意义的 validation"),
+    }));
   });
 
   it("同一目标重试时允许空选择清除上一轮误匹配的 Skill", async () => {

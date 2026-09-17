@@ -9,6 +9,7 @@ describe("task plan progress messages", () => {
     "已按用户请求生成 3 个调整步骤，完全托管模式已自动批准并继续。",
     "已进入下一阶段，包含 1 个执行步骤。",
     "下一阶段计划已生成，包含 1 个执行步骤，等待批准。",
+    "后续方案已重新整理，包含 2 个执行步骤；系统将按现有授权继续，需要确认的步骤会在执行前单独提示。",
   ])("recognizes adjustment progress: %s", (message) => {
     expect(isAdjustmentProgressMessage(message)).toBe(true);
     expect(isPlanProgressMessage(message)).toBe(true);

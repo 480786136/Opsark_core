@@ -51,18 +51,21 @@ function fieldError(field: string) {
           <Search :size="14" />
           <input v-model="query" type="search" :placeholder="t('tools.searchPlaceholder')" />
         </label>
-        <button
-          v-for="tool in filteredTools"
-          :key="tool.id"
-          type="button"
-          class="tool-list-item"
-          :class="{ active: selectedTool?.id === tool.id }"
-          @click="selectedToolId = tool.id"
-        >
-          <span><strong>{{ tool.name }}</strong><small>{{ tool.id }}</small></span>
-          <i :class="{ enabled: tool.enabled }"></i>
-        </button>
-        <p v-if="!filteredTools.length" class="tool-empty">{{ t("tools.empty") }}</p>
+        <div class="tool-list-scroll">
+          <button
+            v-for="tool in filteredTools"
+            :key="tool.id"
+            type="button"
+            class="tool-list-item"
+            :class="{ active: selectedTool?.id === tool.id }"
+            :aria-pressed="selectedTool?.id === tool.id"
+            @click="selectedToolId = tool.id"
+          >
+            <span><strong>{{ tool.name }}</strong><small>{{ tool.id }}</small></span>
+            <i :class="{ enabled: tool.enabled }"></i>
+          </button>
+          <p v-if="!filteredTools.length" class="tool-empty">{{ t("tools.empty") }}</p>
+        </div>
       </aside>
 
       <div v-if="selectedTool" class="tool-editor">

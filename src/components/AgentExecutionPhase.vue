@@ -11,13 +11,14 @@ import {
 } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import type { ObservationStatus, PlanStep, TaskExecutionPhase } from "@/types";
+import { localizeCoreText } from "@/features/preferences/coreText";
 
 const props = defineProps<{
   phase: TaskExecutionPhase;
   index: number;
 }>();
 
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const expanded = ref(false);
 const expandedSteps = ref<string[]>([]);
 
@@ -43,12 +44,12 @@ const outcome = computed(() => {
 const brief = computed(() => t(`agent.phaseBrief${outcome.value === "blocked" ? "Blocked" : outcome.value === "completed" ? "Completed" : "Adjusted"}`));
 const progress = computed(() => t("agent.phaseProgress", counts.value));
 const summary = computed(() => {
-  if (props.phase.summary?.trim()) return props.phase.summary.trim();
+  if (props.phase.summary?.trim()) return localizeCoreText(props.phase.summary.trim(), locale.value);
   const failed = [...props.phase.plan].reverse().find((step) => step.status === "failed");
-  if (failed?.review?.summary) return failed.review.summary;
-  if (failed?.result?.failureReason) return failed.result.failureReason;
+  if (failed?.review?.summary) return localizeCoreText(failed.review.summary, locale.value);
+  if (failed?.result?.failureReason) return localizeCoreText(failed.result.failureReason, locale.value);
   const reviewed = [...props.phase.plan].reverse().find((step) => step.review?.summary);
-  if (reviewed?.review?.summary) return reviewed.review.summary;
+  if (reviewed?.review?.summary) return localizeCoreText(reviewed.review.summary, locale.value);
   return t(`agent.phaseSummary${outcome.value === "blocked" ? "Blocked" : outcome.value === "completed" ? "Completed" : "Adjusted"}`, {
     total: counts.value.total,
   });

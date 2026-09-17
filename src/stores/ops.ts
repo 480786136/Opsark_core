@@ -8,7 +8,7 @@ import { archiveToolEvidence } from "@/features/agent/evidenceArchive";
 import { workflowLifetime } from "@/features/agent/workflowLifetime";
 import { restoreUserInputRequests } from "@/features/agent/restoreUserInputRequests";
 import { automaticContinuationBlocker, workflowProgress } from "@/features/agent/workflowProgress";
-import { assertTaskPlanAuthorization, executionPolicyBlocker, hasRiskAttemptAuthorization, isRelatedRecoveryStep, recoveryHistory, validateRecoveryReferences } from "@/features/agent/recoveryContract";
+import { assertTaskPlanAuthorization, ExecutionPolicyError, executionPolicyBlocker, hasRiskAttemptAuthorization, isRelatedRecoveryStep, recoveryHistory, validateRecoveryReferences } from "@/features/agent/recoveryContract";
 import { backend, buildExecutionSummary, isTauri, ModelInvocationError, PlanProtocolError, normalizePlanPreconditions } from "@/services/backend";
 import type { RuntimeConnection } from "@/services/backend";
 import {
@@ -210,6 +210,8 @@ import { validateSkillDefinition } from "@/features/skills/skillValidation";
 const now = () => new Date().toISOString();
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+type ProtocolReplanSource = "manual" | "system_initial" | "system_continuation";
+type AutomaticPlanApprovalReason = "managed" | "protocol_replan";
 const executionServerId = (task: Pick<OpsTask, "serverId" | "executionTargetServerId">) => (
   task.executionTargetServerId ?? task.serverId
 );
@@ -2059,13 +2061,16 @@ export const useOpsStore = defineStore("ops", {
                 });
               });
             }
+            const technicalError = error instanceof PlanProtocolError
+              ? error.developerMessage
+              : error instanceof Error ? `${error.name}: ${error.message}` : String(error);
             this.addDeveloperLog({
               level: "error",
               operation: "requirement_processing",
               title: "需求处理模型调用失败",
-              summary: error instanceof Error ? error.message : String(error),
+              summary: technicalError,
               request: error instanceof ModelInvocationError ? undefined : developerRequest,
-              error: error instanceof Error ? `${error.name}: ${error.message}` : String(error),
+              error: technicalError,
               stack: error instanceof Error ? error.stack : undefined,
               serverId,
               taskId: task.id,
@@ -2254,19 +2259,20 @@ export const useOpsStore = defineStore("ops", {
           });
           this.addLog({
             category: "model",
-            level: "error",
-            title: "Skill 选择已保留，计划生成失败",
+            level: "warning",
+            title: "Skill 选择已保留，后续方案待完善",
             detail: JSON.stringify({
               requirement: content,
               selectedSkillIds: task.activeSkillIds ?? [],
-              error: processed.planError,
+              serverCommandDispatched: false,
+              nextAction: "可保留当前结果结束，或稍后重试生成后续方案",
             }, null, 2),
             serverId,
             taskId: task.id,
           });
           transitionTask(task, "planning_failed");
           task.summary = undefined;
-          task.pauseReason = `计划生成未通过协议或安全校验：${processed.planError}。未向服务器发送任何计划命令；整体目标、Skill 选择和已有证据均已保留，可直接重试规划。`;
+          task.pauseReason = "整体目标、Skill 选择和已有证据已保留，未向服务器发送新命令。后续方案待完善，可以稍后重试生成。";
           this.persist();
           return;
         }
@@ -2342,12 +2348,13 @@ export const useOpsStore = defineStore("ops", {
             repair: error.repair, repairError: error.repairError
           };
           transitionTask(task, "needs_adjustment");
-          task.pauseReason = error.message;
-          task.managedAdjustmentPhase = "manual_required";
-          task.managedStopReason = "model_generation_failed";
+          task.pauseReason = error.userMessage;
+          task.managedAdjustmentPhase = undefined;
+          task.managedStopReason = undefined;
           task.autoAdjustmentSeconds = undefined;
-          this.pushMessage(task, { role: "assistant", kind: "event", content: error.message });
+          this.pushMessage(task, { role: "assistant", kind: "event", content: error.userMessage });
           this.persist();
+          await this.beginAdjustment(task.id, false, undefined, "system_initial");
           return;
         }
         if (canTransitionTask(task.status, "planning_failed")) transitionTask(task, "planning_failed");
@@ -2357,7 +2364,20 @@ export const useOpsStore = defineStore("ops", {
         }
         task.summary = undefined;
         const message = error instanceof Error ? error.message : String(error);
-        task.pauseReason = `本轮计划生成失败：${message}。未执行服务器变更，可直接重试规划。`;
+        this.addDeveloperLog({
+          level: "error",
+          operation: "requirement_planning",
+          title: "需求计划未能进入审批",
+          summary: message,
+          error: error instanceof Error ? `${error.name}: ${error.message}` : message,
+          stack: error instanceof Error ? error.stack : undefined,
+          taskId: task.id,
+          serverId: executionServerId(task),
+        });
+        const actionableConfiguration = /(?:模型配置不存在|API Key 未恢复)/.test(message);
+        task.pauseReason = actionableConfiguration
+          ? `${message}当前目标和已有记录已保留。`
+          : "当前目标和已有结果已保留，未向服务器发送新命令。执行方案尚未就绪，可以稍后重试规划。";
         this.pushMessage(task, { role: "assistant", kind: "summary", content: task.pauseReason });
         this.persist();
       } finally {
@@ -2414,15 +2434,32 @@ export const useOpsStore = defineStore("ops", {
       return true;
     },
 
-    pauseWorkflowFailure(task: OpsTask, error: unknown) {
+    pauseWorkflowFailure(task: OpsTask, error: unknown, automaticProtocolRecovery = false) {
       if (task.cancelRequested || ["completed", "cancelled"].includes(task.status)) return;
       if (canTransitionTask(task.status, "needs_adjustment")) transitionTask(task, "needs_adjustment");
-      if (error instanceof PlanProtocolError) task.protocolRepair = {
-        roundId: task.currentRoundId, serverId: executionServerId(task), repair: error.repair, repairError: error.repairError,
-      };
-      task.pauseReason = `后续流程暂不可用：${String(error)}。已完成步骤及其执行证据保持有效，可检查后继续。`;
-      task.managedAdjustmentPhase = "manual_required";
-      task.managedStopReason = "workflow_error";
+      if (error instanceof PlanProtocolError) {
+        task.protocolRepair = {
+          roundId: task.currentRoundId, serverId: executionServerId(task), repair: error.repair, repairError: error.repairError,
+        };
+        this.addDeveloperLog({
+          level: "error",
+          operation: "workflow_progression",
+          title: "后续阶段方案未通过计划协议校验",
+          summary: error.developerMessage,
+          response: { repair: error.repair, repairError: error.repairError },
+          error: error.developerMessage,
+          stack: error.stack,
+          taskId: task.id,
+          serverId: executionServerId(task),
+        });
+      }
+      task.pauseReason = error instanceof PlanProtocolError
+        ? automaticProtocolRecovery
+          ? "当前检查已完成，系统正在根据已有结果完善后续方案。需要确认的操作会在执行前提示。"
+          : error.userMessage
+        : `后续流程暂不可用：${String(error)}。已完成步骤及其执行证据保持有效，可检查后继续。`;
+      task.managedAdjustmentPhase = automaticProtocolRecovery ? undefined : "manual_required";
+      task.managedStopReason = automaticProtocolRecovery ? undefined : "workflow_error";
       task.autoAdjustmentSeconds = undefined;
       this.pushMessage(task, { role: "system", kind: "event", content: task.pauseReason });
       this.persist();
@@ -2642,7 +2679,12 @@ export const useOpsStore = defineStore("ops", {
       }
     },
 
-    async beginAdjustment(taskId: string, automatic = false, expectedFingerprint?: string) {
+    async beginAdjustment(
+      taskId: string,
+      automatic = false,
+      expectedFingerprint?: string,
+      protocolReplanSource: ProtocolReplanSource = "manual",
+    ) {
       if (adjustingTaskIds.get(taskId)?.current()) return;
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || !["needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)) return;
@@ -2703,10 +2745,14 @@ export const useOpsStore = defineStore("ops", {
           task.protocolRepairHistory ??= [];
           task.protocolRepairHistory.push(replanRecord!);
           this.addLog({
-            category: "model", level: "info", title: "用户请求从协议阻断转入业务重新规划",
+            category: "model", level: "info",
+            title: protocolReplanSource !== "manual"
+              ? "系统从协议阻断自动转入业务重新规划"
+              : "用户请求从协议阻断转入业务重新规划",
             detail: JSON.stringify({
-              rejectedPlanExecuted: false, fieldPath: protocolReplan.repair.fieldPath,
-              originalError: protocolReplan.repair.validationError, repairError: protocolReplan.repairError,
+              triggerSource: protocolReplanSource,
+              rejectedPlanExecuted: false,
+              protocolIncidentRecorded: true,
               instruction: "原方案单独归档；新步骤重新通过授权、安全、风险审批和验收。"
             }),
             taskId, serverId: executionServerId(task)
@@ -2717,7 +2763,7 @@ export const useOpsStore = defineStore("ops", {
           kind: "event",
           content: cachedPlanFresh
             ? "正在采用整体目标判断时已生成的下一阶段计划…"
-            : protocolReplan ? "原方案未执行并已归档，正在生成新的业务调整方案；新步骤将重新评估风险并按当前授权审批…" : "正在结合失败输出重新生成调整计划…",
+            : protocolReplan ? "正在根据当前目标和已有结果重新整理后续方案；新步骤将按当前授权逐项进行安全检查…" : "正在结合失败输出重新生成调整计划…",
         });
         this.persist();
         try {
@@ -2783,7 +2829,11 @@ export const useOpsStore = defineStore("ops", {
           transitionTask(task, "awaiting_plan_approval");
           this.pushPlanProgressMessage(
             task,
-            task.permission === "managed"
+            protocolReplan && protocolReplanSource === "system_continuation"
+              ? `后续方案已重新整理，包含 ${adjustment.replacement.length} 个执行步骤；系统将按现有授权继续，需要确认的步骤会在执行前单独提示。`
+              : protocolReplan && protocolReplanSource === "system_initial"
+              ? `后续方案已重新整理，包含 ${adjustment.replacement.length} 个执行步骤；请检查风险、命令和预期结果后确认计划。`
+              : task.permission === "managed"
               ? `已进入下一阶段，包含 ${adjustment.replacement.length} 个执行步骤。`
               : `下一阶段计划已生成，包含 ${adjustment.replacement.length} 个执行步骤，等待批准。`,
           );
@@ -2792,7 +2842,11 @@ export const useOpsStore = defineStore("ops", {
             level: "warning",
             title: cachedPlanFresh ? "已复用联合决策中的下一阶段计划" : "模型调整计划已返回",
             detail: JSON.stringify({
-              context: adjustment.context,
+              context: protocolReplan ? {
+                workflowPhase: "business_replan_after_protocol_failure",
+                triggerSource: protocolReplanSource,
+                rejectedPlanExecuted: false,
+              } : adjustment.context,
               replacement: adjustment.replacement,
             }, null, 2),
             serverId: task.serverId,
@@ -2801,11 +2855,27 @@ export const useOpsStore = defineStore("ops", {
           this.persist();
           task.adjustmentInProgress = false;
           if (task.permission === "managed") {
-            await this.approvePlan(task.id, true);
+            task.managedAdjustmentPhase = undefined;
+            task.managedStopReason = undefined;
+          }
+          if (task.permission === "managed" || protocolReplan && protocolReplanSource === "system_continuation") {
+            // Planning ownership ends before execution starts. approvePlan can
+            // synchronously advance through an entire low-risk phase and may
+            // need a fresh protocol replan; retaining this lock would strand
+            // that nested handoff without a worker or a manual recovery action.
+            if (adjustingTaskIds.get(taskId) === lifetime) adjustingTaskIds.delete(taskId);
+            await this.approvePlan(
+              task.id,
+              true,
+              protocolReplan && protocolReplanSource !== "manual" ? "protocol_replan" : "managed",
+            );
           }
         } catch (error) {
           if (!lifetime.current()) return;
-          if (replanRecord) { replanRecord.status = "failed"; replanRecord.outcome = String(error); }
+          if (replanRecord) {
+            replanRecord.status = "failed";
+            replanRecord.outcome = error instanceof PlanProtocolError ? error.userMessage : String(error);
+          }
           // A rejected late model response is just as stale as a successful one.
           // Never bind its old proposal to a newly selected target or authority.
           if (!policyCurrent()) error = new Error("规划期间目标、授权或已确认输入发生变化，已丢弃过期响应；原协议事故保持原目标绑定，请重新生成");
@@ -2815,19 +2885,31 @@ export const useOpsStore = defineStore("ops", {
               repair: error.repair, repairError: error.repairError
             };
             transitionTask(task, "needs_adjustment");
-            task.pauseReason = error.message;
+            task.pauseReason = error.userMessage;
             task.autoAdjustmentSeconds = undefined;
             task.managedAdjustmentPhase = "manual_required";
             task.managedStopReason = "model_generation_failed";
             this.addLog({
-              category: "model", level: "error", title: "计划协议修复失败（未执行）",
+              category: "model", level: "warning", title: "当前结果已保留，后续方案待完善",
               detail: JSON.stringify({
-                originalError: error.repair.validationError, repairError: error.repairError,
-                fieldPath: error.repair.fieldPath, stepCount: error.repair.previousModelOutput.length
+                message: error.userMessage,
+                rejectedPlanExecuted: false,
+                nextAction: "自动恢复已达本轮边界，可保留结果结束或稍后重试生成后续方案",
               }),
               taskId, serverId: executionServerId(task)
             });
-            this.pushMessage(task, { role: "system", kind: "event", content: error.message });
+            this.addDeveloperLog({
+              level: "error",
+              operation: "protocol_business_replan",
+              title: "业务重规划仍未通过计划协议校验",
+              summary: error.developerMessage,
+              response: { repair: error.repair, repairError: error.repairError },
+              error: error.developerMessage,
+              stack: error.stack,
+              taskId,
+              serverId: executionServerId(task),
+            });
+            this.pushMessage(task, { role: "system", kind: "event", content: error.userMessage });
             this.persist();
             return;
           }
@@ -2837,14 +2919,31 @@ export const useOpsStore = defineStore("ops", {
             adjustmentIncident.generationFailureCount =
               (adjustmentIncident.generationFailureCount ?? 0) + 1;
           }
-          const reason = `调整计划生成失败：${String(error)}`;
+          const technicalDetail = error instanceof Error
+            ? error.stack || `${error.name}: ${error.message}`
+            : String(error);
+          const actionablePolicyReason = error instanceof ExecutionPolicyError
+            || /(?:规划期间目标、授权或已确认输入发生变化|原协议事故保持原目标绑定)/.test(String(error));
+          const reason = actionablePolicyReason
+            ? String(error)
+            : "当前结果和已有执行证据已保留，但后续方案暂未就绪。可以稍后重试生成。";
+          this.addDeveloperLog({
+            level: "error",
+            operation: "adjustment_planning",
+            title: "调整方案未能进入审批",
+            summary: technicalDetail,
+            error: technicalDetail,
+            stack: error instanceof Error ? error.stack : undefined,
+            taskId,
+            serverId: executionServerId(task),
+          });
           this.pushMessage(task, { role: "system", kind: "event", content: reason });
           transitionTask(task, "needs_adjustment");
           const phaseCompleted = task.plan.length > 0
             && task.plan.every((step) => step.status === "completed");
           task.pauseReason = phaseCompleted
-            ? `当前阶段的 ${task.plan.length} 个步骤已成功完成，证据保持有效；${reason}。整体目标尚未完成，可基于现有证据继续生成后续方案。`
-            : `${reason}。原执行证据和未完成目标已保留，可生成调整方案。`;
+            ? `当前阶段的 ${task.plan.length} 个步骤已成功完成，证据保持有效；整体目标尚未完成。${reason}`
+            : actionablePolicyReason ? reason : `${reason}未完成目标也已保留。`;
           task.summary = undefined;
           if (task.permission === "managed") {
             task.managedAdjustmentPhase = "manual_required";
@@ -2853,7 +2952,7 @@ export const useOpsStore = defineStore("ops", {
           this.addLog({
             category: "model",
             level: "warning",
-            title: "调整计划生成失败，任务保持可恢复",
+            title: "当前结果已保留，后续方案待完善",
             detail: task.pauseReason,
             serverId: task.serverId,
             taskId,
@@ -3150,7 +3249,11 @@ export const useOpsStore = defineStore("ops", {
       return true;
     },
 
-    async approvePlan(taskId: string, automatic = false) {
+    async approvePlan(
+      taskId: string,
+      automatic = false,
+      automaticReason: AutomaticPlanApprovalReason = "managed",
+    ) {
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || task.status !== "awaiting_plan_approval") return;
       if (hasWaitingStep(task)) return;
@@ -3180,7 +3283,9 @@ export const useOpsStore = defineStore("ops", {
         role: automatic ? "system" : "user",
         kind: "event",
         content: automatic
-          ? "完全托管模式已自动批准计划，开始执行。"
+          ? automaticReason === "protocol_replan"
+            ? "系统已按原任务授权自动衔接重新整理后的计划；后续仍按步骤风险规则执行或等待确认。"
+            : "完全托管模式已自动批准计划，开始执行。"
           : "计划已批准，开始执行。",
       });
       this.addLog({
@@ -3210,7 +3315,9 @@ export const useOpsStore = defineStore("ops", {
       const pending = task.plan.find((step) => step.status === "awaiting_approval");
       if (pending) cancelStep(pending, "用户取消");
       this.pushMessage(task, { role: "user", kind: "event", content: "用户已停止本次执行。" });
-      task.summary = task.pauseReason
+      task.summary = task.protocolRepair
+        ? "本次执行已停止，当前目标、已完成结果和执行记录已保留。"
+        : task.pauseReason
         ? `本次执行已停止，业务目标保留。停止前的暂停原因：${task.pauseReason}`
         : "本次执行已停止，业务目标与执行记录保留，可继续完成。";
       task.pauseReason = undefined;
@@ -3340,17 +3447,39 @@ export const useOpsStore = defineStore("ops", {
                     roundId: task.currentRoundId, serverId: executionServerId(task),
                     repair: refinement.protocolError.repair, repairError: refinement.protocolError.repairError
                   };
-                  task.managedAdjustmentPhase = "manual_required";
-                  task.managedStopReason = "model_generation_failed";
+                  task.managedAdjustmentPhase = undefined;
+                  task.managedStopReason = undefined;
                   task.autoAdjustmentSeconds = undefined;
+                  this.addDeveloperLog({
+                    level: "error",
+                    operation: "discovery_refinement",
+                    title: "发现阶段后续方案未通过计划协议校验",
+                    summary: refinement.technicalDetail,
+                    response: {
+                      repair: refinement.protocolError.repair,
+                      repairError: refinement.protocolError.repairError,
+                    },
+                    error: refinement.technicalDetail,
+                    stack: refinement.protocolError.stack,
+                    taskId,
+                    serverId: executionServerId(task),
+                  });
                 }
                 this.pushMessage(task, {
-                  role: "assistant",
+                  role: refinement.protocolError ? "system" : "assistant",
                   kind: "event",
                   content: refinement.eventMessage,
                 });
               }
               this.persist();
+              if (refinement.kind === "failed" && refinement.protocolError) {
+                // The discovery owner must be released before the replacement
+                // plan can acquire its own operation lifetime. This handoff is
+                // deliberately bounded: a protocol error from the replan path
+                // is retained for manual recovery and is never auto-replanned.
+                lifetime.release();
+                await this.beginAdjustment(task.id, false, undefined, "system_continuation");
+              }
               return;
             }
             task.plan = [...task.plan, ...refinement.pending];
@@ -3530,7 +3659,16 @@ export const useOpsStore = defineStore("ops", {
         lifetime.release();
         await this.runStep(taskId, step.id);
       } catch (error) {
-        if (lifetime.current()) this.pauseWorkflowFailure(task, error);
+        if (lifetime.current()) {
+          this.pauseWorkflowFailure(task, error, error instanceof PlanProtocolError);
+          if (error instanceof PlanProtocolError) {
+            // A rejected continuation proposal has not executed anything and
+            // does not grant new authority. Rebuild it once as a clean business
+            // plan; a second protocol rejection is bounded inside beginAdjustment.
+            lifetime.release();
+            await this.beginAdjustment(task.id, false, undefined, "system_continuation");
+          }
+        }
       } finally {
         lifetime.release();
       }

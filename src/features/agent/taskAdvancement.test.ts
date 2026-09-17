@@ -73,6 +73,11 @@ describe("task advancement", () => {
     const planner = vi.fn().mockRejectedValue(error);
     const result = await runDiscoveryRefinement(discoveryInput(currentTask), planner);
     expect(result).toMatchObject({ kind: "failed", protocolError: error });
+    if (result.kind !== "failed") throw new Error("expected a failed refinement");
+    expect(result.pauseReason).toContain("正在根据已有结果完善后续方案");
+    expect(result.pauseReason).not.toContain("PlanProtocolError");
+    expect(result.pauseReason).not.toContain("不得改写业务");
+    expect(result.technicalDetail).toContain("不得改写业务");
     expect(planner).toHaveBeenCalledOnce();
   });
   it("returns a continuation and automatic approval for managed tasks", async () => {
@@ -119,8 +124,10 @@ describe("task advancement", () => {
 
     expect(result).toMatchObject({
       kind: "failed",
-      pauseReason: "后续计划生成失败：Error: invalid plan",
+      pauseReason: "当前检查结果已保留，但暂时无法形成可执行的后续方案。可以稍后重试生成。",
     });
+    if (result.kind !== "failed") throw new Error("expected a failed refinement");
+    expect(result.technicalDetail).toContain("invalid plan");
     expect(currentTask.plan).toHaveLength(1);
   });
 

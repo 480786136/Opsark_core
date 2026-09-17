@@ -134,7 +134,7 @@ describe("通用澄清与审批的单次恢复", () => {
     expect(backend.executeCommand).not.toHaveBeenCalled();
   });
 
-  it("协议失败保留原始计划和两次错误，不触发自动业务调整", async () => {
+  it("初始协议阻断自动重新整理一次，safe 模式仍等待整体计划批准", async () => {
     const { store, task } = createTask();
     const original = inputStep();
     const repair = buildPlanNormalizationRepair(new Error("第 1 个计划步骤的工具参数无效：字段错误"), [original]);
@@ -143,19 +143,30 @@ describe("通用澄清与审批的单次恢复", () => {
       selectedSkillIds: ["database-inspection-operations"] };
     vi.mocked(backend.processRequirement).mockRejectedValueOnce(protocolError);
     task.status = "draft";
-    await store.submitRequirement(server.id, "检查目标信息", "managed", "clarification-model", task.id);
-    const failed = store.tasks.find(item => item.protocolRepair);
-    expect(failed).toBeDefined();
-    expect(failed!.protocolRepair!.repair.previousModelOutput).toEqual([original]);
-    expect(failed!.rootGoal).toBe("检查目标信息");
-    expect(failed!.activeSkillIds).toContain("database-inspection-operations");
-    expect(failed!.pauseReason).toContain("字段错误");
-    expect(failed!.pauseReason).toContain("description");
-    await store.queueManagedAdjustment(failed!.id, 0);
-    await store.routeAutomaticAdjustment(failed!.id);
-    expect(backend.generatePlan).not.toHaveBeenCalled();
+    await store.submitRequirement(server.id, "检查目标信息", "safe", "clarification-model", task.id);
+    const replanned = store.tasks.find(item => item.rootGoal === "检查目标信息");
+    expect(replanned).toBeDefined();
+    expect(replanned!.rootGoal).toBe("检查目标信息");
+    expect(replanned!.activeSkillIds).toContain("database-inspection-operations");
+    expect(replanned!.status).toBe("awaiting_plan_approval");
+    expect(replanned!.protocolRepair).toBeUndefined();
+    expect(replanned!.protocolRepairHistory?.[0]).toMatchObject({
+      status: "accepted",
+      repair: expect.objectContaining({ previousModelOutput: [original] }),
+    });
+    expect(backend.generatePlan).toHaveBeenCalledOnce();
+    expect(replanned!.messages.map(message => message.content).join("\n")).not.toContain("字段错误");
+    expect(replanned!.messages.map(message => message.content).join("\n")).not.toContain("description");
+    expect(store.developerLogs).toContainEqual(expect.objectContaining({
+      operation: "requirement_processing",
+      error: expect.stringContaining("字段错误"),
+    }));
+    expect(store.developerLogs).toContainEqual(expect.objectContaining({
+      operation: "requirement_processing",
+      error: expect.stringContaining("description"),
+    }));
     expect(backend.executeCommand).not.toHaveBeenCalled();
-    expect(failed!.autoAdjustmentSeconds).toBeUndefined();
+    expect(replanned!.autoAdjustmentSeconds).toBeUndefined();
   });
 
   it.each(["awaiting_input", "awaiting_approval"] as const)(

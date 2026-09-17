@@ -72,6 +72,14 @@ const messages: ReadonlyArray<readonly [string, string]> = [
   ["正在等待绑定终端恢复；终端传输故障不会消耗业务重拟次数，也不会交给模型改写业务计划。", "Waiting for the bound terminal to recover. Terminal transport failures do not consume replanning attempts or trigger model-generated plan changes."],
   ["等待用户明确回答；提交前不会执行后续操作或自动调整。", "Waiting for your explicit response. No further actions or automatic adjustments will run before you submit it."],
   ["计划内容在批准前完成了安全规范化，请检查更新后的最终命令并重新确认。", "The plan was normalized for safety before approval. Review the updated commands and confirm again."],
+  ["当前目标和已完成结果已保留，未执行任何新的服务器操作。后续方案待完善；需要确认的操作会在执行前提示。", "The current goal and completed results were preserved, and no new server action was executed. The follow-up plan needs refinement; any required approval will be requested before the relevant action."],
+  ["当前检查已完成，系统正在根据已有结果完善后续方案。需要确认的操作会在执行前提示。", "The current checks are complete. The system is refining the follow-up plan from the available results; any required approval will be requested before the relevant action."],
+  ["正在根据当前目标和已有结果重新整理后续方案；新步骤将按当前授权逐项进行安全检查…", "Reorganizing the follow-up plan from the current goal and available results. Each new step will be checked against the current authorization…"],
+  ["系统已按原任务授权自动衔接重新整理后的计划；后续仍按步骤风险规则执行或等待确认。", "The reorganized plan was connected under the existing task authorization. Each step will still follow the applicable risk checks or wait for approval."],
+  ["当前检查结果已保留，但暂时无法形成可执行的后续方案。可以稍后重试生成。", "Current findings were preserved, but an executable follow-up plan is not available yet. You can retry planning later."],
+  ["当前结果和已有执行证据已保留，但后续方案暂未就绪。可以稍后重试生成。", "Current results and execution evidence were preserved, but the follow-up plan is not ready yet. You can retry planning later."],
+  ["整体目标、Skill 选择和已有证据已保留，未向服务器发送新命令。后续方案待完善，可以稍后重试生成。", "The overall goal, selected skills, and existing evidence were preserved, and no new server command was sent. The follow-up plan needs refinement; you can retry planning later."],
+  ["当前目标和已有结果已保留，未向服务器发送新命令。执行方案尚未就绪，可以稍后重试规划。", "The current goal and available results were preserved, and no new server command was sent. The execution plan is not ready yet; you can retry planning later."],
   ["主命令已完成，正在整理观察证据", "Main command completed; collecting observations"],
   ["主命令已完成，正在执行独立后置校验", "Main command completed; running independent post-execution checks"],
   ["用户确认请求已过期", "This confirmation request has expired"],
@@ -82,9 +90,22 @@ const messages: ReadonlyArray<readonly [string, string]> = [
 
 const english = new Map(messages);
 const chinese = new Map(messages.map(([zh, en]) => [en, zh]));
+const INTERNAL_PLAN_DIAGNOSTIC = /(?:PlanProtocolError|计划协议校验失败|协议修复失败|OBSERVE_COMMAND_MUTATION|PROTOCOL_REPAIR_[A-Z_]+|Skill 选择已保留，计划生成失败|(?:后续|调整)计划生成失败|计划生成未通过)/;
+
+export function isInternalPlanDiagnostic(value: string | undefined | null): boolean {
+  return Boolean(value && INTERNAL_PLAN_DIAGNOSTIC.test(value));
+}
 
 export function localizeCoreText(value: string | undefined | null, locale: string = i18n.global.locale.value): string {
   if (!value) return "";
+  // Persisted tasks from older builds may contain internal plan compiler details.
+  // Keep those diagnostics available in developer logs, but never render rule
+  // codes, field paths or repair internals in the user conversation.
+  if (isInternalPlanDiagnostic(value)) {
+    return locale.startsWith("zh")
+      ? "当前检查结果和已完成步骤已保留，后续方案需要重新整理。需要确认的操作将在执行前提示。"
+      : "Current findings and completed steps were preserved, and the follow-up plan needs to be reorganized. Any required approval will be requested before the relevant action.";
+  }
   const httpError = value.match(/^(?:知识服务返回 HTTP |Knowledge service returned HTTP )(\d{3})$/);
   if (httpError) return locale.startsWith("zh") ? `知识服务返回 HTTP ${httpError[1]}` : `Knowledge service returned HTTP ${httpError[1]}`;
   if (locale.startsWith("zh")) return chinese.get(value) ?? value;
@@ -97,6 +118,10 @@ export function localizeCoreText(value: string | undefined | null, locale: strin
     [/^参数“(.+)”必须选择当前候选项中的有效选项$/, m => `Select a valid option for “${m[1]}”`],
     [/^参数“(.+)”必须是有效数字$/, m => `“${m[1]}” must be a valid number`],
     [/^工具“(.+)”的信息不完整$/, m => `Tool “${m[1]}” has incomplete configuration`],
+    [/^后续方案已重新整理，包含 (\d+) 个执行步骤；系统将按现有授权继续，需要确认的步骤会在执行前单独提示。$/, m => `The follow-up plan has been reorganized with ${m[1]} execution steps. It will continue under the existing authorization, and any required approval will be requested before the relevant step.`],
+    [/^后续方案包含一项具体变更。步骤“(.+)”将修改目标状态，请核对已确认决定：([\s\S]+)。本次确认仅授权本步骤展示的具体变更，不撤销任务级禁止事项；如与原决定冲突，请先补充授权或调整方案。$/, m => `The follow-up plan contains a specific change. Step “${m[1]}” will modify the target state. Review the confirmed decision: ${m[2]}. This approval authorizes only the displayed change and does not remove task-level restrictions; if it conflicts with the prior decision, update the authorization or revise the plan first.`],
+    [/^当前阶段的 (\d+) 个步骤已成功完成，证据保持有效；整体目标尚未完成。当前结果和已有执行证据已保留，但后续方案暂未就绪。可以稍后重试生成。$/, m => `All ${m[1]} steps in the current phase completed successfully and their evidence remains valid, but the overall goal is not complete. Current results were preserved; you can retry follow-up planning later.`],
+    [/^当前结果和已有执行证据已保留，但后续方案暂未就绪。可以稍后重试生成。未完成目标也已保留。$/, () => "Current results, execution evidence, and the unfinished goal were preserved, but the follow-up plan is not ready yet. You can retry planning later."],
     [/^Skill ID“(.+)”重复$/, m => `Duplicate Skill ID “${m[1]}”`],
     [/^Skill“(.+)”的配置不完整$/, m => `Skill “${m[1]}” has incomplete configuration`],
     [/^保存输入失败：([\s\S]*)$/, m => `Failed to save input: ${localizeCoreText(m[1], locale)}`],

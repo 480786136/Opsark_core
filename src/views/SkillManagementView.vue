@@ -23,7 +23,7 @@ function saveSkills() {
 </script>
 
 <template>
-  <div class="page management-page">
+  <div class="page management-page registry-management-page">
     <header class="page-header">
       <div><span class="eyebrow">{{ locale.startsWith("zh") ? "Skill 管理" : "SKILL REGISTRY" }}</span><h1>{{ t("skills.title") }}</h1><p>{{ t("skills.subtitle") }}</p></div>
       <button class="button primary" :disabled="saveState === 'saving'" @click="saveSkills">

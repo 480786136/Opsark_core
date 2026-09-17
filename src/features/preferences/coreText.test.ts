@@ -30,6 +30,30 @@ describe("Core system message presentation", () => {
     expect(localizeCoreText(null, "zh-CN")).toBe("");
   });
 
+  it("keeps persisted protocol compiler details out of the user-facing conversation", () => {
+    const legacy = "后续计划生成失败：PlanProtocolError: 计划协议校验失败：OBSERVE_COMMAND_MUTATION / steps[3].command；协议修复失败：PROTOCOL_REPAIR_SCOPE_VIOLATION";
+    const chinese = localizeCoreText(legacy, "zh-CN");
+    const english = localizeCoreText(legacy, "en-US");
+    expect(chinese).toContain("当前检查结果和已完成步骤已保留");
+    expect(english).toContain("were preserved");
+    for (const visible of [chinese, english]) {
+      expect(visible).not.toContain("PlanProtocolError");
+      expect(visible).not.toContain("OBSERVE_COMMAND_MUTATION");
+      expect(visible).not.toContain("steps[3].command");
+      expect(visible).not.toContain("PROTOCOL_REPAIR_SCOPE_VIOLATION");
+    }
+    expect(localizeCoreText("当前阶段已完成；调整计划生成失败：模型未返回后续步骤", "zh-CN"))
+      .not.toContain("生成失败");
+    expect(localizeCoreText("Skill 选择已保留，计划生成失败", "zh-CN"))
+      .not.toContain("生成失败");
+    const actionable = "本轮计划生成失败：模型 API Key 未恢复，请前往设置重新保存。";
+    expect(localizeCoreText(actionable, "zh-CN")).toBe(actionable);
+    expect(localizeCoreText(
+      "当前目标和已完成结果已保留，未执行任何新的服务器操作。后续方案待完善；需要确认的操作会在执行前提示。",
+      "en-US",
+    )).toContain("no new server action was executed");
+  });
+
   it("translates persisted credential and knowledge errors in both directions", () => {
     const translated = localizeCoreText("该服务器已存在同名变量", "en-US");
     expect(translated).not.toBe("该服务器已存在同名变量");
