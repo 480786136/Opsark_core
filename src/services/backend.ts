@@ -213,9 +213,13 @@ export interface PlanNormalizationRepair {
 export class PlanProtocolError extends Error {
   processed?: RequirementProcessingResult;
   developerTrace?: ModelDeveloperTrace;
+  readonly userMessage = "当前目标和已完成结果已保留，未执行任何新的服务器操作。后续方案待完善；需要确认的操作会在执行前提示。";
+  readonly developerMessage: string;
   constructor(public repair: PlanNormalizationRepair, public repairError: string) {
-    super(`计划协议校验失败：${repair.validationError}\n协议修复失败：${repairError}。未执行该计划，原始计划已保留；可生成业务调整方案，新的步骤须重新评估风险并按当前授权审批。`);
+    const developerMessage = `计划协议校验失败：${repair.validationError}\n协议修复失败：${repairError}。未执行该计划，原始计划已保留。`;
+    super(developerMessage);
     this.name = "PlanProtocolError";
+    this.developerMessage = developerMessage;
   }
 }
 

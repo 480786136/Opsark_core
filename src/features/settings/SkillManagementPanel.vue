@@ -108,21 +108,24 @@ function updateSelectedCategory(value: string) {
         <button class="skill-add-button" type="button" @click="addSkill">
           <Plus :size="13" />{{ t("skills.add") }}
         </button>
-        <template v-for="group in filteredSkillGroups" :key="group.category">
-          <p class="skill-category-heading">{{ t(`skills.categories.${group.category}`) }}<span>{{ group.skills.length }}</span></p>
-          <button
-            v-for="skill in group.skills"
-            :key="skill.id"
-            type="button"
-            class="tool-list-item"
-            :class="{ active: selectedSkill?.id === skill.id }"
-            @click="selectedSkillId = skill.id"
-          >
-            <span><strong>{{ skill.name }}</strong><small>{{ skill.id }}</small></span>
-            <i :class="{ enabled: skill.enabled }"></i>
-          </button>
-        </template>
-        <p v-if="!filteredSkills.length" class="tool-empty">{{ t("skills.empty") }}</p>
+        <div class="tool-list-scroll">
+          <template v-for="group in filteredSkillGroups" :key="group.category">
+            <p class="skill-category-heading">{{ t(`skills.categories.${group.category}`) }}<span>{{ group.skills.length }}</span></p>
+            <button
+              v-for="skill in group.skills"
+              :key="skill.id"
+              type="button"
+              class="tool-list-item"
+              :class="{ active: selectedSkill?.id === skill.id }"
+              :aria-pressed="selectedSkill?.id === skill.id"
+              @click="selectedSkillId = skill.id"
+            >
+              <span><strong>{{ skill.name }}</strong><small>{{ skill.id }}</small></span>
+              <i :class="{ enabled: skill.enabled }"></i>
+            </button>
+          </template>
+          <p v-if="!filteredSkills.length" class="tool-empty">{{ t("skills.empty") }}</p>
+        </div>
       </aside>
 
       <div v-if="selectedSkill" class="tool-editor">

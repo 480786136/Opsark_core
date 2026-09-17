@@ -109,6 +109,8 @@ const failedStep = computed(() => task.value?.plan.find((step) => step.status ==
 const adjustmentLabel = computed(() =>
   task.value?.status === "awaiting_continuation"
     ? t("agent.continuationRequired")
+    : task.value?.protocolRepair
+    ? t("agent.planAdjustmentPaused")
     : !failedStep.value && /(?:调整|后续)计划生成失败|计划生成未通过/.test(task.value?.pauseReason ?? "")
     ? t("agent.planAdjustmentPaused")
     : failedStep.value?.result?.executionStatus === "failed"
@@ -212,7 +214,7 @@ function planProgressText(current: OpsTask) {
 }
 
 function archivedRoundResponse(round: TaskPlanHistory) {
-  if (round.response?.content) return round.response.content;
+  if (round.response?.content) return coreText(round.response.content);
   return round.plan.length
     ? t("agent.generatedSteps", { count: round.plan.length })
     : t("agent.planGenerationIncomplete");
@@ -738,7 +740,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
               <div v-if="expandedRecords.includes(round.id)" class="execution-record-body">
                 <div v-for="record in round.records ?? []" :key="record.id" class="execution-event-row">
                   <time>{{ new Date(record.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
-                  <span>{{ record.content }}</span>
+                  <span>{{ coreText(record.content) }}</span>
                 </div>
                 <div v-for="step in round.plan.filter((item) => item.output)" :key="`output-${step.id}`" class="execution-output">
                   <strong>{{ step.title }}</strong><code>{{ step.command }}</code><pre>{{ step.output }}</pre>
@@ -759,7 +761,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
               <div class="summary-card-content">
                 <span class="summary-eyebrow">{{ summaryTitle(round.status) }}</span>
                 <div class="summary-content">
-                  <template v-for="(block, index) in summaryBlocks(round.summary ?? round.pauseReason)" :key="index">
+                  <template v-for="(block, index) in summaryBlocks(coreText(round.summary ?? round.pauseReason))" :key="index">
                     <h4 v-if="block.type === 'heading'">{{ block.text }}</h4>
                     <ul v-else-if="block.type === 'list'"><li v-for="item in block.items" :key="item">{{ item }}</li></ul>
                     <p v-else>{{ block.text }}</p>
@@ -794,7 +796,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
             :index="phaseIndex + 1"
           />
 
-          <div v-if="(task.plan.length || hasTransportRecovery || canRequestAdjustment) && !pendingFreshRequirement" :class="['plan-card', 'current-plan-card', `task-card-${task.status}`]">
+          <div v-if="(task.plan.length || hasTransportRecovery || needsUserAction) && !pendingFreshRequirement" :class="['plan-card', 'current-plan-card', `task-card-${task.status}`]">
             <div class="plan-card-head">
               <span class="plan-title-block">
                 <span class="plan-title-line">
@@ -949,7 +951,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                 <ShieldAlert :size="15" />
                 <span><strong>{{ adjustmentLabel }}</strong><small v-if="task.pauseReason">{{ coreText(task.pauseReason) }}</small></span>
               </span>
-              <button class="button secondary" @click="store.rejectTask(task.id)">{{ t("agent.endTask") }}</button>
+              <button class="button secondary" @click="store.rejectTask(task.id)">{{ t(task.protocolRepair ? "agent.keepResultsAndEnd" : "agent.endTask") }}</button>
               <span v-if="isWaitingForTerminalRecovery" class="managed-approval-countdown">
                 <LoaderCircle class="spin" :size="13" />{{ t('agent.waitingTerminalRecovery') }}
               </span>
@@ -1002,7 +1004,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
             <div class="summary-card-content">
               <span class="summary-eyebrow">{{ summaryTitle(task.status) }}</span>
               <div class="summary-content">
-                <template v-for="(block, index) in summaryBlocks(task.summary ?? coreText(task.pauseReason))" :key="index">
+                <template v-for="(block, index) in summaryBlocks(coreText(task.summary ?? task.pauseReason))" :key="index">
                   <h4 v-if="block.type === 'heading'">{{ block.text }}</h4>
                   <ul v-else-if="block.type === 'list'"><li v-for="item in block.items" :key="item">{{ item }}</li></ul>
                   <p v-else>{{ block.text }}</p>
@@ -1028,15 +1030,18 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
         <div class="composer-tools">
           <button class="context-button" type="button" :title="t('agent.referenceTerminal')" @click="referenceTerminal"><Quote :size="13" />{{ t("agent.terminal") }}</button>
           <ParameterSelect
+            class="composer-model-select"
             :model-value="modelId"
             :options="modelOptions"
             :ariaLabel="t('agent.model')"
             :title="t('agent.model')"
             :placeholder="modelPlaceholder"
+            :popup-min-width="280"
             size="compact"
             @update:model-value="handleModelSelection"
           />
           <ParameterSelect
+            class="composer-permission-select"
             :model-value="permission"
             :options="permissionOptions"
             :ariaLabel="t('agent.permission')"

@@ -63,7 +63,7 @@ export function requestStepApproval(
   return {
     taskStatus: "awaiting_step_approval",
     eventMessage: step.protocolReplanApproval
-      ? `协议修复已转为新的业务调整。步骤“${step.title}”将修改目标状态，请核对已确认决定：${step.protocolReplanApproval.decisionSummary}。本次确认仅授权本步骤展示的具体变更，不撤销任务级禁止事项；如与原决定冲突，请先补充授权或调整方案。`
+      ? `后续方案包含一项具体变更。步骤“${step.title}”将修改目标状态，请核对已确认决定：${step.protocolReplanApproval.decisionSummary}。本次确认仅授权本步骤展示的具体变更，不撤销任务级禁止事项；如与原决定冲突，请先补充授权或调整方案。`
       : `步骤“${step.title}”为${RISK_LABEL[step.risk]}风险，需要单独确认。`,
   };
 }

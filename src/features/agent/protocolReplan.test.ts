@@ -31,11 +31,13 @@ describe("protocol failure to business plan boundary", () => {
     });
     expect(business.planGenerationRepair).toBeUndefined();
     expect(business.workflowPhase).toBe("business_replan_after_protocol_failure");
-    expect(business.protocolReplan).toMatchObject({ rejectedPlanExecuted: false, rejectedStepCount: 1,
+    expect(business.protocolReplan).toMatchObject({ source: "business_replan_after_protocol_failure",
+      rejectedPlanExecuted: false, rejectedStepCount: 1,
       rejectedStep: { command: rejected.command }, errorCode: "OBSERVE_COMMAND_MUTATION" });
     expect(business.baseSnapshot).toBeDefined();
     expect(JSON.stringify(business)).not.toContain("must-not-reuse");
     expect(business.instruction).toContain("重新选择 kind");
+    expect(business.instruction).not.toContain("用户点击");
     expect(task.protocolRepair!.repair.previousModelOutput).toEqual([rejected]);
   });
 

@@ -15,7 +15,7 @@ export function protocolReplanContext(task: OpsTask) {
   const rejected = repair.previousModelOutput ?? [];
   const index = repair.diagnostic?.stepIndex;
   return {
-    source: "user_requested_business_replan",
+    source: "business_replan_after_protocol_failure",
     rejectedPlanExecuted: false,
     errorCode: repair.diagnostic?.code ?? repair.errorCode,
     fieldPath: repair.fieldPath,
@@ -28,7 +28,7 @@ export function protocolReplanContext(task: OpsTask) {
       expected: compactReviewText(rejected[index].expected, 600),
     },
     rejectedStepCount: rejected.length,
-    instruction: "原方案未执行，仅作拒绝原因参考，不是执行证据或必须保留的业务契约。允许为同一未完成目标生成新步骤、重新选择 kind、命令、顺序和风险；保留真实历史失败及其验收契约。新步骤必须重新通过协议、安全、授权和风险审批。不得把用户点击重新规划视为新增操作授权；已确认输入中的明确拒绝仍有效，若新方案需要突破限制，先只返回一个 user.request_input 请求针对性授权并等待。",
+    instruction: "原方案未执行，仅作拒绝原因参考，不是执行证据或必须保留的业务契约。允许为同一未完成目标生成新步骤、重新选择 kind、命令、顺序和风险；保留真实历史失败及其验收契约。新步骤必须重新通过协议、安全、授权和风险审批。进入业务重规划不代表新增操作授权；已确认输入中的明确拒绝仍有效，若新方案需要突破限制，先只返回一个 user.request_input 请求针对性授权并等待。",
   };
 }
 

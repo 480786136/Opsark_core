@@ -20,7 +20,7 @@ function saveTools() {
 </script>
 
 <template>
-  <div class="page management-page">
+  <div class="page management-page registry-management-page">
     <header class="page-header">
       <div><span class="eyebrow">{{ locale.startsWith("zh") ? "工具管理" : "TOOL REGISTRY" }}</span><h1>{{ t("tools.title") }}</h1><p>{{ t("tools.subtitle") }}</p></div>
       <button class="button primary" :disabled="saveState === 'saving'" @click="saveTools"><Save :size="15" />{{ saveState === "saved" ? t("settings.saved") : t("common.save") }}</button>

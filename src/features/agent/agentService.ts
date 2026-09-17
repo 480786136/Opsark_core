@@ -466,7 +466,7 @@ export async function planTaskAdjustment(
       .filter((field): field is "command" | "validation" => field === "command" || field === "validation"))]
     : [];
   const adjustmentInstruction = businessReplan
-    ? "原方案在执行前被拒绝，用户要求生成新的业务调整方案，而非修补旧计划字段。依据真实证据规划剩余目标，重新评估每个新步骤的操作类型、风险和验收；不继承旧步骤批准，不扩大用户授权。"
+    ? "原方案在执行前被拒绝，现在需要生成新的业务调整方案，而非继续修补旧计划字段。依据真实证据规划剩余目标，重新评估每个新步骤的操作类型、风险和验收；不继承旧步骤批准，不扩大用户授权。"
     : safetyFields.length
     ? `上一步在发送服务器前被安全门禁拦截。只修复该步骤的 ${safetyFields.join("、")} 字段并且只返回一个完整替代步骤；不得改写其他字段或扩大任务范围。`
     : input.failedStep

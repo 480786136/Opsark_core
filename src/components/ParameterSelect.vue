@@ -18,8 +18,10 @@ const props = withDefaults(defineProps<{
   clearable?: boolean;
   clearLabel?: string;
   size?: "compact" | "small" | "default";
+  popupMinWidth?: number;
 }>(), {
   size: "default",
+  popupMinWidth: 160,
 });
 const emit = defineEmits<{
   "update:modelValue": [value: string];
@@ -208,7 +210,7 @@ function updatePopupPosition() {
   const estimatedHeight = Math.min(240, props.options.length * (props.size === "compact" ? 28 : 34) + (props.clearable ? 38 : 10));
   placement.value = availableBelow < Math.min(estimatedHeight, 150) && availableAbove > availableBelow ? "top" : "bottom";
   const availableHeight = placement.value === "top" ? availableAbove : availableBelow;
-  const width = Math.max(0, Math.min(Math.max(rect.width, 160), viewportWidth - margin * 2));
+  const width = Math.max(0, Math.min(Math.max(rect.width, props.popupMinWidth), viewportWidth - margin * 2));
   const left = Math.min(Math.max(rect.left, viewportLeft + margin), Math.max(viewportLeft + margin, viewportRight - margin - width));
   popupStyle.value = {
     left: `${left}px`,

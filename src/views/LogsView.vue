@@ -7,6 +7,7 @@ import type { AuditEvent, TaskStatus } from "@/types";
 import { backend } from "@/services/backend";
 import DeveloperLogsPanel from "@/components/DeveloperLogsPanel.vue";
 import ParameterSelect from "@/components/ParameterSelect.vue";
+import { isInternalPlanDiagnostic, localizeCoreText } from "@/features/preferences/coreText";
 
 const store = useOpsStore();
 const { t, locale } = useI18n();
@@ -318,6 +319,12 @@ function selectTask(task: TaskGroup) {
 function formatTime(value: string) { return new Date(value).toLocaleString(locale.value, { hour12: false }); }
 function levelLabel(level: AuditEvent["level"]) { return t(`logs.levels.${level}`); }
 function categoryLabel(category: AuditEvent["category"]) { return t(`logs.${category}`); }
+function auditText(value: string) { return localizeCoreText(value, locale.value); }
+function auditDetail(log: AuditEvent) {
+  return isInternalPlanDiagnostic(log.title)
+    ? localizeCoreText(log.title, locale.value)
+    : localizeCoreText(log.detail, locale.value);
+}
 function commandContent(log: AuditEvent) {
   if (log.category !== "command" || log.detail.trimStart().startsWith("{")) return undefined;
   const [command, ...output] = log.detail.split("\n");
@@ -381,7 +388,7 @@ function commandContent(log: AuditEvent) {
               <div class="complete-process-list">
                 <article v-for="(log, index) in selectedTask.events" :key="log.id" class="complete-process-event">
                   <div class="process-rail"><span :class="['log-level', log.level]"></span><span v-if="index < selectedTask.events.length - 1" class="process-line"></span></div>
-                  <div class="process-event-card"><header><div><span class="log-category">{{ categoryLabel(log.category) }}</span><strong>{{ log.title }}</strong></div><div class="process-event-meta"><span :class="['log-level-label', log.level]">{{ levelLabel(log.level) }}</span><time>{{ formatTime(log.createdAt) }}</time></div></header><div class="process-event-identifiers"><span>{{ log.id }}</span><span v-if="log.stepId">{{ t("logs.stepId", { id: log.stepId }) }}</span><span v-if="log.executionId">{{ t("logs.executionId", { id: log.executionId }) }}</span></div><template v-if="commandContent(log)"><div class="process-output-block"><label>{{ t("logs.executionContent") }}</label><pre>{{ commandContent(log)?.command }}</pre></div><div class="process-output-block"><label>{{ t("logs.returnContent") }}</label><pre>{{ commandContent(log)?.output || t("logs.noDetail") }}</pre></div></template><pre v-else>{{ log.detail || t("logs.noDetail") }}</pre></div>
+                  <div class="process-event-card"><header><div><span class="log-category">{{ categoryLabel(log.category) }}</span><strong>{{ auditText(log.title) }}</strong></div><div class="process-event-meta"><span :class="['log-level-label', log.level]">{{ levelLabel(log.level) }}</span><time>{{ formatTime(log.createdAt) }}</time></div></header><div class="process-event-identifiers"><span>{{ log.id }}</span><span v-if="log.stepId">{{ t("logs.stepId", { id: log.stepId }) }}</span><span v-if="log.executionId">{{ t("logs.executionId", { id: log.executionId }) }}</span></div><template v-if="commandContent(log)"><div class="process-output-block"><label>{{ t("logs.executionContent") }}</label><pre>{{ commandContent(log)?.command }}</pre></div><div class="process-output-block"><label>{{ t("logs.returnContent") }}</label><pre>{{ commandContent(log)?.output || t("logs.noDetail") }}</pre></div></template><pre v-else>{{ auditDetail(log) || t("logs.noDetail") }}</pre></div>
                 </article>
               </div>
             </template>

@@ -77,6 +77,59 @@ describe("LogsView", () => {
     app.unmount();
   });
 
+  it("旧协议详情在操作日志中使用中性提示，开发者日志仍保留原始诊断", async () => {
+    const pinia = createPinia();
+    const store = useOpsStore(pinia);
+    const diagnostic = "PlanProtocolError: OBSERVE_COMMAND_MUTATION / steps[3].command / PROTOCOL_REPAIR_SCOPE_VIOLATION";
+    const legacyAuditDetail = JSON.stringify({
+      originalError: "RECOVERY_DIAGNOSE_MUTATION",
+      repairError: "确定性拆分后的步骤仍需调整",
+      fieldPath: "steps[3].command",
+    });
+    store.logs = [{
+      id: "legacy-protocol-audit",
+      category: "model",
+      level: "error",
+      title: "计划协议修复失败（未执行）",
+      detail: legacyAuditDetail,
+      serverId: "srv-protocol",
+      serverName: "协议测试服务器",
+      taskId: "task-protocol",
+      taskTitle: "检查运行状态",
+      createdAt: "2026-09-17T00:00:00.000Z",
+    }];
+    store.addDeveloperLog({
+      level: "error",
+      operation: "protocol_business_replan",
+      title: "计划协议诊断",
+      summary: diagnostic,
+      error: diagnostic,
+      serverId: "srv-protocol",
+      taskId: "task-protocol",
+    });
+
+    const app = createApp(LogsView).use(pinia).use(i18n);
+    app.mount(host);
+    await flushView();
+    host.querySelector<HTMLButtonElement>(".log-server-summary")!.click();
+    await new Promise((resolve) => window.setTimeout(resolve, 220));
+    await nextTick();
+
+    expect(host.textContent).toContain("当前检查结果和已完成步骤已保留");
+    expect(host.textContent).not.toContain("OBSERVE_COMMAND_MUTATION");
+    expect(host.textContent).not.toContain("PROTOCOL_REPAIR_SCOPE_VIOLATION");
+    expect(host.textContent).not.toContain("RECOVERY_DIAGNOSE_MUTATION");
+    expect(host.textContent).not.toContain("steps[3].command");
+
+    host.querySelectorAll<HTMLButtonElement>(".log-mode-tabs button")[1].click();
+    await nextTick();
+    host.querySelector<HTMLButtonElement>(".developer-server-summary")!.click();
+    await nextTick();
+    expect(host.textContent).toContain("OBSERVE_COMMAND_MUTATION");
+    expect(host.textContent).toContain("PROTOCOL_REPAIR_SCOPE_VIOLATION");
+    app.unmount();
+  });
+
   it("keeps server lifecycle events separate from task execution logs", async () => {
     const pinia = createPinia();
     const store = useOpsStore(pinia);

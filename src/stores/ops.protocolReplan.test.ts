@@ -69,6 +69,26 @@ function generatedContext(index = 0) {
   return JSON.parse(call?.[1]?.context || "{}");
 }
 
+function discoveryFixture(permission: PermissionLevel = "safe") {
+  const current = fixture(permission);
+  const repair = clone(current.task.protocolRepair!.repair);
+  current.task.protocolRepair = undefined;
+  current.task.protocolRepairHistory = undefined;
+  current.task.status = "running";
+  current.task.pauseReason = undefined;
+  current.task.discoveryRefined = false;
+  current.task.refinementCount = 0;
+  current.task.executionConstraints = {
+    changePolicy: "allow_necessary_changes",
+    environmentPolicy: "preserve",
+    failurePolicy: "strict",
+    prohibitedActions: [],
+    requiredConditions: [],
+    userDirectives: ["依据检查证据继续完成目标"],
+  };
+  return { ...current, repair };
+}
+
 describe("协议阻断后的人工业务重规划与重新审批", () => {
   beforeEach(async () => {
     vi.restoreAllMocks();
@@ -239,6 +259,176 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     expect(task.protocolRepairHistory ?? []).toHaveLength(0);
     expect(task.status).toBe("needs_adjustment");
     expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("发现阶段协议失败后由系统自动重规划，safe 低风险步骤直接衔接且不展示技术错误", async () => {
+    const { store, task, repair } = discoveryFixture("safe");
+    task.submittedInputs = undefined;
+    const protocolError = new PlanProtocolError(repair, "PROTOCOL_REPAIR_SCOPE_VIOLATION: fixture detail");
+    const replacement = change("low");
+    vi.mocked(backend.generatePlan)
+      .mockRejectedValueOnce(protocolError)
+      .mockResolvedValueOnce([replacement]);
+    const runStep = vi.spyOn(store, "runStep").mockResolvedValue(undefined);
+
+    await store.advanceTask(task.id);
+
+    expect(backend.generatePlan).toHaveBeenCalledTimes(2);
+    expect(task.protocolRepair).toBeUndefined();
+    expect(task.protocolRepairHistory).toHaveLength(1);
+    expect(task.protocolRepairHistory?.[0]).toMatchObject({
+      status: "accepted",
+      replacementStepIds: [task.plan[0].id],
+    });
+    expect(task.status).toBe("running");
+    expect(runStep).toHaveBeenCalledTimes(1);
+    expect(runStep).toHaveBeenCalledWith(task.id, task.plan[0].id);
+    expect(runStep).not.toHaveBeenCalledWith(task.id, "completed-inspection");
+    expect(store.needsApproval("safe", task.plan[0])).toBe(false);
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+
+    const visible = task.messages.map(message => message.content).join("\n");
+    expect(visible).toContain("系统已按原任务授权自动衔接");
+    expect(visible).not.toContain("完全托管模式已自动批准");
+    expect(visible).not.toContain(repair.validationError);
+    expect(visible).not.toContain("PROTOCOL_REPAIR_SCOPE_VIOLATION");
+    expect(visible).not.toContain("PlanProtocolError");
+    expect(store.logs).toContainEqual(expect.objectContaining({
+      title: "系统从协议阻断自动转入业务重新规划",
+      detail: expect.stringContaining('"triggerSource":"system_continuation"'),
+    }));
+    expect(store.developerLogs).toContainEqual(expect.objectContaining({
+      operation: "discovery_refinement",
+      error: expect.stringContaining("PROTOCOL_REPAIR_SCOPE_VIOLATION"),
+    }));
+  });
+
+  it("系统协议重规划在 managed 高风险步骤前停下等待具体步骤确认", async () => {
+    const { store, task, repair } = discoveryFixture("managed");
+    const protocolError = new PlanProtocolError(repair, "PROTOCOL_REPAIR_SCOPE_VIOLATION: fixture detail");
+    vi.mocked(backend.generatePlan)
+      .mockRejectedValueOnce(protocolError)
+      .mockResolvedValueOnce([change("high")]);
+    const runStep = vi.spyOn(store, "runStep");
+
+    await store.advanceTask(task.id);
+
+    expect(backend.generatePlan).toHaveBeenCalledTimes(2);
+    expect(task.status, task.pauseReason ?? JSON.stringify(task.messages)).toBe("awaiting_step_approval");
+    expect(task.plan[0]).toMatchObject({ kind: "change", risk: "high", status: "awaiting_approval" });
+    expect(store.needsApproval("managed", task.plan[0])).toBe(true);
+    expect(runStep).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+    expect(task.messages.some(message => message.content.includes("系统已按原任务授权自动衔接"))).toBe(true);
+    expect(task.messages.some(message => message.content.includes("完全托管模式已自动批准"))).toBe(false);
+  });
+
+  it("整体目标复核产生的后续方案协议阻断也会自动重新整理", async () => {
+    const { store, task, repair } = discoveryFixture("safe");
+    task.discoveryRefined = true;
+    task.refinementCount = 1;
+    const protocolError = new PlanProtocolError(repair, "PROTOCOL_REPAIR_SCOPE_VIOLATION: next-stage fixture");
+    const decide = vi.spyOn(backend, "decideNextStage").mockRejectedValueOnce(protocolError);
+    vi.mocked(backend.generatePlan).mockResolvedValueOnce([step({
+      id: "next-stage-replacement",
+      command: "cat /proc/sys/net/ipv4/ip_forward",
+    })]);
+    const runStep = vi.spyOn(store, "runStep").mockResolvedValue(undefined);
+
+    await store.advanceTask(task.id);
+
+    expect(decide).toHaveBeenCalledOnce();
+    expect(backend.generatePlan).toHaveBeenCalledOnce();
+    expect(task.status).toBe("running");
+    expect(task.protocolRepair).toBeUndefined();
+    expect(task.protocolRepairHistory?.[0]).toMatchObject({ status: "accepted" });
+    expect(runStep).toHaveBeenCalledOnce();
+    expect(store.developerLogs).toContainEqual(expect.objectContaining({
+      operation: "workflow_progression",
+      error: expect.stringContaining("next-stage fixture"),
+    }));
+    const visible = task.messages.map(message => message.content).join("\n");
+    expect(visible).not.toContain(repair.validationError);
+    expect(visible).not.toContain("next-stage fixture");
+  });
+
+  it("连续两个发现阶段的协议阻断不会被上一轮调整锁吞掉", async () => {
+    const { store, task, repair } = discoveryFixture("managed");
+    const secondRepair: PlanNormalizationRepair = {
+      ...clone(repair),
+      validationError: "OBSERVE_COMMAND_MUTATION / steps[1].command / matchedToken=redirect",
+      previousModelOutput: [step({ id: "second-rejected", command: "printf data >/tmp/second-rejected" })],
+    };
+    vi.mocked(backend.generatePlan)
+      .mockRejectedValueOnce(new PlanProtocolError(repair, "first discovery protocol stop"))
+      .mockResolvedValueOnce([step({ id: "phase-one", command: "cat /proc/version" })])
+      .mockRejectedValueOnce(new PlanProtocolError(secondRepair, "second discovery protocol stop"))
+      .mockResolvedValueOnce([step({ id: "phase-two", command: "cat /proc/uptime" })]);
+    const runStep = vi.spyOn(store, "runStep").mockImplementation(async (_taskId, stepId) => {
+      if (runStep.mock.calls.length !== 1) return;
+      const completed = task.plan.find(candidate => candidate.id === stepId)!;
+      completed.status = "completed";
+      completed.result = {
+        executionStatus: "success",
+        observationStatus: "matched",
+        exitCode: 0,
+        facts: { observed: true },
+        warnings: [],
+        evidenceIds: [],
+      };
+      task.status = "running";
+      task.discoveryRefined = false;
+      await store.advanceTask(task.id);
+    });
+
+    await store.advanceTask(task.id);
+
+    expect(backend.generatePlan).toHaveBeenCalledTimes(4);
+    expect(task.protocolRepair).toBeUndefined();
+    expect(task.protocolRepairHistory?.map(record => record.status)).toEqual(["accepted", "accepted"]);
+    expect(task.status).toBe("running");
+    expect(task.adjustmentInProgress).toBe(false);
+    expect(task.managedAdjustmentPhase).toBeUndefined();
+    expect(runStep).toHaveBeenCalledTimes(2);
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it("系统业务重规划再次违反协议时有界停止，拒绝计划与旧计划都不会远程执行", async () => {
+    const { store, task, repair } = discoveryFixture("safe");
+    const discoveryError = new PlanProtocolError(repair, "first protocol repair rejected");
+    const rejectedAgain = {
+      ...repair,
+      validationError: "OBSERVE_COMMAND_MUTATION / steps[2].command / matchedToken=redirect",
+      previousModelOutput: [change("low")],
+    };
+    const replanError = new PlanProtocolError(rejectedAgain, "PROTOCOL_REPAIR_SCOPE_VIOLATION: bounded stop");
+    vi.mocked(backend.generatePlan)
+      .mockRejectedValueOnce(discoveryError)
+      .mockRejectedValueOnce(replanError);
+    const runStep = vi.spyOn(store, "runStep");
+
+    await store.advanceTask(task.id);
+
+    expect(backend.generatePlan).toHaveBeenCalledTimes(2);
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.managedAdjustmentPhase).toBe("manual_required");
+    expect(task.protocolRepair?.repair.validationError).toBe(rejectedAgain.validationError);
+    expect(task.protocolRepairHistory).toHaveLength(1);
+    expect(task.protocolRepairHistory?.[0]).toMatchObject({ status: "failed" });
+    expect(runStep).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+    expect(store.developerLogs).toContainEqual(expect.objectContaining({
+      operation: "protocol_business_replan",
+      error: expect.stringContaining("bounded stop"),
+    }));
+    const visible = task.messages.map(message => message.content).join("\n");
+    expect(visible).not.toContain(rejectedAgain.validationError);
+    expect(visible).not.toContain("bounded stop");
+    expect(visible).not.toContain("PlanProtocolError");
   });
 
   it("模型请求失败不丢失旧方案和协议事故，人工重试仍进入新计划而不是局部修复", async () => {
