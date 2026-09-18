@@ -77,6 +77,8 @@ cd "/Users/lizhiming/智感/agent/OpsArk_v3.0/Opsark_core"
 
 npm run build:macos -- x86_64-apple-darwin
 npm run build:macos -- aarch64-apple-darwin
+
+
 ## 代码提交
 git -c http.proxy=http://127.0.0.1:7897 -c https.proxy=http://127.0.0.1:7897 push
 ## 演示流程

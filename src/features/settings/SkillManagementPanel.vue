@@ -28,7 +28,7 @@ const officialCatalog = useOfficialCatalogStore();
 const skillSync = useSkillAutoSyncStore();
 const router = useRouter();
 defineProps<{ standalone?: boolean }>();
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const query = ref("");
 const categoryFilter = ref<SkillCategory | "all">("all");
 const selectedSkillId = ref(store.skills.find(skill => !skill.builtIn)?.id ?? "");
@@ -120,6 +120,13 @@ const hasSkillContent = computed(() => {
   return Boolean(skill && [skill.name, skill.description, skill.instructions, ...skill.matchRules]
     .some(value => value.trim()));
 });
+function formatLocalDate(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "--";
+  return new Intl.DateTimeFormat(locale.value.startsWith("zh") ? "zh-CN" : locale.value, {
+    year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(date);
+}
 
 watch(modelOptions, (options) => {
   if (!options.some(option => option.value === authoringModelId.value && !option.disabled && !option.action)) {
@@ -321,7 +328,7 @@ function closePreview() {
         <div class="tool-editor-head">
           <div>
             <span class="skill-id-line"><strong>{{ selectedSkill.id }}</strong><button v-if="account.current" type="button" class="skill-cloud-state" :class="{ editing: hasUnsavedChanges, pending: !hasUnsavedChanges && !skillSync.isSynced(selectedSkill.id), synced: !hasUnsavedChanges && skillSync.isSynced(selectedSkill.id) }" :disabled="skillSync.busy || hasUnsavedChanges || skillSync.isSynced(selectedSkill.id)" :aria-label="hasUnsavedChanges ? '请先保存 Skill' : skillSync.isSynced(selectedSkill.id) ? '已同步到云端' : '同步此 Skill'" @click="skillSync.syncSkill(selectedSkill.id)"><Cloud v-if="skillSync.isSynced(selectedSkill.id) && !hasUnsavedChanges" :size="14"/><CloudUpload v-else :size="14"/></button></span>
-            <small>{{ selectedSkill.builtIn ? t("skills.builtInVersion", { version: selectedSkill.version }) : t("skills.customVersion", { version: selectedSkill.version }) }}</small>
+            <small>{{ selectedSkill.builtIn ? t("skills.builtInVersion", { version: selectedSkill.version }) : t("skills.localVersion", { date: formatLocalDate(selectedSkill.updatedAt) }) }}</small>
           </div>
           <label class="toggle" :title="t('skills.toggle')">
             <input v-model="selectedSkill.enabled" type="checkbox" /><i></i>

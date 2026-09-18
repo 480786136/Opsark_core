@@ -40,7 +40,7 @@ describe("SkillManagementPanel", () => {
     expect(host.querySelector<HTMLTextAreaElement>(".skill-basic-fields textarea")?.placeholder)
       .toBe("说明这个 Skill 负责处理的业务场景。");
     expect(host.textContent).toContain(custom!.id);
-    expect(host.textContent).toContain("自定义 Skill");
+    expect(host.textContent).toContain("本地版本");
     expect(host.textContent).toContain("Skill 分类");
     expect(host.textContent).not.toContain("请求的执行能力");
 
