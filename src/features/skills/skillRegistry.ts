@@ -69,6 +69,7 @@ function parseCustomSkill(value: unknown): SkillDefinition | undefined {
     matchRules,
     enabled: value.enabled !== false,
     builtIn: false,
+    source: "user",
     version: Number.isInteger(value.version) ? Number(value.version) : 1,
     updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : new Date().toISOString(),
   };
@@ -162,6 +163,7 @@ export function createSkillConfiguration(
       description: skill.description,
       enabled: skill.enabled,
       builtIn: false,
+      source: "user",
       version: skill.version,
       matchRules: [...skill.matchRules],
       instructions: skill.instructions,
@@ -177,9 +179,10 @@ export function createCustomSkill(id: string): SkillDefinition {
     category: "other",
     description: "说明这个 Skill 负责处理的业务场景。",
     matchRules: [],
-    instructions: "说明模型必须遵循的处理阶段、可用工具、阻断条件和最终验收要求。",
+    instructions: "用自然语言说明目标、处理阶段、关键判断、失败处理和最终验收要求。",
     enabled: true,
     builtIn: false,
+    source: "user",
     version: 1,
     updatedAt: new Date().toISOString(),
   };
@@ -228,7 +231,7 @@ export function buildSkillDirectory(skills: SkillDefinition[]): ModelSkillDirect
 
 export function resolveTaskSkills(task: OpsTask, catalog: SkillDefinition[] = builtInSkillCatalog) {
   const ids = new Set(task.activeSkillIds ?? []);
-  return catalog.filter((skill) => skill.enabled && ids.has(skill.id));
+  return (task.skillSnapshot ?? catalog).filter((skill) => skill.enabled && ids.has(skill.id));
 }
 
 export function buildSkillContext(skills: SkillDefinition[]): ModelSkillDefinition[] {

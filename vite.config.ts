@@ -16,5 +16,9 @@ export default defineConfig({
     host: host || false,
     hmr: host ? { protocol: "ws", host, port: 1421 } : undefined,
     watch: { ignored: ["**/src-tauri/**"] },
+    proxy: {
+      // Only public catalogue discovery is proxied for browser development; no account APIs.
+      "^/api/core/v1/official-models$": { target: process.env.OPSARK_PLATFORM_URL || "http://127.0.0.1:8001", changeOrigin: true },
+    },
   },
 });

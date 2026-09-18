@@ -374,6 +374,8 @@ export type ManagedStopReason =
   | "cancelled";
 
 export interface OpsTask {
+  /** Controller-authored versions used throughout a task; never taken from model output. */
+  skillSnapshot?: import("@/features/skills/types").SkillDefinition[];
   /** Ephemeral classification work does not replace the execution/approval state. */
   requirementProcessing?: boolean;
   /** Only explicit goal cancellation/replacement sets this; stopping an attempt does not. */
@@ -400,6 +402,13 @@ export interface OpsTask {
   status: TaskStatus;
   permission: PermissionLevel;
   modelId: string;
+  /** Provider refusal is not a failed server operation. Retry only after conditions change. */
+  modelPlanningBlocker?: {
+    error: ModelServiceError;
+    conditionsFingerprint: string;
+    recordedAt: string;
+    accountBalance?: { userId: string; available: number; reserved: number };
+  };
   messages: TaskMessage[];
   plan: PlanStep[];
   planHistory?: TaskPlanHistory[];
@@ -522,6 +531,8 @@ export interface ModelRequestParameters {
 }
 
 export interface ModelProfile {
+  /** Official profiles exist only for the active cloud session; never persist credentials. */
+  source?: "official";
   requestParameters?: ModelRequestParameters;
   /** End-to-end deadline for each model request. It is not sent in the JSON body. */
   timeoutSeconds?: number;
@@ -558,6 +569,23 @@ export interface RequirementProcessingResult {
   selectedSkillIds?: string[];
   planError?: string;
   developerTrace?: ModelDeveloperTrace;
+}
+
+export interface ModelServiceError {
+  httpStatus: number;
+  code: string;
+  message: string;
+  retryable: boolean;
+  details?: {
+    available_tokens?: number;
+    required_tokens?: number;
+    reserved_tokens?: number;
+    estimated_input_tokens?: number;
+    billing_mode?: "direct" | "reserved";
+    max_output_tokens?: number;
+    estimator?: string;
+    exact?: boolean;
+  };
 }
 
 export interface ModelDeveloperTrace {

@@ -38,6 +38,9 @@ export interface SkillPlanningEvidence {
 }
 
 export interface SkillDefinition {
+  source?: "system" | "user";
+  /** A requested capability, never an execution grant. Missing preserves legacy Shell workflows. */
+  allowShell?: boolean;
   id: string;
   name: string;
   category: SkillCategory;
@@ -113,6 +116,15 @@ export interface SkillConfiguration {
 export interface SkillValidationIssue {
   field: "name" | "description" | "matchRules" | "instructions";
   message: string;
+}
+
+/** Model-authored content is a draft until the user explicitly applies it to the editor. */
+export interface GeneratedSkillDraft {
+  name: string;
+  category: SkillCategory;
+  description: string;
+  matchRules: string[];
+  instructions: string;
 }
 
 export interface ModelSkillDefinition {

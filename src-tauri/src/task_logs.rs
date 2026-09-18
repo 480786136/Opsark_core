@@ -530,6 +530,38 @@ fn validate_snapshot_file(log_root: &Path, snapshot: &LogFileSnapshot) -> Result
     Ok(())
 }
 
+/// Export every persisted record in the selected task's streams, including rotated parts.
+/// Unlike the log browser, support export preserves model request/response bodies.
+pub(crate) fn support_export(root: &Path, task_id: &str) -> Result<Value, String> {
+    if task_id.trim().is_empty() || task_id.len() > 128 {
+        return Err("请选择有效任务".into());
+    }
+    let log_root = root.join("logs");
+    let mut snapshots = Vec::new();
+    for stream in ["events", "developer-events", "model-calls"] {
+        snapshots.extend(snapshot_log_files(&log_root, stream, Some(task_id))?);
+    }
+    let total: u64 = snapshots.iter().map(|file| file.bytes).sum();
+    if total > 64 * 1024 * 1024 {
+        return Err("该任务的完整日志超过 64 MB，请通过联系我们提交；日志不会被截断".into());
+    }
+    let mut files = Vec::new();
+    for snapshot in snapshots {
+        validate_snapshot_file(&log_root, &snapshot)?;
+        let mut content = String::new();
+        File::open(&snapshot.path).map_err(|e| e.to_string())?
+            .take(snapshot.bytes).read_to_string(&mut content).map_err(|e| e.to_string())?;
+        if content.len() as u64 != snapshot.bytes {
+            return Err("任务日志在读取时发生变化，请重试".into());
+        }
+        files.push(json!({
+            "name": snapshot.path.file_name().unwrap().to_string_lossy(),
+            "content": content,
+        }));
+    }
+    Ok(json!({"taskId": task_id, "files": files}))
+}
+
 fn retain_candidate(
     candidates: &mut BinaryHeap<Candidate>,
     candidate_bytes: &mut usize,
@@ -1956,6 +1988,32 @@ mod tests {
         invalid_stream.stream = "../events".into();
         assert!(query(&root, invalid_stream).is_err());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn support_export_includes_all_task_streams_and_parts_without_other_tasks() {
+        let root = std::env::temp_dir().join(call_id());
+        let context = json!({"taskId":"support-task"});
+        for stream in ["events", "developer-events", "model-calls"] {
+            append(&root, stream, json!({"request":"complete request", "response":"complete response"}), &context).unwrap();
+            append(&root, stream, json!({"private":"other task data"}), &json!({"taskId":"other-task"})).unwrap();
+            append(&root, stream, json!({"private":"system data"}), &json!({})).unwrap();
+        }
+        let directory = root.join("logs/tasks").join(task_directory("support-task"));
+        std::fs::write(directory.join("events-1.jsonl"), "historical rotated record\n").unwrap();
+        let exported = support_export(&root, "support-task").unwrap();
+        assert_eq!(exported["files"].as_array().unwrap().len(), 4);
+        let text = exported.to_string();
+        for included in ["complete request", "complete response", "historical rotated record"] {
+            assert!(text.contains(included));
+        }
+        assert!(!text.contains("other task data"));
+        assert!(!text.contains("system data"));
+        assert!(support_export(&root, "").is_err());
+        assert_eq!(support_export(&root, "../../outside").unwrap()["files"], json!([]));
+        std::fs::write(directory.join("events-1.jsonl"), [0xff]).unwrap();
+        assert!(support_export(&root, "support-task").is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -118,4 +118,36 @@ describe("SecretManagementView", () => {
     expect(select.textContent).toContain("Alpha · 10.0.0.1");
     app.unmount();
   });
+
+  it("删除敏感信息前要求二次确认", async () => {
+    const pinia = createPinia();
+    const store = useOpsStore(pinia);
+    const createdAt = new Date().toISOString();
+    store.servers = [{
+      id: "server-a", name: "Alpha", host: "10.0.0.1", port: 22, username: "root", group: "test", status: "online", environment: [],
+      info: { os: "Linux", kernel: "6", cpu: "CPU", cores: 1, memoryGb: 1, diskGb: 1, uptime: "1h" }, createdAt,
+    }];
+    store.secretMetadata = [{ key: "API_TOKEN", description: "测试令牌", scope: "server", serverId: "server-a" }];
+    vi.spyOn(backend, "deleteCredential").mockResolvedValue(undefined);
+
+    const app = createApp(SecretManagementView);
+    app.use(pinia).use(i18n).mount(host);
+    await nextTick();
+    host.querySelector<HTMLButtonElement>(".secret-list-row")!.click();
+    await nextTick();
+    document.querySelector<HTMLButtonElement>(".secret-drawer-footer .button.danger")!.click();
+    await nextTick();
+
+    expect(document.querySelector("[role='alertdialog']")?.textContent).toContain("将删除此敏感变量");
+    expect(store.secretMetadata).toHaveLength(1);
+    document.querySelector<HTMLButtonElement>(".action-confirmation .button.secondary")!.click();
+    await nextTick();
+    expect(store.secretMetadata).toHaveLength(1);
+
+    document.querySelector<HTMLButtonElement>(".secret-drawer-footer .button.danger")!.click();
+    await nextTick();
+    document.querySelector<HTMLButtonElement>(".action-confirmation .button.primary")!.click();
+    await vi.waitFor(() => expect(store.secretMetadata).toHaveLength(0));
+    app.unmount();
+  });
 });

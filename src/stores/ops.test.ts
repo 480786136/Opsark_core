@@ -24,6 +24,7 @@ import { useAgentTerminalStore } from "@/features/terminal/agentTerminalStore";
 import { automaticContinuationBlocker } from "@/features/agent/workflowProgress";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { recoveryHistory, unresolvedRecoveryBlockers, validateRecoveryReferences } from "@/features/agent/recoveryContract";
+import { useAccountStore } from "@/features/account/accountStore";
 
 const plan: PlanStep[] = [
   {
@@ -66,6 +67,7 @@ describe("智能任务状态机", () => {
 
   beforeEach(async () => {
     vi.restoreAllMocks();
+    vi.spyOn(backend, "configureTaskCapabilities").mockResolvedValue();
     localStorage.clear();
     localStorage.setItem("opsark.servers", JSON.stringify([
       {
@@ -196,6 +198,210 @@ describe("智能任务状态机", () => {
     }];
     return { store, task };
   }
+
+  function quotaError(code = "INSUFFICIENT_CREDITS") {
+    return new ModelInvocationError("provider credit failure", undefined, {
+      httpStatus: 402, code, message: "可用额度不足", retryable: false,
+      details: { available_tokens: 12000, required_tokens: 24000, exact: false },
+    });
+  }
+
+  it("服务切换直接扣费后刷新账号可解除历史预留不足阻断，余额不必改变", () => {
+    const { store, task } = completedObservationTask();
+    store.models.find(model => model.id === task.modelId)!.source = "official";
+    const account = useAccountStore();
+    account.current = { user: { id: "billing-user", email: "fixture@example.invalid" },
+      billingMode: "reserved", balance: { available: 12000, reserved: 0, revision: 1, unit: "tokens" },
+      models: [], endpoint: "https://account.invalid" };
+    store.recordModelPlanningBlocker(task, quotaError().modelError!);
+    expect(store.stopBlockedModelPlanning(task)).toBe(true);
+    account.current.billingMode = "direct";
+    expect(store.stopBlockedModelPlanning(task)).toBe(false);
+    store.recordModelPlanningBlocker(task, { httpStatus: 402, code: "INSUFFICIENT_CREDITS",
+      message: "余额已用完", retryable: false, details: { billing_mode: "direct", available_tokens: 0 } });
+    expect(store.stopBlockedModelPlanning(task)).toBe(true);
+  });
+
+  it("额度不足后托管调整和重复人工点击均不再次调用模型，已完成证据保持不变", async () => {
+    const { store, task } = completedObservationTask();
+    task.status = "needs_adjustment";
+    const original = JSON.parse(JSON.stringify(task.plan));
+    vi.mocked(backend.generatePlan).mockRejectedValueOnce(quotaError());
+
+    await store.requestAdjustment(task.id, true);
+    const conditions = task.modelPlanningBlocker?.conditionsFingerprint;
+    expect(task.pauseReason).toContain("可用 2 积分");
+    expect(task.pauseReason).toContain("需要预留 3 积分");
+    expect(task.pauseReason).not.toContain("稍后重试");
+    expect(task.managedAdjustmentPhase).toBe("manual_required");
+    expect(task.modelPlanningBlocker?.error.code).toBe("INSUFFICIENT_CREDITS");
+    for (let index = 0; index < 3; index++) {
+      await store.requestAdjustment(task.id);
+      await store.beginAdjustment(task.id, true);
+      await store.queueManagedAdjustment(task.id, 0);
+    }
+    expect(backend.generatePlan).toHaveBeenCalledOnce();
+    expect(task.modelPlanningBlocker?.conditionsFingerprint).toBe(conditions);
+    expect(task.autoAdjustmentSeconds).toBeUndefined();
+    expect(task.plan).toEqual(original);
+    expect(task.adjustmentIncident?.executionAttemptCount).toBe(0);
+  });
+
+  it("发现阶段续规划额度不足后不会再被五秒托管队列重复请求", async () => {
+    vi.useFakeTimers();
+    const { store, task } = completedObservationTask();
+    task.plan[0].command = `opsark-tool evidence.read ${JSON.stringify({ evidenceId: "a".repeat(64) })}`;
+    const original = JSON.parse(JSON.stringify(task.plan));
+    vi.mocked(backend.generatePlan).mockRejectedValueOnce(quotaError());
+    await store.advanceTask(task.id);
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.modelPlanningBlocker?.error.httpStatus).toBe(402);
+    const queued = store.queueManagedAdjustment(task.id);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await queued;
+    await store.requestAdjustment(task.id);
+    expect(backend.generatePlan).toHaveBeenCalledOnce();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(task.plan).toEqual(original);
+    expect(task.pauseReason).toContain("补充积分");
+  });
+
+  it("阶段联合决策额度不足不降级付费复核、不重规划、不改写已成功步骤", async () => {
+    const { store, task } = completedObservationTask();
+    const original = JSON.parse(JSON.stringify(task.plan));
+    vi.mocked(backend.decideNextStage).mockRejectedValueOnce(quotaError());
+    await store.advanceTask(task.id);
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.modelPlanningBlocker?.error.code).toBe("INSUFFICIENT_CREDITS");
+    expect(task.pauseReason).toContain("需要预留 3 积分");
+    await store.queueManagedAdjustment(task.id, 0);
+    await store.requestAdjustment(task.id);
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(backend.reviewGoal).not.toHaveBeenCalled();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(task.plan).toEqual(original);
+  });
+
+  it("额度阻断持久化后仍有效，状态/展示文案/失败计数变化不能自行解锁", async () => {
+    const { store, task } = completedObservationTask();
+    task.status = "needs_adjustment";
+    store.recordModelPlanningBlocker(task, quotaError().modelError!);
+    const stored = JSON.parse(JSON.stringify(task.modelPlanningBlocker));
+    task.modelPlanningBlocker = stored;
+    task.pauseReason = "用户查看了详情";
+    task.adjustmentCount = 42;
+    task.status = "awaiting_continuation";
+    expect(store.stopBlockedModelPlanning(task)).toBe(true);
+    await store.requestAdjustment(task.id);
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(task.modelPlanningBlocker).toEqual(stored);
+  });
+
+  it.each(["budget", "model", "instruction", "balance"])("%s条件变化后可恢复规划，但不会自动重放已完成步骤", async (changed) => {
+    const { store, task } = completedObservationTask();
+    task.status = "needs_adjustment";
+    task.permission = "safe";
+    const account = useAccountStore();
+    if (changed === "balance") {
+      store.models[0].source = "official";
+      account.current = { user: { id: "account-fixture", email: "fixture@example.invalid" },
+        balance: { available: 12000, reserved: 0, revision: 1, unit: "tokens" },
+        models: [], endpoint: "https://account.invalid" };
+    }
+    vi.mocked(backend.generatePlan).mockRejectedValueOnce(quotaError()).mockResolvedValueOnce([
+      { ...structuredClone(plan[0]), kind: "observe", id: "new-observation", command: "uname -a", validation: "" },
+    ]);
+    await store.requestAdjustment(task.id);
+    expect(backend.generatePlan).toHaveBeenCalledOnce();
+    if (changed === "budget") store.aiGenerationSettings.maxOutputTokens -= 100;
+    if (changed === "model") store.models[0].model = "alternative-model";
+    if (changed === "instruction") task.currentInstruction = "仅补充当前服务状态，缩小诊断范围";
+    if (changed === "balance") account.current!.balance = { available: 50000, reserved: 0, revision: 2, unit: "tokens" };
+    await store.requestAdjustment(task.id);
+    expect(backend.generatePlan).toHaveBeenCalledTimes(2);
+    expect(task.modelPlanningBlocker).toBeUndefined();
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("迟到的额度错误不会给已取消的任务新增阻断", async () => {
+    const { store, task } = completedObservationTask();
+    task.status = "needs_adjustment";
+    let reject;
+    vi.mocked(backend.generatePlan).mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+    const planning = store.requestAdjustment(task.id);
+    await vi.waitFor(() => expect(reject).toBeTypeOf("function"));
+    await store.terminateTask(task.id);
+    reject(quotaError());
+    await planning;
+    expect(task.status).toBe("cancelled");
+    expect(task.modelPlanningBlocker).toBeUndefined();
+  });
+
+  it("初始需求分类成功但planError含402时保留Skill并阻断相同需求重试", async () => {
+    const store = useOpsStore();
+    const selectedSkillIds = [store.skills[0].id];
+    const failure = `需求已判定为执行类，但计划生成失败：OPSARK_MODEL_TRACE_V1:${JSON.stringify({
+      message: "计划生成返回错误（402 Payment Required）", modelError: quotaError().modelError,
+      developerTrace: { attempts: [] },
+    })}`;
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({
+      intent: "execute", relation: "new_goal", selectedSkillIds, plan: [], planError: failure,
+    });
+    const requirement = "检查服务器当前运行状态并给出建议";
+    await store.submitRequirement("srv-production-01", requirement, "managed", "model-deepseek");
+    const task = store.activeTask!;
+    expect(task.status).toBe("planning_failed");
+    expect(task.activeSkillIds).toEqual(selectedSkillIds);
+    expect(task.pauseReason).toContain("本次调用预留额度不足");
+    expect(task.pauseReason).toContain("需要预留 3 积分");
+    expect(task.modelPlanningBlocker?.error.code).toBe("INSUFFICIENT_CREDITS");
+    await store.submitRequirement("srv-production-01", requirement, "managed", "model-deepseek", "", task.id);
+    expect(backend.processRequirement).toHaveBeenCalledOnce();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(task.activeSkillIds).toEqual(selectedSkillIds);
+  });
+
+  it("余额revision增长或陈旧高余额刷新到实际拒绝余额不会解锁额度阻断", async () => {
+    const { store, task } = completedObservationTask();
+    task.status = "needs_adjustment";
+    store.models[0].source = "official";
+    const account = useAccountStore();
+    account.current = { user: { id: "account-fixture", email: "fixture@example.invalid" },
+      balance: { available: 99899, reserved: 0, revision: 1, unit: "tokens" },
+      models: [], endpoint: "https://account.invalid" };
+    vi.mocked(backend.generatePlan).mockRejectedValueOnce(quotaError());
+    await store.requestAdjustment(task.id);
+    account.current.balance.revision += 1;
+    await store.requestAdjustment(task.id);
+    expect(backend.generatePlan).toHaveBeenCalledOnce();
+    account.current.balance = { available: 12000, reserved: 0, revision: 3, unit: "tokens" };
+    await store.requestAdjustment(task.id);
+    expect(backend.generatePlan).toHaveBeenCalledOnce();
+    expect(task.modelPlanningBlocker).toBeDefined();
+    account.current.balance = { available: 24000, reserved: 0, revision: 4, unit: "tokens" };
+    expect(store.stopBlockedModelPlanning(task)).toBe(false);
+    expect(task.modelPlanningBlocker).toBeUndefined();
+  });
+
+  it("请求准备期间恢复账户模型后，以实际发送条件记录额度阻断而不自解锁", async () => {
+    const { store, task } = completedObservationTask();
+    task.status = "needs_adjustment";
+    vi.spyOn(store, "hydrateCredentials").mockImplementationOnce(async () => {
+      store.models[0].source = "official";
+      useAccountStore().current = { user: { id: "account-fixture", email: "fixture@example.invalid" },
+        balance: { available: 12000, reserved: 0, revision: 1, unit: "tokens" },
+        models: [], endpoint: "https://account.invalid" };
+    });
+    vi.mocked(backend.generatePlan).mockRejectedValueOnce(quotaError());
+    await store.requestAdjustment(task.id);
+    expect(task.modelPlanningBlocker?.conditionsFingerprint).toBe(store.modelPlanningConditions(task));
+    await store.requestAdjustment(task.id);
+    await store.queueManagedAdjustment(task.id, 0);
+    expect(backend.generatePlan).toHaveBeenCalledOnce();
+  });
 
   it("目标判断等待期间终止任务，迟到结果不会恢复任务或把已完成步骤标为失败", async () => {
     const { store, task } = completedObservationTask();

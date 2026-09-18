@@ -26,6 +26,7 @@ import {
   Search,
 } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
+import { useRouter } from "vue-router";
 import { useOpsStore } from "@/stores/ops";
 import type { ObservationStatus, OpsTask, PlanStep, TaskPlanHistory } from "@/types";
 import type { PendingUserInput } from "@/features/tools/types";
@@ -38,10 +39,16 @@ import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
 import { useWorkspaceLinkStore } from "@/features/workspace/workspaceLinkStore";
 import { conversationHistoryRounds } from "@/features/agent/conversationHistory";
 import { localizeCoreText } from "@/features/preferences/coreText";
+import { useAccountStore } from "@/features/account/accountStore";
+import { useOfficialCatalogStore } from "@/features/account/officialCatalogStore";
+import { formatCredits } from "@/features/account/credits";
 
 const props = defineProps<{ serverId: string; active?: boolean }>();
 const showDevelopmentFeatures = import.meta.env.DEV;
 const store = useOpsStore();
+const account = useAccountStore();
+const officialCatalog = useOfficialCatalogStore();
+const router = useRouter();
 const connectionReady = computed(() => store.isServerConnected(props.serverId));
 const agentWorkspaces = useAgentWorkspaceStore();
 const workspaceLinks = useWorkspaceLinkStore();
@@ -81,6 +88,11 @@ const modelOptions = computed(() => [
     label: modelOptionText(model.id, model.name),
     disabled: store.modelAvailability[model.id]?.status !== "available",
   })),
+  ...(!account.current ? officialCatalog.models.map(model => ({
+    value: `__official_login__:${model.id}`,
+    label: `${model.name} · 登录后使用官方模型 · 点击登录`,
+    action: true,
+  })) : []),
   { value: "__manage_models__", label: t("agent.manageModels") },
 ]);
 const modelPlaceholder = computed(() => checkingModels.value
@@ -445,6 +457,10 @@ function handleModelSelection(value: string) {
   selectFirstAvailableModel();
 }
 
+function handleModelAction(value: string) {
+  if (value.startsWith("__official_login__:")) void router.push("/account");
+}
+
 function handlePermissionSelection(value: string) {
   if (["observe", "safe", "managed"].includes(value)) {
     permission.value = value as "observe" | "safe" | "managed";
@@ -452,7 +468,13 @@ function handlePermissionSelection(value: string) {
 }
 
 function modelOptionText(modelIdValue: string, name: string) {
+  const model = store.models.find(item => item.id === modelIdValue);
   const availability = store.modelAvailability[modelIdValue];
+  if (model?.source === "official" && account.current) {
+    const status = availability?.status === "available" ? t("agent.modelAvailable")
+      : availability?.status === "checking" ? t("agent.modelChecking") : t("agent.modelUnavailable");
+    return `${name} · 剩余 ${formatCredits(account.current.balance.available)} 积分 · ${status}`;
+  }
   if (availability?.status === "available") return `${name} · ${t("agent.modelAvailable")}`;
   if (availability?.status === "checking") return `${name} · ${t("agent.modelChecking")}`;
   return `${name} · ${availability?.reason ? coreText(availability.reason) : t("agent.modelUnavailable")}`;
@@ -576,6 +598,7 @@ function closeTaskMenuOnOutsidePointer(event: PointerEvent) {
 
 onMounted(() => {
   document.addEventListener("pointerdown", closeTaskMenuOnOutsidePointer);
+  if (import.meta.env.MODE !== "test") void officialCatalog.refresh();
   void restoreAutomation();
 });
 onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuOnOutsidePointer));
@@ -1039,6 +1062,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
             :popup-min-width="280"
             size="compact"
             @update:model-value="handleModelSelection"
+            @option-action="handleModelAction"
           />
           <ParameterSelect
             class="composer-permission-select"

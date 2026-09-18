@@ -18,8 +18,13 @@ const router = createRouter({
     { path: "/server/:id", component: () => import("@/views/WorkspaceView.vue") },
     { path: "/logs", component: () => import("@/views/LogsView.vue") },
     { path: "/models", component: () => import("@/views/ModelManagementView.vue") },
+    { path: "/account", component: () => import("@/views/AccountView.vue") },
     { path: "/secrets", component: () => import("@/views/SecretManagementView.vue") },
-    { path: "/tools", component: () => import("@/views/ToolManagementView.vue") },
+    import.meta.env.DEV ? { path: "/tools", component: () => import("@/views/ToolManagementView.vue") } : { path: "/tools", redirect: "/" },
+    import.meta.env.DEV
+      ? { path: "/permissions", component: () => import("@/views/ExecutionPermissionsView.vue") }
+      : { path: "/permissions", redirect: "/" },
+    { path: "/support", component: () => import("@/views/SupportView.vue") },
     { path: "/skills", component: () => import("@/views/SkillManagementView.vue") },
     import.meta.env.DEV
       ? { path: "/settings", component: () => import("@/views/SettingsView.vue") }

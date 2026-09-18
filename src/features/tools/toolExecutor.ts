@@ -1,6 +1,8 @@
+import { fillToolDefaults, validateSchemaValue } from "./toolParameterSchema";
 import { normalizeFileStructureRequest } from "@/features/tools/fileStructure";
 import { normalizeAuthenticationTarget } from "@/features/agent/authenticationTarget";
 import { defaultToolCatalog } from "@/features/tools/toolCatalog";
+import { effectiveOfficialTool, officialToolEnabled } from "@/features/support/officialContent";
 import { normalizeSoftwareCheckRequest } from "@/features/tools/softwareCheck";
 import { argumentPropertyPath, ToolArgumentValidationError } from "@/features/tools/toolArgumentProtocol";
 import type {
@@ -131,10 +133,11 @@ export function parseToolCommand(
   const decoded = decodeToolCommand(command);
   if (!decoded) return undefined;
   const { toolId, arguments: parsed } = decoded;
-  const definition = tools.find((tool) => tool.id === toolId);
-  if (!definition) throw new Error(`工具不存在或未注册：${toolId}`);
-  validateToolArguments(definition, parsed);
-  const argumentsValue = normalizeKnownToolArguments(toolId, parsed);
+  const registered = tools.find((tool) => tool.id === toolId);
+  if (!registered) throw new Error(`工具不存在或未注册：${toolId}`);
+  const definition = effectiveOfficialTool(registered);
+  const supplied = prepareToolArguments(definition, parsed);
+  const argumentsValue = normalizeKnownToolArguments(toolId, supplied);
   validateToolArguments(definition, argumentsValue);
   return { id: callId, toolId, arguments: argumentsValue };
 }
@@ -167,51 +170,16 @@ function hasUnquotedToolInvocation(value: string) {
   return false;
 }
 
+function prepareToolArguments(tool: ToolDefinition, value: Record<string, unknown>) {
+  const argumentsValue = tool.configurationVersion ? fillToolDefaults(tool.inputSchema, value) as Record<string, unknown> : value;
+  validateToolArguments(tool, argumentsValue);
+  return argumentsValue;
+}
+
 function validateToolArguments(tool: ToolDefinition, value: Record<string, unknown>) {
   validateSchemaValue(tool.inputSchema, value, `工具 ${tool.id} 参数`, "");
 }
 
-function validateSchemaValue(schema: Record<string, unknown>, value: unknown, path: string, argumentPath: string | undefined) {
-  const properties = isRecord(schema.properties) ? schema.properties : {};
-  const required = Array.isArray(schema.required) ? schema.required.filter((key): key is string => typeof key === "string") : [];
-  const type = schema.type;
-  const validType = type === "string" ? typeof value === "string"
-    : type === "boolean" ? typeof value === "boolean"
-      : type === "number" ? typeof value === "number" && Number.isFinite(value)
-        : type === "integer" ? typeof value === "number" && Number.isInteger(value)
-          : type === "array" ? Array.isArray(value)
-            : type === "object" ? isRecord(value)
-              : true;
-  if (!validType) throw new ToolArgumentValidationError(`${path} 类型必须为 ${String(type)}`, argumentPath);
-  if (isRecord(value) && schema.additionalProperties === false) {
-    const unknown = Object.keys(value).find((key) => !(key in properties));
-    if (unknown) throw new ToolArgumentValidationError(`${path} 不支持字段：${unknown}`, argumentPropertyPath(argumentPath, unknown));
-  }
-  if (isRecord(value)) {
-    const missing = required.find((key) => value[key] === undefined);
-    if (missing) throw new ToolArgumentValidationError(`${path} 缺少必填字段：${missing}`, argumentPropertyPath(argumentPath, missing));
-    for (const [key, rawRule] of Object.entries(properties)) {
-      if (value[key] !== undefined && isRecord(rawRule)) validateSchemaValue(rawRule, value[key], `${path}.${key}`, argumentPropertyPath(argumentPath, key));
-    }
-  }
-  if (typeof value === "number") {
-    if (typeof schema.minimum === "number" && value < schema.minimum) throw new ToolArgumentValidationError(`${path} 小于最小值 ${schema.minimum}`, argumentPath);
-    if (typeof schema.maximum === "number" && value > schema.maximum) throw new ToolArgumentValidationError(`${path} 超过最大值 ${schema.maximum}`, argumentPath);
-  }
-  if (typeof value === "string" && typeof schema.pattern === "string" && !new RegExp(schema.pattern).test(value)) {
-    throw new ToolArgumentValidationError(`${path} 格式无效，应匹配 ${schema.pattern}`, argumentPath);
-  }
-  if (Array.isArray(value)) {
-    if (typeof schema.minItems === "number" && value.length < schema.minItems) throw new ToolArgumentValidationError(`${path} 数量不足，至少 ${schema.minItems} 项`, argumentPath);
-    if (typeof schema.maxItems === "number" && value.length > schema.maxItems) throw new ToolArgumentValidationError(`${path} 数量过多，最多 ${schema.maxItems} 项`, argumentPath);
-    const itemRule = isRecord(schema.items) ? schema.items : undefined;
-    if (itemRule) value.forEach((item, index) => validateSchemaValue(itemRule, item, `${path}[${index}]`,
-      argumentPath === undefined ? undefined : `${argumentPath}[${index}]`));
-  }
-  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
-    throw new ToolArgumentValidationError(`${path} 不在允许范围内：${schema.enum.join("、")}`, argumentPath);
-  }
-}
 
 /** Validates built-in atomic tool contracts before a plan reaches execution. */
 function normalizeKnownToolArguments(toolId: string, value: Record<string, unknown>) {
@@ -438,11 +406,12 @@ export async function executeToolCall(
   tools: ToolDefinition[],
   dependencies: ToolExecutionDependencies,
 ): Promise<ToolResult> {
-  const tool = tools.find((item) => item.id === call.toolId);
-  if (!tool) {
+  const registered = tools.find((item) => item.id === call.toolId);
+  if (!registered) {
     return { callId: call.id, toolId: call.toolId, success: false, error: { code: "TOOL_NOT_FOUND", message: "工具不存在" } };
   }
-  if (!tool.enabled) {
+  const tool = effectiveOfficialTool(registered);
+  if (!tool.enabled || !officialToolEnabled(tool.id)) {
     return { callId: call.id, toolId: call.toolId, success: false, error: { code: "TOOL_DISABLED", message: "工具未启用" } };
   }
   if (!isRecord(call.arguments)) {
@@ -450,6 +419,13 @@ export async function executeToolCall(
   }
 
   try {
+    call = { ...call, arguments: prepareToolArguments(tool, call.arguments) };
+    // Adapters can trim strings, deduplicate lists or supply compiled fallback values.
+    // Recheck their final request so those transformations cannot bypass a published constraint.
+    const checked = <T extends object>(request: T): T => {
+      if (tool.configurationVersion) validateSchemaValue(tool.inputSchema, request, `工具 ${tool.id} 参数`, "");
+      return request;
+    };
     if (tool.implementation === "expandPlanningContext") {
       validateToolArguments(tool, call.arguments);
       if (!dependencies.expandPlanningContext) throw new Error("当前上下文不支持展开 Skill");
@@ -459,26 +435,27 @@ export async function executeToolCall(
     if (tool.implementation === "readEvidence") {
       validateToolArguments(tool, call.arguments);
       if (!dependencies.readEvidence) throw new Error("当前任务不能读取存档证据");
-      const data = await dependencies.readEvidence(String(call.arguments.evidenceId), Number(call.arguments.offset ?? 0), Number(call.arguments.limit ?? 6000));
+      const request = checked({ evidenceId: String(call.arguments.evidenceId), offset: Number(call.arguments.offset ?? 0), limit: Number(call.arguments.limit ?? 6000) });
+      const data = await dependencies.readEvidence(request.evidenceId, request.offset, request.limit);
       return { callId: call.id, toolId: call.toolId, success: true, data };
     }
     if (tool.implementation === "serverResolveConnection") {
       if (!dependencies.resolveServerConnection) throw new Error("当前执行环境不支持服务器连接资料查询");
-      const data = await dependencies.resolveServerConnection(parseConnectionTarget(call.arguments));
+      const data = await dependencies.resolveServerConnection(checked(parseConnectionTarget(call.arguments)));
       return { callId: call.id, toolId: call.toolId, success: true, data };
     }
     if (tool.implementation === "serverConnect") {
       if (!dependencies.connectServer) throw new Error("当前执行环境不支持纳管 SSH 连接");
-      const data = await dependencies.connectServer(parseServerConnectArguments(call.arguments));
+      const data = await dependencies.connectServer(checked(parseServerConnectArguments(call.arguments)));
       return { callId: call.id, toolId: call.toolId, success: true, data };
     }
     if (tool.implementation === "userRequestInput") {
       if (!dependencies.requestUserInput) throw new Error("当前执行环境不支持用户输入交互");
-      const data = await dependencies.requestUserInput(parseUserInputArguments(call.arguments));
+      const data = await dependencies.requestUserInput(checked(parseUserInputArguments(call.arguments)));
       return { callId: call.id, toolId: call.toolId, success: true, data };
     }
     if (tool.implementation === "getRemoteFileStructure") {
-      const request = parseFileStructureArguments(call.arguments);
+      const request = checked(parseFileStructureArguments(call.arguments));
       const data = await dependencies.getRemoteFileStructure(request);
       const modelData: FileStructureResult = {
         tree: data.tree, rootPath: request.rootPath, truncated: data.truncated, warnings: data.warnings,
@@ -487,17 +464,17 @@ export async function executeToolCall(
     }
     if (tool.implementation === "readRemoteFileContent") {
       if (!dependencies.readRemoteFileContent) throw new Error("当前执行环境不支持远程文件内容读取");
-      const data = await dependencies.readRemoteFileContent(parseFileContentArguments(call.arguments));
+      const data = await dependencies.readRemoteFileContent(checked(parseFileContentArguments(call.arguments)));
       return { callId: call.id, toolId: call.toolId, success: true, data, truncated: data.truncated };
     }
     if (tool.implementation === "checkSoftware") {
       if (!dependencies.checkSoftware) throw new Error("当前执行环境不支持软件检查");
-      const data = await dependencies.checkSoftware(normalizeSoftwareCheckRequest(call.arguments));
+      const data = await dependencies.checkSoftware(checked(normalizeSoftwareCheckRequest(call.arguments)));
       return { callId: call.id, toolId: call.toolId, success: true, data };
     }
     if (tool.implementation === "transferFileBetweenServers") {
       if (!dependencies.transferFileBetweenServers) throw new Error("当前执行环境不支持跨服务器文件传输");
-      const data = await dependencies.transferFileBetweenServers(parseServerTransferArguments(call.arguments));
+      const data = await dependencies.transferFileBetweenServers(checked(parseServerTransferArguments(call.arguments)));
       return { callId: call.id, toolId: call.toolId, success: true, data };
     }
     return {

@@ -15,8 +15,22 @@ if [[ ! -s "$icon_path" ]]; then
 fi
 
 cd "$project_root"
-npm run tauri -- build --bundles app,dmg
+export OPSARK_PLATFORM_URL="${OPSARK_PLATFORM_URL:-https://zgspace.cn}"
+target="${1:-}"
+build_args=(build --bundles app,dmg)
+if [[ -n "$target" ]]; then
+  if [[ "$target" != "aarch64-apple-darwin" && "$target" != "x86_64-apple-darwin" ]]; then
+    echo "Unsupported macOS target: $target" >&2
+    exit 1
+  fi
+  if ! rustup target list --installed | grep -qx "$target"; then
+    echo "Rust target is not installed. Run: rustup target add $target" >&2
+    exit 1
+  fi
+  build_args+=(--target "$target")
+fi
+npm run tauri -- "${build_args[@]}"
 
-bundle_root="$project_root/src-tauri/target/release/bundle"
+bundle_root="$project_root/src-tauri/target/${target:+$target/}release/bundle"
 echo "macOS package build completed. Output: $bundle_root"
 find "$bundle_root" -maxdepth 3 \( -name '*.app' -o -name '*.dmg' \) -print

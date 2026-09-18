@@ -3,9 +3,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp, defineComponent, h, nextTick } from "vue";
 import { createPinia } from "pinia";
+import { createMemoryHistory, createRouter } from "vue-router";
 import { i18n } from "@/features/preferences/i18n";
 import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
 import { useOpsStore } from "@/stores/ops";
+import { useAccountStore } from "@/features/account/accountStore";
+import { useOfficialCatalogStore } from "@/features/account/officialCatalogStore";
 import { buildAdjustmentBlockerSnapshot, openAdjustmentIncident } from "@/features/agent/adjustmentIncident";
 import type { PendingUserInput } from "@/features/tools/types";
 import type { OpsTask, TaskStatus } from "@/types";
@@ -1288,6 +1291,38 @@ describe("AgentConsole 服务器工作区隔离", () => {
 
     expect(host.querySelector(".summary-content h4")?.textContent).toBe("执行结果");
     expect(host.querySelectorAll(".summary-content li")).toHaveLength(2);
+    app.unmount();
+  });
+
+  it("未登录时展示官方模型登录入口，登录后显示剩余积分", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const catalog = useOfficialCatalogStore(pinia);
+    catalog.models = [{ id: "official-trial", name: "OpsArk Trial" }];
+    catalog.loaded = true;
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    useAgentWorkspaceStore(pinia).updateServer("server-a", { automationEnabled: true });
+    const router = createRouter({ history: createMemoryHistory(), routes: [
+      { path: "/", component: { template: "<div/>" } },
+      { path: "/account", component: { template: "<div/>" } },
+    ] });
+    await router.push("/");
+    const app = createApp(AgentConsole, { serverId: "server-a" }).use(pinia).use(i18n).use(router);
+    app.mount(host); await nextTick();
+
+    host.querySelector<HTMLElement>(".composer summary")!.click(); await nextTick();
+    const login = Array.from(document.querySelectorAll<HTMLButtonElement>('[role="option"]'))
+      .find(option => option.textContent?.includes("OpsArk Trial"))!;
+    expect(login.dataset.action).toBe("true");
+    login.click(); await vi.waitFor(() => expect(router.currentRoute.value.path).toBe("/account"));
+    expect(useAgentWorkspaceStore(pinia).ensureServer("server-a").modelId).toBe("");
+
+    useAccountStore(pinia).apply({ user: { id: "member", email: "member@example.test" },
+      balance: { available: 11_000, reserved: 0, revision: 1, unit: "tokens" },
+      models: [{ id: "official-trial", name: "OpsArk Trial" }], endpoint: "https://zgspace.cn/v1" });
+    await nextTick();
+    host.querySelector<HTMLElement>(".composer summary")!.click(); await nextTick();
+    expect(document.body.textContent).toContain("OpsArk Trial · 剩余 2 积分");
     app.unmount();
   });
 });

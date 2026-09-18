@@ -1,6 +1,22 @@
 use super::*;
 
 #[test]
+fn validates_and_normalizes_generated_skill_drafts() {
+    let mut draft = GeneratedSkillDraft {
+        name: "  Java 服务上线  ".into(),
+        category: "deployment".into(),
+        description: "  安全部署 Java 服务  ".into(),
+        match_rules: vec![" Java 上线 ".into(), "".into()],
+        instructions: "  先识别项目，再部署并验收。  ".into(),
+    };
+    validate_generated_skill(&mut draft).unwrap();
+    assert_eq!(draft.name, "Java 服务上线");
+    assert_eq!(draft.match_rules, vec!["Java 上线"]);
+    draft.category = "unknown".into();
+    assert!(validate_generated_skill(&mut draft).unwrap_err().contains("分类"));
+}
+
+#[test]
 fn detects_compact_periodic_long_running_review_context() {
     assert!(is_periodic_long_running_review(
         r#"{"trigger":"periodic_long_running","reviewRound":1}"#
@@ -1046,7 +1062,12 @@ fn focused_plan_repair_context_omits_history_and_unrelated_tool_schemas() {
         "server": {"id": "server-1", "os": "linux"},
         "executionConstraints": {"changePolicy": "requested_changes_only"},
         "confirmedUserInputs": {"registry": {"value": "mirror.example"}},
-        "planGenerationRepair": {"originalPlan": [{"id": "step-1"}], "error": "repair only"},
+        "planGenerationRepair": {"originalPlan": ["OLD_PLAN".repeat(5_000)],
+            "previousModelOutput": ["OLD_PLAN"], "progress": {"seenPlans": ["OLD_PLAN"]},
+            "nextStageDecision": {"steps": ["OLD_PLAN"]}, "error": "repair only"},
+        "task": {"id": "task-1", "rootGoal": "deploy app", "permission": "safe",
+            "executionConstraints": {"changePolicy":"read_only"},
+            "steps": ["TASK_HISTORY".repeat(5_000)], "output": "TASK_HISTORY"},
         "instruction": "repair the original protocol only",
         "activeSkills": [],
         "tools": [
@@ -1085,6 +1106,11 @@ fn focused_plan_repair_context_omits_history_and_unrelated_tool_schemas() {
     );
     assert_eq!(parsed["server"]["id"], "server-1");
     assert_eq!(parsed["planGenerationRepair"]["error"], "repair only");
+    assert_eq!(parsed["task"]["permission"], "safe");
+    assert_eq!(parsed["task"]["rootGoal"], "deploy app");
+    assert_eq!(parsed["task"]["executionConstraints"]["changePolicy"], "read_only");
+    assert!(!compact.contains("OLD_PLAN"));
+    assert!(!compact.contains("TASK_HISTORY"));
     assert_eq!(parsed["instruction"], "repair the original protocol only");
     assert!(parsed.get("baseSnapshot").is_none());
     assert!(parsed.get("recentPhases").is_none());
@@ -1092,6 +1118,150 @@ fn focused_plan_repair_context_omits_history_and_unrelated_tool_schemas() {
     assert_eq!(parsed["tools"].as_array().unwrap().len(), 1);
     assert_eq!(parsed["tools"][0]["id"], "files.read_content");
     assert!(compact.len() < 2_000);
+}
+
+#[test]
+fn compilation_repair_prompt_is_smaller_and_has_one_output_contract() {
+    let full = plan_generation_system(false, PLAN_STEP_OUTPUT_CONTRACT, "limit");
+    let external = plan_generation_system(true, PLAN_STEP_OUTPUT_CONTRACT, "limit");
+    let internal = plan_generation_system(true, "仅返回 repair 对象", "limit");
+    let old_internal = plan_generation_system(false, "仅返回 repair 对象", "limit");
+    assert!(full.contains(GENERAL_PLAN_SYSTEM));
+    for compact in [&internal, &external] {
+        assert!(!compact.contains(GENERAL_DISCOVERY_RULES));
+        assert!(compact.contains("allowedRepairPaths"));
+        assert!(compact.contains("真实退出码"));
+        assert!(compact.contains("不写临时文件"));
+        assert!(compact.contains(SECRET_PLACEHOLDER_RULE));
+        assert!(compact.len() * 2 < full.len());
+    }
+    assert!(external.contains(PLAN_STEP_OUTPUT_CONTRACT));
+    assert!(!internal.contains("输出必须是 {\"steps\""));
+    println!("system UTF-8 bytes: external-before={}, external-after={}, internal-before={}, internal-after={}",
+        full.len(), external.len(), old_internal.len(), internal.len());
+}
+
+#[test]
+fn compact_prompt_requires_the_external_scoped_repair_envelope() {
+    let context = json!({"workflowPhase":"protocol_repair",
+        "planGenerationRepair":{"previousModelOutput":[{}],"originalPlanMergedLocally":true},
+        "protocolRepairBudget":{"remainingModelCalls":1}});
+    assert!(is_scoped_protocol_repair(&context.to_string()));
+    for key in ["workflowPhase", "planGenerationRepair", "protocolRepairBudget"] {
+        let mut missing = context.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        assert!(!is_scoped_protocol_repair(&missing.to_string()));
+    }
+    assert!(!is_scoped_protocol_repair("not-json"));
+    assert!(!is_scoped_protocol_repair(r#"{"instruction":"protocol_repair"}"#));
+}
+
+#[test]
+fn plan_generation_retries_use_compact_requests_and_merge_the_original_plan() {
+    use std::io::{Read, Write};
+    use std::time::Duration;
+    let good = json!({"kind":"observe","title":"Inspect OS","description":"Read OS",
+        "command":"uname -a","expected":"OS details","validation":"","risk":"low"});
+    let invalid = json!({"kind":"change","title":"Build","description":"Build app",
+        "command":"npm run build | tail -20","expected":"Build output",
+        "validation":"test -f dist/index.html","risk":"medium"});
+    let mut fixed = invalid.clone();
+    fixed["command"] = json!("set -o pipefail\nnpm run build | tail -20");
+    for external in [false, true] {
+        let responses = if external {
+            vec![json!({"steps":[good.clone()]})]
+        } else {
+            vec![json!({"steps":[good.clone(), invalid.clone()]}),
+                json!({"repair":{"stepIndex":2,"replacementSteps":[fixed.clone()]}})]
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut captured = Vec::new();
+            for response in responses {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "missing expected model request");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                loop {
+                    let count = socket.read(&mut chunk).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let length: usize = headers.lines().find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        }).unwrap();
+                        if bytes.len() >= end + 4 + length {
+                            captured.push(serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + length]).unwrap());
+                            break;
+                        }
+                    }
+                }
+                let payload = json!({"choices":[{"finish_reason":"stop",
+                    "message":{"content":response.to_string()}}]}).to_string();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).unwrap();
+            }
+            captured
+        });
+        let context = if external {
+            json!({"workflowPhase":"protocol_repair", "permission":"safe",
+                "planGenerationRepair":{"previousModelOutput":[good.clone()],"originalPlanMergedLocally":true},
+                "protocolRepairBudget":{"remainingModelCalls":1}})
+        } else {
+            json!({"taskGoal":{"rootGoal":"Build app"},"permission":"safe",
+                "confirmedUserInputs":{"path":"/opt/app"},
+                "baseSnapshot":{"currentPlan":{"output":"HISTORY_MARKER".repeat(5_000)}}})
+        };
+        let mut trace = ModelDeveloperTrace::default();
+        let result = tokio::runtime::Runtime::new().unwrap().block_on(generate_ai_plan_with_trace(
+            "test-only".into(), endpoint, "fixture".into(), "Build app".into(),
+            context.to_string(), None, 5, &mut trace, None,
+        )).unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), if external { 1 } else { 2 });
+        let last = requests.last().unwrap();
+        let system = last["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains(PLAN_COMPILATION_REPAIR_SYSTEM));
+        assert!(!last.to_string().contains("HISTORY_MARKER"));
+        if external {
+            assert!(system.contains(PLAN_STEP_OUTPUT_CONTRACT));
+        } else {
+            assert!(!system.contains(PLAN_STEP_OUTPUT_CONTRACT));
+            assert!(last.to_string().contains("replacementSteps"));
+            assert!(last.to_string().contains("/opt/app"));
+            assert!(last.to_string().len() * 2 < requests[0].to_string().len());
+            assert_eq!(result.len(), 2);
+            assert_eq!(result[0].command, "uname -a");
+            assert_eq!(result[1].command, fixed["command"].as_str().unwrap());
+        }
+    }
+}
+
+#[test]
+fn structured_repair_guidance_does_not_request_both_steps_and_repair() {
+    let invalid = AiPlanStep { kind: "observe".into(), command: "rm /tmp/example".into(),
+        ..AiPlanStep::default() };
+    let issue = recovery_rules::metadata_issue(&serde_json::to_value(&invalid).unwrap(), 0).unwrap();
+    let prompt = focused_plan_repair_instruction(&json!({"issue":issue}).to_string(), &[invalid], 1);
+    assert!(prompt.contains("replacementSteps"));
+    assert!(prompt.contains("其他字段逐字保留"));
+    assert!(!prompt.contains("修复后仍必须返回完整的"));
+    assert!(!prompt.contains("重新返回完整、必要"));
 }
 
 #[test]
@@ -1634,6 +1804,23 @@ fn serializes_model_failure_with_complete_developer_trace() {
         payload["developerTrace"]["attempts"][0]["error"],
         "模型响应缺少需求理解结果"
     );
+}
+
+#[test]
+fn structured_model_failure_survives_workflow_trace_wrapping() {
+    let inner = format!("{MODEL_TRACE_ERROR_PREFIX}{}", json!({
+        "message": "本次预留额度不足",
+        "modelError": {"httpStatus": 402, "code": "INSUFFICIENT_CREDITS", "retryable": false,
+            "details": {"available_tokens": 53152, "required_tokens": 93074}},
+    }));
+    let trace = ModelDeveloperTrace::default();
+    let encoded = traced_model_error(inner, &trace);
+    let payload: Value = serde_json::from_str(encoded.strip_prefix(MODEL_TRACE_ERROR_PREFIX).unwrap()).unwrap();
+    assert_eq!(payload["message"], "本次预留额度不足");
+    assert_eq!(payload["modelError"]["details"]["available_tokens"], 53152);
+    assert_eq!(payload["modelError"]["retryable"], false);
+    assert_eq!(payload["developerTrace"]["attempts"], json!([]));
+    assert_eq!(encoded.matches(MODEL_TRACE_ERROR_PREFIX).count(), 1);
 }
 
 #[test]

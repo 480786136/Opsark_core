@@ -83,6 +83,121 @@ describe("execution scope contract", () => {
     }))).toThrow("user_action");
   });
 
+  it.each([
+    ["只读获取当前负载、运行时长与登录会话概况，作为运行状态基线。", "uptime && who"],
+    ["只读查看当前登录会话、最近登录记录与关键目录权限提示，评估访问安全性。", "who; w; last -n 5; uptime; date"],
+    ["Read the current shell environment and list existing sessions.", "printenv; who"],
+    ["查看当前 Shell 的运行状态、运行时长和执行记录", "ps -p $$; uptime; history"],
+    ["查看当前会话的运行状态", "who; w"],
+    ["查看当前 Shell 的环境变量设置", "printenv"],
+    ["读取当前会话的配置更新记录", "history"],
+    ["Read the update history of the current shell", "history"],
+    ["返回当前 Shell 加载状态", "command -v nvm"],
+    ["检查当前 Shell 是否已加载 nvm", "command -v nvm"],
+    ["Check whether the current shell has already loaded nvm", "command -v nvm"],
+    ["读取当前 Shell 的环境变量，不修改用户当前 Shell", "printenv"],
+  ])("allows read-only shell/session observations: %s", (description, command) => {
+    expect(() => validatePlanStepExecutionScope(step({
+      kind: "observe",
+      title: "读取状态",
+      description,
+      command,
+      expected: "返回当前观察结果",
+      validation: "",
+    }))).not.toThrow();
+  });
+
+  it.each([
+    "在用户已打开 Shell 中执行 source /root/.bashrc",
+    "修改用户当前 Shell 的环境变量",
+    "将命令注入用户 PTY",
+    "Reload the existing user shell environment",
+    "Send input to the user's terminal",
+    "只读检查，然后修改用户当前 Shell",
+    "只读检查用户当前 Shell 并修改环境变量",
+    "Read the current user shell settings and then modify them",
+  ])("does not trust observe labels for live-shell mutations: %s", (description) => {
+    expect(() => validatePlanStepExecutionScope(step({
+      kind: "observe",
+      description,
+      command: "source /root/.bashrc",
+    }))).toThrow("user_action");
+  });
+
+  it.each([
+    "tmux send-keys -t user:0 'source /root/.bashrc' Enter",
+    "tmux -L session send -t user:0 'id' Enter",
+    "screen -S user -X stuff 'id\n'",
+    "python -c 'fcntl.ioctl(fd, termios.TIOCSTI, value)'",
+    "printf 'source /root/.bashrc\\n' > /dev/pts/2",
+    "printf 'id\\n' | tee -a /dev/tty1",
+  ])("rejects terminal injection despite an observe label and benign prose: %s", (command) => {
+    expect(() => validatePlanStepExecutionScope(step({
+      kind: "observe",
+      title: "查看状态",
+      description: "只读检查会话状态",
+      expected: "获得状态",
+      command,
+      validation: "",
+    }))).toThrow("user_action");
+  });
+
+  it("also rejects terminal injection in validation", () => {
+    expect(() => validatePlanStepExecutionScope(step({
+      validation: "tmux send-keys -t user:0 'echo ready' Enter",
+    }))).toThrow("user_action");
+  });
+
+  it.each([
+    "tmux capture-pane -p -t user:0",
+    "screen -ls",
+    "stat /dev/pts/2",
+    "printf '%s' 'tmux send-keys'",
+    "printf '%s' 'example; tmux send-keys'",
+    "printf '%s' 'example | tee /dev/pts/2'",
+    "printf '%s' '> /dev/pts/2'",
+    "tmux display-message 'send-keys'",
+    "grep TIOCSTI file",
+    "grep 'ioctl(fd, TIOCSTI)' file",
+  ])("allows observing terminal state without sending input: %s", (command) => {
+    expect(() => validatePlanStepExecutionScope(step({
+      kind: "observe",
+      description: "读取用户当前终端状态",
+      command,
+    }))).not.toThrow();
+  });
+
+  it("permits pending user actions but never automatically runs them", () => {
+    const action = step({
+      executionScope: "user_action",
+      description: "在用户当前 Shell 中执行 source /root/.bashrc",
+      command: "source /root/.bashrc",
+    });
+    expect(() => validatePlanStepExecutionScope(action)).not.toThrow();
+    expect(() => validatePlanStepExecutionScope({ ...action, status: "running" }))
+      .toThrow("用户操作步骤不得由 Agent 自动执行");
+  });
+
+  it.each([
+    "更新 Agent 当前 Shell 的环境变量",
+    "Update the current agent shell environment",
+  ])("keeps explicit Agent-owned context separate from user shells: %s", (description) => {
+    expect(() => validatePlanStepExecutionScope(step({
+      executionScope: "agent_session",
+      description,
+      command: "export NODE_ENV=production",
+      sessionContextChange: { environment: { NODE_ENV: "production" } },
+    }))).not.toThrow();
+  });
+
+  it("does not let agent_session authorize a user-shell mutation", () => {
+    expect(() => validatePlanStepExecutionScope(step({
+      executionScope: "agent_session",
+      description: "更新 Agent 当前 Shell 的环境变量，同时修改用户当前 Shell",
+      sessionContextChange: { environment: { NODE_ENV: "production" } },
+    }))).toThrow("user_action");
+  });
+
   it("creates a deterministic empty context", () => {
     expect(defaultAgentSessionContext()).toEqual({ environment: {}, sourceFiles: [], shell: "bash", revision: 0 });
   });

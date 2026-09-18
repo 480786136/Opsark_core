@@ -4,7 +4,7 @@ import {
   runTaskCompletion,
 } from "@/features/agent/taskAdvancement";
 import type { ModelProfile, OpsTask, PlanStep } from "@/types";
-import { buildPlanNormalizationRepair, PlanProtocolError } from "@/services/backend";
+import { buildPlanNormalizationRepair, ModelInvocationError, PlanProtocolError } from "@/services/backend";
 
 const model: ModelProfile = {
   id: "model-1",
@@ -66,6 +66,21 @@ function discoveryInput(currentTask: OpsTask) {
 }
 
 describe("task advancement", () => {
+  it("keeps an actionable quota failure through discovery without replacing successful evidence", async () => {
+    const currentTask = task("managed");
+    const original = structuredClone(currentTask);
+    const modelError = { httpStatus: 402, code: "INSUFFICIENT_CREDITS", message: "可用额度不足", retryable: false,
+      details: { available_tokens: 12000, required_tokens: 24000, exact: false } };
+    const planner = vi.fn().mockRejectedValue(new ModelInvocationError("quota", undefined, modelError));
+    const result = await runDiscoveryRefinement(discoveryInput(currentTask), planner);
+    expect(result).toMatchObject({ kind: "failed", modelError });
+    if (result.kind !== "failed") throw new Error("expected failure");
+    expect(result.pauseReason).toContain("可用 2 积分");
+    expect(result.pauseReason).toContain("需要预留 3 积分");
+    expect(result.pauseReason).not.toContain("稍后重试");
+    expect(currentTask).toEqual(original);
+    expect(planner).toHaveBeenCalledOnce();
+  });
   it("preserves typed protocol failures across discovery continuation", async () => {
     const currentTask = task();
     const repair = buildPlanNormalizationRepair(new Error("工具参数无效"), [step("input", "pending")]);

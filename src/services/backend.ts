@@ -1,8 +1,9 @@
 import { parameterContext, validateRequestParameters } from "@/features/agent/modelParameters";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AgentSessionContext, AgentSessionRef, AiGenerationSettings, ExecutionScope, FileEntry, Metrics, ModelDeveloperTrace, NextStageDecision, PlanStep, RequirementProcessingResult, ServerInfo, StepReview } from "@/types";
-import type { ModelSkillDefinition } from "@/features/skills/types";
+import { formatCredits } from "@/features/account/credits";
+import type { AgentSessionContext, AgentSessionRef, AiGenerationSettings, ExecutionScope, FileEntry, Metrics, ModelDeveloperTrace, ModelServiceError, NextStageDecision, PlanStep, RequirementProcessingResult, ServerInfo, StepReview } from "@/types";
+import type { GeneratedSkillDraft, ModelSkillDefinition } from "@/features/skills/types";
 import {
   normalizeLongRunningCommandOutput,
   normalizePlanPreconditions,
@@ -80,12 +81,67 @@ const MODEL_TRACE_ERROR_PREFIX = "OPSARK_MODEL_TRACE_V1:";
 
 export class ModelInvocationError extends Error {
   developerTrace?: ModelDeveloperTrace;
+  modelError?: ModelServiceError;
 
-  constructor(message: string, developerTrace?: ModelDeveloperTrace) {
-    super(message);
+  constructor(message: string, developerTrace?: ModelDeveloperTrace, modelError?: ModelServiceError) {
+    const classified = parseModelServiceError(modelError) ?? parseLegacyModelServiceError(message);
+    super(classified ? modelServiceErrorMessage(classified) : message);
     this.name = "ModelInvocationError";
     this.developerTrace = developerTrace;
+    this.modelError = classified;
   }
+}
+
+const CREDIT_ERROR_CODES = new Set(["INSUFFICIENT_CREDITS", "CREDITS_RECONCILIATION_REQUIRED"]);
+
+function parseModelServiceError(value: unknown): ModelServiceError | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const item = value as Record<string, unknown>;
+  if (typeof item.code !== "string" || !CREDIT_ERROR_CODES.has(item.code)
+    || typeof item.message !== "string") return undefined;
+  const details: NonNullable<ModelServiceError["details"]> = {};
+  const raw = item.details && typeof item.details === "object" && !Array.isArray(item.details)
+    ? item.details as Record<string, unknown> : {};
+  for (const key of ["available_tokens", "required_tokens", "reserved_tokens", "estimated_input_tokens", "max_output_tokens"] as const) {
+    if (typeof raw[key] === "number" && Number.isFinite(raw[key]) && raw[key] >= 0) details[key] = raw[key];
+  }
+  if (typeof raw.exact === "boolean") details.exact = raw.exact;
+  if (raw.billing_mode === "direct" || raw.billing_mode === "reserved") details.billing_mode = raw.billing_mode;
+  if (typeof raw.estimator === "string") details.estimator = raw.estimator.slice(0, 120);
+  return { httpStatus: typeof item.httpStatus === "number" ? item.httpStatus : 402,
+    code: item.code, message: item.message.slice(0, 500), retryable: false,
+    details: Object.keys(details).length ? details : undefined };
+}
+
+function parseLegacyModelServiceError(message: string): ModelServiceError | undefined {
+  // Old Rust builds preserved the provider error JSON inside the human-readable message.
+  // Match its explicit code, never a model's prose mentioning billing or token limits.
+  const offset = message.indexOf("{");
+  if (offset < 0) return undefined;
+  try {
+    const parsed = JSON.parse(message.slice(offset));
+    return parseModelServiceError(parsed.modelError ?? parsed.error ?? parsed)
+      ?? (typeof parsed.message === "string" && parsed.message !== message ? parseLegacyModelServiceError(parsed.message) : undefined);
+  } catch { return undefined; }
+}
+
+export function modelServiceError(error: unknown): ModelServiceError | undefined {
+  if (error instanceof ModelInvocationError && error.modelError) return error.modelError;
+  return parseLegacyModelServiceError(error instanceof Error ? error.message : String(error));
+}
+
+export function modelServiceErrorMessage(error: ModelServiceError) {
+  const details = error.details;
+  const direct = details?.billing_mode === "direct";
+  const credits = [
+    details?.available_tokens !== undefined ? `可用 ${formatCredits(details.available_tokens)} 积分` : "",
+    details?.required_tokens !== undefined ? `本次需要${direct ? "扣减" : "预留"} ${formatCredits(details.required_tokens)} 积分` : "",
+  ].filter(Boolean).join("，");
+  const headline = error.code === "CREDITS_RECONCILIATION_REQUIRED"
+    ? "模型账户额度需要完成结算核对，暂不能继续调用。"
+    : direct ? "模型可用余额已用完，暂不能生成后续方案。" : "本次调用预留额度不足，暂不能生成后续方案。";
+  if (direct) return `${headline}${credits ? `${credits}。` : ""}当前按实际用量直接扣余额，不预留额度。已有目标和执行证据已保留；请处理待扣用量或补充积分后到账号页刷新，也可切换模型。条件未变化时不会重复请求模型。`;
+  return `${headline}${credits ? `${credits}。` : ""}${details?.exact === false ? "所需预留量为估算，不是实际扣费。" : ""}已有目标和执行证据已保留；请补充积分后到账号页刷新，或切换模型、降低输出预算/缩小上下文后再继续。条件未变化时不会重复请求模型。`;
 }
 
 function normalizeModelInvocationError(error: unknown) {
@@ -93,13 +149,16 @@ function normalizeModelInvocationError(error: unknown) {
   if (diagnostic) return new RecoveryProtocolError(diagnostic);
   const raw = error instanceof Error ? error.message : String(error);
   const marker = raw.indexOf(MODEL_TRACE_ERROR_PREFIX);
-  if (marker < 0) return error instanceof Error ? error : new Error(raw);
+  if (marker < 0) return modelServiceError(error)
+    ? new ModelInvocationError(raw, undefined, modelServiceError(error))
+    : error instanceof Error ? error : new Error(raw);
   try {
     const parsed = JSON.parse(raw.slice(marker + MODEL_TRACE_ERROR_PREFIX.length)) as {
       message?: string;
       developerTrace?: ModelDeveloperTrace;
+      modelError?: ModelServiceError;
     };
-    return new ModelInvocationError(parsed.message || "模型调用失败", parsed.developerTrace);
+    return new ModelInvocationError(parsed.message || "模型调用失败", parsed.developerTrace, parsed.modelError);
   } catch {
     return new Error(raw);
   }
@@ -802,11 +861,16 @@ async function executeProtocolRepair(repair: PlanNormalizationRepair, requiremen
         throw new PlanProtocolError(repair, String(mergedError));
       }
     }
-    throw new PlanProtocolError(repair, String(normalizeModelInvocationError(error)));
+    const invocationError = normalizeModelInvocationError(error);
+    if (modelServiceError(invocationError)) throw invocationError;
+    throw new PlanProtocolError(repair, String(invocationError));
   }
 }
 
 export const backend = {
+  async configureTaskCapabilities(taskId: string, allowShell: boolean) {
+    if (isTauri()) await invoke("configure_task_execution", { taskId, allowShell });
+  },
   async appendTaskLog(stream: "events" | "developer-events", event: unknown, context: unknown) {
     if (isTauri()) await invoke("append_task_log", { stream, event, context });
   },
@@ -1195,6 +1259,29 @@ export const backend = {
     return requireDesktopRuntime("智能计划生成");
   },
 
+  async generateSkill(
+    requirement: string,
+    mode: "generate" | "optimize",
+    runtimeModel: RuntimeModel,
+    currentSkill?: GeneratedSkillDraft,
+  ): Promise<GeneratedSkillDraft> {
+    if (!isTauri()) return requireDesktopRuntime("AI Skill 生成");
+    try {
+      return await invoke<GeneratedSkillDraft>("generate_ai_skill", {
+        apiKey: runtimeModel.apiKey,
+        endpoint: runtimeModel.endpoint,
+        model: runtimeModel.model,
+        requirement,
+        mode,
+        currentSkill: currentSkill ?? null,
+        requestParameters: runtimeModel.requestParameters,
+        timeoutSeconds: runtimeModel.timeoutSeconds,
+      });
+    } catch (error) {
+      throw normalizeModelInvocationError(error);
+    }
+  },
+
   async analyzePlanStepSafety(
     command: string,
     validation: string,
@@ -1247,8 +1334,10 @@ export const backend = {
           });
           return { ...result, plan: repaired };
         } catch (repairError) {
+          const invocationError = normalizeModelInvocationError(repairError);
+          if (modelServiceError(invocationError)) throw invocationError;
           const error = repairError instanceof PlanProtocolError ? repairError
-            : new PlanProtocolError(repair, String(normalizeModelInvocationError(repairError)));
+            : new PlanProtocolError(repair, String(invocationError));
           error.processed = result;
           throw error;
         }
@@ -1358,7 +1447,9 @@ export const backend = {
         timeoutSeconds: runtimeModel.timeoutSeconds,
       });
       return { ...review, source: "model" };
-    } catch {
+    } catch (error) {
+      const invocationError = normalizeModelInvocationError(error);
+      if (modelServiceError(invocationError)) throw invocationError;
       return fallback;
     }
   },

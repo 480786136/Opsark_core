@@ -112,6 +112,7 @@ button:disabled, input:disabled, textarea:disabled, select:disabled { opacity: v
 .app-rail nav a:hover { color: var(--text); background: var(--panel-2); }
 .app-rail nav a.router-link-active { color: var(--accent); border-left-color: var(--accent); background: var(--accent-soft); }
 .rail-bottom { position: relative; margin-top: auto; padding-bottom: 9px; display: flex; flex-direction: column; align-items: center; gap: 5px; color: var(--dim); }
+.rail-bottom>a{display:grid;place-items:center;width:36px;height:36px;border-radius:7px;color:var(--dim)}.rail-bottom>a:hover,.rail-bottom>a.router-link-active{color:var(--accent);background:var(--accent-soft)}
 .app-main { flex: 1; min-width: 0; height: 100%; overflow: auto; }
 .app-main.workspace-main { overflow: hidden; }
 

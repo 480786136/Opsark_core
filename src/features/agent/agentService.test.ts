@@ -11,7 +11,7 @@ import {
 } from "@/features/agent/agentService";
 import type { ModelProfile, OpsTask, PlanStep } from "@/types";
 import { defaultToolCatalog } from "@/features/tools/toolCatalog";
-import { PlanProtocolError } from "@/services/backend";
+import { ModelInvocationError, PlanProtocolError } from "@/services/backend";
 import { confirmedInputScope } from "@/features/agent/confirmedUserInputs";
 
 const model: ModelProfile = {
@@ -63,6 +63,23 @@ const generationSettings = {
 };
 
 describe("agentService", () => {
+  it.each(["INSUFFICIENT_CREDITS", "CREDITS_RECONCILIATION_REQUIRED"])(
+    "%s in the combined decision stops without another paid goal-review request", async (code) => {
+      const currentTask = task();
+      const original = structuredClone(currentTask.plan);
+      const error = new ModelInvocationError("quota", undefined, {
+        httpStatus: 402, code, message: "额度不足或待核对", retryable: false,
+      });
+      const decide = vi.fn().mockRejectedValue(error);
+      const fallbackReview = vi.fn();
+      await expect(decideTaskNextStage({
+        task: currentTask, model, apiKey: "fixture", tools: [], secretMetadata: [], generationSettings, skills: [],
+      }, decide, fallbackReview)).rejects.toBe(error);
+      expect(decide).toHaveBeenCalledOnce();
+      expect(fallbackReview).not.toHaveBeenCalled();
+      expect(currentTask.plan).toEqual(original);
+    },
+  );
   it("decides completion and creates the next bounded stage in one model call", async () => {
     const decide = vi.fn().mockResolvedValue({
       decision: "adjust",

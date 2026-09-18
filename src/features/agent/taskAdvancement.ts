@@ -9,7 +9,7 @@ import type {
 } from "@/features/agent/agentService";
 import type { AuditEventDraft } from "@/features/agent/auditTrail";
 import type { ModelProfile } from "@/types";
-import { PlanProtocolError } from "@/services/backend";
+import { modelServiceError, modelServiceErrorMessage, PlanProtocolError } from "@/services/backend";
 
 type ContinuationPlanner = (
   input: PlanDiscoveryContinuationInput,
@@ -52,13 +52,14 @@ export async function runDiscoveryRefinement(
   } catch (error) {
     if (input.isCancelled()) return { kind: "cancelled" as const };
     const protocolError = error instanceof PlanProtocolError ? error : undefined;
-    const pauseReason = protocolError
+    const modelError = modelServiceError(error);
+    const pauseReason = modelError ? modelServiceErrorMessage(modelError) : protocolError
       ? "当前检查已完成，系统正在根据已有结果完善后续方案。需要确认的操作会在执行前提示。"
       : "当前检查结果已保留，但暂时无法形成可执行的后续方案。可以稍后重试生成。";
     const technicalDetail = protocolError?.developerMessage
-      ?? (error instanceof Error ? error.stack || `${error.name}: ${error.message}` : String(error));
+      ?? (error instanceof Error ? `${error.name}: ${error.message}${error.stack ? `\n${error.stack}` : ""}` : String(error));
     return { kind: "failed" as const, pauseReason, eventMessage: pauseReason,
-      protocolError, technicalDetail };
+      protocolError, modelError, technicalDetail };
   }
 }
 

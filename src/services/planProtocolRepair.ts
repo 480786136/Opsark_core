@@ -121,6 +121,7 @@ export function repairStepIndices(fieldPath: string | undefined, steps: PlanStep
 /** Only the invalid step is sent. The full original plan is merged and checked locally. */
 export function compactProtocolRepairContext<T extends {
   fieldPath?: string; diagnostic?: PlanRepairDiagnostic; previousModelOutput: PlanStep[]; progress?: ProtocolRepairProgress;
+  nextStageDecision?: unknown;
 }>(
   context: string,
   repair: T,
@@ -132,7 +133,7 @@ export function compactProtocolRepairContext<T extends {
   const referencedTools = new Set(steps.flatMap(step => step.command.match(/^opsark-tool\s+(\S+)/)?.[1] ?? []));
   const failedIds = new Set(steps.flatMap(step => step.recovery?.failedStepId ?? []));
   const recovery = record(authority.recovery);
-  const { previousModelOutput: _fullPlan, progress: _progress, ...feedback } = repair;
+  const { previousModelOutput: _fullPlan, progress: _progress, nextStageDecision: _decision, ...feedback } = repair;
   return JSON.stringify({
     ...authority,
     workflowPhase: "protocol_repair",

@@ -26,6 +26,53 @@ const VALIDATION_SCOPES = new Set<ExecutionScope>([
 const SAFE_CONTEXT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SENSITIVE_CONTEXT_NAME = /(?:PASSWORD|PASSWD|TOKEN|SECRET|CREDENTIAL|API_KEY|ACCESS_KEY|PRIVATE_KEY|_PWD$)/i;
 
+// Observing login sessions is not the same as changing a user's live shell.
+// Require both a live-shell target and an affirmative mutation intent instead
+// of matching unrelated words such as “当前负载…登录会话”.
+const LIVE_SHELL_TARGET = /(?:用户(?:的)?\s*)?(?:当前|已打开|原有|现有|已有)(?:的)?\s*(?:用户(?:的)?\s*)?(?:登录|交互)?\s*(?:shell|终端|PTY|会话)|用户(?:的)?\s*(?:shell|终端|PTY)|\b(?:current|existing|already[- ]open)\s+(?:user(?:'s)?\s+)?(?:interactive\s+|login\s+)?(?:shell|terminal|PTY|session)\b|\buser(?:'s)?\s+(?:shell|terminal|PTY)\b/i;
+const SHELL_MUTATION_INTENT = /修改|更改|改变|更新|设置|注入|写入|发送|执行(?!状态|情况|结果|记录|历史|权限)|运行(?!状态|情况|时长|时间)|加载(?!状态|情况|结果|记录)|重载|刷新|切换|替换|关闭|终止|立即生效|\b(?:modify|change|update|set|inject|write|send|execute|run|load|reload|source|export|switch|replace|close|terminate)\b/i;
+const AGENT_OWNED_SHELL = /(?:Agent|智能体)(?:\s*的)?\s*(?:当前|已有|现有|原有)?\s*(?:shell|终端|PTY|会话)|\b(?:current|existing)\s+agent(?:'s)?\s+(?:shell|terminal|PTY|session)\b|\bagent(?:'s)?\s+(?:current\s+|existing\s+)?(?:shell|terminal|PTY|session)\b/gi;
+const OBSERVATION_INTENT = /^\s*(?:只读(?:地)?\s*)?(?:查看|读取|检查|确认|验证|检测|获取|收集|列出|返回|显示|展示|\b(?:read|check|inspect|verify|observe|list|display|show|collect)\b)/i;
+const FOLLOWUP_MUTATION_INTENT = new RegExp(
+  `(?:并且|并|然后|同时|接着|\\band(?:\\s+then)?\\b|\\bthen\\b)\\s*(?:直接|立即)?\\s*(?:${SHELL_MUTATION_INTENT.source})`,
+  "i",
+);
+
+function declaresLiveUserShellMutation(semantics: string) {
+  return semantics.split(/[\n。；;！？!?，,]/).some((clause) => {
+    const userClause = clause.replace(AGENT_OWNED_SHELL, "Agent-owned context");
+    if (!LIVE_SHELL_TARGET.test(userClause)) return false;
+    // A question about an existing state does not promise to change that state.
+    const intent = userClause
+      .replace(/(?:检查|查看|确认|验证|检测)[^，,]*(?:是否|能否|已经|已)[^，,]*/g, "")
+      .replace(/\b(?:check|inspect|verify|observe)\b[^,]*\b(?:whether|if|already)\b[^,]*/gi, "")
+      .replace(/(?:不|未)(?:会|要|应|得|需要)?\s*(?:修改|更改|改变|更新|注入|写入|加载|重载|刷新)/g, "")
+      .replace(/\b(?:do not|don't|without|never)\s+(?:modify|modifying|change|changing|inject|injecting|write|writing|load|loading|reload|reloading)\b/gi, "");
+    // In an observation clause, words such as “设置” and “更新” may name the
+    // state/history being read. A second affirmative action still changes intent.
+    if (OBSERVATION_INTENT.test(intent) && !FOLLOWUP_MUTATION_INTENT.test(intent)) return false;
+    return SHELL_MUTATION_INTENT.test(intent);
+  });
+}
+
+function hasTerminalInjectionCommand(command: string) {
+  // Independently inspect executable fields: kind=observe (or an innocent
+  // description) cannot authorize sending input to an existing terminal. This
+  // catches direct forms, not arbitrary scripts; executor isolation remains
+  // the boundary. Mask quoted data so printing/searching these names is safe.
+  const executable = command.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, (quoted) => " ".repeat(quoted.length));
+  const invocations = executable.matchAll(/(?:^|[;\n|&])\s*(?:(?:sudo|command|exec)\s+)?(?:\/[\w./-]+\/)?(tmux|screen|tee|python(?:\d(?:\.\d+)*)?)\b[^;\n|&]*/gi);
+  for (const invocation of invocations) {
+    const script = command.slice(invocation.index, invocation.index + invocation[0].length);
+    if (/^tmux$/i.test(invocation[1]) && /\bsend(?:-keys|-prefix)?\b/i.test(invocation[0])) return true;
+    if (/^screen$/i.test(invocation[1]) && /\s-X\s+[^\n]*\b(?:stuff|paste)\b/i.test(invocation[0])) return true;
+    if (/^tee$/i.test(invocation[1]) && /\btee\s+(?:-a\s+)?["']?\/dev\/(?:pts\/\d+|tty\d+)(?:[\s"';]|$)/i.test(script)) return true;
+    if (/^python/i.test(invocation[1]) && /\bioctl\s*\([\s\S]*\bTIOCSTI\b/.test(script)) return true;
+  }
+  return [...command.matchAll(/>{1,2}\s*["']?\/dev\/(?:pts\/\d+|tty\d+)(?:[\s"';]|$)/g)]
+    .some((redirect) => executable[redirect.index] === ">");
+}
+
 export function defaultAgentSessionContext(): AgentSessionContext {
   return { environment: {}, sourceFiles: [], shell: "bash", revision: 0 };
 }
@@ -92,7 +139,9 @@ export function validatePlanStepExecutionScope(step: PlanStep) {
   if (normalized.kind === "change" && !VALIDATION_SCOPES.has(normalized.validationScope!)) {
     throw new Error("变更步骤的 validation 必须在独立或全新 Shell 中执行");
   }
-  if (/(?:当前|已打开|原有).{0,12}(?:Shell|会话)|(?:current|existing)\s+(?:shell|session)/i.test(semantics)
+  if ((declaresLiveUserShellMutation(semantics)
+        || hasTerminalInjectionCommand(normalized.command)
+        || hasTerminalInjectionCommand(normalized.validation))
       && normalized.executionScope !== "user_action") {
     throw new Error("修改用户已打开 Shell 必须规划为 user_action，Agent 不得注入用户 PTY");
   }

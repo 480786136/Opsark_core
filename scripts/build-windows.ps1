@@ -30,6 +30,9 @@ if ($iconBytes.Length -lt 6 -or [BitConverter]::ToUInt16($iconBytes, 2) -ne 1) {
 }
 
 $bundles = if ($Bundle -eq "all") { "nsis,msi" } else { $Bundle }
+if ([string]::IsNullOrWhiteSpace($env:OPSARK_PLATFORM_URL)) {
+    $env:OPSARK_PLATFORM_URL = "https://zgspace.cn"
+}
 Push-Location $projectRoot
 try {
     & npm.cmd run tauri -- build --bundles $bundles

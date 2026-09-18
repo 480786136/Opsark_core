@@ -6,6 +6,7 @@ export type ParameterSelectOption = {
   value: string;
   label: string;
   disabled?: boolean;
+  action?: boolean;
 };
 
 const props = withDefaults(defineProps<{
@@ -26,6 +27,7 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   "update:modelValue": [value: string];
   change: [value: string];
+  "option-action": [value: string];
 }>();
 const root = ref<HTMLDetailsElement>();
 const trigger = ref<HTMLElement>();
@@ -170,6 +172,11 @@ function chooseOption(value: string) {
   if (effectiveDisabled.value) return;
   const option = props.options.find((item) => item.value === value);
   if (option?.disabled) return;
+  if (option?.action) {
+    emit("option-action", value);
+    closeMenu(true);
+    return;
+  }
   if (value !== props.modelValue) {
     emit("update:modelValue", value);
     emit("change", value);
@@ -321,6 +328,7 @@ onDeactivated(() => closeMenu());
             role="option"
             tabindex="-1"
             :data-value="option.value"
+            :data-action="option.action || undefined"
             :disabled="effectiveDisabled || option.disabled"
             :aria-disabled="option.disabled || undefined"
             :aria-selected="option.value === modelValue"
@@ -329,7 +337,7 @@ onDeactivated(() => closeMenu());
             @keydown="onOptionKeydown($event, index)"
           >
             <span>{{ option.label }}</span>
-            <Check v-if="option.value === modelValue" :size="14" />
+            <Check v-if="!option.action && option.value === modelValue" :size="14" />
           </button>
         </div>
         <button
@@ -350,5 +358,6 @@ onDeactivated(() => closeMenu());
 .parameter-select,.parameter-options{--parameter-select-height:38px;--parameter-select-font-size:12px;--parameter-select-radius:7px;--parameter-option-height:34px}.parameter-select.size-small{--parameter-select-height:35px;--parameter-select-font-size:10px;--parameter-select-radius:5px;--parameter-option-height:32px}.parameter-options.size-small{--parameter-select-font-size:11px;--parameter-select-radius:5px;--parameter-option-height:32px}.parameter-select.size-compact{--parameter-select-height:26px;--parameter-select-font-size:10px;--parameter-select-radius:4px;--parameter-option-height:30px}.parameter-options.size-compact{--parameter-select-font-size:11px;--parameter-select-radius:4px;--parameter-option-height:30px}
 .parameter-select{position:relative;width:100%;min-width:0;margin:0;border:0}.parameter-select summary{display:flex;align-items:center;justify-content:space-between;width:100%;height:var(--parameter-select-height);padding:0 10px;gap:8px;border:1px solid var(--border,#3a414b);border-radius:var(--parameter-select-radius);background:var(--panel,var(--raised,#171b21));color:var(--text,#edf0f3);font-size:var(--parameter-select-font-size);cursor:pointer;list-style:none;transition:border-color .14s ease,background-color .14s ease,box-shadow .14s ease}.parameter-select summary::-webkit-details-marker{display:none}.parameter-select summary:hover{border-color:color-mix(in srgb,var(--accent,#d9f763) 34%,var(--border,#3a414b));background:var(--hover,var(--panel-2,#20252c))}.parameter-select[open] summary{border-color:var(--accent,#d9f763);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent,#d9f763) 16%,transparent)}.parameter-select[open] summary svg{transform:rotate(180deg)}.parameter-select summary svg{flex-shrink:0;color:var(--muted,#929ba7);transition:transform .14s ease}.parameter-select summary span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.parameter-select .placeholder{color:var(--muted,#929ba7)}.parameter-select.is-disabled summary{opacity:.52;cursor:not-allowed}.parameter-select.is-disabled summary:hover{border-color:var(--border,#3a414b);background:var(--panel,var(--raised,#171b21))}.parameter-select summary:focus-visible{outline:2px solid var(--accent,#d9f763);outline-offset:2px}
 .parameter-options{position:fixed;z-index:2000;display:flex;flex-direction:column;min-width:0;padding:5px;overflow:hidden;border:1px solid var(--border,#3a414b);border-radius:calc(var(--parameter-select-radius) + 1px);background:var(--raised,#171b21);color:var(--text,#edf0f3);box-shadow:var(--shadow-popover,0 14px 34px rgba(0,0,0,.36));font-size:var(--parameter-select-font-size)}.parameter-options>div{min-height:0;overflow:auto;overscroll-behavior:contain;scrollbar-color:var(--border,#3a414b) transparent}.parameter-options button{display:flex;align-items:center;justify-content:space-between;width:100%;min-height:var(--parameter-option-height);padding:6px 9px;gap:8px;border:0;border-radius:calc(var(--parameter-select-radius) - 2px);background:transparent;color:var(--text,#edf0f3);font-size:inherit;text-align:left;cursor:pointer}.parameter-options button span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.parameter-options button:hover:not(:disabled),.parameter-options button:focus-visible{background:var(--hover,var(--panel-2,#222830));color:var(--text,#edf0f3);outline:0}.parameter-options button[aria-selected="true"]{background:var(--accent-soft,color-mix(in srgb,var(--accent,#d9f763) 12%,transparent));color:var(--accent,#d9f763)}.parameter-options button[aria-selected="true"]:hover,.parameter-options button[aria-selected="true"]:focus-visible{background:color-mix(in srgb,var(--accent,#d9f763) 18%,transparent)}.parameter-options button:focus-visible{box-shadow:inset 0 0 0 1px var(--accent,#d9f763)}.parameter-options button:disabled{opacity:.45;cursor:not-allowed}.parameter-options svg{flex-shrink:0;color:var(--accent,#d9f763)}.parameter-options .parameter-clear{margin-top:4px;border-top:1px solid var(--border,#3a414b);border-radius:0;color:var(--muted,#929ba7)}
+.parameter-options button[data-action="true"]{color:var(--muted,#929ba7)}.parameter-options button[data-action="true"]:hover,.parameter-options button[data-action="true"]:focus-visible{color:var(--accent,#d9f763)}
 @media(prefers-reduced-motion:reduce){.parameter-select summary,.parameter-select summary svg{transition:none}}
 </style>

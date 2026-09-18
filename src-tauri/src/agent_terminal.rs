@@ -236,6 +236,7 @@ impl AgentTerminalManager {
         let session = sessions
             .get_mut(session_id)
             .ok_or("AgentSession 不存在或已关闭")?;
+        crate::execution_permissions::ensure_shell(&session.task_id)?;
         if session.generation != generation {
             return Err("AgentSession generation 已变更，拒绝向旧通道发送命令".into());
         }

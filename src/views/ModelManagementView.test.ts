@@ -1,21 +1,35 @@
 // @vitest-environment happy-dom
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createApp, nextTick, type App } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import { createI18n } from "vue-i18n";
+import { createMemoryHistory, createRouter } from "vue-router";
 import { useOpsStore } from "@/stores/ops";
 import ModelManagementView from "./ModelManagementView.vue";
+import { useAccountStore } from "@/features/account/accountStore";
+import { fetchOfficialCatalog, officialCatalogOrigin } from "@/features/account/officialCatalogApi";
+vi.mock("@/features/account/officialCatalogApi", () => ({ fetchOfficialCatalog: vi.fn(), officialCatalogOrigin: vi.fn() }));
 
 let app: App;
+beforeEach(() => {
+  vi.restoreAllMocks(); localStorage.clear();
+  vi.mocked(fetchOfficialCatalog).mockReset().mockResolvedValue({ models: [] });
+  vi.mocked(officialCatalogOrigin).mockReset().mockResolvedValue("https://platform.example.test");
+});
 afterEach(() => { app?.unmount(); document.body.innerHTML = ""; });
 async function mount() {
   const pinia = createPinia(); setActivePinia(pinia);
   const store = useOpsStore();
+  vi.spyOn(useAccountStore(), "refresh").mockResolvedValue();
   store.models = [{ id: "one", name: "Example", model: "model", provider: "Compatible", endpoint: "https://example.test/v1", enabled: true, hasApiKey: true, timeoutSeconds: 180 }];
   store.modelApiKeys.one = "secret";
   const host = document.createElement("div"); document.body.append(host);
-  app = createApp(ModelManagementView).use(pinia).use(createI18n({ legacy: false, locale: "en", missingWarn: false, fallbackWarn: false, messages: { en: {} } }));
-  app.mount(host); await nextTick(); return store;
+  const router = createRouter({ history: createMemoryHistory(), routes: [
+    { path: "/", component: ModelManagementView }, { path: "/account", component: { template: "<p>Account</p>" } },
+  ] });
+  await router.push("/");
+  app = createApp(ModelManagementView).use(pinia).use(router).use(createI18n({ legacy: false, locale: "en", missingWarn: false, fallbackWarn: false, messages: { en: {} } }));
+  app.mount(host); await new Promise(resolve => setTimeout(resolve, 0)); await nextTick(); return store;
 }
 it("keeps cards compact and discards draft changes on Escape", async () => {
   const store = await mount();
@@ -55,4 +69,38 @@ it("keeps the editor open on backdrop clicks and saves the per-model timeout", a
   document.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
   await nextTick(); await nextTick();
   expect(store.models[0].timeoutSeconds).toBe(360);
+});
+
+it("official model editor exposes only timeout and advanced parameters, with the Admin name read-only", async () => {
+  vi.mocked(fetchOfficialCatalog).mockResolvedValue({ models: [{ id: "model", name: "Official display" }] });
+  const store = await mount();
+  useAccountStore().apply({ user: { id: "one", email: "one@example.test" }, balance: { available: 100, reserved: 0, revision: 1, unit: "tokens" }, models: [{ id: "model", name: "Official display" }], endpoint: "https://official.example.test/v1" });
+  await nextTick();
+  expect(document.querySelector(".model-card")?.textContent).not.toContain("example.test");
+  document.querySelector<HTMLButtonElement>(".official-model-open")!.click(); await nextTick();
+  const dialog = document.querySelector('[role="dialog"]')!;
+  expect(dialog.querySelectorAll(".connection-fields input")).toHaveLength(1);
+  expect(dialog.textContent).not.toContain("settings.configName");
+  expect(dialog.querySelector('input[type="password"]')).toBeNull();
+  expect(dialog.querySelector("select")).toBeNull();
+  const timeout = dialog.querySelector<HTMLInputElement>('input[type="number"]')!;
+  timeout.value = "240"; timeout.dispatchEvent(new Event("input")); await nextTick();
+  document.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); await nextTick();
+  expect(store.models.find(m => m.source === "official")).toMatchObject({ name: "Official display", timeoutSeconds: 240, endpoint: "https://official.example.test/v1" });
+  expect(localStorage.getItem("opsark.officialModelSettings")).not.toContain("endpoint");
+  expect(localStorage.getItem("opsark.officialModelSettings")).not.toContain('"name"');
+});
+
+it("automatically lists public official models first and overlays login without granting execution", async () => {
+  vi.mocked(fetchOfficialCatalog).mockResolvedValue({ models: [{ id: "trial", name: "Official trial" }] });
+  const store = await mount();
+  expect(fetchOfficialCatalog).toHaveBeenCalledOnce();
+  expect(document.querySelector(".model-grid > :first-child")?.textContent).toContain("Official trial");
+  expect(document.querySelector<HTMLButtonElement>(".official-model-open")?.disabled).toBe(true);
+  expect(document.querySelector(".official-model-lock")?.textContent).toContain("Sign in to use");
+  expect(document.querySelector(".official-model-lock")?.getAttribute("href")).toBe("/account");
+  expect(document.body.textContent).not.toContain("Refresh official models");
+  expect(document.body.textContent).not.toContain("sign in / view credits");
+  expect(store.models.map(m => m.id)).toEqual(["one"]);
+  expect(store.modelApiKeys).not.toHaveProperty("official:trial");
 });

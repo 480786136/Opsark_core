@@ -1,4 +1,4 @@
-import { backend, PlanProtocolError } from "@/services/backend";
+import { backend, modelServiceError, PlanProtocolError } from "@/services/backend";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { workflowLifetime, StaleWorkflowError } from "./workflowLifetime";
 import { activeProtocolRepair, freshProtocolReplanSteps } from "./protocolReplan";
@@ -383,7 +383,8 @@ export async function decideTaskNextStage(
     };
   } catch (combinedError) {
     assertCurrent();
-    if (combinedError instanceof PlanProtocolError || combinedError instanceof ExecutionPolicyError) throw combinedError;
+    if (combinedError instanceof PlanProtocolError || combinedError instanceof ExecutionPolicyError
+      || modelServiceError(combinedError)) throw combinedError;
     const fallback = await reviewTaskGoal(input, fallbackReview);
     return {
       ...fallback,

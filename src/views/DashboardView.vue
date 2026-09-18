@@ -4,7 +4,9 @@ import { useRouter } from "vue-router";
 import { useI18n } from "vue-i18n";
 import { Boxes, Cpu, HardDrive, MemoryStick, Pencil, Plus, Search, Server, Trash2, X } from "lucide-vue-next";
 import AddServerModal from "@/components/AddServerModal.vue";
+import ConfirmActionDialog from "@/components/ConfirmActionDialog.vue";
 import ParameterSelect from "@/components/ParameterSelect.vue";
+import { useActionConfirmation } from "@/components/useActionConfirmation";
 import { useOpsStore } from "@/stores/ops";
 
 const store = useOpsStore();
@@ -28,6 +30,15 @@ const editingServerId = ref("");
 const editingServer = computed(() => store.servers.find((server) => server.id === editingServerId.value));
 const groupCount = computed(() => new Set(store.servers.map((server) => server.group).filter(Boolean)).size);
 const hasAmount = (value: unknown) => Number.isFinite(Number(value)) && Number(value) > 0;
+const { confirmationMessage, confirmAction, resolveConfirmation } = useActionConfirmation();
+
+async function removeServer(server: (typeof store.servers)[number]) {
+  const message = zh.value
+    ? `确定删除服务器“${server.name}”吗？该服务器的连接配置、保存的凭据和本地工作区数据将一并移除。`
+    : `Delete server “${server.name}”? Its connection settings, saved credentials, and local workspace data will also be removed.`;
+  if (!await confirmAction(message)) return;
+  store.removeServer(server.id);
+}
 
 onMounted(async () => {
   await store.hydrateCredentials();
@@ -80,7 +91,7 @@ onMounted(async () => {
           <div class="server-card-foot">
             <span>{{ t("dashboard.openWorkspace") }}</span>
             <button class="server-edit" :title="t('dashboard.editServer')" :aria-label="t('dashboard.editServer')" @click.stop="editingServerId = server.id"><Pencil :size="14" /></button>
-            <button :title="t('dashboard.removeServer')" :aria-label="t('dashboard.removeServer')" @click.stop="store.removeServer(server.id)"><Trash2 :size="14" /></button>
+            <button :title="t('dashboard.removeServer')" :aria-label="t('dashboard.removeServer')" @click.stop="removeServer(server)"><Trash2 :size="14" /></button>
           </div>
         </article>
         <button v-if="!store.servers.length" class="server-card add-card" @click="adding = true">
@@ -91,6 +102,12 @@ onMounted(async () => {
     </section>
     <AddServerModal v-if="adding" @close="adding = false" />
     <AddServerModal v-if="editingServer" :server="editingServer" @close="editingServerId = ''" />
+    <ConfirmActionDialog
+      :message="confirmationMessage"
+      :title="zh ? '删除服务器' : 'Delete server'"
+      :confirm-label="zh ? '确认删除' : 'Delete'"
+      @result="resolveConfirmation"
+    />
   </div>
 </template>
 

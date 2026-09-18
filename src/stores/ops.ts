@@ -1,5 +1,7 @@
 import { validateRequestParameters } from "@/features/agent/modelParameters";
 import { defineStore } from "pinia";
+import { useAccountStore } from "@/features/account/accountStore";
+import { textFingerprint } from "@/features/agent/longRunningReviewOutput";
 import { watch } from "vue";
 import { useConnectionStore, isConnectionTransportFailure } from "@/features/connection/connectionStore";
 import { modelLogContext } from "@/features/agent/modelLogContext";
@@ -9,7 +11,7 @@ import { workflowLifetime } from "@/features/agent/workflowLifetime";
 import { restoreUserInputRequests } from "@/features/agent/restoreUserInputRequests";
 import { automaticContinuationBlocker, workflowProgress } from "@/features/agent/workflowProgress";
 import { assertTaskPlanAuthorization, ExecutionPolicyError, executionPolicyBlocker, hasRiskAttemptAuthorization, isRelatedRecoveryStep, recoveryHistory, validateRecoveryReferences } from "@/features/agent/recoveryContract";
-import { backend, buildExecutionSummary, isTauri, ModelInvocationError, PlanProtocolError, normalizePlanPreconditions } from "@/services/backend";
+import { backend, buildExecutionSummary, isTauri, ModelInvocationError, modelServiceError, modelServiceErrorMessage, PlanProtocolError, normalizePlanPreconditions } from "@/services/backend";
 import type { RuntimeConnection } from "@/services/backend";
 import {
   classifyStepResult,
@@ -167,6 +169,7 @@ import type {
   Metrics,
   ModelAvailability,
   ModelProfile,
+  ModelServiceError,
   OpsTask,
   PermissionLevel,
   PlanStep,
@@ -196,15 +199,15 @@ import { agentSandboxTerminalV1Enabled } from "@/features/terminal/agentSandboxF
 import { mergeAgentSessionContext, normalizePlanStepExecutionScope } from "@/features/agent/executionScope";
 import {
   createCustomSkill,
-  createSkillConfiguration,
   buildSkillContext,
   normalizeSkillRegistry,
-  parseSkillConfiguration,
   resetSkillDefinition,
-  resolveSkillRegistry,
   resolveTaskSkills,
 } from "@/features/skills/skillRegistry";
 import { validateSkillDefinition } from "@/features/skills/skillValidation";
+import { loadOwnedSkills, persistOwnedSkills, enforceSystemSkills, pinTaskSkills } from "@/features/skills/ownedSkills";
+import { executionCapabilityBlocker, shellAllowed } from "@/features/tools/executionPermissions";
+import { applyOfficialTools } from "@/features/support/officialContent";
 
 
 const now = () => new Date().toISOString();
@@ -431,11 +434,12 @@ function initialAiGenerationSettings() {
 }
 
 function initialTools() {
-  return resolveToolRegistry(parseToolOverrides(readSaved<unknown>("opsark.toolOverrides", [])));
+  if (!import.meta.env.DEV) return applyOfficialTools(resolveToolRegistry([]));
+  return applyOfficialTools(resolveToolRegistry(parseToolOverrides(readSaved<unknown>("opsark.toolOverrides", []))));
 }
 
 function initialSkills() {
-  return resolveSkillRegistry(parseSkillConfiguration(readSaved<unknown>("opsark.skillConfiguration", {})));
+  return loadOwnedSkills();
 }
 
 function readSaved<T>(key: string, fallback: T): T {
@@ -462,6 +466,7 @@ function initialServers() {
 
 function initialModels(): ModelProfile[] {
   const saved = readSaved<ModelProfile[]>("opsark.models", defaultModels)
+    .filter((model) => model.source !== "official")
     .filter((model) => model.provider !== "Built-in" && model.id !== "model-local")
     .filter((model) => !(
       model.id === "model-deepseek"
@@ -874,10 +879,10 @@ export const useOpsStore = defineStore("ops", {
           localStorage.setItem("opsark.logs", JSON.stringify(store.logs.slice(0, 300)));
           localStorage.setItem("opsark.developerLogs", JSON.stringify(store.developerLogs.slice(0, MAX_DEVELOPER_LOGS)));
           localStorage.setItem("opsark.servers", JSON.stringify(store.servers));
-          localStorage.setItem("opsark.models", JSON.stringify(store.models));
+          localStorage.setItem("opsark.models", JSON.stringify(store.models.filter(model => model.source !== "official")));
           localStorage.setItem("opsark.aiGenerationSettings", JSON.stringify(store.aiGenerationSettings));
-          localStorage.setItem("opsark.toolOverrides", JSON.stringify(createToolOverrides(store.tools)));
-          localStorage.setItem("opsark.skillConfiguration", JSON.stringify(createSkillConfiguration(store.skills)));
+          if (import.meta.env.DEV) localStorage.setItem("opsark.toolOverrides", JSON.stringify(createToolOverrides(store.tools)));
+          persistOwnedSkills(store.skills);
           localStorage.setItem("opsark.secretMetadata", JSON.stringify(store.secretMetadata));
           store.persistenceWarning = "";
         } catch (error) {
@@ -917,6 +922,9 @@ export const useOpsStore = defineStore("ops", {
 
     addSkill() {
       const skill = createCustomSkill(uid("skill"));
+      skill.name = "";
+      skill.description = "";
+      skill.instructions = "";
       this.skills.push(skill);
       this.skillSaveError = "";
       return skill;
@@ -927,13 +935,37 @@ export const useOpsStore = defineStore("ops", {
       if (!skill || skill.builtIn) return false;
       this.skills = this.skills.filter((item) => item.id !== skillId);
       this.skillSaveError = "";
-      this.persist(true);
+      // Remove only this Skill from durable state. Other open editor drafts
+      // remain in memory until their own Save button is used.
+      persistOwnedSkills(loadOwnedSkills().filter((item) => item.builtIn || item.id !== skillId));
       return true;
+    },
+
+    saveSkill(skillId: string) {
+      this.skillSaveError = "";
+      const skill = this.skills.find((item) => item.id === skillId);
+      if (!skill || skill.builtIn) return false;
+      const normalized = normalizeSkillRegistry([skill])[0]!;
+      const issues = validateSkillDefinition(normalized);
+      if (issues.length) {
+        this.skillSaveError = `Skill“${normalized.name || normalized.id}”的配置不完整`;
+        throw new Error(this.skillSaveError);
+      }
+      const index = this.skills.findIndex((item) => item.id === skillId);
+      this.skills[index] = normalized;
+      const persisted = loadOwnedSkills().filter((item) => item.builtIn || item.id !== skillId);
+      persistOwnedSkills([...persisted, normalized]);
+      return true;
+    },
+
+    refreshOfficialContent() {
+      this.skills = enforceSystemSkills(this.skills);
+      this.tools = initialTools();
     },
 
     saveSkills() {
       this.skillSaveError = "";
-      const normalized = normalizeSkillRegistry(this.skills);
+      const normalized = enforceSystemSkills(normalizeSkillRegistry(this.skills));
       const duplicateId = normalized.find((skill, index) =>
         normalized.findIndex((candidate) => candidate.id === skill.id) !== index,
       );
@@ -969,7 +1001,7 @@ export const useOpsStore = defineStore("ops", {
         );
         const modelCredentials = await Promise.allSettled(
           this.models
-            .filter((model) => model.provider !== "Built-in")
+            .filter((model) => model.provider !== "Built-in" && model.source !== "official")
             .map(async (model) => ({
               id: model.id,
               value: await backend.loadCredential("model", model.id),
@@ -1361,10 +1393,19 @@ export const useOpsStore = defineStore("ops", {
       _legacyPaneId?: string,
       taskId?: string,
     ) {
+      const assertCapabilities = () => {
+        if (!taskId) return;
+        const task = this.tasks.find(item => item.id === taskId);
+        if (!task) throw new Error("任务已失效，拒绝派发工具");
+        const blocker = executionCapabilityBlocker(task, { command: `opsark-tool ${call.toolId} ${JSON.stringify(call.arguments)}`, validation: "true" }, this.skills);
+        if (blocker) throw new Error(blocker);
+      };
+      assertCapabilities();
       const connection = this.getRuntimeConnection(serverId);
       if (!connection) throw new Error("请先连接真实服务器");
       const generation = this.serverConnection(serverId).generation;
       const assertConnection = () => {
+        assertCapabilities();
         if (!this.getRuntimeConnection(serverId) || this.serverConnection(serverId).generation !== generation) {
           throw new Error("SSH 连接已断开或更换，已停止派发远程操作");
         }
@@ -1828,9 +1869,12 @@ export const useOpsStore = defineStore("ops", {
       const contextTask = contextTaskId
         ? this.tasks.find((item) => item.id === contextTaskId && item.serverId === serverId) ?? task
         : task;
-      await this.ensureTaskAgentSession(task.id);
       const sourceTask = task;
       const pureResume = /^(?:请)?(?:继续(?:完成|执行|处理|部署)?|重试|再试一次)(?:吧|。|！|!)?$/u.test(content.trim());
+      if (task.modelPlanningBlocker && modelId === task.modelId && permission === task.permission
+        && (pureResume || content.trim() === latestTaskRequirement(task).trim())
+        && this.stopBlockedModelPlanning(task)) return;
+      await this.ensureTaskAgentSession(task.id);
       if (pureResume && task.status === "awaiting_input") {
         this.pushMessage(task, { role: "user", kind: "message", content, requirementRelation: "continue" });
         this.pushMessage(task, { role: "assistant", kind: "message", content: "当前步骤仍有必需信息待确认，请先完成已有表单后继续。" });
@@ -2231,6 +2275,7 @@ export const useOpsStore = defineStore("ops", {
         this.activeTaskId = task.id;
         const selectedSkillIds = processed.selectedSkillIds ?? [];
         task.activeSkillIds = mergeTaskSkillIds(task.activeSkillIds, selectedSkillIds, relation);
+        pinTaskSkills(task, this.skills);
         task.executionConstraints = relation === "continue" && task === sourceTask && previousConstraints
           ? previousConstraints
           : processed.constraints ? {
@@ -2245,6 +2290,7 @@ export const useOpsStore = defineStore("ops", {
             : task.executionConstraints;
         if (pendingProtocolError) throw pendingProtocolError;
         if (processed.planError) {
+          const serviceError = modelServiceError(processed.planError);
           const selectedSkillNames = resolveTaskSkills(task, this.skills).map((skill) => skill.name);
           const selectionSummary = selectedSkillNames.length
             ? `已选择 Skill：${selectedSkillNames.join("、")}。`
@@ -2265,14 +2311,17 @@ export const useOpsStore = defineStore("ops", {
               requirement: content,
               selectedSkillIds: task.activeSkillIds ?? [],
               serverCommandDispatched: false,
-              nextAction: "可保留当前结果结束，或稍后重试生成后续方案",
+              modelError: serviceError,
+              nextAction: serviceError ? "处理账户额度或修改模型/请求预算后再继续；原条件下不重复调用"
+                : "可保留当前结果结束，或稍后重试生成后续方案",
             }, null, 2),
             serverId,
             taskId: task.id,
           });
           transitionTask(task, "planning_failed");
           task.summary = undefined;
-          task.pauseReason = "整体目标、Skill 选择和已有证据已保留，未向服务器发送新命令。后续方案待完善，可以稍后重试生成。";
+          if (serviceError) this.recordModelPlanningBlocker(task, serviceError);
+          else task.pauseReason = "整体目标、Skill 选择和已有证据已保留，未向服务器发送新命令。后续方案待完善，可以稍后重试生成。";
           this.persist();
           return;
         }
@@ -2375,7 +2424,9 @@ export const useOpsStore = defineStore("ops", {
           serverId: executionServerId(task),
         });
         const actionableConfiguration = /(?:模型配置不存在|API Key 未恢复)/.test(message);
-        task.pauseReason = actionableConfiguration
+        const serviceError = modelServiceError(error);
+        if (serviceError) this.recordModelPlanningBlocker(task, serviceError);
+        task.pauseReason = serviceError ? modelServiceErrorMessage(serviceError) : actionableConfiguration
           ? `${message}当前目标和已有记录已保留。`
           : "当前目标和已有结果已保留，未向服务器发送新命令。执行方案尚未就绪，可以稍后重试规划。";
         this.pushMessage(task, { role: "assistant", kind: "summary", content: task.pauseReason });
@@ -2400,6 +2451,70 @@ export const useOpsStore = defineStore("ops", {
         port: server?.port,
         username: server?.username,
       };
+    },
+
+    /** Stable retry conditions: exclude task status, pause text, counters and wall-clock metrics. */
+    modelPlanningConditions(task: OpsTask) {
+      const model = this.models.find(item => item.id === task.modelId);
+      const account = model?.source === "official" ? useAccountStore().current : undefined;
+      const failed = task.plan.find(step => step.status === "failed");
+      return textFingerprint(JSON.stringify({
+        policy: nextStagePolicyFingerprint({ task,
+          server: this.servers.find(item => item.id === executionServerId(task)),
+          tools: this.tools, secretMetadata: this.secretMetadata, skills: resolveTaskSkills(task, this.skills) }),
+        instruction: task.currentInstruction ?? latestTaskRequirement(task),
+        model: model && { id: model.id, model: model.model, provider: model.provider, endpoint: model.endpoint,
+          source: model.source, requestParameters: model.requestParameters },
+        generationSettings: this.aiGenerationSettings,
+        evidence: buildAdjustmentBlockerSnapshot(task, failed, this.adjustmentTargetState(task)).evidenceFingerprint,
+        accountUserId: account?.user.id,
+        billingMode: account?.billingMode,
+      }));
+    },
+
+    modelAccountBalance(task: OpsTask) {
+      if (this.models.find(model => model.id === task.modelId)?.source !== "official") return undefined;
+      const current = useAccountStore().current;
+      return current ? { userId: current.user.id, available: current.balance.available, reserved: current.balance.reserved } : undefined;
+    },
+
+    recordModelPlanningBlocker(task: OpsTask, error: ModelServiceError, conditionsFingerprint?: string) {
+      task.modelPlanningBlocker = { error, conditionsFingerprint: conditionsFingerprint ?? this.modelPlanningConditions(task),
+        accountBalance: this.modelAccountBalance(task), recordedAt: now() };
+      task.autoAdjustmentSeconds = undefined;
+      task.managedAdjustmentPhase = "manual_required";
+      task.managedStopReason = "model_generation_failed";
+      task.pauseReason = modelServiceErrorMessage(error);
+      this.persist();
+    },
+
+    /** Checking unchanged conditions is local and never probes the paid model endpoint. */
+    stopBlockedModelPlanning(task: OpsTask) {
+      const blocker = task.modelPlanningBlocker;
+      if (!blocker) return false;
+      const balance = this.modelAccountBalance(task);
+      const prior = blocker.accountBalance;
+      const availableAtRefusal = blocker.error.details?.available_tokens ?? prior?.available;
+      const reservedAtRefusal = blocker.error.details?.reserved_tokens ?? prior?.reserved;
+      // A balance revision alone, or refreshing a stale optimistic cache down to
+      // the refusal's actual balance, is not evidence that this call can now run.
+      const changedBalance = balance && JSON.stringify(balance) !== JSON.stringify(prior);
+      const improvedBalance = changedBalance && (
+        availableAtRefusal !== undefined && balance.available > availableAtRefusal
+        || reservedAtRefusal !== undefined && balance.reserved < reservedAtRefusal
+      );
+      if (blocker.conditionsFingerprint !== this.modelPlanningConditions(task) || improvedBalance) {
+        task.modelPlanningBlocker = undefined;
+        task.autoAdjustmentSeconds = undefined;
+        this.persist();
+        return false;
+      }
+      task.autoAdjustmentSeconds = undefined;
+      task.managedAdjustmentPhase = "manual_required";
+      task.managedStopReason = "model_generation_failed";
+      task.pauseReason = modelServiceErrorMessage(blocker.error);
+      this.persist();
+      return true;
     },
 
     stopAutomaticLoop(task: OpsTask) {
@@ -2437,6 +2552,12 @@ export const useOpsStore = defineStore("ops", {
     pauseWorkflowFailure(task: OpsTask, error: unknown, automaticProtocolRecovery = false) {
       if (task.cancelRequested || ["completed", "cancelled"].includes(task.status)) return;
       if (canTransitionTask(task.status, "needs_adjustment")) transitionTask(task, "needs_adjustment");
+      const serviceError = modelServiceError(error);
+      if (serviceError) {
+        this.recordModelPlanningBlocker(task, serviceError);
+        this.pushMessage(task, { role: "system", kind: "event", content: task.pauseReason! });
+        return;
+      }
       if (error instanceof PlanProtocolError) {
         task.protocolRepair = {
           roundId: task.currentRoundId, serverId: executionServerId(task), repair: error.repair, repairError: error.repairError,
@@ -2689,6 +2810,7 @@ export const useOpsStore = defineStore("ops", {
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || !["needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)) return;
       if (hasWaitingStep(task) || (automatic && task.protocolRepair)) return;
+      if (this.stopBlockedModelPlanning(task)) return;
       const protocolReplan = activeProtocolRepair(task);
       if (task.protocolRepair && !protocolReplan) {
         task.pauseReason = "保留的协议事故与当前目标或轮次不一致，请补充当前需求后重新规划。";
@@ -2698,6 +2820,7 @@ export const useOpsStore = defineStore("ops", {
       let replanRecord: NonNullable<OpsTask["protocolRepairHistory"]>[number] | undefined;
       if (expectedFingerprint && task.adjustmentIncident?.fingerprint !== expectedFingerprint) return;
       const lifetime = workflowLifetime(task);
+      let modelConditions = this.modelPlanningConditions(task);
       if (automatic && this.stopAutomaticLoop(task)) return;
       adjustingTaskIds.set(taskId, lifetime);
       task.adjustmentInProgress = true;
@@ -2790,6 +2913,11 @@ export const useOpsStore = defineStore("ops", {
             if (model.provider !== "Built-in" && !apiKey) {
               throw new Error(`“${model.name}”的 API Key 未恢复，请前往“模型与设置”重新保存一次。`);
             }
+            modelConditions = this.modelPlanningConditions(task);
+            this.addLog({ category: "model", level: "info", title: "开始生成后续方案",
+              detail: JSON.stringify({ triggerSource: protocolReplan ? protocolReplanSource : automatic ? "managed_scheduler" : "manual",
+                automatic, modelId: task.modelId, conditionsFingerprint: modelConditions }),
+              taskId, serverId: executionServerId(task) });
             adjustment = await planTaskAdjustment({
               task,
               failedStep: failed,
@@ -2879,6 +3007,8 @@ export const useOpsStore = defineStore("ops", {
           // A rejected late model response is just as stale as a successful one.
           // Never bind its old proposal to a newly selected target or authority.
           if (!policyCurrent()) error = new Error("规划期间目标、授权或已确认输入发生变化，已丢弃过期响应；原协议事故保持原目标绑定，请重新生成");
+          const serviceError = modelServiceError(error);
+          if (serviceError) this.recordModelPlanningBlocker(task, serviceError, modelConditions);
           if (error instanceof PlanProtocolError) {
             task.protocolRepair = {
               roundId: task.currentRoundId, serverId: executionServerId(task),
@@ -2920,11 +3050,11 @@ export const useOpsStore = defineStore("ops", {
               (adjustmentIncident.generationFailureCount ?? 0) + 1;
           }
           const technicalDetail = error instanceof Error
-            ? error.stack || `${error.name}: ${error.message}`
+            ? `${error.name}: ${error.message}${error.stack ? `\n${error.stack}` : ""}`
             : String(error);
           const actionablePolicyReason = error instanceof ExecutionPolicyError
             || /(?:规划期间目标、授权或已确认输入发生变化|原协议事故保持原目标绑定)/.test(String(error));
-          const reason = actionablePolicyReason
+          const reason = serviceError ? modelServiceErrorMessage(serviceError) : actionablePolicyReason
             ? String(error)
             : "当前结果和已有执行证据已保留，但后续方案暂未就绪。可以稍后重试生成。";
           this.addDeveloperLog({
@@ -2933,6 +3063,7 @@ export const useOpsStore = defineStore("ops", {
             title: "调整方案未能进入审批",
             summary: technicalDetail,
             error: technicalDetail,
+            response: serviceError ? { modelError: serviceError } : undefined,
             stack: error instanceof Error ? error.stack : undefined,
             taskId,
             serverId: executionServerId(task),
@@ -2980,6 +3111,7 @@ export const useOpsStore = defineStore("ops", {
       if (!task || !["needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)) return;
       if (hasWaitingStep(task)) return;
       if (task.protocolRepair && automatic) return;
+      if (!transportOnly && this.stopBlockedModelPlanning(task)) return;
       // A manual request is a new business proposal, not another field-local
       // repair attempt. Do not invent a fresh environment failure/incident.
       if (task.protocolRepair && !transportOnly) {
@@ -3112,6 +3244,7 @@ export const useOpsStore = defineStore("ops", {
       if (!task || task.permission !== "managed"
         || !["needs_adjustment", "awaiting_continuation"].includes(task.status)) return;
       if (hasWaitingStep(task) || task.protocolRepair) return;
+      if (this.stopBlockedModelPlanning(task)) return;
       if (task.managedStopReason === "workflow_error" || this.stopAutomaticLoop(task)) return;
       const failed = [...task.plan].reverse().find((step) => step.status === "failed");
       if (buildAdjustmentBlockerSnapshot(task, failed, this.adjustmentTargetState(task)).kind === "transport") {
@@ -3138,6 +3271,7 @@ export const useOpsStore = defineStore("ops", {
           if (!current || current.permission !== "managed"
             || !["needs_adjustment", "awaiting_continuation"].includes(current.status)
             || current.cancelRequested || hasWaitingStep(current)) break;
+          if (this.stopBlockedModelPlanning(current)) break;
           if (this.stopAutomaticLoop(current)) break;
           const blockedStep = [...current.plan].reverse().find((step) => step.status === "failed");
           if (buildAdjustmentBlockerSnapshot(current, blockedStep, this.adjustmentTargetState(current)).kind === "transport") {
@@ -3160,6 +3294,7 @@ export const useOpsStore = defineStore("ops", {
           if (!["needs_adjustment", "awaiting_continuation"].includes(current.status)
             || current.cancelRequested) continue;
           if (hasWaitingStep(current)) break;
+          if (this.stopBlockedModelPlanning(current)) break;
           if (current.managedStopReason === "transport_recovery") break;
           const latestFailed = [...current.plan].reverse().find((step) => step.status === "failed");
           if (buildAdjustmentBlockerSnapshot(current, latestFailed, this.adjustmentTargetState(current)).kind === "transport") {
@@ -3407,7 +3542,13 @@ export const useOpsStore = defineStore("ops", {
           return;
         }
         if (progression.kind !== "execute-step") {
+          if (this.stopBlockedModelPlanning(task)) {
+            transitionTask(task, "needs_adjustment");
+            this.persist();
+            return;
+          }
           if (progression.kind === "refine-discovery") {
+            const modelConditions = this.modelPlanningConditions(task);
             task.discoveryRefined = true;
             if (!progression.afterUserInput) task.refinementCount = (task.refinementCount ?? 0) + 1;
             transitionTask(task, "planning");
@@ -3442,6 +3583,7 @@ export const useOpsStore = defineStore("ops", {
               transitionTask(task, "needs_adjustment");
               task.pauseReason = refinement.pauseReason;
               if (refinement.kind === "failed") {
+                if (refinement.modelError) this.recordModelPlanningBlocker(task, refinement.modelError, modelConditions);
                 if (refinement.protocolError) {
                   task.protocolRepair = {
                     roundId: task.currentRoundId, serverId: executionServerId(task),
@@ -3694,7 +3836,15 @@ export const useOpsStore = defineStore("ops", {
       const task = this.tasks.find(item => item.id === taskId);
       const step = task?.plan.find(item => item.id === stepId);
       if (!task || !step || isCancelled()) return false;
+      pinTaskSkills(task, this.skills);
+      const capabilityError = executionCapabilityBlocker(task, step, this.skills);
+      if (capabilityError) {
+        transitionTask(task, "needs_adjustment"); task.pauseReason = capabilityError;
+        this.pushMessage(task, { role: "assistant", kind: "event", content: capabilityError });
+        this.persist(); return false;
+      }
       try {
+        await backend.configureTaskCapabilities(task.id, shellAllowed(task, this.skills));
         validateRecoveryReferences(recoveryHistory(task), [step], taskAttemptContext(task));
       } catch (error) {
         transitionTask(task, "needs_adjustment");
@@ -3835,6 +3985,8 @@ export const useOpsStore = defineStore("ops", {
         const targetServerId = executionServerId(task);
         const connectionGeneration = this.serverConnection(targetServerId).generation;
         const assertConnection = () => {
+          const capabilityError = executionCapabilityBlocker(task, step, this.skills);
+          if (capabilityError) throw new Error(capabilityError);
           if (!this.getRuntimeConnection(targetServerId)
             || this.serverConnection(targetServerId).generation !== connectionGeneration) {
             throw new Error("SSH 连接已断开或更换，远程操作已暂停；已发送命令的结果需核对");
@@ -5243,7 +5395,7 @@ export const useOpsStore = defineStore("ops", {
       for (const model of this.models) validateRequestParameters(model.requestParameters);
       this.aiGenerationSettings = normalizeAiGenerationSettings(this.aiGenerationSettings);
       this.models = this.models.filter((model) => model.provider !== "Built-in" && model.id !== "model-local");
-      const credentials = this.models.map(async (model) => {
+      const credentials = this.models.filter(model => model.source !== "official").map(async (model) => {
         const apiKey = this.modelApiKeys[model.id] ?? "";
         if (apiKey) await backend.saveCredential("model", model.id, apiKey);
         else await backend.deleteCredential("model", model.id);
@@ -5264,6 +5416,8 @@ export const useOpsStore = defineStore("ops", {
     async refreshModelAvailability() {
       await this.hydrateCredentials();
       await Promise.all(this.models.map(async (model) => {
+        // Official availability includes account/credit state and is refreshed by the account store.
+        if (model.source === "official") return;
         if (!model.enabled) {
           this.modelAvailability[model.id] = { status: "unavailable", reason: "模型已停用", checkedAt: now() };
           return;

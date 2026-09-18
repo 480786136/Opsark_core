@@ -12,6 +12,7 @@ import { isInternalPlanDiagnostic, localizeCoreText } from "@/features/preferenc
 const store = useOpsStore();
 const { t, locale } = useI18n();
 const zh = computed(() => locale.value.startsWith("zh"));
+const showDeveloperLogs = import.meta.env.DEV;
 const logMode = ref<"audit" | "developer">("audit");
 const query = ref("");
 const serverFilter = ref("all");
@@ -335,9 +336,9 @@ function commandContent(log: AuditEvent) {
 <template>
   <div class="page logs-page">
     <header class="page-header logs-header">
-      <div><span class="eyebrow">{{ zh ? "审计轨迹 / 开发者诊断" : "AUDIT TRAIL / DEVELOPER DIAGNOSTICS" }}</span><h1>{{ logMode === "audit" ? t("logs.title") : t("logs.developerTitle") }}</h1><p>{{ logMode === "audit" ? t("logs.subtitle") : t("logs.developerSubtitle") }}</p></div>
+      <div><span class="eyebrow">{{ showDeveloperLogs ? (zh ? "审计轨迹 / 开发者诊断" : "AUDIT TRAIL / DEVELOPER DIAGNOSTICS") : (zh ? "审计轨迹" : "AUDIT TRAIL") }}</span><h1>{{ logMode === "audit" ? t("logs.title") : t("logs.developerTitle") }}</h1><p>{{ logMode === "audit" ? t("logs.subtitle") : t("logs.developerSubtitle") }}</p></div>
       <div class="log-header-actions">
-        <div class="log-mode-tabs" :aria-label="t('logs.logMode')">
+        <div v-if="showDeveloperLogs" class="log-mode-tabs" :aria-label="t('logs.logMode')">
           <button type="button" :class="{ active: logMode === 'audit' }" @click="logMode = 'audit'"><ShieldCheck :size="14" />{{ t("logs.auditMode") }}</button>
           <button type="button" :class="{ active: logMode === 'developer' }" @click="logMode = 'developer'"><Bug :size="14" />{{ t("logs.developerMode") }}</button>
         </div>
@@ -345,7 +346,7 @@ function commandContent(log: AuditEvent) {
       </div>
     </header>
 
-    <DeveloperLogsPanel v-if="logMode === 'developer'" />
+    <DeveloperLogsPanel v-if="showDeveloperLogs && logMode === 'developer'" />
 
     <template v-else>
       <section class="log-filters">

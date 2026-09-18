@@ -31,6 +31,20 @@ beforeEach(() => Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {
 afterEach(() => { Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); vi.resetAllMocks(); });
 
 describe("bounded protocol repair", () => {
+  it("does not resend the preserved next-stage decision with a rejected field", () => {
+    const repair = { ...repairOf(), nextStageDecision: {
+      reason: "OLD_DECISION".repeat(5_000), steps: [diagnose()],
+    } };
+    const compact = compactProtocolRepairContext(runtime().context, repair);
+    const parsed = JSON.parse(compact);
+    expect(parsed.planGenerationRepair.nextStageDecision).toBeUndefined();
+    expect(compact).not.toContain("OLD_DECISION");
+    expect(parsed.planGenerationRepair.previousModelOutput).toHaveLength(1);
+    expect(parsed.planGenerationRepair.diagnostic).toEqual(repair.diagnostic);
+    expect(parsed.taskGoal.rootGoal).toBe("部署应用");
+    expect(parsed.permission).toBe("safe");
+    expect(repair.nextStageDecision.reason).toContain("OLD_DECISION");
+  });
   it("cannot delete an invalid array tail while claiming to repair only its value", () => {
     const step = { ...diagnose(), recovery: undefined, command: 'opsark-tool software.check {"names":["git",3]}' };
     const repair = repairOf([step]);

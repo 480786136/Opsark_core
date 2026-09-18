@@ -24,6 +24,8 @@ export interface ToolDefinition {
   enabled: boolean;
   builtIn: boolean;
   version: number;
+  /** Official parameter/metadata version; the implementation version above stays compiled. */
+  configurationVersion?: number;
   updatedAt: string;
 }
 

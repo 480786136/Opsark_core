@@ -1,38 +1,27 @@
 <script setup lang="ts">
 import { ref } from "vue";
-import { Save } from "lucide-vue-next";
+import { Cloud } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
-import { localizeCoreText } from "@/features/preferences/coreText";
 import SkillManagementPanel from "@/features/settings/SkillManagementPanel.vue";
-import { useOpsStore } from "@/stores/ops";
+import SkillSyncPanel from "@/features/skills/SkillSyncPanel.vue";
+import CloudSkillManager from "@/features/skills/CloudSkillManager.vue";
+import { useAccountStore } from "@/features/account/accountStore";
 
-const store = useOpsStore();
 const { t, locale } = useI18n();
-const saveState = ref<"idle" | "saving" | "saved" | "error">("idle");
-
-function saveSkills() {
-  saveState.value = "saving";
-  try {
-    store.saveSkills();
-    saveState.value = "saved";
-    window.setTimeout(() => { if (saveState.value === "saved") saveState.value = "idle"; }, 1800);
-  } catch {
-    saveState.value = "error";
-  }
-}
+const account = useAccountStore();
+const cloudOpen = ref(false);
 </script>
 
 <template>
   <div class="page management-page registry-management-page">
     <header class="page-header">
       <div><span class="eyebrow">{{ locale.startsWith("zh") ? "Skill 管理" : "SKILL REGISTRY" }}</span><h1>{{ t("skills.title") }}</h1><p>{{ t("skills.subtitle") }}</p></div>
-      <button class="button primary" :disabled="saveState === 'saving'" @click="saveSkills">
-        <Save :size="15" />{{ saveState === "saved" ? t("settings.saved") : t("common.save") }}
-      </button>
+      <button v-if="account.current" class="button secondary" type="button" @click="cloudOpen = true"><Cloud :size="15"/>云同步管理</button>
     </header>
     <main class="management-layout">
-      <p v-if="saveState === 'error'" class="security-hint">{{ t("settings.saveFailed", { reason: localizeCoreText(store.skillSaveError) || t("settings.invalidSettings") }) }}</p>
+      <SkillSyncPanel />
       <SkillManagementPanel standalone />
     </main>
+    <CloudSkillManager v-if="account.current" :open="cloudOpen" @close="cloudOpen = false" />
   </div>
 </template>
