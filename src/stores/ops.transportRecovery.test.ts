@@ -53,7 +53,7 @@ describe("bounded task transport recovery", () => {
     vi.spyOn(backend, "loadCredential").mockResolvedValue(null);
     vi.spyOn(backend, "saveCredential").mockResolvedValue(undefined);
     vi.spyOn(backend, "generatePlan").mockResolvedValue([]);
-    vi.spyOn(backend, "processRequirement").mockResolvedValue({ intent: "execute", plan: [] });
+    vi.spyOn(backend, "processRequirement").mockResolvedValue({ intent: "execute", relation: "new_goal", plan: [] });
     vi.spyOn(backend, "executeCommand").mockRejectedValue(new Error("unexpected business command"));
     vi.spyOn(backend, "executeAgentCommand").mockRejectedValue(new Error("unexpected Agent business command"));
     vi.spyOn(backend, "createAgentTerminal").mockImplementation(async (_serverId, taskId) =>
@@ -77,7 +77,7 @@ describe("bounded task transport recovery", () => {
     expect(task.adjustmentIncident).toBeUndefined();
     expect(task.managedAdjustmentPhase).toBeUndefined();
     expect(task.managedStopReason).toBeUndefined();
-    expect(task.pauseReason).toContain("手动生成调整方案");
+    expect(task.pauseReason).toContain("手动生成后续计划");
     expect(backend.generatePlan).not.toHaveBeenCalled();
   });
 

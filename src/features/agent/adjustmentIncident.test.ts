@@ -5,6 +5,8 @@ import {
   openAdjustmentIncident,
   isTerminalTransportFailure,
   isSshConnectionSetupFailure,
+  recordAdjustmentPlan,
+  recordAdjustmentExecution,
 } from "./adjustmentIncident";
 import type { OpsTask, PlanStep } from "@/types";
 
@@ -57,6 +59,30 @@ const target = {
 };
 
 describe("adjustment incident fingerprint", () => {
+  it("计划采纳不消耗执行次数，多步骤实际恢复只计一次", () => {
+    const task = taskWith(failedStep());
+    const original = structuredClone(task.plan[0]);
+    const incident = openAdjustmentIncident(buildAdjustmentBlockerSnapshot(task, task.plan[0], target), true, task.createdAt);
+    const replacement = ["diagnose", "repair", "verify"].map(id => ({ ...failedStep(), id, status: "pending" as const }));
+
+    recordAdjustmentPlan(incident, replacement, task.updatedAt);
+    expect(incident.planningAttemptCount).toBe(1);
+    expect(incident.executionAttemptCount).toBe(0);
+    expect(recordAdjustmentExecution(incident, original.id, task.updatedAt)).toBe(false);
+    expect(recordAdjustmentExecution(incident, "diagnose", task.updatedAt)).toBe(true);
+    expect(recordAdjustmentExecution(incident, "diagnose", task.updatedAt)).toBe(false);
+    expect(recordAdjustmentExecution(incident, "repair", task.updatedAt)).toBe(false);
+    expect(recordAdjustmentExecution(incident, "verify", task.updatedAt)).toBe(false);
+    expect(incident.executionAttemptCount).toBe(1);
+    expect(task.plan[0]).toEqual(original);
+
+    recordAdjustmentPlan(incident, [{ ...replacement[0], id: "next-diagnose" }], task.updatedAt);
+    expect(incident.planningAttemptCount).toBe(2);
+    expect(recordAdjustmentExecution(incident, "verify", task.updatedAt)).toBe(false);
+    expect(recordAdjustmentExecution(incident, "next-diagnose", task.updatedAt)).toBe(true);
+    expect(incident.executionAttemptCount).toBe(2);
+  });
+
   it("识别执行器 SSH 建连错误，但不把业务日志或未知退出当成安全重放证据", () => {
     const error = "SSH 握手失败：[Session(-8)] Unable to exchange encryption keys";
     expect(isTerminalTransportFailure(error)).toBe(true);

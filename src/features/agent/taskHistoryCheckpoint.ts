@@ -161,9 +161,9 @@ function mergePhase(
     const sameIssue = (item: TaskHistoryCheckpoint["unresolvedIssues"][number]) =>
       unresolvedIssueKey(item) === issueKey;
     if (!isExceptionalTaskStep(step)) {
-      // A recovery verification executes the original acceptance command, not
-      // the failed mutation command. Resolve its explicit relation using the
-      // same evidence contract as the execution gate, with the exact source.
+      // Conservatively compact only an exact historical verification match.
+      // Other methods or replacement routes remain available to goal review;
+      // this history index is not an execution or completion gate.
       unresolvedIssues = unresolvedIssues.filter(issue => {
         const source = sourcePhases.find(item => item.id === issue.sourcePhaseId);
         const failed = (source?.plan ?? sourcePhases.flatMap(item => item.plan)).find(candidate =>

@@ -1,4 +1,4 @@
-import { buildPlanningToolContext, buildToolContext } from "@/features/tools/toolContext";
+import { buildPlanningToolContext } from "@/features/tools/toolContext";
 import {
   buildSkillDirectory,
   buildSkillContext,
@@ -17,7 +17,7 @@ import type {
   ServerProfile,
 } from "@/types";
 import { credentialGroupContext } from "@/features/agent/serverCredentialGroup";
-import { activeRoundSteps, allTaskSteps, taskGoal } from "@/features/agent/taskGoal";
+import { allTaskSteps, taskGoal } from "@/features/agent/taskGoal";
 import { buildTaskDecisionSnapshot } from "@/features/agent/taskDecisionSnapshot";
 import { compactReviewText, textFingerprint } from "@/features/agent/longRunningReviewOutput";
 import type { StepReview } from "@/types";
@@ -27,10 +27,12 @@ import { taskAttemptContext } from "@/features/agent/attemptState";
 import { executionContextEvidence, modelContextStep, EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION } from "@/features/agent/executionContextEvidence";
 import { DECISION_EVIDENCE_INSTRUCTION } from "./decisionEvidence";
 import { authenticationContext } from "./authenticationEvidence";
-import { completedContinuationCommandFingerprints } from "./taskProgression";
 import { confirmedUserInputsContext } from "./confirmedUserInputs";
 import { recoveryPlanningContext } from "./recoveryContract";
 import { activeProtocolRepair, protocolReplanContext } from "./protocolReplan";
+import { taskKnowledgeContext } from "@/features/knowledge/retrieval";
+
+export const GOAL_DIRECTED_RECOVERY_INSTRUCTION = "历史命令、失败结果与证据是不可改写的事实，不是必须逐条重试成功的旧计划。可按问题影响范围修正当前步骤、补充前置检查或重规划剩余目标，也可修正模型先前生成的不适用验收方法；说明调整原因及新证据如何证明用户目标，不得降低用户明确要求的验收标准或扩大授权。旧路径被替代后无需逐条复验，但替代方案仍须有真实执行与验收证据；提出方案、修复命令成功或 recovery 关联本身都不代表目标完成。";
 
 export function trimEvidence(value: string | undefined, limit = 3200) {
   if (!value) return "";
@@ -157,6 +159,7 @@ export interface AgentContextInput {
 
 export function buildAgentContext(input: AgentContextInput) {
   return {
+    knowledgeReferences: input.task ? taskKnowledgeContext(input.task.id) : undefined,
     _log: input.task ? modelLogContext(input.task) : undefined,
     skillEvidence: input.task ? buildSkillEvidenceContext(planningSkills(input.task, input.skillDirectory ?? input.skills ?? [])) : undefined,
     server: serverSnapshot(input.server),
@@ -170,7 +173,7 @@ export function buildAgentContext(input: AgentContextInput) {
     knownExecutionFacts: input.knownExecutionFacts,
     confirmedUserInputs: input.task ? confirmedUserInputsContext(input.task) : undefined,
     recovery: input.task ? recoveryPlanningContext(input.task) : undefined,
-    tools: buildToolContext(input.tools),
+    tools: buildPlanningToolContext(input.tools),
     skillSelection: {
       mode: "model",
       multiple: true,
@@ -197,8 +200,6 @@ export interface AdjustmentContextOptions {
   sharedSnapshot?: Record<string, unknown>;
   reviewDecision?: StepReview;
   adjustmentReason?: string;
-  /** Explicit business planning transition; never inferred by a protocol compiler. */
-  replanAfterProtocolFailure?: boolean;
 }
 
 function boundedPlanningTools(tools: ToolDefinition[], skills: SkillDefinition[]) {
@@ -221,16 +222,14 @@ export function buildAdjustmentContext(
   options: AdjustmentContextOptions = {},
 ) {
   const activeSkills = planningSkills(input.task, input.skills ?? resolveTaskSkills(input.task));
-  const planSafetyRejection = !options.replanAfterProtocolFailure
-    && failedStep?.result?.facts.category === "plan_safety_rejection";
+  const planSafetyRejection = failedStep?.result?.facts.category === "plan_safety_rejection";
   const focusedSafety = planSafetyRejection && failedStep
     ? planSafetyAdjustmentContext(input.task, failedStep)
     : undefined;
-  const protocolReplan = options.replanAfterProtocolFailure ? protocolReplanContext(input.task) : undefined;
-  const protocolRepair = protocolReplan ? undefined : activeProtocolRepair(input.task)?.repair;
+  const protocolRepair = activeProtocolRepair(input.task)?.repair;
   return {
-    workflowPhase: protocolReplan ? "business_replan_after_protocol_failure" : "adjust_after_failure",
-    protocolReplan,
+    workflowPhase: "adjust_after_failure",
+    knowledgeReferences: planSafetyRejection || protocolRepair ? undefined : taskKnowledgeContext(input.task.id),
     recovery: planSafetyRejection ? undefined : recoveryPlanningContext(input.task),
     taskGoal: {
       rootGoal: taskGoal(input.task),
@@ -239,10 +238,6 @@ export function buildAdjustmentContext(
     },
     permission: input.task.permission,
     executionConstraints: input.task.executionConstraints,
-    completedCommandFingerprints: completedContinuationCommandFingerprints(
-      activeRoundSteps(input.task),
-      taskAttemptContext(input.task),
-    ),
     authentication: protocolRepair ? undefined : authenticationContext(input.task),
     confirmedUserInputs: confirmedUserInputsContext(input.task),
     planGenerationRepair: protocolRepair,
@@ -252,13 +247,11 @@ export function buildAdjustmentContext(
     // the longest stable request prefix across adjustments for the same goal.
     tools: boundedPlanningTools(input.tools, activeSkills),
     activeSkills: boundedPlanningSkills(activeSkills),
-    instruction: protocolReplan
-      ? protocolReplan.instruction
-      : protocolRepair
+    instruction: protocolRepair
       ? "只修复 planGenerationRepair 中的原始计划协议；不得重新理解需求、换目标、换工具或改写无关字段。认证和历史证据不是扩大本次修复范围的授权。"
       : planSafetyRejection
       ? "这是执行前确定性安全门禁，不是远端执行失败。命令尚未发送到服务器。只修复 failedStep.offendingFields 列出的字段，必须保留真实失败退出码；不要改写步骤标题、风险、预期结果、其他步骤或用户授权。只返回该步骤的一个完整替代步骤，它仍会重新经过统一安全门禁。"
-      : "只根据 baseSnapshot、adjustmentTrigger 和尚未完成目标生成最少必要步骤。recentPhases 是最近两个阶段，historyCheckpoint 是更早历史的滚动摘要；不得要求重复其中已经完成的工作。计划描述和阶段总结不是成功证据，只有结构化 result/evidence 才能证明状态。失败方法必须有实质变化后才能重试。每步在独立非交互 Shell 中建立自身环境，并以 activeSkills 要求的独立验收结束。",
+      : `只根据 baseSnapshot、adjustmentTrigger 和尚未完成目标生成最少必要步骤。recentPhases 是最近两个阶段，historyCheckpoint 是更早历史的滚动摘要；复用已经完成且仍有效的工作。计划描述和阶段总结不是成功证据，只有真实输出和结构化 result/evidence 才能证明状态。同一失败在方案、环境和证据均无变化时不得机械重试；缺少事实可先安排已授权的只读诊断，不必为了取证强行填写 recovery。每步在独立非交互 Shell 中建立自身环境，并以独立验收证明用户要求，activeSkills 的验收方法仅作参考。${GOAL_DIRECTED_RECOVERY_INSTRUCTION}`,
     server: serverSnapshot(input.server),
     secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),
     serverCredentialGroups: credentialGroupContext(input.secretMetadata, input.task.serverId),
@@ -267,7 +260,7 @@ export function buildAdjustmentContext(
     // unrelated commands and outputs into what must be a field-local rewrite.
     baseSnapshot: planSafetyRejection || protocolRepair
       ? undefined
-      : (!protocolReplan && options.sharedSnapshot) || buildTaskDecisionSnapshot(input.task, failedStep,
+      : options.sharedSnapshot || buildTaskDecisionSnapshot(input.task, failedStep,
         buildPlanningToolContext(input.tools, activeSkills).some(tool => tool.id === "evidence.read")),
     adjustmentTrigger: {
       reason: options.adjustmentReason
@@ -305,6 +298,7 @@ export function nextStagePolicyFingerprint(input: WorkflowContextInput) {
     permission: input.task.permission,
     modelId: input.task.modelId,
     executionConstraints: input.task.executionConstraints,
+    protocolReplan: protocolReplanContext(input.task),
     skills: activeSkills.map((skill) => ({
       id: skill.id,
       version: skill.version,
@@ -329,8 +323,11 @@ export function nextStagePolicyFingerprint(input: WorkflowContextInput) {
 export function buildNextStageContext(input: WorkflowContextInput) {
   const activeSkills = planningSkills(input.task, input.skills ?? resolveTaskSkills(input.task));
   const policyFingerprint = nextStagePolicyFingerprint(input);
+  const protocolReplan = protocolReplanContext(input.task);
   return {
-    workflowPhase: "decide_after_phase",
+    workflowPhase: protocolReplan ? "decide_after_protocol_failure" : "decide_after_phase",
+    protocolReplan,
+    knowledgeReferences: taskKnowledgeContext(input.task.id),
     recovery: recoveryPlanningContext(input.task),
     taskGoal: {
       rootGoal: taskGoal(input.task),
@@ -338,17 +335,13 @@ export function buildNextStageContext(input: WorkflowContextInput) {
       relation: input.task.lastRequirementRelation,
     },
     permission: input.task.permission,
-    completedCommandFingerprints: completedContinuationCommandFingerprints(
-      activeRoundSteps(input.task),
-      taskAttemptContext(input.task),
-    ),
     authentication: authenticationContext(input.task),
     confirmedUserInputs: confirmedUserInputsContext(input.task),
     _log: modelLogContext(input.task),
     skillEvidence: buildSkillEvidenceContext(activeSkills),
     tools: buildPlanningToolContext(input.tools, activeSkills),
     activeSkills: buildSkillContext(activeSkills),
-    instruction: `先依据 baseSnapshot 的真实输出、result/evidence 和全部 activeSkills 验收要求判断整体目标。证据充分时返回 complete 且 steps 为空；尚未完成时明确未满足条件和缺少的事实，只规划最小下一阶段。recoveredEvidence 是从已有执行记录补读的原文，应先检查，再决定是否需要执行新命令。不得重复已完成步骤，不得用计划描述或阶段摘要冒充成功证据。${DECISION_EVIDENCE_INSTRUCTION}`,
+    instruction: `${protocolReplan ? "protocolReplan 只记录上一个方案在执行前未通过硬协议校验，该方案未执行。请仍先根据整体目标和真实证据决定 complete、continue 或 adjust；当前没有合法动作时返回 adjust 且 steps=[]，不得为消除协议事故而编造步骤。" : ""}先依据 baseSnapshot 的真实输出、result/evidence 判断用户整体目标；activeSkills 的流程和验收方法仅作参考，可按事实调整，不得降低用户要求。证据充分时返回 complete 且 steps 为空；尚未完成时明确未满足条件和缺少的事实，只规划最小下一阶段。recoveredEvidence 是从已有执行记录补读的原文，应先检查，再决定是否需要执行新命令。复用已完成且仍有效的工作，不得用计划描述或阶段摘要冒充成功证据。${GOAL_DIRECTED_RECOVERY_INSTRUCTION}${DECISION_EVIDENCE_INSTRUCTION}`,
     server: serverSnapshot(input.server),
     executionConstraints: input.task.executionConstraints,
     secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),
@@ -364,18 +357,15 @@ export function buildContinuationContext(input: WorkflowContextInput) {
   const activeSkills = planningSkills(input.task, input.skills ?? resolveTaskSkills(input.task));
   return {
     workflowPhase: "continue_after_discovery",
+    knowledgeReferences: taskKnowledgeContext(input.task.id),
     recovery: recoveryPlanningContext(input.task),
-    completedCommandFingerprints: completedContinuationCommandFingerprints(
-      activeRoundSteps(input.task),
-      taskAttemptContext(input.task),
-    ),
     authentication: authenticationContext(input.task),
     confirmedUserInputs: confirmedUserInputsContext(input.task),
     _log: modelLogContext(input.task),
     skillEvidence: buildSkillEvidenceContext(activeSkills),
     tools: buildPlanningToolContext(input.tools, activeSkills),
     activeSkills: buildSkillContext(activeSkills),
-    instruction: `依据已确认输入、本轮真实证据和仍有效的历史证据，在整体目标及 executionConstraints 的授权边界内生成最少必要的后续步骤。read_only 目标只能进行只读操作；缺少环境事实时可有限只读取证，缺少必须由用户作出的决定时只生成一个 user.request_input 步骤并等待。复用已回答的问题和已完成且仍有效的步骤，不得猜测路径、工具、端口、服务名或用户选择。用户提交输入仅补充对应决定，不代表目标完成，也不能被外推为未明确给出的授权。${EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION}`,
+    instruction: `依据已确认输入、本轮真实证据和仍有效的历史证据，在整体目标及 executionConstraints 的授权边界内生成最少必要的后续步骤。read_only 目标只能进行只读操作；缺少环境事实时可有限只读取证，缺少必须由用户作出的决定时只生成一个 user.request_input 步骤并等待。复用已回答的问题和已完成且仍有效的步骤，不得猜测路径、工具、端口、服务名或用户选择。用户提交输入仅补充对应决定，不代表目标完成，也不能被外推为未明确给出的授权。${GOAL_DIRECTED_RECOVERY_INSTRUCTION}${EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION}`,
     taskGoal: {
       rootGoal: taskGoal(input.task),
       currentInstruction: input.task.currentInstruction,

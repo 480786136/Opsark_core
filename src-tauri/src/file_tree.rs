@@ -32,9 +32,32 @@ pub struct FileStructureNode {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileStructureResult {
+    path_status: &'static str,
     tree: String,
     truncated: bool,
     warnings: Vec<String>,
+}
+
+// Only the protocol's ENOENT is an absence observation. Permission, transport
+// and generic I/O errors remain failures; never infer absence from error prose.
+fn root_metadata(
+    result: Result<FileStat, ssh2::Error>,
+    root_path: &str,
+) -> Result<Option<FileStat>, String> {
+    match result {
+        Ok(stat) => Ok(Some(stat)),
+        Err(error) if error.code() == ssh2::ErrorCode::SFTP(2) => Ok(None),
+        Err(error) => Err(format!("无法访问远程根目录 {root_path}：{error}")),
+    }
+}
+
+fn missing_root() -> FileStructureResult {
+    FileStructureResult {
+        path_status: "missing",
+        tree: String::new(),
+        truncated: false,
+        warnings: Vec::new(),
+    }
 }
 
 struct ScanOptions {
@@ -73,28 +96,45 @@ fn normalize_remote_root_path(raw_path: &str) -> Result<String, String> {
     })
 }
 
-fn normalize_remote_exclude(raw_exclude: &str) -> Result<Option<String>, String> {
+fn normalize_remote_exclude(raw_exclude: &str, root_path: &str) -> Result<Option<String>, String> {
     let normalized = raw_exclude.trim().replace('\\', "/");
-    if normalized.starts_with('/') || normalized.contains('\0') {
-        return Err(format!(
-            "排除目录必须是目录名或根目录下的相对路径：{raw_exclude}"
-        ));
+    if normalized.contains('\0') {
+        return Err(format!("排除目录不能包含 NUL 字符：{raw_exclude}"));
     }
 
+    let absolute = normalized.starts_with('/');
     let mut segments = Vec::new();
     for segment in normalized.split('/') {
         match segment {
             "" => {}
-            "." | ".." => {
-                return Err(format!(
-                    "排除目录必须是目录名或根目录下的相对路径：{raw_exclude}"
-                ))
-            }
+            "." | ".." => return Err(format!("排除目录不能包含 . 或 .. 路径段：{raw_exclude}")),
             _ => segments.push(segment),
         }
     }
 
-    Ok((!segments.is_empty()).then(|| segments.join("/")))
+    if segments.is_empty() {
+        return if absolute {
+            Err(format!("排除目录不能与根路径相同：{raw_exclude}"))
+        } else {
+            Ok(None)
+        };
+    }
+
+    let value = segments.join("/");
+    if !absolute {
+        return Ok(Some(value));
+    }
+
+    let absolute_path = format!("/{value}");
+    if absolute_path == root_path {
+        return Err(format!("排除目录不能与根路径相同：{raw_exclude}"));
+    }
+    if root_path != "/" && !absolute_path.starts_with(&format!("{root_path}/")) {
+        return Err(format!(
+            "绝对排除路径必须位于根路径 {root_path} 下：{raw_exclude}"
+        ));
+    }
+    Ok(Some(absolute_path))
 }
 
 fn remote_file_name(path: &Path) -> Option<String> {
@@ -131,7 +171,7 @@ fn validate_options(
         .map(|item| item.to_string())
         .collect();
     for raw_exclude in exclude_directories {
-        if let Some(exclude) = normalize_remote_exclude(&raw_exclude)? {
+        if let Some(exclude) = normalize_remote_exclude(&raw_exclude, &root_path)? {
             excludes.push(exclude);
         }
     }
@@ -156,9 +196,12 @@ fn kind_from_stat(stat: &FileStat) -> &'static str {
     }
 }
 
-fn is_excluded(relative_path: &str, name: &str, excludes: &[String]) -> bool {
+fn is_excluded(root_path: &str, relative_path: &str, name: &str, excludes: &[String]) -> bool {
+    let absolute_path = join_remote_path(root_path, relative_path);
     excludes.iter().any(|exclude| {
-        if exclude.contains('/') {
+        if exclude.starts_with('/') {
+            absolute_path == *exclude || absolute_path.starts_with(&format!("{exclude}/"))
+        } else if exclude.contains('/') {
             relative_path == exclude || relative_path.starts_with(&format!("{exclude}/"))
         } else {
             name == exclude
@@ -224,7 +267,9 @@ fn read_directory(
             format!("{relative_parent}/{name}")
         };
         let kind = kind_from_stat(&stat);
-        if kind == "directory" && is_excluded(&relative_path, &name, &options.excludes) {
+        if kind == "directory"
+            && is_excluded(&options.root_path, &relative_path, &name, &options.excludes)
+        {
             continue;
         }
 
@@ -307,9 +352,24 @@ pub fn scan_sftp(
         max_nodes,
         include_hidden,
     )?;
-    let root_stat = sftp
-        .stat(Path::new(&options.root_path))
-        .map_err(|error| format!("无法访问远程根目录 {}：{error}", options.root_path))?;
+    // lstat distinguishes a missing entry from an occupied dangling symlink.
+    let Some(entry_stat) = root_metadata(
+        sftp.lstat(Path::new(&options.root_path)),
+        &options.root_path,
+    )?
+    else {
+        return Ok(missing_root());
+    };
+    let root_stat = if kind_from_stat(&entry_stat) == "symlink" {
+        sftp.stat(Path::new(&options.root_path)).map_err(|error| {
+            format!(
+                "根路径符号链接存在但无法读取其目标 {}：{error}",
+                options.root_path
+            )
+        })?
+    } else {
+        entry_stat
+    };
     if kind_from_stat(&root_stat) != "directory" {
         return Err(format!("远程路径不是目录：{}", options.root_path));
     }
@@ -321,6 +381,7 @@ pub fn scan_sftp(
     };
     let nodes = read_directory(sftp, &options.root_path, "", 1, &options, &mut state)?;
     Ok(FileStructureResult {
+        path_status: "directory",
         tree: render_tree(&options.root_path, &nodes),
         truncated: state.truncated || !state.warnings.is_empty(),
         warnings: state.warnings,
@@ -330,6 +391,28 @@ pub fn scan_sftp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_explicit_missing_entry_is_a_successful_absence_observation() {
+        let missing = ssh2::Error::new(ssh2::ErrorCode::SFTP(2), "no such file");
+        assert!(root_metadata(Err(missing), "/opt/report")
+            .unwrap()
+            .is_none());
+        let data = serde_json::to_value(missing_root()).unwrap();
+        assert_eq!(data["pathStatus"], "missing");
+        assert_eq!(data["tree"], "");
+        assert_eq!(data["truncated"], false);
+        for code in [
+            ssh2::ErrorCode::SFTP(3),
+            ssh2::ErrorCode::SFTP(4),
+            ssh2::ErrorCode::Session(-43),
+        ] {
+            // Even misleading error text cannot turn a different status into ENOENT.
+            assert!(
+                root_metadata(Err(ssh2::Error::new(code, "no such file")), "/opt/report").is_err()
+            );
+        }
+    }
 
     #[test]
     fn validates_and_deduplicates_caller_excludes() {
@@ -354,9 +437,64 @@ mod tests {
             1
         );
         assert!(is_excluded(
+            &options.root_path,
             "storage/cache/items",
             "items",
             &options.excludes
+        ));
+    }
+
+    #[test]
+    fn accepts_absolute_excludes_below_the_remote_root() {
+        let options = validate_options(
+            "/".into(),
+            vec![
+                "/proc".into(),
+                " //proc/ ".into(),
+                "//sys/".into(),
+                "/dev".into(),
+                " /run// ".into(),
+                "/var/lib/docker/overlay2".into(),
+            ],
+            3,
+            600,
+            false,
+        )
+        .unwrap();
+
+        assert!(options.excludes.contains(&"/proc".to_string()));
+        assert_eq!(
+            options
+                .excludes
+                .iter()
+                .filter(|item| *item == "/proc")
+                .count(),
+            1
+        );
+        assert!(options.excludes.contains(&"/sys".to_string()));
+        assert!(is_excluded("/", "proc", "proc", &options.excludes));
+        assert!(is_excluded(
+            "/",
+            "var/lib/docker/overlay2/abc",
+            "abc",
+            &options.excludes
+        ));
+        assert!(!is_excluded("/", "opt/proc", "proc", &options.excludes));
+        assert!(!is_excluded("/", "proc2", "proc2", &options.excludes));
+
+        let nested = validate_options(
+            "/opt/app".into(),
+            vec!["/opt/app/storage/cache/".into()],
+            3,
+            600,
+            false,
+        )
+        .unwrap();
+        assert!(is_excluded(
+            "/opt/app",
+            "storage/cache/items",
+            "items",
+            &nested.excludes
         ));
     }
 
@@ -372,7 +510,27 @@ mod tests {
         assert!(
             validate_options("/opt/app".into(), vec!["..\\etc".into()], 6, 2000, false).is_err()
         );
+        assert!(validate_options(
+            "/opt/app".into(),
+            vec!["/opt/app/../etc".into()],
+            6,
+            2000,
+            false
+        )
+        .is_err());
         assert!(validate_options("/opt/app".into(), vec!["/etc".into()], 6, 2000, false).is_err());
+        assert!(validate_options(
+            "/opt/app".into(),
+            vec!["/opt/application/cache".into()],
+            6,
+            2000,
+            false
+        )
+        .is_err());
+        assert!(validate_options("/".into(), vec!["/".into()], 6, 2000, false).is_err());
+        assert!(
+            validate_options("/opt/app".into(), vec!["/opt/app".into()], 6, 2000, false).is_err()
+        );
         assert!(validate_options("/opt/app".into(), vec![], 0, 2000, false).is_err());
         assert!(validate_options("/opt/app".into(), vec![], 6, 10_001, false).is_err());
     }

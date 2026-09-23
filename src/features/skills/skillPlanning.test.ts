@@ -39,29 +39,29 @@ describe("evidence-driven Skill projection", () => {
   it.each([true, false])("keeps clarification during stage projection when the Skill declares it: %s", (declaresInput) => {
     const definition = orderedSkill();
     definition.allowedToolIds = ["files.read_content", "software.check", ...(declaresInput ? ["user.request_input"] : [])];
-    definition.planningContract!.stages[0].allowedToolIds.push("server.connect");
+    definition.planningContract!.stages[0].allowedToolIds!.push("server.connect");
     const projected = planningSkills(task(), [definition])[0];
     const ids = buildPlanningToolContext(resolveToolRegistry([]), [projected]).map(({ id }) => id);
 
     expect(projected.planningEvidence?.stageId).toBe("first");
-    expect(projected.allowedToolIds).toContain("user.request_input");
+    expect(projected.allowedToolIds).toEqual(definition.allowedToolIds);
     expect(ids).toContain("user.request_input");
     expect(ids).toContain("evidence.read");
     expect(ids).toContain("files.read_content");
-    expect(ids).not.toContain("software.check");
-    expect(ids).not.toContain("server.connect");
+    expect(ids).toContain("software.check");
+    expect(ids).toContain("server.connect");
   });
 
-  it("preserves an explicit clarification ban through stage projection", () => {
+  it("preserves legacy metadata without treating it as a clarification ban", () => {
     const definition = orderedSkill();
     definition.forbiddenToolIds = ["user.request_input"];
-    definition.planningContract!.stages[0].allowedToolIds.push("user.request_input");
+    definition.planningContract!.stages[0].allowedToolIds!.push("user.request_input");
     const projected = planningSkills(task(), [definition])[0];
 
     expect(projected.planningEvidence?.stageId).toBe("first");
     expect(projected.forbiddenToolIds).toEqual(["user.request_input"]);
-    expect(projected.allowedToolIds).not.toContain("user.request_input");
-    expect(buildPlanningToolContext(resolveToolRegistry([]), [projected]).map(({ id }) => id)).not.toContain("user.request_input");
+    expect(projected.allowedToolIds).toEqual(definition.allowedToolIds);
+    expect(buildPlanningToolContext(resolveToolRegistry([]), [projected]).map(({ id }) => id)).toContain("user.request_input");
   });
 
   it("keeps build acceptance and recovery boundaries through discovery and preparation", () => {
@@ -72,29 +72,29 @@ describe("evidence-driven Skill projection", () => {
     expect(initial.instructions).toContain(build.planningContract!.acceptanceInstructions);
     expect(initial.instructions).toContain("真实退出码");
     expect(initial.instructions).toContain("没有证据时不得切换镜像");
-    expect(initial.allowedToolIds).toContain("context.expand");
-    expect(initial.instructions).toContain("当前阶段 discover");
+    expect(buildPlanningToolContext(resolveToolRegistry([]), [initial]).map(tool => tool.id)).toContain("context.expand");
+    expect(initial.instructions).toContain("建议阶段 discover");
     current.plan = [read(current)];
     const prepared = planningSkills(current, [build])[0];
-    expect(prepared.instructions).toContain("当前阶段 prepare");
+    expect(prepared.instructions).toContain("建议阶段 prepare");
     expect(prepared.instructions).toContain(build.planningContract!.acceptanceInstructions);
     expect(prepared.instructions).toContain("--production=false 表示包含开发依赖");
-    expect(prepared.allowedToolIds).toContain("software.check");
+    expect(buildPlanningToolContext(resolveToolRegistry([]), [prepared]).map(tool => tool.id)).toContain("software.check");
   });
 
-  it("opens software tools after parsed manifest evidence and loses it on credential changes", () => {
+  it("updates workflow advice from evidence without changing tool capabilities", () => {
     const current = task();
     const definition = skill();
     const initial = planningSkills(current, [definition])[0];
     expect(initial.instructions.length).toBeLessThan(definition.instructions.length);
-    expect(initial.allowedToolIds).not.toContain("software.check");
-    expect(initial.allowedToolIds).toContain("context.expand");
+    expect(initial.allowedToolIds).toEqual(definition.allowedToolIds);
+    expect(buildPlanningToolContext(resolveToolRegistry([]), [initial]).map(tool => tool.id)).toContain("context.expand");
     expect(initial.instructions).toContain(definition.planningContract!.acceptanceInstructions);
     expect(initial.instructions).toContain("不得为了“能启动”关闭 TLS");
     current.plan = [read(current)];
-    expect(planningSkills(current, [definition])[0].allowedToolIds).toContain("software.check");
+    expect(buildPlanningToolContext(resolveToolRegistry([]), planningSkills(current, [definition])).map(tool => tool.id)).toContain("software.check");
     current.credentialRevision = 1;
-    expect(planningSkills(current, [definition])[0].allowedToolIds).not.toContain("software.check");
+    expect(planningSkills(current, [definition])[0].allowedToolIds).toEqual(definition.allowedToolIds);
   });
 
   it.each([
@@ -105,25 +105,25 @@ describe("evidence-driven Skill projection", () => {
   ])("does not advance from unsupported or partial content at %s (%s, partial=%s)", (path, content, truncated) => {
     const current = task();
     current.plan = [read(current, path, content, truncated)];
-    expect(planningSkills(current, [skill()])[0].instructions).toContain("当前阶段 discover");
+    expect(planningSkills(current, [skill()])[0].instructions).toContain("建议阶段 discover");
   });
 
   it("rejects unlinked facts and observations from another target", () => {
     const current = task();
     current.plan = [read(current)];
     current.plan[0].evidence = [];
-    expect(planningSkills(current, [skill()])[0].instructions).toContain("当前阶段 discover");
+    expect(planningSkills(current, [skill()])[0].instructions).toContain("建议阶段 discover");
     current.plan = [{ ...read(current), attemptContext: "another-server" }];
-    expect(planningSkills(current, [skill()])[0].instructions).toContain("当前阶段 discover");
+    expect(planningSkills(current, [skill()])[0].instructions).toContain("建议阶段 discover");
   });
 
   it("walks exits in order without changing completion state", () => {
     const current = task();
     const definition = orderedSkill();
     current.plan = [read(current, "/app/2.txt", "second")];
-    expect(planningSkills(current, [definition])[0].instructions).toContain("当前阶段 first");
+    expect(planningSkills(current, [definition])[0].instructions).toContain("建议阶段 first");
     current.plan.push(read(current, "/app/1.txt", "first"));
-    expect(planningSkills(current, [definition])[0].instructions).toContain("当前阶段 third");
+    expect(planningSkills(current, [definition])[0].instructions).toContain("建议阶段 third");
     current.plan.push(read(current, "/app/3.txt", "third"));
     const before = structuredClone(current);
     expect(planningSkills(current, [definition])[0]).toEqual(definition);

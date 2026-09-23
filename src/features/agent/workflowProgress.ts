@@ -53,12 +53,17 @@ export function workflowProgress(task: OpsTask) {
   let stagnantPhases = 0;
   let observationPhases = 0;
   let completedPhases = 0;
+  let automaticPhases = 0;
+  const budget = task.automaticPhaseBudget;
+  const excluded = new Set(budget?.roundId === task.currentRoundId
+    && budget?.serverId === (task.executionTargetServerId ?? task.serverId) ? budget.stepIds : []);
   for (const phase of phases) {
     const steps = phase.filter(step => !stepIds.has(step.id));
     steps.forEach(step => stepIds.add(step.id));
     if (!steps.length || steps.every(step => step.status === "skipped"
       || ["terminal_transport", "terminal_recovery", "validation_protocol_exception"].includes(String(step.result?.facts.category)))) continue;
     completedPhases += 1;
+    if (steps.some(step => !excluded.has(step.id))) automaticPhases += 1;
     const changed = steps.some(step => step.kind === "change" && step.status === "completed"
       && step.result?.executionStatus === "success");
     const decisionConfirmed = steps.some(isConfirmedUserDecision);
@@ -78,20 +83,35 @@ export function workflowProgress(task: OpsTask) {
     stagnantPhases = added || changed || decisionConfirmed ? 0 : stagnantPhases + 1;
     observationPhases = changed || decisionConfirmed || changeAttempted ? 0 : observationPhases + 1;
   }
-  return { completedPhases, stagnantPhases, observationPhases,
+  return { completedPhases, automaticPhases, stagnantPhases, observationPhases,
     evidenceCount: seen.size, rereadEvidence: stagnantPhases > 0 || observationPhases >= 3 };
 }
 
-export function automaticContinuationBlocker(task: OpsTask): string | undefined {
+export function automaticContinuationStop(task: OpsTask): { code: "no_progress" | "phase_budget_exhausted"; reason: string } | undefined {
   const progress = workflowProgress(task);
   if (progress.stagnantPhases >= MAX_STAGNANT_PHASES) {
-    return "连续阶段没有新增执行事实，已停止自动重复取证。已保留原始证据，请检查已有证据或补充尚未满足的目标条件后继续。";
+    return { code: "no_progress", reason: "连续阶段没有新增执行事实，已停止自动重复取证。已保留原始证据，请检查已有证据或补充尚未满足的目标条件后继续。" };
   }
   if (progress.observationPhases >= MAX_OBSERVATION_PHASES) {
-    return "连续多个阶段仍停留在取证，已停止自动循环。已有证据已保留并补充到决策上下文，请明确剩余目标或缺少的证据后继续。";
+    return { code: "no_progress", reason: "连续多个阶段仍停留在取证，已停止自动循环。已有证据已保留并补充到决策上下文，请明确剩余目标或缺少的证据后继续。" };
   }
-  if (progress.completedPhases >= MAX_AUTOMATIC_PHASES) {
-    return "本轮已达到自动阶段上限，任务与证据已保留；请检查实际进展后明确继续。";
+  if (progress.automaticPhases >= MAX_AUTOMATIC_PHASES) {
+    return { code: "phase_budget_exhausted", reason: "本轮自动阶段预算已用完，不代表任务没有进展。目标与证据已保留；明确继续后将开启新的自动阶段预算。" };
   }
   return undefined;
+}
+
+export function automaticContinuationBlocker(task: OpsTask): string | undefined {
+  return automaticContinuationStop(task)?.reason;
+}
+
+/** Call only from an explicit user continuation, never a timer/system handoff. */
+export function renewAutomaticPhaseBudget(task: OpsTask, renewedAt: string): boolean {
+  if (workflowProgress(task).automaticPhases < MAX_AUTOMATIC_PHASES) return false;
+  const plans = (task.phaseHistory ?? []).filter(phase => phase.roundId === task.currentRoundId).map(phase => phase.plan);
+  if (task.plan.every(step => ["completed", "failed", "skipped"].includes(step.status))) plans.push(task.plan);
+  task.automaticPhaseBudget = { roundId: task.currentRoundId,
+    serverId: task.executionTargetServerId ?? task.serverId,
+    stepIds: [...new Set(plans.flatMap(plan => plan.map(step => step.id)))], renewedAt };
+  return true;
 }

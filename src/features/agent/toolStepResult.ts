@@ -50,17 +50,18 @@ export function buildToolStepOutcome(input: BuildToolStepOutcomeInput): ToolStep
     truncated,
     ...buildToolEvidenceFacts(call, result),
   };
+  const missingPath = facts.evidenceKind === "path_state" && facts.pathExists === false;
   if (call.toolId === "context.expand" && result.data && typeof result.data === "object"
     && "skillId" in result.data && typeof result.data.skillId === "string") {
     Object.assign(facts, { expandedSkillId: result.data.skillId });
   }
-  const successSummary = truncated
+  const successSummary = missingPath ? "已确认目标路径不存在；这不是目录内容或部署完成证据。" : truncated
     ? "工具已返回部分结构化证据。"
     : "工具已返回结构化证据。";
   return {
     status: "completed",
     output,
-    progressMessage: truncated ? "工具结果已截断" : "工具调用完成",
+    progressMessage: missingPath ? "已确认路径不存在" : truncated ? "工具结果已截断" : "工具调用完成",
     evidence: [{
       id: evidenceId,
       type: "command-output",
@@ -82,7 +83,7 @@ export function buildToolStepOutcome(input: BuildToolStepOutcomeInput): ToolStep
       summary: successSummary,
       source: "rules",
     },
-    eventMessage: truncated
+    eventMessage: missingPath ? `工具 ${call.toolId} 已确认路径不存在：${facts.evidenceScope}` : truncated
       ? `工具 ${call.toolId} 已返回部分结果，达到处理限制。`
       : `工具 ${call.toolId} 已返回完整结果。`,
   };

@@ -99,11 +99,11 @@ export function buildPreconditionReviewContext(
   currentStep = modelContextStep(currentStep);
   blockerStep = modelContextStep(blockerStep);
   return {
-    trigger: "已发现未解决的阻断条件，即将执行变更操作，需结合用户目标和已有证据决定继续还是调整",
+    trigger: "历史失败证据仍未验收；仅核对当前步骤是否超出用户授权边界",
     reviewPolicy: {
-      preconditionGate: true,
+      authorizationBoundaryOnly: true,
+      recoveryRelationIsAdvisory: true,
       unresolvedBlockingSignal: true,
-      userMayExplicitlyAuthorizeAttempt: true,
       failureFactsCannotBeRewritten: true,
     },
     executionConstraints: task.executionConstraints,

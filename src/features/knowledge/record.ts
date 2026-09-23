@@ -1,4 +1,4 @@
-import type { OpsTask } from "@/types";
+import type { OpsTask, PlanStep, ServerProfile } from "@/types";
 import { redactDecisionText } from "@/features/agent/decisionEvidence";
 import { redactExecutionOutput } from "@/features/agent/secretTool";
 import { sanitizeTerminalOutput } from "@/utils/terminal";
@@ -64,6 +64,45 @@ export function knowledgeExcerpt(
 
 const DATABASE_SECURITY_METADATA_REQUEST = /(?:show\s+grants?|current_user|\buser\s*\(\s*\)|\bgrants?\b|权限|授权|身份审计)/iu;
 
+/** Deterministic opaque identity, independent of list offsets and source revisions. */
+function stableKnowledgeId(kind: string, ...parts: unknown[]) {
+  let hash = 0xcbf29ce484222325n;
+  for (const character of JSON.stringify(parts)) {
+    hash ^= BigInt(character.codePointAt(0)!);
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+  }
+  return `${kind}-${hash.toString(16).padStart(16, "0")}`;
+}
+
+function knowledgeRuntimeContext(steps: PlanStep[], server: ServerProfile | undefined, input: KnowledgeRedactionInput): KnowledgeRecord["context"] {
+  const scopes = steps.flatMap(step => (step.evidence ?? [])
+    .filter(item => step.result?.evidenceIds?.includes(item.id) && item.scope)
+    .map(item => item.scope!));
+  const targetIds = [...new Set(scopes.map(scope => scope.targetId))];
+  const runtime: NonNullable<KnowledgeRecord["context"]>["runtime"] = {};
+  const bounded = (value: string) => Array.from(redactKnowledgeText(value, input)).slice(0, 200).join("");
+  const shells = [...new Set(scopes.map(scope => scope.shell).filter((shell): shell is string => Boolean(shell)))];
+  if (shells.length === 1 && scopes.every(scope => scope.shell === shells[0])) runtime.shell = bounded(shells[0]);
+  const scopeNames = [...new Set(scopes.map(scope => scope.scope))];
+  if (scopeNames.length) runtime.scope = bounded(scopeNames.join(", "));
+  const doesNotProve = [...new Set(scopes.flatMap(scope => scope.doesNotProve ?? []))];
+  if (doesNotProve.length) runtime.visibility = bounded(doesNotProve.join("；"));
+  // A profile belongs to this export only when actual evidence identifies that target.
+  const matchingServer = server && targetIds.length === 1 && targetIds[0] === server.id ? server : undefined;
+  if (matchingServer?.info.os && !/^(?:unknown|未知|未采集|待连接|[-—]+)$/i.test(matchingServer.info.os.trim())) {
+    runtime.os = bounded(matchingServer.info.os);
+  }
+  const software = (matchingServer?.environment ?? []).flatMap(value => {
+    const match = /^([A-Za-z0-9][A-Za-z0-9_.+-]{0,39})\s+v?(\d[\w.+-]{0,99})$/.exec(value.trim());
+    return match ? [{ name: redactKnowledgeText(match[1], input), version: redactKnowledgeText(match[2], input) }] : [];
+  }).filter(item => item.name && Array.from(item.name).length <= 40 && Array.from(item.version).length <= 100).slice(0, 20);
+  return Object.keys(runtime).length || software.length ? {
+    ...(targetIds.length === 1 ? { server_ref: stableKnowledgeId("server", targetIds[0]) } : {}),
+    ...(Object.keys(runtime).length ? { runtime } : {}),
+    ...(software.length ? { software } : {}),
+  } : undefined;
+}
+
 /** Do not publish unrelated database identities or grants from an over-broad prior query. */
 function omitUnrequestedDatabaseSecurityMetadata(text: string, requirement: string) {
   if (DATABASE_SECURITY_METADATA_REQUEST.test(requirement)) return text;
@@ -101,6 +140,7 @@ export function buildKnowledgeRecord(
   revision: number,
   input: KnowledgeRedactionInput,
   includeCommands = false,
+  server?: ServerProfile,
 ): KnowledgeRecord {
   const truncate = (value: string, limit: number) => Array.from(value).slice(0, limit).join("");
   const clean = (value: string, limit: number) =>
@@ -120,10 +160,18 @@ export function buildKnowledgeRecord(
   const scopeRequirement = archivedRound?.requirement ?? task.rootGoal ?? task.title;
   const scopeTimestamp = archivedRound?.completedAt ?? task.updatedAt;
   const selected = allSteps.slice(-30);
+  const identityCounts = new Map<string, number>();
+  const identities = allSteps.map(step => {
+    const identity = stableKnowledgeId("attempt", task.id, step.id ?? "legacy", step.startedAt ?? "", [...(step.result?.evidenceIds ?? [])].sort());
+    const occurrence = identityCounts.get(identity) ?? 0;
+    identityCounts.set(identity, occurrence + 1);
+    return stableKnowledgeId("step", identity, occurrence);
+  }).slice(-30);
   const evidenceText = (value: string) =>
     omitUnrequestedDatabaseSecurityMetadata(value, scopeRequirement);
   const steps = selected.map((step, index): KnowledgeRecord["steps"][number] => {
     const result = step.result;
+    const stepId = identities[index];
     const linked = (step.evidence ?? []).filter(item => result?.evidenceIds?.includes(item.id));
     const main = [...linked].reverse().find(item => item.source === "main");
     const validation = [...linked].reverse().find(item => item.source === "validation");
@@ -131,11 +179,11 @@ export function buildKnowledgeRecord(
     const commandOmitted = includeCommands && Array.from(command).length > 4000;
     const validationCommand = redactKnowledgeText(step.validation || "", input);
     const evidence: KnowledgeRecord["steps"][number]["evidence"] = result ? [{
-      evidence_id: `result-${index + 1}`,
+      evidence_id: stableKnowledgeId("result", stepId, main?.id),
       kind: "command_result",
       // These values come from typed execution state, not remote/user text.
       summary: truncate(
-        `执行状态=${result.executionStatus}；观测状态=${result.observationStatus}；退出码=${result.exitCode ?? "未知"}${main?.archive?.capturedPartial ? "；输出采集不完整" : ""}`,
+        `执行状态=${result.executionStatus}；观测状态=${result.observationStatus}；退出码=${result.exitCode ?? "未知"}${main?.archive?.capturedPartial ? "；输出采集不完整" : ""}${main?.scope ? `；采集范围=${main.scope.scope}${main.scope.shell ? `；Shell=${clean(main.scope.shell, 100)}` : ""}` : ""}`,
         1000,
       ),
       excerpt: knowledgeExcerpt(
@@ -158,7 +206,7 @@ export function buildKnowledgeRecord(
           : "；校验命令过长，未附带命令"
         : "";
       evidence.push({
-        evidence_id: `validation-${index + 1}`,
+        evidence_id: stableKnowledgeId("validation", stepId, validation.id),
         kind: "validation",
         summary: truncate(
           `独立校验：${validationStatus}；退出码=${validation.facts.exitCode ?? "未知"}${validationCommandSummary}`,
@@ -172,8 +220,8 @@ export function buildKnowledgeRecord(
     }
     if (step.expected) {
       evidence.push({
-        evidence_id: `expected-${index + 1}`,
-        kind: "observation",
+        evidence_id: stableKnowledgeId("expected", stepId),
+        kind: "expectation",
         summary: truncate(
           `预期验收标准（不是已验证事实）：${clean(step.expected, 900)}`,
           1000,
@@ -183,20 +231,20 @@ export function buildKnowledgeRecord(
     if (result?.failureReason || result?.warnings?.length) {
       const warning = [result.failureReason, ...(result.warnings ?? [])].filter(Boolean).join("；");
       evidence.push({
-        evidence_id: `warning-${index + 1}`,
+        evidence_id: stableKnowledgeId("warning", stepId),
         kind: "observation",
         summary: truncate(`风险与异常：${clean(warning, 900)}`, 1000),
       });
     }
     if (commandOmitted) {
       evidence.push({
-        evidence_id: `omitted-${index + 1}`,
+        evidence_id: stableKnowledgeId("omitted", stepId),
         kind: "observation",
         summary: "执行命令超过 4000 字符，已省略整条命令，避免上传不可安全复用的截断命令。",
       });
     }
     return {
-      step_id: `step-${index + 1}`,
+      step_id: stepId,
       description: clean(
         [step.title, step.description].filter(Boolean).join("\n"),
         2000,
@@ -240,6 +288,7 @@ export function buildKnowledgeRecord(
     record_type: "task_result",
     title: clean(task.title, 200) || "任务记录",
     occurred_at: Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString(),
+    context: knowledgeRuntimeContext(selected, server, input),
     problem: clean(scopeRequirement, 8000) || "任务记录",
     steps,
     outcome: {

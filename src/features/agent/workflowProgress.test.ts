@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { OpsTask, PlanStep } from "@/types";
-import { automaticContinuationBlocker, observationIdentity, workflowProgress, MAX_AUTOMATIC_PHASES, MAX_OBSERVATION_PHASES } from "./workflowProgress";
+import { automaticContinuationBlocker, automaticContinuationStop, renewAutomaticPhaseBudget, observationIdentity, workflowProgress, MAX_AUTOMATIC_PHASES, MAX_OBSERVATION_PHASES } from "./workflowProgress";
 import { workflowLifetime } from "./workflowLifetime";
 
 function observed(id: string, output = "STATE=ready", overrides: Partial<PlanStep> = {}): PlanStep {
@@ -43,7 +43,29 @@ describe("generic workflow progress", () => {
     expect(workflowProgress(current)).toMatchObject({ stagnantPhases: 0, observationPhases: 1 });
     expect(automaticContinuationBlocker(current)).toBeUndefined();
     expect(automaticContinuationBlocker(task(Array.from({ length: MAX_AUTOMATIC_PHASES }, (_, i) =>
-      observed(`${i}`, `done-${i}`, { kind: "change" }))))).toContain("自动阶段上限");
+      observed(`${i}`, `done-${i}`, { kind: "change" }))))).toContain("自动阶段预算");
+  });
+  it("renews only the phase budget, persists its boundary, and reaches a fresh finite limit", () => {
+    const current = task(Array.from({ length: MAX_AUTOMATIC_PHASES }, (_, i) => observed(`${i}`, `done-${i}`, { kind: "change" })));
+    const history = JSON.stringify(current.phaseHistory);
+    expect(automaticContinuationStop(current)?.code).toBe("phase_budget_exhausted");
+    expect(renewAutomaticPhaseBudget(current, "now")).toBe(true);
+    expect(JSON.stringify(current.phaseHistory)).toBe(history);
+    const restored: OpsTask = JSON.parse(JSON.stringify(current));
+    expect(automaticContinuationStop(restored)).toBeUndefined();
+    expect(workflowProgress(restored)).toMatchObject({ completedPhases: 12, automaticPhases: 0 });
+    const next = task(Array.from({ length: 12 }, (_, i) => observed(`next-${i}`, `new-${i}`, { kind: "change" })));
+    restored.phaseHistory!.push({ id: "previous", roundId: "round", requirement: "inspect", reason: "adjustment", plan: restored.plan, createdAt: "now", completedAt: "now" }, ...next.phaseHistory!);
+    restored.plan = next.plan;
+    expect(automaticContinuationStop(restored)?.code).toBe("phase_budget_exhausted");
+    restored.currentRoundId = "another-round";
+    expect(workflowProgress(restored).automaticPhases).toBe(1);
+  });
+  it("does not erase repeated evidence or stagnation when renewing an exhausted phase budget", () => {
+    const current = task(Array.from({ length: 12 }, (_, i) => observed(`${i}`)));
+    expect(renewAutomaticPhaseBudget(current, "now")).toBe(true);
+    expect(automaticContinuationStop(current)?.code).toBe("no_progress");
+    expect(workflowProgress(current).stagnantPhases).toBe(11);
   });
   it("starts a fresh observation budget after a confirmed user decision", () => {
     const decision = observed("decision", JSON.stringify({ values: { registry: "mirror.example" } }), {

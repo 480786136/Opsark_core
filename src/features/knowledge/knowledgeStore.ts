@@ -2,14 +2,14 @@ import { defineStore } from "pinia";
 import { backend, isTauri } from "@/services/backend";
 import { knowledgeRequest, KnowledgeError, normalizeEndpoint } from "./service";
 import { serializeRecord } from "./record";
-import type { KnowledgeBase, KnowledgeConfig, KnowledgeRecord, UploadEntry } from "./types";
+import type { KnowledgeBase, KnowledgeConfig, KnowledgeRecord, TaskKnowledgeRetrieval, UploadEntry } from "./types";
 import { i18n } from "@/features/preferences/i18n";
 
 const STORAGE = "opsark.knowledge.v1";
 const tr = (key: string, params?: Record<string, unknown>) => String(i18n.global.t(key, params ?? {}));
 const defaults = (): KnowledgeConfig => ({endpoint:"http://127.0.0.1:8002/api/v1",credentialId:"knowledge-primary",hasApiKey:false,knowledgeBaseId:"",uploadEnabled:false,searchEnabled:false});
 export const useKnowledgeStore = defineStore("knowledge", {
-  state: () => ({ config: defaults(), entries: [] as UploadEntry[], revisions: {} as Record<string,number>, bases: [] as KnowledgeBase[], hydrated:false, busy:false, storageError:"" }),
+  state: () => ({ config: defaults(), entries: [] as UploadEntry[], revisions: {} as Record<string,number>, bases: [] as KnowledgeBase[], retrievals: {} as Record<string, TaskKnowledgeRetrieval>, hydrated:false, busy:false, storageError:"" }),
   actions: {
     hydrate() {
       if (this.hydrated) return;
@@ -39,25 +39,26 @@ export const useKnowledgeStore = defineStore("knowledge", {
       const changed=endpoint!==this.config.endpoint;
       const hasApiKey=Boolean(apiKey.trim()) || !changed && this.config.hasApiKey;
       if (changed && this.config.hasApiKey && !apiKey.trim()) throw new Error(tr("knowledge.endpointChangeNeedsKey"));
-      if (config.uploadEnabled && (!hasApiKey || !config.knowledgeBaseId)) throw new Error(tr("knowledge.enableNeedsConfiguration"));
+      if ((config.uploadEnabled || config.searchEnabled) && (!hasApiKey || !config.knowledgeBaseId)) throw new Error(tr("knowledge.enableNeedsConfiguration"));
       if (apiKey.trim()) {
         if (!isTauri()) throw new Error(tr("knowledge.desktopSaveKey"));
       }
       const next: KnowledgeConfig={endpoint,credentialId:changed?crypto.randomUUID():this.config.credentialId,hasApiKey,
         knowledgeBaseId:config.knowledgeBaseId,uploadEnabled:config.uploadEnabled===true,searchEnabled:config.searchEnabled===true};
       if (changed) next.knowledgeBaseId="";
-      if (changed && next.uploadEnabled) throw new Error(tr("knowledge.newEndpointNeedsTest"));
+      if (changed && (next.uploadEnabled || next.searchEnabled)) throw new Error(tr("knowledge.newEndpointNeedsTest"));
       if (apiKey.trim()) await backend.saveCredential("knowledge",next.credentialId,apiKey.trim());
       const previous=this.config;
       this.config=next;
       try { this.persist(); } catch(error) { this.config=previous; throw error; }
+      if(changed || !next.searchEnabled || next.knowledgeBaseId !== previous.knowledgeBaseId || apiKey.trim()) this.retrievals={};
       if(changed) this.bases=[];
     },
     async removeKey() {
       if(this.busy) throw new Error(tr("knowledge.requestBusy"));
       if(!isTauri()) throw new Error(tr("knowledge.desktopKeychain"));
       await backend.deleteCredential("knowledge",this.config.credentialId);
-      this.config={...this.config,hasApiKey:false,uploadEnabled:false,searchEnabled:false};this.bases=[];this.persist();
+      this.config={...this.config,hasApiKey:false,uploadEnabled:false,searchEnabled:false};this.bases=[];this.retrievals={};this.persist();
     },
     async testConnection() {
       if(this.busy) throw new Error(tr("knowledge.requestBusy"));

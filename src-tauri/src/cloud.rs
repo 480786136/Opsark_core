@@ -15,7 +15,7 @@ fn client_info_path() -> String {
         "x86_64"
     };
     format!(
-        "/api/core/v1/client-info?platform={platform}&arch={arch}&content_protocol=2&version={}",
+        "/api/core/v1/client-info?platform={platform}&arch={arch}&content_protocol=3&version={}",
         env!("CARGO_PKG_VERSION")
     )
 }

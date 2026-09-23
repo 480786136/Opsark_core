@@ -12,6 +12,7 @@ import { executionCapabilityBlocker, readExecutionPermissions, saveExecutionPerm
 import { buildToolContext, selectPlanningTools } from "@/features/tools/toolContext";
 import { executeToolCall, parseToolCommand } from "@/features/tools/toolExecutor";
 import type { OpsTask } from "@/types";
+import { version as coreVersion } from "../../../package.json";
 import { hydrateOfficialContent, officialSkills, officialToolEnabled, officialVersions, syncOfficialRelease, validateOfficialContent, type ContentKind } from "./officialContent";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -26,6 +27,11 @@ function envelope(kind: ContentKind, version = 1, items: unknown[] = kind === "s
   : defaultToolCatalog.map(t => ({ id: t.id, enabled: true, min_implementation_version: t.version }))) {
   return { id: `${kind}-${version}`, kind, version, min_core_version: "0.3.0", sha256: "a".repeat(64),
     content: JSON.stringify({ schema_version: 1, kind, version, min_core_version: "0.3.0", required_tools: [], items }) };
+}
+const futureCoreVersion = `${Number(coreVersion.split(".")[0]) + 1}.0.0`;
+function requiringCoreVersion(value: ReturnType<typeof envelope>, minimum: string) {
+  return { ...value, min_core_version: minimum,
+    content: JSON.stringify({ ...JSON.parse(value.content), min_core_version: minimum }) };
 }
 async function activate(value: ReturnType<typeof envelope>) {
   native.mockResolvedValueOnce(value).mockResolvedValueOnce({ ok: true });
@@ -44,6 +50,23 @@ beforeEach(async () => {
   localStorage.clear(); Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   await hydrateOfficialContent(); native.mockReset();
   setActivePinia(createPinia()); vi.mocked(cloudRequest).mockReset();
+});
+
+it("loads guidance-only publications and ignores legacy permission metadata", () => {
+  const items = skillItems().map(({ allowShell: _shell, allowedToolIds: _allowed, forbiddenToolIds: _forbidden, ...skill }) => skill);
+  const value = envelope("skills", 1, items);
+  const body = JSON.parse(value.content);
+  body.schema_version = 2;
+  value.content = JSON.stringify(body);
+  const current = validateOfficialContent(value).skills!;
+  expect(current).toHaveLength(7);
+  const legacy = validateOfficialContent(envelope("skills", 1, items.map(skill => ({
+    ...skill, allowShell: false, allowedToolIds: ["retired.tool"], forbiddenToolIds: ["software.check"],
+  })))).skills!;
+  expect(legacy).toEqual(current);
+  expect(legacy[0]).not.toHaveProperty("allowedToolIds");
+  expect(legacy[0]).not.toHaveProperty("allowShell");
+  expect(legacy[0]).not.toHaveProperty("forbiddenToolIds");
 });
 afterEach(async () => { Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); await hydrateOfficialContent(); });
 
@@ -184,11 +207,11 @@ it("does not activate failed downloads, incompatible payloads or failed persiste
   native.mockResolvedValueOnce(next).mockRejectedValueOnce(new Error("disk full"));
   await expect(syncOfficialRelease(next)).rejects.toThrow("disk full");
   expect(officialVersions().skills).toBe(1);
-  const incompatible = envelope("skills", 2); incompatible.min_core_version = "0.4.0";
+  const incompatible = requiringCoreVersion(envelope("skills", 2), futureCoreVersion);
   expect(() => validateOfficialContent(incompatible)).toThrow("不兼容");
   const newerTools = envelope("skills", 2); const body = JSON.parse(newerTools.content);
   body.required_tools = [{ id: "files.read_content", min_implementation_version: 999 }]; newerTools.content = JSON.stringify(body);
-  expect(() => validateOfficialContent(newerTools)).toThrow("工具实现");
+  expect(() => validateOfficialContent(newerTools)).not.toThrow();
 });
 
 it("uses only higher versions and restores the latest compatible cache offline", async () => {
@@ -198,11 +221,20 @@ it("uses only higher versions and restores the latest compatible cache offline",
   expect(await syncOfficialRelease(envelope("tools", 1))).toBe(false);
   expect(native).not.toHaveBeenCalled();
   Object.assign(window, { __TAURI_INTERNALS__: {} });
-  const invalid = { ...envelope("tools", 3), min_core_version: "0.4.0" };
+  const invalid = requiringCoreVersion(envelope("tools", 3), futureCoreVersion);
   native.mockResolvedValueOnce([invalid, envelope("tools", 2), envelope("tools", 1), envelope("skills")]);
   await hydrateOfficialContent();
   expect(officialVersions()).toEqual({ skills: 1, tools: 2 });
   expect(native).toHaveBeenCalledExactlyOnceWith("official_content_request", { operation: "cache" });
+});
+
+it.each(["skills", "tools"] as const)("checks %s compatibility against the current Core without weakening envelope validation", (kind) => {
+  const compatible = requiringCoreVersion(envelope(kind), coreVersion);
+  const future = requiringCoreVersion(envelope(kind), futureCoreVersion);
+  expect(() => validateOfficialContent(compatible)).not.toThrow();
+  expect(() => validateOfficialContent(future)).toThrow("不兼容");
+  // A supported outer version cannot conceal a different requirement in the payload.
+  expect(() => validateOfficialContent({ ...compatible, content: future.content })).toThrow("格式无效");
 });
 
 it("does not activate unknown tools or insufficient implementation versions", async () => {

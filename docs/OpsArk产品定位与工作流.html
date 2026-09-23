@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>OpsArk · 产品定位与全链路工作流</title>
+<style>
+  :root{
+    --bg:#F6F7F9; --card:#FFFFFF; --ink:#14181F; --muted:#5B6472; --faint:#8A93A3;
+    --line:#E4E7EC; --accent:#1F5EFF; --accent-soft:#EDF2FF; --accent-line:#C7D6FF;
+    --risk:#B45309; --risk-soft:#FEF3E2; --ok:#14855A; --ok-soft:#E8F6EF;
+    --r:14px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;
+    line-height:1.65; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1180px;margin:0 auto;padding:0 28px 90px}
+
+  /* ---------- top bar ---------- */
+  .topbar{border-bottom:1px solid var(--line);background:#fff}
+  .topbar-in{max-width:1180px;margin:0 auto;padding:14px 28px;display:flex;align-items:center;gap:12px}
+  .logo{width:26px;height:26px;border-radius:7px;background:var(--ink);color:#fff;
+    display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;letter-spacing:.5px}
+  .brand{font-weight:650;font-size:15px;letter-spacing:.2px}
+  .brand span{color:var(--faint);font-weight:400;margin-left:8px;font-size:13px}
+
+  /* ---------- hero ---------- */
+  .hero{padding:64px 0 46px}
+  .kicker{display:inline-flex;align-items:center;gap:7px;font-size:12px;letter-spacing:1.4px;
+    color:var(--accent);background:var(--accent-soft);border:1px solid var(--accent-line);
+    padding:5px 12px;border-radius:999px;font-weight:600}
+  h1{font-size:42px;line-height:1.28;letter-spacing:-.5px;margin:22px 0 16px;font-weight:700}
+  h1 em{font-style:normal;color:var(--accent)}
+  .lede{font-size:17px;color:var(--muted);max-width:760px}
+  .tags{display:flex;flex-wrap:wrap;gap:10px;margin-top:26px}
+  .tag{font-size:13px;color:var(--muted);background:#fff;border:1px solid var(--line);
+    border-radius:8px;padding:7px 13px}
+  .tag b{color:var(--ink);font-weight:600}
+
+  /* ---------- section ---------- */
+  section{margin-top:58px}
+  .sec-head{display:flex;align-items:baseline;gap:14px;margin-bottom:8px}
+  .sec-num{font-size:12px;font-weight:700;color:var(--accent);letter-spacing:1.2px;
+    background:var(--accent-soft);border-radius:6px;padding:3px 9px}
+  h2{font-size:25px;font-weight:680;letter-spacing:-.2px}
+  .sec-sub{color:var(--muted);font-size:14.5px;margin-bottom:24px;max-width:840px}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:24px}
+
+  /* ---------- positioning ---------- */
+  .pos-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  .pos{border-radius:var(--r);padding:24px;border:1px solid var(--line)}
+  .pos.is{background:#fff;border-color:var(--accent-line)}
+  .pos.not{background:#FBFCFD;border-style:dashed}
+  .pos h3{font-size:15px;margin-bottom:14px;display:flex;align-items:center;gap:8px;font-weight:650}
+  .dot{width:8px;height:8px;border-radius:50%}
+  .dot.b{background:var(--accent)} .dot.g{background:#C3C9D4}
+  .pos ul{list-style:none}
+  .pos li{position:relative;padding-left:18px;font-size:14.5px;color:var(--ink);margin-bottom:10px}
+  .pos li:before{content:"";position:absolute;left:0;top:9px;width:6px;height:6px;border-radius:2px}
+  .pos.is li:before{background:var(--accent)}
+  .pos.not li:before{background:#C3C9D4}
+  .pos li small{display:block;color:var(--muted);font-size:13px;margin-top:2px}
+
+  .oneline{margin-top:18px;background:var(--ink);color:#fff;border-radius:var(--r);
+    padding:26px 28px;display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+  .oneline .lbl{font-size:12px;letter-spacing:1.4px;color:#8FA3C8;font-weight:600}
+  .oneline .val{font-size:20px;font-weight:650;letter-spacing:-.2px}
+  .oneline .val em{font-style:normal;color:#7FA9FF}
+
+  /* ---------- user flow ---------- */
+  .uflow{display:grid;grid-template-columns:repeat(5,1fr);gap:0;margin-top:4px}
+  .ustep{position:relative;padding:20px 16px;background:#fff;border:1px solid var(--line);
+    border-right:none;display:flex;flex-direction:column;gap:6px}
+  .ustep:first-child{border-radius:12px 0 0 12px}
+  .ustep:last-child{border-radius:0 12px 12px 0;border-right:1px solid var(--line)}
+  .ustep .n{font-size:11px;font-weight:700;color:var(--accent);letter-spacing:1px}
+  .ustep .t{font-size:15px;font-weight:650}
+  .ustep .d{font-size:13px;color:var(--muted);line-height:1.6}
+
+  /* ---------- system flow ---------- */
+  .phases{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:6px}
+  .phase{background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px}
+  .phase .ph{font-size:12px;font-weight:700;letter-spacing:.8px;padding-bottom:10px;
+    border-bottom:1px solid var(--line);margin-bottom:12px;color:var(--ink)}
+  .phase .ph span{color:var(--faint);font-weight:500;margin-left:6px;letter-spacing:0}
+  .phase ol{list-style:none;counter-reset:s}
+  .phase li{counter-increment:s;position:relative;padding-left:26px;font-size:13.5px;margin-bottom:11px}
+  .phase li:last-child{margin-bottom:0}
+  .phase li:before{content:counter(s);position:absolute;left:0;top:2px;width:18px;height:18px;
+    border-radius:5px;background:var(--accent-soft);color:var(--accent);font-size:11px;
+    font-weight:700;display:flex;align-items:center;justify-content:center}
+  .phase li small{display:block;color:var(--faint);font-size:12px;margin-top:1px;line-height:1.5}
+
+  /* ---------- guardrails ---------- */
+  .guards{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:16px}
+  .guard{border-radius:12px;padding:20px;background:#fff;border:1px solid var(--line);border-top:3px solid var(--accent)}
+  .guard.r{border-top-color:var(--risk)} .guard.g{border-top-color:var(--ok)}
+  .guard h4{font-size:15px;font-weight:650;margin-bottom:8px}
+  .guard p{font-size:13.5px;color:var(--muted)}
+  .guard .mt{margin-top:12px;font-size:12.5px;color:var(--ink);background:var(--bg);
+    border-radius:8px;padding:10px 12px;line-height:1.6}
+
+  /* ---------- personas ---------- */
+  .people{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}
+  .p{background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px;position:relative}
+  .p.p1{border-color:var(--accent-line);box-shadow:0 0 0 3px #F2F6FF}
+  .p .pr{position:absolute;top:14px;right:14px;font-size:10.5px;font-weight:700;letter-spacing:.6px;
+    padding:3px 7px;border-radius:5px;background:var(--accent-soft);color:var(--accent)}
+  .p .pr.low{background:#F1F3F6;color:var(--faint)}
+  .p h4{font-size:14.5px;font-weight:650;margin-bottom:6px;padding-right:52px}
+  .p .who{font-size:12.5px;color:var(--faint);margin-bottom:10px}
+  .p .need{font-size:13px;color:var(--muted);line-height:1.6}
+
+  /* ---------- problems ---------- */
+  table{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--line);
+    border-radius:12px;overflow:hidden}
+  th{text-align:left;font-size:12.5px;letter-spacing:.6px;color:var(--faint);font-weight:600;
+    padding:13px 18px;background:#FBFCFD;border-bottom:1px solid var(--line)}
+  td{padding:15px 18px;font-size:14px;border-bottom:1px solid #F0F2F5;vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  td.pain{color:var(--muted);width:44%}
+  td.fix{width:56%}
+  .num{display:inline-block;min-width:20px;color:var(--faint);font-size:12px;font-weight:600;margin-right:8px}
+
+  /* ---------- highlights ---------- */
+  .hl{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}
+  .h{background:#fff;border:1px solid var(--line);border-radius:12px;padding:20px}
+  .h .ic{width:32px;height:32px;border-radius:9px;background:var(--accent-soft);color:var(--accent);
+    display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:700;margin-bottom:12px}
+  .h h4{font-size:15px;font-weight:650;margin-bottom:7px}
+  .h p{font-size:13px;color:var(--muted);line-height:1.62}
+
+  .slogans{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-top:16px}
+  .sl{background:#fff;border:1px solid var(--line);border-radius:10px;padding:16px 18px;
+    display:flex;align-items:center;justify-content:space-between;gap:12px}
+  .sl .s{font-size:16px;font-weight:600;letter-spacing:-.2px}
+  .sl .m{font-size:12px;color:var(--faint);text-align:right;white-space:nowrap}
+  .sl.best{border-color:var(--accent-line);background:var(--accent-soft)}
+  .sl.best .m{color:var(--accent);font-weight:600}
+
+  /* ---------- scenes ---------- */
+  .scenes{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  .sc{background:#fff;border:1px solid var(--line);border-radius:12px;padding:22px}
+  .sc .k{font-size:12px;font-weight:700;color:var(--accent);letter-spacing:1px}
+  .sc h4{font-size:17px;font-weight:650;margin:8px 0 10px}
+  .sc p{font-size:13.5px;color:var(--muted);margin-bottom:14px}
+  .sc .steps{list-style:none;border-top:1px dashed var(--line);padding-top:12px}
+  .sc .steps li{font-size:12.5px;color:var(--ink);padding:4px 0 4px 16px;position:relative}
+  .sc .steps li:before{content:"›";position:absolute;left:2px;color:var(--accent);font-weight:700}
+
+  /* ---------- notes ---------- */
+  .notes{background:#FFFBF2;border:1px solid #F0E0BE;border-radius:var(--r);padding:24px}
+  .notes h3{font-size:15px;font-weight:650;margin-bottom:12px;color:var(--risk)}
+  .notes ol{list-style:none;counter-reset:n}
+  .notes li{counter-increment:n;position:relative;padding-left:28px;font-size:14px;margin-bottom:11px;color:#4A4033}
+  .notes li:before{content:counter(n);position:absolute;left:0;top:2px;width:19px;height:19px;
+    border-radius:50%;background:var(--risk);color:#fff;font-size:11px;font-weight:700;
+    display:flex;align-items:center;justify-content:center}
+  .notes li b{color:var(--ink)}
+
+  footer{margin-top:56px;padding-top:20px;border-top:1px solid var(--line);
+    color:var(--faint);font-size:12.5px;display:flex;justify-content:space-between}
+
+  @media(max-width:1000px){
+    .pos-grid,.guards,.scenes{grid-template-columns:1fr}
+    .people,.hl,.uflow,.phases{grid-template-columns:1fr 1fr}
+    h1{font-size:32px}
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-in">
+    <div class="logo">O</div>
+    <div class="brand">OpsArk <span>智能运维 · 产品定位与全链路工作流</span></div>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <!-- HERO -->
+  <div class="hero">
+    <div class="kicker">AI OPS AGENT · 执行闭环</div>
+    <h1>把运维从「<em>查命令、试命令</em>」<br/>变成「<em>说一句话，它做完并证明做完了</em>」</h1>
+    <p class="lede">
+      OpsArk 是运行在桌面的智能运维执行体。它直连你的服务器，感知真实环境，把一句自然语言需求拆成带风险等级的执行计划，
+      在隔离终端里逐步执行、独立校验、自动调整，最终交出可审计的完整证据链 —— 而不是给你一段需要自己复制粘贴的命令。
+    </p>
+    <div class="tags">
+      <div class="tag"><b>全链路闭环</b> 需求 → 计划 → 审批 → 执行 → 校验 → 总结</div>
+      <div class="tag"><b>真执行</b> 独立 Agent 沙箱终端 · 真实退出码</div>
+      <div class="tag"><b>真校验</b> 独立只读后置校验 · 整体目标门禁</div>
+      <div class="tag"><b>凭据不出本机</b> 系统钥匙串 · 全链路脱敏</div>
+      <div class="tag"><b>全过程留痕</b> 命令 / 输出 / 模型输入输出审计</div>
+    </div>
+  </div>
+
+  <!-- 1. 定位 -->
+  <section>
+    <div class="sec-head"><span class="sec-num">01</span><h2>产品定位</h2></div>
+    <p class="sec-sub">先把边界说清楚。OpsArk 的价值不在"AI 很聪明",而在"它真的能把事情做完、做对、说得清"。</p>
+    <div class="pos-grid">
+      <div class="pos is">
+        <h3><span class="dot b"></span>它是</h3>
+        <ul>
+          <li>会连服务器、会执行、会自检的<strong>运维执行体</strong><small>规划与执行在同一条链路上闭合，不是建议器</small></li>
+          <li>带<strong>风险分级与人工确认</strong>的变更管控工具<small>三档授权 + 高危命令强制人工逐步确认</small></li>
+          <li>把团队 SOP 沉淀成 <strong>Skill</strong> 的流程资产<small>部署、数据库、文件传输等领域工作流可复用可同步</small></li>
+          <li>可回溯的<strong>审计与交接凭据</strong><small>每一步的命令、输出、校验结论完整留痕</small></li>
+        </ul>
+      </div>
+      <div class="pos not">
+        <h3><span class="dot g"></span>它不是</h3>
+        <ul>
+          <li>不是聊天问答 / 命令生成器<small>不输出让你自己复制粘贴的答案</small></li>
+          <li>不是监控告警看板<small>不做 Agent/指标平台那套采集告警生态</small></li>
+          <li>不是 Ansible / Jenkins 的替代品<small>不编排既定流水线，处理的是临时、模糊、需要判断的活</small></li>
+          <li>不是云端 SaaS 控制台<small>本地优先，服务器与凭据留在你的机器上</small></li>
+        </ul>
+      </div>
+    </div>
+    <div class="oneline">
+      <div>
+        <div class="lbl">POSITIONING LINE</div>
+        <div class="val">一句话运维：<em>说清楚要什么，剩下的它做完、验完、记完。</em></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2. 工作流 -->
+  <section>
+    <div class="sec-head"><span class="sec-num">02</span><h2>工作流</h2></div>
+    <p class="sec-sub">上层是用户感受到的五步，下层是系统真正跑完的十步闭环。宣传用上层，技术可信度靠下层。</p>
+
+    <div style="font-size:13px;color:var(--faint);font-weight:600;letter-spacing:.6px;margin-bottom:10px">用户视角 · 五步</div>
+    <div class="uflow">
+      <div class="ustep"><div class="n">STEP 01</div><div class="t">纳管服务器</div><div class="d">填一次连接信息，自动探测并采集物理信息与软件环境</div></div>
+      <div class="ustep"><div class="n">STEP 02</div><div class="t">说一句话</div><div class="d">"检查这台机器为什么慢""把项目部署起来"</div></div>
+      <div class="ustep"><div class="n">STEP 03</div><div class="t">看计划</div><div class="d">每一步要跑什么命令、为什么、风险多高，全部展开可查</div></div>
+      <div class="ustep"><div class="n">STEP 04</div><div class="t">点确认</div><div class="d">低风险自动跑，中高风险弹给你确认，危险操作永远人工</div></div>
+      <div class="ustep"><div class="n">STEP 05</div><div class="t">拿结果</div><div class="d">实时回显 + 独立校验 + 完成总结 + 完整审计记录</div></div>
+    </div>
+
+    <div style="font-size:13px;color:var(--faint);font-weight:600;letter-spacing:.6px;margin:30px 0 10px">系统视角 · 十步闭环</div>
+    <div class="phases">
+      <div class="phase">
+        <div class="ph">感知 <span>环境快照</span></div>
+        <ol>
+          <li>连接与探测<small>SSH 直连、连通性测试、凭据恢复</small></li>
+          <li>环境与指标采集<small>CPU/内存/磁盘/网络 + 已部署软件清单</small></li>
+        </ol>
+      </div>
+      <div class="phase">
+        <div class="ph">理解与规划 <span>生成计划</span></div>
+        <ol>
+          <li>需求分类<small>意图、目标关系、变更边界（只读/指定变更）</small></li>
+          <li>Skill 选择与编排<small>命中领域工作流，可多 Skill 组合</small></li>
+          <li>分阶段计划生成<small>每步含命令、预期、校验、风险等级</small></li>
+        </ol>
+      </div>
+      <div class="phase">
+        <div class="ph">执行与校验 <span>逐步推进</span></div>
+        <ol>
+          <li>分级审批<small>三档授权 + 高危强制人工 + 计划快照失效校验</small></li>
+          <li>沙箱执行<small>独立 Agent 会话，不污染用户终端，取真实退出码</small></li>
+          <li>独立后置校验<small>只读、独立、能证伪预期；有界稳定窗口重试</small></li>
+        </ol>
+      </div>
+      <div class="phase">
+        <div class="ph">收口 <span>验收与留痕</span></div>
+        <ol>
+          <li>异常复核与调整<small>失败事实不可改写，防循环，可续接原目标</small></li>
+          <li>整体目标门禁<small>计划跑完 ≠ 目标完成；部署要验端口/HTTP/日志</small></li>
+          <li aria-hidden="true" style="opacity:.55">审计归档<small>命令、输出、模型输入输出全程留痕</small></li>
+        </ol>
+      </div>
+    </div>
+
+    <div style="font-size:13px;color:var(--faint);font-weight:600;letter-spacing:.6px;margin:30px 0 0">贯穿全程的三条护栏</div>
+    <div class="guards">
+      <div class="guard">
+        <h4>安全护栏</h4>
+        <p>风险只能被抬升不能被降低；<code>rm -rf</code>、<code>DROP TABLE</code>、重启等破坏性操作无论授权档位一律人工确认。</p>
+        <div class="mt">命令在下发前至少经过两轮安全检查，第二轮不通过就不发给服务器。</div>
+      </div>
+      <div class="guard r">
+        <h4>凭据护栏</h4>
+        <p>模型只看到 <code>${secret.KEY}</code> 占位符，真实口令在执行边界才注入；SSH 密码、Git 令牌、数据库密码按用途隔离，绝不串用。</p>
+        <div class="mt">真实值存系统钥匙串，不写入 localStorage、日志或任何模型上下文。</div>
+      </div>
+      <div class="guard g">
+        <h4>证据护栏</h4>
+        <p>"命令执行成功"与"观察结果健康"分开判定；校验拿不到真实结束标记就判未完成，不允许模型把失败解释成成功。</p>
+        <div class="mt">失败事实不可改写：非零退出、认证失败、协议不完整都是硬事实。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. 人群 -->
+  <section>
+    <div class="sec-head"><span class="sec-num">03</span><h2>针对的人群</h2></div>
+    <p class="sec-sub">按"痛感强度 × 付费意愿"排序。前两类是首发主战场，第三类是规模化收入来源。</p>
+    <div class="people">
+      <div class="p p1">
+        <div class="pr">P0 首选</div>
+        <h4>兼运维的后端开发</h4>
+        <div class="who">10–200 人团队 · 无专职运维</div>
+        <div class="need">会写代码但记不住运维命令，部署/排查靠搜博客。要的是"别让我查了，直接搞定"。</div>
+      </div>
+      <div class="p p1">
+        <div class="pr">P0 首选</div>
+        <h4>中小团队 IT / 系统管理员</h4>
+        <div class="who">几十到上百台机器</div>
+        <div class="need">日常巡检、打补丁、部署上线重复劳动重，人手不够，希望有可留痕的半自动执行。</div>
+      </div>
+      <div class="p">
+        <div class="pr">P1</div>
+        <h4>代运维 / 外包服务商</h4>
+        <div class="who">多客户 · 多环境</div>
+        <div class="need">交付要留证据、要可复现、要给客户看做了什么。审计日志与 Skill 沉淀是直接价值。</div>
+      </div>
+      <div class="p">
+        <div class="pr">P1</div>
+        <h4>运维新人 / 实习生</h4>
+        <div class="who">学习期 · 不敢乱敲</div>
+        <div class="need">怕误操作、怕背锅。风险分级 + 逐步确认 + 可展开的解释，是最好的带教工具。</div>
+      </div>
+      <div class="p">
+        <div class="pr low">P2</div>
+        <h4>研发团队的临时环境操作</h4>
+        <div class="who">CI/CD 覆盖不到的缝隙</div>
+        <div class="need">流水线之外的临时部署、改配置、拉日志。属于高频但轻量的补充场景。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. 解决的问题 -->
+  <section>
+    <div class="sec-head"><span class="sec-num">04</span><h2>解决的问题</h2></div>
+    <p class="sec-sub">每一条都对应现有实现里的具体机制，宣传时可以逐条拆成场景短视频或落地页模块。</p>
+    <table>
+      <thead><tr><th>今天运维的真实痛点</th><th>OpsArk 的解法</th></tr></thead>
+      <tbody>
+        <tr><td class="pain"><span class="num">01</span>指令记不住，每次都要搜、要试、要翻历史记录</td><td class="fix">自然语言直达执行。模型拿到的是这台机器的真实环境，不是通用答案。</td></tr>
+        <tr><td class="pain"><span class="num">02</span>不确定命令安不安全、会不会误伤生产</td><td class="fix">先出计划再执行，风险分级可见；三档授权控制自动执行范围，高危一律人工确认。</td></tr>
+        <tr><td class="pain"><span class="num">03</span>复制粘贴来回试错，一步报错就要重来</td><td class="fix">执行后自动做独立只读校验，不达标就自动复核、调整计划，失败事实不会被粉饰。</td></tr>
+        <tr><td class="pain"><span class="num">04</span>"以为做完了",其实服务没起来、文件没传全</td><td class="fix">整体目标完成门禁：部署必须验端口、HTTP、日志；传文件必须核字节数与 SHA-256。</td></tr>
+        <tr><td class="pain"><span class="num">05</span>操作前不知道机器现在什么状态</td><td class="fix">进入即采集并持续刷新 CPU / 内存 / 磁盘 / 网络与已装软件环境，规划基于真实快照。</td></tr>
+        <tr><td class="pain"><span class="num">06</span>数据库密码、Git 令牌写在命令里、贴在聊天框里</td><td class="fix">敏感变量库 + 凭据组 + 用途校验，模型只见占位符，真实值只在本机钥匙串与执行边界出现。</td></tr>
+        <tr><td class="pain"><span class="num">07</span>做完说不清做了什么，出事无法回溯，交接断层</td><td class="fix">命令、输出、模型输入输出、审批记录全链路审计，一键导出与工单关联。</td></tr>
+        <tr><td class="pain"><span class="num">08</span>巡检排查靠人肉，覆盖面取决于个人经验</td><td class="fix">全方面检查分析：按领域 Skill 分阶段做发现式检查，不遗漏、有证据、有结论。</td></tr>
+        <tr><td class="pain"><span class="num">09</span>团队 SOP 只存在于老员工的脑子里</td><td class="fix">个人 Skill 可编写、可同步，把"我们公司怎么部署"固化成可复用工作流。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- 5. 亮点 -->
+  <section>
+    <div class="sec-head"><span class="sec-num">05</span><h2>宣传亮点</h2></div>
+    <p class="sec-sub">对外传播的五个核心卖点，建议按此顺序做落地页主视觉区。</p>
+    <div class="hl">
+      <div class="h"><div class="ic">执</div><h4>真执行</h4><p>不是给你命令，是它自己连上去跑。独立 Agent 沙箱终端执行，取真实退出码，你的终端不会被抢占。</p></div>
+      <div class="h"><div class="ic">验</div><h4>真校验</h4><p>每步执行完都跑一次独立的只读后置校验。"命令跑通"不等于"结果正确"，这是与其他工具最大的分水岭。</p></div>
+      <div class="h"><div class="ic">控</div><h4>看得见的风险</h4><p>计划、命令、风险等级全部展开可查；低风险自动跑，中风险问你，高风险永远等你点头。</p></div>
+      <div class="h"><div class="ic">密</div><h4>凭据不出本机</h4><p>口令存系统钥匙串，模型永远只看到占位符；SSH / Git / 数据库凭据按用途隔离，不会串用。</p></div>
+      <div class="h"><div class="ic">痕</div><h4>全过程留痕</h4><p>每一步的命令、输出、校验与审批都有记录，可回溯、可追责、可交接、可作为交付凭证。</p></div>
+    </div>
+
+    <div style="font-size:13px;color:var(--faint);font-weight:600;letter-spacing:.6px;margin:30px 0 10px">Slogan 候选</div>
+    <div class="slogans">
+      <div class="sl best"><div class="s">一句话，把运维做完。</div><div class="m">主推 · 最短最硬</div></div>
+      <div class="sl"><div class="s">从查命令，到直接交付结果。</div><div class="m">强调范式转移</div></div>
+      <div class="sl"><div class="s">会执行、会验证、会留痕的运维搭档。</div><div class="m">强调三重能力</div></div>
+      <div class="sl"><div class="s">不是给你命令，是替你做完。</div><div class="m">对抗式 · 差异化强</div></div>
+    </div>
+  </section>
+
+  <!-- 6. 主打场景 -->
+  <section>
+    <div class="sec-head"><span class="sec-num">06</span><h2>建议主推的三个场景</h2></div>
+    <p class="sec-sub">场景收敛才能做出可传播的 Demo。这三个最能体现"全链路"三个字，也最容易拍成对比视频。</p>
+    <div class="scenes">
+      <div class="sc">
+        <div class="k">SCENE A</div>
+        <h4>日常巡检 / 健康检查</h4>
+        <p>一句话发起一次全方面检查，输出结构化健康报告。</p>
+        <ul class="steps">
+          <li>采集指标与软件环境</li>
+          <li>按领域 Skill 分阶段发现</li>
+          <li>每项结论附真实证据</li>
+          <li>异常项给出建议与风险</li>
+        </ul>
+      </div>
+      <div class="sc">
+        <div class="k">SCENE B</div>
+        <h4>故障排查 / 诊断</h4>
+        <p>"服务为什么起不来""机器为什么慢"，从现象一路查到根因。</p>
+        <ul class="steps">
+          <li>先只读诊断，不夹带变更</li>
+          <li>证据不足就请求更多上下文</li>
+          <li>失败事实不被改写</li>
+          <li>给出结论 + 修复方案待你确认</li>
+        </ul>
+      </div>
+      <div class="sc">
+        <div class="k">SCENE C</div>
+        <h4>部署上线 / 环境搭建</h4>
+        <p>从源码获取到端到端验收，一条需求走完整个交付。</p>
+        <ul class="steps">
+          <li>探目录 → 读说明 → 查依赖</li>
+          <li>装环境 → 构建 → 启动托管</li>
+          <li>端口 / HTTP / 日志端到端验收</li>
+          <li>中途可继续、可补充、可替换目标</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- 7. 建议 -->
+  <section>
+    <div class="sec-head"><span class="sec-num">07</span><h2>落地前要对齐的几点</h2></div>
+    <p class="sec-sub">作为设计侧的建议：宣传口径需要和能力现状严格对齐，否则第一个 demo 就会翻车。</p>
+    <div class="notes">
+      <h3>对外承诺的红线</h3>
+      <ol>
+        <li><b>别把"AI 聪明"当卖点。</b>市场上给命令的 AI 工具太多了。所有物料的主语应该是"做完、验完、记完"，而不是"懂运维"。</li>
+        <li><b>安全是最大卖点，也是最大顾虑。</b>桌面端直连生产服务器，落地页必须前置回答三件事：凭据在哪、谁能批准、做错了怎么回溯。</li>
+        <li><b>演示要选"有失败"的场景。</b>只演示顺利执行反而削弱可信度。展示一次"校验没过 → 自动调整 → 二次验证通过"，说服力最强。</li>
+        <li><b>暂不宣传未完成能力。</b>大文件传输分片、断点恢复、SQLite 持久化等仍在路上，物料中不要出现相关承诺。</li>
+        <li><b>目标人群先打 P0 两类。</b>兼运维的开发 + 中小团队 IT，他们的痛感最强、决策链最短，落地页文案应该直接用他们的话术。</li>
+      </ol>
+    </div>
+  </section>
+
+  <footer>
+    <div>OpsArk · 产品定位与全链路工作流一页纸</div>
+    <div>基于 Opsark Core 现有实现整理 · 内部对齐用</div>
+  </footer>
+</div>
+
+</body>
+</html>

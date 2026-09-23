@@ -1,11 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { assertPlanRepairScope, backend, buildPlanNormalizationRepair, normalizePlanPreconditions, PlanProtocolError } from "@/services/backend";
-import { textFingerprint } from "@/features/agent/longRunningReviewOutput";
-import { planCommandIdentity } from "@/features/agent/taskProgression";
-import { buildContinuationContext } from "@/features/agent/agentContext";
-import { defaultToolCatalog } from "@/features/tools/toolCatalog";
-import type { OpsTask, PlanStep } from "@/types";
+import type { PlanStep } from "@/types";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 afterEach(() => { Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); vi.resetAllMocks(); });
 
@@ -98,136 +94,70 @@ function buildStandaloneStageRepair(plan = standaloneStagePlan) {
 }
 
 describe("plan normalization repair feedback", () => {
-  it("classifies a standalone conflict as a whole-plan stage split", () => {
+  it("classifies a standalone conflict as an atomic whole-plan protocol rejection", () => {
     const repair = buildStandaloneStageRepair();
 
     expect(repair).toMatchObject({
       errorCode: "plan_normalization_failed",
-      repairStrategy: {
-        type: "standalone_stage_split",
-        standaloneStepIndex: 4,
-        toolId: "server.resolve_connection",
-      },
+      repairStrategy: { type: "plan_protocol" },
       fieldPath: "steps",
       previousModelOutput: standaloneStagePlan,
     });
-    expect(repair.instruction).toContain("确定性缩小当前执行阶段");
-    expect(repair.instruction).toContain("不是删除整体目标");
+    expect(repair.instruction).toContain("原子拒绝整份计划");
+    expect(repair.instruction).toContain("不会截取前缀");
   });
 
-  it("accepts only an unchanged safe stage subset and rejects edits or additions", () => {
+  it("does not accept a standalone step or preceding prefix as a partial repair", () => {
     const repair = buildStandaloneStageRepair();
     const prefix = structuredClone(standaloneStagePlan.slice(0, 4));
     const standalone = [structuredClone(standaloneStagePlan[4])];
 
-    expect(() => assertPlanRepairScope(repair, prefix)).not.toThrow();
-    expect(() => assertPlanRepairScope(repair, standalone)).not.toThrow();
-    expect(() => assertPlanRepairScope(repair, [{ ...prefix[0], description: "改写业务说明" }]))
-      .toThrow("不得新增、重排或改写");
-    expect(() => assertPlanRepairScope(repair, [
-      ...prefix,
-      { ...prefix[0], id: "added-step", title: "新增操作", command: "whoami" },
-    ])).toThrow("不得新增、重排或改写");
-    expect(() => assertPlanRepairScope(repair, [{
-      ...standalone[0],
-      command: 'opsark-tool user.request_input {"title":"改换工具","fields":[]}',
-    }])).toThrow("工具和命令");
-    expect(() => assertPlanRepairScope(repair, structuredClone(standaloneStagePlan.slice(0, 5))))
-      .toThrow("仍将 standalone 工具与其他待执行步骤混排");
+    expect(() => assertPlanRepairScope(repair, prefix)).toThrow("PLAN_STAGE_CONFLICT");
+    expect(() => assertPlanRepairScope(repair, standalone)).toThrow("PLAN_STAGE_CONFLICT");
+    expect(() => assertPlanRepairScope(repair, structuredClone(standaloneStagePlan)))
+      .toThrow("PLAN_STAGE_CONFLICT");
   });
 
-  it("deterministically splits the first generated plan without a second model call", async () => {
+  it("rejects the first generated standalone conflict without a repair model call", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
     const runtime = { apiKey: "fixture", endpoint: "https://test.invalid", model: "test", context: "{}" };
     vi.mocked(invoke).mockResolvedValueOnce(structuredClone(standaloneStagePlan));
 
-    const repaired = await backend.generatePlan("部署 k8s 集群", runtime);
-
-    expect(repaired).toHaveLength(4);
-    expect(repaired.map(({ command }) => command))
-      .toEqual(standaloneStagePlan.slice(0, 4).map(({ command }) => command));
+    await expect(backend.generatePlan("部署 k8s 集群", runtime)).rejects.toMatchObject({
+      repairError: expect.stringContaining("PLAN_STAGE_CONFLICT"),
+      repair: { previousModelOutput: standaloneStagePlan },
+    });
     expect(invoke).toHaveBeenCalledOnce();
     expect(vi.mocked(invoke).mock.calls[0][0]).toBe("generate_ai_plan");
   });
 
-  it("advances a repeated plan from its completed prefix to the standalone step", async () => {
+  it("does not use completed command fingerprints to delete a prefix", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
-    const completedCommandFingerprints = standaloneStagePlan.slice(0, 4)
-      .map((step) => textFingerprint(planCommandIdentity(step.command)));
     vi.mocked(invoke).mockResolvedValueOnce(structuredClone(standaloneStagePlan));
 
-    const repaired = await backend.generatePlan("部署 k8s 集群", {
+    await expect(backend.generatePlan("部署 k8s 集群", {
       apiKey: "fixture",
       endpoint: "https://test.invalid",
       model: "test",
-      context: JSON.stringify({ workflowPhase: "continue_after_discovery", completedCommandFingerprints }),
-    });
-
-    expect(repaired).toHaveLength(1);
-    expect(repaired[0].command).toBe(standaloneStagePlan[4].command);
+      context: JSON.stringify({ workflowPhase: "continue_after_discovery", completedCommandFingerprints: ["claimed"] }),
+    })).rejects.toMatchObject({ repair: { previousModelOutput: standaloneStagePlan } });
     expect(invoke).toHaveBeenCalledOnce();
   });
 
-  it("advances a repeated plan past its completed standalone step to the suffix", async () => {
+  it("does not use nested continuation context to partially accept a repeated plan", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
-    const completedCommandFingerprints = standaloneStagePlan.slice(0, 5)
-      .map((step) => textFingerprint(planCommandIdentity(step.command)));
     vi.mocked(invoke).mockResolvedValueOnce(structuredClone(standaloneStagePlan));
 
-    const repaired = await backend.generatePlan("部署 k8s 集群", {
+    await expect(backend.generatePlan("部署 k8s 集群", {
       apiKey: "fixture",
       endpoint: "https://test.invalid",
       model: "test",
-      context: JSON.stringify({ workflowPhase: "continue_after_discovery", completedCommandFingerprints }),
-    });
-
-    expect(repaired).toHaveLength(1);
-    expect(repaired[0].command).toBe(standaloneStagePlan[5].command);
+      context: JSON.stringify({ originalContext: JSON.stringify({ completedCommandFingerprints: ["nested-claimed"] }) }),
+    })).rejects.toMatchObject({ repair: { previousModelOutput: standaloneStagePlan } });
     expect(invoke).toHaveBeenCalledOnce();
   });
 
-  it("advances to the suffix using the real archived-prefix continuation context", async () => {
-    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
-    const completed = (step: PlanStep): PlanStep => ({ ...structuredClone(step), status: "completed" });
-    const task: OpsTask = {
-      id: "task-stage-split",
-      serverId: "server-local",
-      title: "部署 k8s 集群",
-      rootGoal: "部署 k8s 集群",
-      status: "running",
-      permission: "managed",
-      modelId: "model-test",
-      messages: [],
-      currentRoundId: "round-stage-split",
-      phaseHistory: [{
-        id: "phase-prefix",
-        roundId: "round-stage-split",
-        requirement: "部署 k8s 集群",
-        reason: "replan",
-        plan: standaloneStagePlan.slice(0, 4).map(completed),
-        createdAt: "2026-09-15T00:00:00.000Z",
-        completedAt: "2026-09-15T00:01:00.000Z",
-      }],
-      plan: [completed(standaloneStagePlan[4])],
-      createdAt: "2026-09-15T00:00:00.000Z",
-      updatedAt: "2026-09-15T00:01:00.000Z",
-    };
-    const context = buildContinuationContext({ task, tools: defaultToolCatalog, secretMetadata: [] });
-    vi.mocked(invoke).mockResolvedValueOnce(structuredClone(standaloneStagePlan));
-
-    const repaired = await backend.generatePlan("部署 k8s 集群", {
-      apiKey: "fixture",
-      endpoint: "https://test.invalid",
-      model: "test",
-      context: JSON.stringify(context),
-    });
-
-    expect(repaired).toHaveLength(1);
-    expect(repaired[0].command).toBe(standaloneStagePlan[5].command);
-    expect(invoke).toHaveBeenCalledOnce();
-  });
-
-  it("uses completed command fingerprints when stage splitting a next-stage decision", async () => {
+  it("preserves the next-stage decision while atomically rejecting its steps", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
     vi.mocked(invoke).mockResolvedValueOnce({
       decision: "continue",
@@ -240,20 +170,21 @@ describe("plan normalization repair feedback", () => {
       endpoint: "https://test.invalid",
       model: "test",
       context: JSON.stringify({
-        completedCommandFingerprints: standaloneStagePlan.slice(0, 4)
-          .map((step) => textFingerprint(planCommandIdentity(step.command))),
+        completedCommandFingerprints: ["claimed"],
       }),
     };
 
-    const decision = await backend.decideNextStage("部署 k8s 集群", runtime);
-
-    expect(decision.steps).toHaveLength(1);
-    expect(decision.steps[0].command).toBe(standaloneStagePlan[4].command);
+    await expect(backend.decideNextStage("部署 k8s 集群", runtime)).rejects.toMatchObject({
+      repair: {
+        previousModelOutput: standaloneStagePlan,
+        nextStageDecision: { decision: "continue", reason: "还需要连接资料", summary: "继续下一阶段" },
+      },
+    });
     expect(invoke).toHaveBeenCalledOnce();
     expect(vi.mocked(invoke).mock.calls[0][0]).toBe("decide_ai_next_stage");
   });
 
-  it("preserves initial requirement classification while stage-splitting its invalid plan", async () => {
+  it("preserves initial requirement classification on atomic rejection", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
     const runtime = { apiKey: "fixture", endpoint: "https://test.invalid", model: "test", context: "{}" };
     const result = {
@@ -264,17 +195,15 @@ describe("plan normalization repair feedback", () => {
     };
     vi.mocked(invoke).mockResolvedValueOnce(result);
 
-    const processed = await backend.processRequirement("部署 k8s 集群", runtime, []);
-
-    expect(processed).toMatchObject({ intent: "execute", relation: "new_goal", selectedSkillIds: [] });
-    expect(processed.plan).toHaveLength(4);
-    expect(processed.plan.map(({ command }) => command))
-      .toEqual(standaloneStagePlan.slice(0, 4).map(({ command }) => command));
+    await expect(backend.processRequirement("部署 k8s 集群", runtime, [])).rejects.toMatchObject({
+      processed: result,
+      repair: { previousModelOutput: standaloneStagePlan },
+    });
     expect(vi.mocked(invoke).mock.calls.map(([command]) => command))
       .toEqual(["process_ai_requirement"]);
   });
 
-  it("upgrades and deterministically splits a saved legacy standalone repair", async () => {
+  it("upgrades and atomically rejects a saved legacy standalone repair", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
     const current = buildStandaloneStageRepair();
     const legacyRepair = {
@@ -283,49 +212,43 @@ describe("plan normalization repair feedback", () => {
       fieldPath: "steps[4]",
       instruction: "旧版通用修复指令",
     };
-    const repaired = await backend.generatePlan("部署 k8s 集群", {
+    await expect(backend.generatePlan("部署 k8s 集群", {
       apiKey: "fixture",
       endpoint: "https://test.invalid",
       model: "test",
       context: JSON.stringify({ planGenerationRepair: legacyRepair }),
+    })).rejects.toMatchObject({
+      repairError: expect.stringContaining("PLAN_STAGE_CONFLICT"),
+      repair: { previousModelOutput: standaloneStagePlan, repairStrategy: { type: "plan_protocol" } },
     });
-
-    expect(repaired).toHaveLength(4);
-    expect(repaired.map(({ command }) => command))
-      .toEqual(standaloneStagePlan.slice(0, 4).map(({ command }) => command));
     expect(invoke).not.toHaveBeenCalled();
   });
 
-  it("isolates a standalone first step and defers its following steps", async () => {
+  it("rejects a standalone first step mixed with a suffix instead of isolating it", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
     const plan = structuredClone(standaloneStagePlan.slice(4));
     const repair = buildStandaloneStageRepair(plan);
-    const repaired = await backend.generatePlan("部署 k8s 集群", {
+    await expect(backend.generatePlan("部署 k8s 集群", {
       apiKey: "fixture",
       endpoint: "https://test.invalid",
       model: "test",
       context: JSON.stringify({ planGenerationRepair: repair }),
-    });
-
-    expect(repaired).toHaveLength(1);
-    expect(repaired[0].command).toBe(plan[0].command);
+    })).rejects.toMatchObject({ repair: { previousModelOutput: plan } });
     expect(invoke).not.toHaveBeenCalled();
   });
 
-  it("accepts normalized standalone tool syntax in a persisted repair", async () => {
+  it("recognizes normalized standalone syntax but still rejects the entire mixed plan", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
     const plan = structuredClone(standaloneStagePlan);
     plan[4].command = '  opsark-tool --server.resolve_connection {"host":"10.213.81.53","port":22}';
     const repair = buildStandaloneStageRepair(plan);
 
-    const repaired = await backend.generatePlan("部署 k8s 集群", {
+    await expect(backend.generatePlan("部署 k8s 集群", {
       apiKey: "fixture",
       endpoint: "https://test.invalid",
       model: "test",
       context: JSON.stringify({ planGenerationRepair: repair }),
-    });
-
-    expect(repaired).toHaveLength(4);
+    })).rejects.toMatchObject({ repair: { previousModelOutput: plan } });
     expect(invoke).not.toHaveBeenCalled();
   });
 
@@ -371,7 +294,7 @@ describe("plan normalization repair feedback", () => {
       fieldPath: "steps[0].command.arguments.title" });
     expect((error as PlanProtocolError).repair.progress?.attemptCount).toBe(1);
     expect((error as Error).message).toContain("description");
-    expect((error as PlanProtocolError).userMessage).toContain("未执行任何新的服务器操作");
+    expect((error as PlanProtocolError).userMessage).toContain("该计划尚未执行");
     expect((error as PlanProtocolError).userMessage).not.toContain("description");
     expect((error as PlanProtocolError).developerMessage).toContain("description");
     expect(invoke).toHaveBeenCalledOnce();

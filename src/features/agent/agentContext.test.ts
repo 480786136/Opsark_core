@@ -11,8 +11,6 @@ import type { OpsTask, ServerProfile } from "@/types";
 import { resolveToolRegistry } from "@/features/tools/toolRegistry";
 import { resolveSkillRegistry } from "@/features/skills/skillRegistry";
 import { taskAttemptContext } from "@/features/agent/attemptState";
-import { planCommandIdentity } from "@/features/agent/taskProgression";
-import { textFingerprint } from "@/features/agent/longRunningReviewOutput";
 import { confirmedInputScope } from "@/features/agent/confirmedUserInputs";
 
 describe("agent context", () => {
@@ -345,6 +343,37 @@ describe("agent context", () => {
       .toBeLessThan(JSON.stringify(continuation).indexOf('"completedDiscovery"'));
   });
 
+  it("allows goal-directed replanning and revised checks without rewriting failed execution facts", () => {
+    const task = createTask();
+    const failed = {
+      ...task.plan[0], id: "failed-build", status: "failed" as const,
+      command: "cd /opt/report && bash build.sh --legacy-peer-deps",
+      validation: "test -f /opt/report/build/aj-report-*.zip && echo built",
+      output: "npm ERR! ERESOLVE unable to resolve dependency tree\n[exit: 1]",
+      result: { executionStatus: "failed" as const, observationStatus: "unknown" as const,
+        exitCode: 1, facts: {}, warnings: [], evidenceIds: [], failureReason: "依赖解析失败" },
+    };
+    task.plan = [failed];
+    const before = structuredClone(task.plan);
+    const input = { task, tools: [], secretMetadata: [] };
+    const adjustment = buildAdjustmentContext(input, failed);
+    expect(adjustment.baseSnapshot).toMatchObject({ currentIncident: {
+      stepId: failed.id, command: failed.command, validation: failed.validation,
+      result: { executionStatus: "failed", exitCode: 1 },
+      output: { content: failed.output },
+    } });
+    for (const context of [adjustment, buildContinuationContext(input), buildNextStageContext(input)]) {
+      expect(context.instruction).toContain("修正当前步骤");
+      expect(context.instruction).toContain("重规划剩余目标");
+      expect(context.instruction).toContain("修正模型先前生成的不适用验收方法");
+      expect(context.instruction).toContain("不得降低用户明确要求的验收标准或扩大授权");
+      expect(context.instruction).toContain("旧路径被替代后无需逐条复验");
+      expect(context.instruction).toContain("真实执行与验收证据");
+    }
+    expect(adjustment.instruction).toContain("不必为了取证强行填写 recovery");
+    expect(task.plan).toEqual(before);
+  });
+
   it("carries valid completed identities across archived and current standalone phases", () => {
     const task = createTask();
     task.currentRoundId = "round-1";
@@ -380,15 +409,12 @@ describe("agent context", () => {
       secretMetadata: [],
     });
 
-    expect(new Set(context.completedCommandFingerprints)).toEqual(new Set([
-      textFingerprint(planCommandIdentity(prefix.command)),
-      textFingerprint(planCommandIdentity(standalone.command)),
-    ]));
+    expect(context).not.toHaveProperty("completedCommandFingerprints");
     expect(context.knownExecutionFacts.completedSteps.map(({ stepId }) => stepId)).toContain("prefix");
     expect(context.completedDiscovery.map(({ stepId }) => stepId)).toEqual(["resolve-worker"]);
   });
 
-  it("builds one next-stage context with only the active Skill tool policy", () => {
+  it("builds one next-stage context without narrowing tools to active Skill preferences", () => {
     const current = createTask();
     current.activeSkillIds = ["software-installation"];
     const skills = resolveSkillRegistry({ overrides: [], customSkills: [] })
@@ -404,7 +430,11 @@ describe("agent context", () => {
     const context = buildNextStageContext(input);
 
     expect(context.workflowPhase).toBe("decide_after_phase");
-    expect(context.tools.map(({ id }) => id)).toEqual(["user.request_input", "evidence.read", "software.check"]);
+    expect(context.tools.map(({ id }) => id)).toEqual(expect.arrayContaining([
+      "user.request_input", "evidence.read", "software.check", "files.get_structure", "files.read_content",
+    ]));
+    expect(context.activeSkills[0]).not.toHaveProperty("allowedToolIds");
+    expect(context.activeSkills[0]).not.toHaveProperty("forbiddenToolIds");
     expect(context.activeSkills[0].instructions).toContain("软件名称明确");
     expect(context.policyFingerprint).toBe(nextStagePolicyFingerprint(input));
     expect(JSON.stringify(context)).not.toContain("secret.merge_command");

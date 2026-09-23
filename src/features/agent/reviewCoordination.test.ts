@@ -89,7 +89,7 @@ describe("review coordination", () => {
     expect(remaining[0].status).toBe("pending");
   });
 
-  it("does not let a failed change skip unrelated remaining work", () => {
+  it("honors model completion for flow while preserving a failed change", () => {
     const failed = createStep("pull-images", "failed");
     failed.kind = "change";
     failed.command = "kubeadm config images pull --kubernetes-version=v1.28.2";
@@ -107,12 +107,14 @@ describe("review coordination", () => {
 
     const outcome = applyCommandFailureReview(failed, remaining, review("complete"));
 
-    expect(outcome).toMatchObject({ taskStatus: "needs_adjustment", shouldAdvance: false });
-    expect(failed.review).toMatchObject({ decision: "adjust", source: "rules" });
-    expect(remaining[0].status).toBe("pending");
+    expect(outcome).toMatchObject({ taskStatus: "running", shouldAdvance: true });
+    expect(failed.review).toMatchObject({ decision: "complete", source: "model" });
+    expect(failed.status).toBe("failed");
+    expect(failed.result?.executionStatus).toBe("failed");
+    expect(remaining[0].status).toBe("skipped");
   });
 
-  it("does not continue a failed change without a strictly related recovery step", () => {
+  it("honors model continuation without requiring recovery metadata", () => {
     const failed = createStep("pull-images", "failed");
     failed.kind = "change";
     failed.command = "kubeadm config images pull --kubernetes-version=v1.28.2";
@@ -130,13 +132,17 @@ describe("review coordination", () => {
 
     const outcome = applyCommandFailureReview(failed, remaining, review("continue"));
 
-    expect(outcome).toMatchObject({ taskStatus: "needs_adjustment", shouldAdvance: false });
-    expect(failed.review).toMatchObject({ decision: "adjust", source: "rules" });
+    expect(outcome).toMatchObject({ taskStatus: "running", shouldAdvance: true });
+    expect(failed.review).toMatchObject({ decision: "continue", source: "model" });
+    expect(failed.status).toBe("failed");
     expect(remaining[0].status).toBe("pending");
   });
 
-  it("fails a validating step after evidence review requests adjustment", () => {
+  it("keeps successful evidence completed when model review requests adjustment", () => {
     const step = createStep("validate", "validating");
+    step.result = {
+      executionStatus: "success", observationStatus: "warning", facts: {}, warnings: [], evidenceIds: [],
+    };
     const outcome = applyExecutionEvidenceReview({
       step,
       remainingSteps: [],
@@ -144,8 +150,28 @@ describe("review coordination", () => {
       reviewWasRequired: true,
     });
 
-    expect(step.status).toBe("failed");
+    expect(step.status).toBe("completed");
     expect(outcome).toMatchObject({ taskStatus: "needs_adjustment", shouldAdvance: false });
+  });
+
+  it("keeps a failed postcondition failed while honoring model continuation", () => {
+    const step = createStep("validate", "validating");
+    step.kind = "change";
+    step.result = {
+      executionStatus: "success", observationStatus: "unknown",
+      facts: { validationPassed: false }, warnings: [], evidenceIds: [],
+    };
+    const remaining = [createStep("diagnose", "pending")];
+    remaining[0].kind = "observe";
+
+    const outcome = applyExecutionEvidenceReview({
+      step, remainingSteps: remaining, review: review("continue"), reviewWasRequired: true,
+    });
+
+    expect(step.status).toBe("failed");
+    expect(step.result.facts.validationPassed).toBe(false);
+    expect(outcome).toMatchObject({ taskStatus: "running", shouldAdvance: true });
+    expect(remaining[0].status).toBe("pending");
   });
 
   it("completes evidence and skips remaining work when the reviewed goal is complete", () => {
@@ -160,7 +186,7 @@ describe("review coordination", () => {
 
     expect(step.status).toBe("completed");
     expect(remaining[0].status).toBe("skipped");
-    expect(outcome.eventMessage).toContain("已跳过 1 个");
+    expect(outcome.eventMessage).toContain("无需继续剩余 1 个");
   });
 
   it("does not skip remaining work for a deterministic completion without model review", () => {

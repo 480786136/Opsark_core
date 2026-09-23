@@ -156,6 +156,43 @@ describe("step review pipeline", () => {
     expect(failed.review).toEqual(adjust);
   });
 
+  it("continues a model-approved diagnostic after a failed change without recovery metadata", async () => {
+    const failed = step("failed-build", "failed");
+    failed.kind = "change";
+    failed.result = {
+      executionStatus: "failed", observationStatus: "unknown", exitCode: 1,
+      facts: { category: "command_failed" }, warnings: [], evidenceIds: [],
+    };
+    const diagnostic = step("inspect-dependencies", "pending");
+    diagnostic.kind = "observe";
+    diagnostic.validation = "";
+    const currentTask = task([failed, diagnostic]);
+    const result = await runCommandFailureReviewPipeline({
+      task: currentTask,
+      step: failed,
+      failureReason: "build failed",
+      failureCategory: "command_failed",
+      serverId: currentTask.serverId,
+      taskId: currentTask.id,
+      isCancelled: () => false,
+    }, vi.fn().mockResolvedValue({
+      context: {},
+      modelDecision: continueReview,
+      finalDecision: continueReview,
+      remainingSteps: [diagnostic],
+      diagnosticStep: false,
+      mutatingStep: true,
+      recoveryStepFound: false,
+      requirement: "deploy",
+    }));
+
+    if (result.cancelled) throw new Error("review unexpectedly cancelled");
+    expect(result.coordination).toMatchObject({ taskStatus: "running", shouldAdvance: true });
+    expect(failed.status).toBe("failed");
+    expect(failed.review).toEqual(continueReview);
+    expect(diagnostic.status).toBe("pending");
+  });
+
   it("combines evidence review, ordered audits and remaining-step completion", async () => {
     const validating = step("validate", "validating");
     const remaining = step("remaining", "pending");

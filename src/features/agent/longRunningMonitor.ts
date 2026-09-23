@@ -1,4 +1,4 @@
-import { backend } from "@/services/backend";
+import { backend, modelServiceError, modelServiceErrorMessage } from "@/services/backend";
 import type { RuntimeConnection, RuntimeModel } from "@/services/backend";
 import type { AgentRuntimeProgress } from "@/services/backend";
 import { buildLongRunningReviewContext } from "@/features/agent/reviewContext";
@@ -12,7 +12,7 @@ import {
   semanticLongRunningOutputFingerprint,
   hasCriticalLongRunningEvidence,
 } from "@/features/agent/longRunningReviewOutput";
-import type { OpsTask, PlanStep, StepReview } from "@/types";
+import type { ModelServiceError, OpsTask, PlanStep, StepReview } from "@/types";
 
 export const LONG_RUNNING_REVIEW_INTERVAL_MS = 30_000;
 export const PROGRESSIVE_ADVISORY_INTERVAL_MS = 120_000;
@@ -26,6 +26,8 @@ export type LongRunningWorkload = "bounded" | "progressive" | "persistent_servic
 
 export interface LongRunningMonitorState {
   decision?: StepReview;
+  /** The execution owner pauses subsequent work after the running command returns. */
+  modelServiceError?: ModelServiceError;
   reviewRound: number;
   validationPassed: boolean;
   workload: LongRunningWorkload;
@@ -329,6 +331,13 @@ export function startLongRunningMonitor(
       state.noProgressReviewRounds = outputChangedSinceLastReview || measuredProgress
         ? 0
         : (runtimeProgress || state.workload === "bounded" ? state.noProgressReviewRounds + 1 : 0);
+      if (state.modelServiceError) {
+        // Account conditions cannot be fixed by another advisory request. Keep
+        // heartbeat, runtime sampling and the caller's deadline active while
+        // the execution owner waits for the command's actual exit result.
+        state.skippedModelReviewCount += 1;
+        return;
+      }
       const monitoringNotice = state.runtimeSamplingStatus === "failed" ? "failed"
         : state.noProgressReviewRounds >= STALLED_REVIEW_NOTICE_ROUNDS ? "idle" : undefined;
       if (state.workload !== "bounded" && monitoringNotice && monitoringNotice !== lastMonitoringNotice) {
@@ -419,12 +428,10 @@ export function startLongRunningMonitor(
       if (stopped || input.isCancelled() || interruptionRequested) return;
       outputReviewCursor = nextOutputReviewCursor;
       lastModelReviewedOutput = currentOutput;
-      // An advisory cannot turn missing/idle telemetry into a hard timeout.
-      // A concrete error in the current output is still actionable immediately.
-      const hasAdjustmentEvidence = state.workload === "bounded"
-        || hasCriticalLongRunningEvidence(newOutput);
-      const acceptedDecision = acceptsLongRunningDecision(modelDecision, false)
-        && (modelDecision.decision !== "adjust" || hasAdjustmentEvidence);
+      // Runtime telemetry remains factual context for the model and for the
+      // executor's liveness circuit breaker; Core does not veto a model-owned
+      // adjust decision with a second workload/error-text heuristic.
+      const acceptedDecision = acceptsLongRunningDecision(modelDecision, false);
       input.onAudit({ round: reviewRound, context, modelDecision, acceptedDecision });
       if (acceptedDecision && modelDecision.decision === "adjust") {
         await stopForAdjustment(
@@ -461,6 +468,14 @@ export function startLongRunningMonitor(
       );
     }).catch((error) => {
       if (!stopped && !input.isCancelled()) {
+        const serviceError = modelServiceError(error);
+        if (serviceError && !state.modelServiceError) {
+          state.modelServiceError = serviceError;
+          input.onEvent(
+            "system",
+            `长任务模型复核已暂停：${modelServiceErrorMessage(serviceError)}当前命令继续运行并保留本地监控；待命令真实退出后暂停后续任务。`,
+          );
+        }
         input.onError("长任务定期模型复核失败", String(error));
       }
     }).finally(() => {

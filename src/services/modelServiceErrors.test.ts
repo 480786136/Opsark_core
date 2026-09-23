@@ -71,6 +71,23 @@ describe("provider credit failures", () => {
     expect(invoke).toHaveBeenCalledOnce();
   });
 
+  it("preserves step-review credit failures instead of continuing through a rule fallback", async () => {
+    vi.mocked(invoke).mockRejectedValueOnce(`OPSARK_MODEL_TRACE_V1:${JSON.stringify({
+      message: "步骤复核返回错误（402 Payment Required）", modelError: quota,
+    })}`);
+    const error = await backend.reviewStep("检查服务器", "{}", true, runtime).catch(error => error);
+    expect(error).toBeInstanceOf(ModelInvocationError);
+    expect(error.modelError).toEqual(quota);
+    expect(error.message).toContain("额度不足");
+    expect(invoke).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the step-review fallback for ordinary unavailability", async () => {
+    vi.mocked(invoke).mockRejectedValueOnce(new Error("network unavailable"));
+    await expect(backend.reviewStep("检查服务器", "{}", true, runtime)).resolves.toMatchObject({ source: "rules" });
+    expect(invoke).toHaveBeenCalledOnce();
+  });
+
   it("retains the established goal-review fallback for ordinary unavailability", async () => {
     vi.mocked(invoke).mockRejectedValueOnce(new Error("network unavailable"));
     await expect(backend.reviewGoal("检查服务器", "{}", runtime)).resolves.toMatchObject({

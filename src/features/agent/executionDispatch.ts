@@ -1,5 +1,6 @@
 import { findInvalidSecretPlaceholders, findSecretKeys } from "@/features/agent/secretTool";
 import { parseToolCommand } from "@/features/tools/toolExecutor";
+import { assertShellToolBoundary } from "@/features/tools/toolShellBoundary";
 import type { ToolCall, ToolDefinition } from "@/features/tools/types";
 import type { PlanStep } from "@/types";
 
@@ -19,7 +20,6 @@ export function resolveStepDispatch(
   toolCallId: string,
   tools?: ToolDefinition[],
   availableServerSecretKeys: string[] = [],
-  forbiddenToolIds: readonly string[] = [],
   allowedToolIds?: readonly string[],
 ): StepDispatchDecision {
   if (step.executionScope === "user_action") {
@@ -34,11 +34,9 @@ export function resolveStepDispatch(
     return { kind: "invalid", error: `敏感变量占位符格式不合法：${invalidPlaceholders.join("、")}；仅支持 \${secret.NAME}` };
   }
   try {
+    assertShellToolBoundary(step.command, step.validation);
     const call = parseToolCommand(step.command, toolCallId, tools);
     if (call) {
-      if (forbiddenToolIds.includes(call.toolId)) {
-        return { kind: "invalid", error: `当前激活 Skill 禁止调用工具：${call.toolId}` };
-      }
       if (allowedToolIds && !allowedToolIds.includes(call.toolId)) {
         return { kind: "invalid", error: `当前规划上下文未开放工具：${call.toolId}` };
       }

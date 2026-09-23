@@ -108,6 +108,149 @@ describe("AgentConsole 服务器工作区隔离", () => {
     await nextTick();
   }
 
+  it("正常续接使用下一步计划入口和中性进度，点击沿用现有规划流程", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = ops.createTask("server-a", "safe", "model-deepseek");
+    task.status = "awaiting_continuation";
+    task.pauseReason = "环境检查已完成，接下来需要构建应用。";
+    task.plan = [{ id: "inspect", title: "检查环境", description: "读取环境信息", command: "uname -a",
+      expected: "取得环境信息", validation: "", risk: "low", status: "completed" }];
+    task.latestGoalReview = { decision: { decision: "continue", reason: "需要构建", summary: task.pauseReason, source: "model" },
+      snapshot: {}, nextPlan: [{ ...task.plan[0], id: "build", status: "pending" }], createdAt: task.createdAt };
+    const request = vi.spyOn(ops, "requestAdjustment").mockResolvedValue(undefined);
+    const app = mountTask(pinia, task);
+    const previousLocale = i18n.global.locale.value;
+    try {
+      await nextTick();
+      const bar = host.querySelector<HTMLElement>(".approval-bar.continuation")!;
+      expect(bar.querySelector("strong")?.textContent).toBe("当前阶段已完成，准备下一步");
+      expect(bar.querySelector(".lucide-shield-alert-icon")).toBeNull();
+      expect(host.querySelector(".summary-card.summary-progress .lucide-arrow-right-icon")).not.toBeNull();
+      expect(host.querySelector(".task-state-pill.continuation")).not.toBeNull();
+      const button = bar.querySelector<HTMLButtonElement>(".button.primary")!;
+      expect(button.textContent).toBe("生成下一步计划");
+      button.click();
+      await nextTick();
+      expect(request).toHaveBeenCalledExactlyOnceWith(task.id);
+      i18n.global.locale.value = "en-US";
+      await nextTick();
+      expect(button.textContent).toBe("Plan next steps");
+    } finally { i18n.global.locale.value = previousLocale; app.unmount(); }
+  });
+
+  it("完全托管正常续接的倒计时和生成提示表达任务推进", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = ops.createTask("server-a", "managed", "model-deepseek");
+    task.status = "awaiting_continuation";
+    task.plan = [{ id: "inspect", title: "检查环境", description: "读取环境信息", command: "uname -a",
+      expected: "取得环境信息", validation: "", risk: "low", status: "completed" }];
+    task.autoAdjustmentSeconds = 3;
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      expect(host.querySelector(".managed-approval-countdown")?.textContent)
+        .toBe("3 秒后生成下一步计划并继续执行；高风险步骤仍需确认");
+      expect(host.querySelector(".approval-bar .button.primary")).toBeNull();
+      task.autoAdjustmentSeconds = undefined;
+      task.adjustmentInProgress = true;
+      task.managedAdjustmentPhase = "generating";
+      await nextTick();
+      expect(host.querySelector(".managed-approval-countdown")?.textContent).toBe("正在规划下一步…");
+      expect(host.querySelector(".approval-bar .button.primary")).toBeNull();
+    } finally { app.unmount(); }
+  });
+
+  it.each([
+    { permission: "safe", reason: "no_action" },
+    { permission: "managed", reason: "no_action" },
+    { permission: "managed", reason: "no_progress" },
+  ] as const)("$permission 模式遇到 $reason 时保留阻断提示，不宣称阶段成功", async ({ permission, reason }) => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = ops.createTask("server-a", permission, "model-deepseek");
+    task.status = "awaiting_continuation";
+    task.pauseReason = "缺少部署授权，需要先确认部署范围。";
+    if (reason === "no_action") task.latestGoalReview = {
+      decision: { decision: "adjust", reason: task.pauseReason, summary: task.pauseReason, source: "model" },
+      snapshot: {}, nextPlan: [], createdAt: task.createdAt,
+    };
+    if (permission === "managed") {
+      task.managedStopReason = reason;
+      task.managedAdjustmentPhase = "manual_required";
+    }
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      const bar = host.querySelector<HTMLElement>(".approval-bar.warning")!;
+      expect(bar.textContent).toContain("缺少部署授权");
+      expect(bar.querySelector(".button.primary")?.textContent).toBe("重新评估下一步");
+      expect(host.textContent).not.toContain("当前阶段已完成");
+      expect(host.querySelector(".summary-progress")).toBeNull();
+      expect(host.querySelector(".managed-approval-countdown")).toBeNull();
+    } finally { app.unmount(); }
+  });
+
+  it("后续计划生成失败时显示重试入口，即使原步骤仍保留失败记录", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = ops.createTask("server-a", "safe", "model-deepseek");
+    task.status = "needs_adjustment";
+    task.pauseReason = "当前结果和已有执行证据已保留，但后续方案暂未就绪。可以稍后重试生成。未完成目标也已保留。";
+    task.plan = [{ id: "install", title: "安装依赖", description: "安装依赖", command: "npm install",
+      expected: "安装完成", validation: "", risk: "medium", status: "failed",
+      result: { executionStatus: "failed", observationStatus: "unknown", facts: {}, warnings: [], evidenceIds: [] } }];
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      const bar = host.querySelector<HTMLElement>(".approval-bar.warning")!;
+      expect(bar.querySelector(".button.primary")?.textContent).toBe("重试生成计划");
+      expect(bar.querySelector("strong")?.textContent).toBe("当前检查结果已保留，后续方案待完善");
+      expect(host.querySelector(".plan-step.failed")).not.toBeNull();
+    } finally { app.unmount(); }
+  });
+
+  it.each(["planning_failed", "needs_adjustment", "awaiting_continuation"] as const)("额度阻断展示明确警告和账户入口：%s", async (status) => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    useAccountStore(pinia).apply({ user: { id: "member", email: "member@example.test" },
+      balance: { available: 0, reserved: 0, revision: 1, unit: "tokens" },
+      models: [{ id: "official-trial", name: "OpsArk Trial" }], endpoint: "https://example.invalid/v1" });
+    const task = ops.createTask("server-a", "managed", ops.models.find(model => model.source === "official")!.id);
+    task.status = status;
+    ops.recordModelPlanningBlocker(task, {
+      httpStatus: 402, code: "INSUFFICIENT_CREDITS", message: "余额不足", retryable: false,
+      details: { billing_mode: "direct", available_tokens: 0 },
+    });
+    const workspace = useAgentWorkspaceStore(pinia);
+    workspace.updateServer("server-a", { activeTaskId: task.id, automationEnabled: true });
+    workspaceStores.add(workspace);
+    const router = createRouter({ history: createMemoryHistory(), routes: [
+      { path: "/", component: { render: () => null } },
+      { path: "/account", component: { render: () => null } },
+    ] });
+    await router.push("/");
+    const app = createApp(AgentConsole, { serverId: "server-a", active: false }).use(pinia).use(i18n).use(router);
+    app.mount(host);
+    try {
+      await nextTick();
+      const alert = host.querySelector<HTMLElement>(".approval-bar[role='alert']")!;
+      expect(alert.querySelector("strong")?.textContent).toBe("模型额度不足，任务已暂停");
+      expect(alert.textContent).toContain("模型可用余额已用完");
+      expect(alert.textContent).not.toContain("证据校验未通过");
+      expect(alert.querySelector(".button.primary")?.textContent).toBe("重试生成计划");
+      expect(host.querySelector(".approval-bar.continuation")).toBeNull();
+      const accountButton = Array.from(alert.querySelectorAll("button")).find(button => button.textContent === "查看账户额度")!;
+      accountButton.click();
+      await vi.waitFor(() => expect(router.currentRoute.value.path).toBe("/account"));
+      ops.recordModelPlanningBlocker(task, { httpStatus: 402, code: "CREDITS_RECONCILIATION_REQUIRED", message: "待结算", retryable: false });
+      await nextTick();
+      expect(alert.querySelector("strong")?.textContent).toBe("模型账户待结算核对，任务已暂停");
+    } finally { app.unmount(); }
+  });
+
   it("单选字段初始为空，必填未选时不提交，也不显示凭据保存说明", async () => {
     const pinia = createPinia();
     const ops = useOpsStore(pinia);
@@ -385,6 +528,27 @@ describe("AgentConsole 服务器工作区隔离", () => {
     } finally { app.unmount(); }
   });
 
+  it.each([false, true])("响应解析失败不会显示为证据校验失败（旧记录：%s）", async legacy => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = ops.createTask("server-a", "safe", "model-deepseek");
+    task.status = "needs_adjustment";
+    task.pauseReason = legacy ? "后续流程暂不可用：ModelInvocationError: 阶段联合决策结构解析失败：missing field steps"
+      : "后续阶段响应格式不完整或不正确，未执行新的计划。已完成步骤及其证据保持有效。";
+    task.plan = [{ id: "inspect", kind: "observe", title: "读取文件", description: "读取部署入口",
+      command: "pwd", validation: "", expected: "取得结果", risk: "low", status: "completed" }];
+    if (!legacy) task.protocolRepair = { serverId: task.serverId, roundId: task.currentRoundId,
+      repair: { errorCode: "next_stage_response_invalid", validationError: "missing field steps",
+        previousModelOutput: [], rawModelResponse: '{"decision":"adjust"}', instruction: "重新生成" },
+      repairError: "响应无法解析" };
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      expect(host.textContent).toContain("后续阶段响应格式错误，已完成结果已保留");
+      expect(host.textContent).not.toContain("证据校验未通过");
+    } finally { app.unmount(); }
+  });
+
   it.each(["safe", "managed"] as const)("%s 模式仅在自动协议恢复耗尽后显示中性重试入口", async permission => {
     const pinia = createPinia();
     const ops = useOpsStore(pinia);
@@ -412,7 +576,7 @@ describe("AgentConsole 服务器工作区隔离", () => {
       expect(host.textContent).not.toContain("PROTOCOL_REPAIR_SCOPE_VIOLATION");
       expect(host.querySelector<HTMLButtonElement>(".approval-bar.warning .button.secondary")?.textContent)
         .toBe("保留结果并结束");
-      expect(button.textContent).toBe("重试生成后续方案");
+      expect(button.textContent).toBe("重试生成计划");
       expect(host.querySelector(".managed-approval-countdown")).toBeNull();
       button.click();
       await nextTick();
@@ -500,6 +664,284 @@ describe("AgentConsole 服务器工作区隔离", () => {
     } finally { app.unmount(); }
   });
 
+  it("交错提交时旧 Task 的 catch/finally 不覆盖新 Task 的规划态、草稿和终端引用", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    ops.models = [{ id: "model", name: "test", provider: "test", model: "test", endpoint: "https://example.invalid", enabled: true, hasApiKey: true }];
+    ops.modelAvailability.model = { status: "available", reason: "test" };
+    ops.serverConnection("server-a").status = "connected";
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    const createFinishedTask = (label: string) => {
+      const current = ops.createTask("server-a", "safe", "model");
+      current.title = `${label} 旧任务`;
+      current.rootGoal = `${label} 旧目标`;
+      current.currentRoundId = `${label}-round`;
+      current.status = "cancelled";
+      current.plan = [{ id: `${label}-step`, title: `${label} 旧计划`, description: "保留原计划", command: "true",
+        expected: "done", validation: "", risk: "low", status: "skipped" }];
+      return current;
+    };
+    const taskA = createFinishedTask("A");
+    const taskC = createFinishedTask("C");
+    const taskB = createFinishedTask("B");
+    const deferred = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
+    const submit = vi.spyOn(ops, "submitRequirement").mockImplementation((
+      _serverId, content, _permission, _modelId, _terminalReference, taskId,
+    ) => {
+      const owner = ops.tasks.find(item => item.id === taskId)!;
+      owner.requirementProcessing = true;
+      ops.pushMessage(owner, { role: "user", kind: "message", content });
+      return new Promise<void>((resolve, reject) => deferred.set(owner.id, {
+        resolve: () => { owner.requirementProcessing = false; resolve(); },
+        reject: (error) => { owner.requirementProcessing = false; reject(error); },
+      }));
+    });
+    const workspace = useAgentWorkspaceStore(pinia);
+    workspace.updateServer("server-a", {
+      activeTaskId: taskA.id, automationEnabled: true, modelId: "model", draft: "A 新需求",
+    });
+    const app = createApp(AgentConsole, { serverId: "server-a", active: false }).use(pinia).use(i18n);
+    app.mount(host);
+    const setDraft = (value: string) => {
+      const textarea = host.querySelector<HTMLTextAreaElement>(".composer textarea")!;
+      textarea.value = value;
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    const setTerminalReference = async (lines: string[]) => {
+      ops.terminalLines.splice(0, ops.terminalLines.length, ...lines);
+      host.querySelector<HTMLButtonElement>(".context-button")!.click();
+      await nextTick();
+    };
+    const submitComposer = async () => {
+      host.querySelector<HTMLFormElement>(".composer")!
+        .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await nextTick();
+    };
+    try {
+      await nextTick();
+      await setTerminalReference(["A-reference"]);
+      await submitComposer();
+      expect(deferred.has(taskA.id)).toBe(true);
+
+      workspace.updateServer("server-a", { activeTaskId: taskC.id });
+      await nextTick();
+      setDraft("C 新需求");
+      await setTerminalReference(["C-reference-1", "C-reference-2"]);
+      await submitComposer();
+      expect(deferred.has(taskC.id)).toBe(true);
+
+      workspace.updateServer("server-a", { activeTaskId: taskB.id });
+      await nextTick();
+      setDraft("B 新需求");
+      await setTerminalReference(["B-reference-1", "B-reference-2", "B-reference-3"]);
+      await submitComposer();
+      expect(deferred.has(taskB.id)).toBe(true);
+      expect(submit.mock.calls.map(call => call[4])).toEqual([
+        "A-reference", "C-reference-1\nC-reference-2", "B-reference-1\nB-reference-2\nB-reference-3",
+      ]);
+      expect(host.querySelector(".agent-title-copy small")?.textContent).toContain("B 新需求");
+      expect(host.querySelectorAll(".phase-history-card")).toHaveLength(1);
+      expect(host.querySelector(".current-plan-card")).toBeNull();
+      expect(host.querySelector<HTMLTextAreaElement>(".composer textarea")?.value).toBe("");
+      expect(host.querySelector(".context-chip")?.textContent).toContain("3");
+      const terminateButton = host.querySelector<HTMLButtonElement>(".requirement-processing-terminate")!;
+      expect(terminateButton).not.toBeNull();
+      expect(host.querySelectorAll(".terminate-business")).toHaveLength(1);
+
+      deferred.get(taskA.id)!.reject(new Error("A 规划失败"));
+      await vi.waitFor(() => expect(submit.mock.settledResults[0]?.type).toBe("rejected"));
+      expect(host.querySelector(".agent-title-copy small")?.textContent).toContain("B 新需求");
+      expect(host.querySelectorAll(".phase-history-card")).toHaveLength(1);
+      expect(host.querySelector<HTMLTextAreaElement>(".composer textarea")?.value).toBe("");
+      expect(host.querySelector('[role="alert"]')).toBeNull();
+
+      deferred.get(taskC.id)!.resolve();
+      await vi.waitFor(() => expect(submit.mock.settledResults[1]?.type).toBe("fulfilled"));
+      expect(host.querySelector(".agent-title-copy small")?.textContent).toContain("B 新需求");
+      expect(host.querySelectorAll(".phase-history-card")).toHaveLength(1);
+      expect(host.querySelector(".context-chip")?.textContent).toContain("3");
+
+      deferred.get(taskB.id)!.resolve();
+      await vi.waitFor(() => expect(submit.mock.settledResults[2]?.type).toBe("fulfilled"));
+      expect(host.querySelector(".context-chip")).toBeNull();
+    } finally { app.unmount(); }
+  });
+
+  it("终止需求分类时立即释放本地 owner，旧提交稍后成功也不切换 Task", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    ops.models = [{ id: "model", name: "test", provider: "test", model: "test", endpoint: "https://example.invalid", enabled: true, hasApiKey: true }];
+    ops.modelAvailability.model = { status: "available", reason: "test" };
+    ops.serverConnection("server-a").status = "connected";
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    const task = ops.createTask("server-a", "safe", "model");
+    task.title = "原任务";
+    task.rootGoal = "原目标";
+    task.status = "cancelled";
+    task.plan = [{ id: "old-step", title: "原计划", description: "保留计划", command: "true",
+      expected: "done", validation: "", risk: "low", status: "skipped" }];
+    const child = ops.createTask("server-a", "safe", "model");
+    child.title = "新子任务";
+    let resolveSubmit!: () => void;
+    const submit = vi.spyOn(ops, "submitRequirement").mockImplementation((_serverId, content) => {
+      task.requirementProcessing = true;
+      task.status = "planning";
+      ops.pushMessage(task, { role: "user", kind: "message", content });
+      return new Promise<void>(resolve => {
+        resolveSubmit = () => { task.requirementProcessing = false; resolve(); };
+      });
+    });
+    const realTerminate = ops.terminateTask.bind(ops);
+    let resolveTerminate!: () => void;
+    const terminate = vi.spyOn(ops, "terminateTask").mockImplementation(async taskId => {
+      await realTerminate(taskId);
+      await new Promise<void>(resolve => { resolveTerminate = resolve; });
+    });
+    const workspace = useAgentWorkspaceStore(pinia);
+    workspace.updateServer("server-a", {
+      activeTaskId: task.id, automationEnabled: true, modelId: "model", draft: "继续执行",
+    });
+    const app = createApp(AgentConsole, { serverId: "server-a", active: false }).use(pinia).use(i18n);
+    app.mount(host);
+    try {
+      await nextTick();
+      ops.terminalLines.splice(0, ops.terminalLines.length, "pending-reference");
+      host.querySelector<HTMLButtonElement>(".context-button")!.click();
+      host.querySelector<HTMLFormElement>(".composer")!
+        .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await nextTick();
+      expect(submit).toHaveBeenCalledOnce();
+      expect(host.querySelector(".agent-title-copy small")?.textContent).toContain("继续执行");
+      expect(host.querySelectorAll(".phase-history-card")).toHaveLength(1);
+
+      host.querySelector<HTMLButtonElement>(".requirement-processing-terminate")!.click();
+      await nextTick();
+      expect(terminate).toHaveBeenCalledExactlyOnceWith(task.id);
+      expect(terminate.mock.settledResults[0]?.type).toBe("incomplete");
+      expect(host.querySelector(".agent-title-copy small")?.textContent).toBe("原任务");
+      expect(host.querySelector(".requirement-processing-terminate")).toBeNull();
+      expect(host.querySelectorAll(".phase-history-card")).toHaveLength(0);
+      expect(host.querySelector(".current-plan-card")).not.toBeNull();
+
+      ops.activeTaskId = child.id;
+      resolveSubmit();
+      await vi.waitFor(() => expect(submit.mock.settledResults[0]?.type).toBe("fulfilled"));
+      expect(workspace.workspaces["server-a"].activeTaskId).toBe(task.id);
+      expect(host.querySelector(".context-chip")).not.toBeNull();
+
+      await vi.waitFor(() => expect(resolveTerminate).toBeTypeOf("function"));
+      resolveTerminate();
+      await vi.waitFor(() => expect(terminate.mock.settledResults[0]?.type).toBe("fulfilled"));
+    } finally { app.unmount(); }
+  });
+
+  it("仅切换查看 B 时，A 的 new_goal 稍后完成不把界面切到子 Task", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    ops.models = [{ id: "model", name: "test", provider: "test", model: "test", endpoint: "https://example.invalid", enabled: true, hasApiKey: true }];
+    ops.modelAvailability.model = { status: "available", reason: "test" };
+    ops.serverConnection("server-a").status = "connected";
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    const taskA = ops.createTask("server-a", "safe", "model");
+    taskA.title = "Task A";
+    taskA.status = "cancelled";
+    const taskB = ops.createTask("server-a", "safe", "model");
+    taskB.title = "Task B";
+    taskB.status = "cancelled";
+    const child = ops.createTask("server-a", "safe", "model");
+    child.title = "A 创建的子 Task";
+    let resolveSubmit!: () => void;
+    const submit = vi.spyOn(ops, "submitRequirement").mockImplementation((_serverId, content) => {
+      taskA.requirementProcessing = true;
+      ops.pushMessage(taskA, { role: "user", kind: "message", content });
+      return new Promise<void>(resolve => {
+        resolveSubmit = () => { taskA.requirementProcessing = false; resolve(); };
+      });
+    });
+    const workspace = useAgentWorkspaceStore(pinia);
+    workspace.updateServer("server-a", {
+      activeTaskId: taskA.id, automationEnabled: true, modelId: "model", draft: "为 A 创建新目标",
+    });
+    const app = createApp(AgentConsole, { serverId: "server-a", active: false }).use(pinia).use(i18n);
+    app.mount(host);
+    try {
+      await nextTick();
+      host.querySelector<HTMLFormElement>(".composer")!
+        .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await nextTick();
+      expect(submit).toHaveBeenCalledOnce();
+      workspace.updateServer("server-a", { activeTaskId: taskB.id });
+      await nextTick();
+      ops.activeTaskId = child.id;
+      resolveSubmit();
+      await vi.waitFor(() => expect(submit.mock.settledResults[0]?.type).toBe("fulfilled"));
+      expect(workspace.workspaces["server-a"].activeTaskId).toBe(taskB.id);
+      expect(host.querySelector(".agent-title-copy small")?.textContent).toBe("Task B");
+    } finally { app.unmount(); }
+  });
+
+  it("需求分类期间隐藏并拒绝旧的审批、参数和密钥交互", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = clarificationTask(ops);
+    const provideInput = vi.spyOn(ops, "provideUserInput").mockResolvedValue(true);
+    const approvePlan = vi.spyOn(ops, "approvePlan").mockResolvedValue(undefined);
+    const approveStep = vi.spyOn(ops, "approveStep").mockResolvedValue(undefined);
+    const provideSecret = vi.spyOn(ops, "provideSecret").mockResolvedValue(true);
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      const oldInputForm = host.querySelector<HTMLFormElement>(".user-input-card")!;
+      enterClarification("旧参数");
+      task.requirementProcessing = true;
+      await nextTick();
+      expect(host.querySelector(".user-input-card")).toBeNull();
+      submitClarification(oldInputForm);
+      expect(provideInput).not.toHaveBeenCalled();
+
+      task.requirementProcessing = false;
+      task.status = "awaiting_plan_approval";
+      task.plan[0].status = "pending";
+      await nextTick();
+      const oldPlanApprovalButton = host.querySelector<HTMLButtonElement>(".approval-bar .primary")!;
+      task.requirementProcessing = true;
+      await nextTick();
+      expect(host.querySelector(".approval-bar")).toBeNull();
+      oldPlanApprovalButton.click();
+      expect(approvePlan).not.toHaveBeenCalled();
+
+      task.requirementProcessing = false;
+      task.status = "awaiting_step_approval";
+      task.plan[0].status = "awaiting_approval";
+      await nextTick();
+      const oldApprovalButton = host.querySelector<HTMLButtonElement>(".approval-bar .primary")!;
+      task.requirementProcessing = true;
+      await nextTick();
+      expect(host.querySelector(".approval-bar")).toBeNull();
+      oldApprovalButton.click();
+      expect(approveStep).not.toHaveBeenCalled();
+
+      task.requirementProcessing = false;
+      task.status = "awaiting_input";
+      task.plan[0].status = "awaiting_input";
+      ops.pendingUserInputs = [];
+      ops.pendingSecret = {
+        taskId: task.id, stepId: task.plan[0].id, key: "TOKEN", label: "令牌",
+        description: "输入令牌", unlockDescription: "继续执行",
+      };
+      await nextTick();
+      const oldSecretForm = host.querySelector<HTMLFormElement>(".secret-unlock-card")!;
+      const secret = oldSecretForm.querySelector<HTMLInputElement>("input")!;
+      secret.value = "secret";
+      secret.dispatchEvent(new Event("input", { bubbles: true }));
+      task.requirementProcessing = true;
+      await nextTick();
+      expect(host.querySelector(".secret-unlock-card")).toBeNull();
+      oldSecretForm.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      expect(provideSecret).not.toHaveBeenCalled();
+    } finally { app.unmount(); }
+  });
+
   it("发送期间连接失效时保留草稿并显示错误，离线禁用发送", async () => {
     const pinia = createPinia();
     const ops = useOpsStore(pinia);
@@ -555,6 +997,175 @@ describe("AgentConsole 服务器工作区隔离", () => {
     app.unmount();
   });
 
+  it("同一轮继续与旁问按时间线展示，旧阶段位于继续消息上方", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    const task = ops.createTask("server-a", "safe", "model-deepseek");
+    task.status = "awaiting_plan_approval";
+    task.currentRoundId = "round-current";
+    task.messages = [
+      { id: "original", role: "user", kind: "message", content: "部署服务", requirementRelation: "new_goal",
+        createdAt: "2026-09-06T01:00:00.000Z" },
+      { id: "continue", role: "user", kind: "message", content: "继续执行", requirementRelation: "continue",
+        createdAt: "2026-09-06T01:05:00.000Z" },
+      { id: "question", role: "user", kind: "message", content: "现在进展如何？", requirementRelation: "side_question",
+        createdAt: "2026-09-06T01:06:00.000Z" },
+      { id: "answer", role: "assistant", kind: "message", content: "已完成第一阶段。",
+        createdAt: "2026-09-06T01:06:01.000Z" },
+    ];
+    task.phaseHistory = [{
+      id: "old-phase", roundId: task.currentRoundId, archivedBeforeMessageId: "continue",
+      requirement: "部署服务", reason: "replan", plan: [],
+      createdAt: "2026-09-06T01:01:00.000Z", completedAt: task.messages[1].createdAt,
+    }];
+    task.plan = [{
+      id: "new-step", title: "验证服务", description: "检查服务健康状态", command: "systemctl is-active app",
+      expected: "服务运行", validation: "", risk: "low", status: "pending",
+    }];
+    useAgentWorkspaceStore(pinia).updateServer("server-a", { activeTaskId: task.id, automationEnabled: true });
+
+    const app = createApp(AgentConsole, { serverId: "server-a" }).use(pinia).use(i18n);
+    app.mount(host);
+    try {
+      await nextTick();
+      const timeline = host.querySelector<HTMLElement>(".agent-timeline")!;
+      const children = [...timeline.children];
+      const userMessages = [...timeline.querySelectorAll<HTMLElement>(".task-message.user")];
+      const original = userMessages.find(element => element.textContent?.includes("部署服务"))!;
+      const continuation = userMessages.find(element => element.textContent?.includes("继续执行"))!;
+      const question = userMessages.find(element => element.textContent?.includes("现在进展如何？"))!;
+      const phase = timeline.querySelector<HTMLElement>(".phase-history-card")!;
+      const currentPlan = timeline.querySelector<HTMLElement>(".current-plan-card")!;
+      expect(original).toBeDefined();
+      expect(continuation).toBeDefined();
+      expect(question).toBeDefined();
+      expect(children.indexOf(original)).toBeLessThan(children.indexOf(phase));
+      expect(children.indexOf(phase)).toBeLessThan(children.indexOf(continuation));
+      expect(children.indexOf(continuation)).toBeLessThan(children.indexOf(question));
+      expect(children.indexOf(question)).toBeLessThan(children.indexOf(currentPlan));
+    } finally { app.unmount(); }
+  });
+
+  it("后续补充需求不会丢失上一轮的继续、旁问和回答", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    const task = ops.createTask("server-a", "safe", "model-deepseek");
+    const archivedMessages: OpsTask["messages"] = [
+      { id: "goal", role: "user", kind: "message", content: "部署服务", requirementRelation: "new_goal",
+        createdAt: "2026-09-06T01:00:00.000Z" },
+      { id: "continue", role: "user", kind: "message", content: "继续执行", requirementRelation: "continue",
+        createdAt: "2026-09-06T01:05:00.000Z" },
+      { id: "question", role: "user", kind: "message", content: "已经做到哪了？", requirementRelation: "side_question",
+        createdAt: "2026-09-06T01:06:00.000Z" },
+      { id: "answer", role: "assistant", kind: "message", content: "已完成第一阶段。",
+        createdAt: "2026-09-06T01:06:01.000Z" },
+    ];
+    task.rootGoal = "部署服务";
+    task.currentRoundId = "round-supplement";
+    task.status = "completed";
+    task.messages = [...archivedMessages, {
+      id: "supplement", role: "user", kind: "message", content: "再增加健康检查", requirementRelation: "supplement",
+      createdAt: "2026-09-06T02:00:00.000Z",
+    }];
+    task.planHistory = [{
+      id: "round-original", roundId: "round-original", requirement: "部署服务", status: "completed", plan: [],
+      messages: archivedMessages.map(message => ({ ...message })),
+      phases: [{ id: "old-phase", roundId: "round-original", archivedBeforeMessageId: "continue",
+        requirement: "部署服务", reason: "replan", plan: [], createdAt: "2026-09-06T01:01:00.000Z",
+        completedAt: archivedMessages[1].createdAt }],
+      createdAt: archivedMessages[0].createdAt, completedAt: "2026-09-06T01:10:00.000Z",
+    }];
+    useAgentWorkspaceStore(pinia).updateServer("server-a", { activeTaskId: task.id, automationEnabled: true });
+
+    const app = createApp(AgentConsole, { serverId: "server-a" }).use(pinia).use(i18n);
+    app.mount(host);
+    try {
+      await nextTick();
+      const timeline = host.querySelector<HTMLElement>(".agent-timeline")!;
+      const texts = [...timeline.querySelectorAll<HTMLElement>(".task-message p")].map(element => element.textContent);
+      for (const expected of ["部署服务", "继续执行", "已经做到哪了？", "已完成第一阶段。", "再增加健康检查"]) {
+        expect(texts.filter(text => text === expected)).toHaveLength(1);
+      }
+      const continuation = [...timeline.querySelectorAll<HTMLElement>(".task-message")]
+        .find(element => element.querySelector("p")?.textContent === "继续执行")!;
+      const phase = timeline.querySelector<HTMLElement>(".phase-history-card")!;
+      expect([...timeline.children].indexOf(phase)).toBeLessThan([...timeline.children].indexOf(continuation));
+    } finally { app.unmount(); }
+  });
+
+  it("已结束任务提交新需求的规划期间把旧计划保留在新消息上方", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    ops.models = [{ id: "model", name: "test", provider: "test", model: "test", endpoint: "https://example.invalid", enabled: true, hasApiKey: true }];
+    ops.modelAvailability.model = { status: "available", reason: "test" };
+    ops.serverConnection("server-a").status = "connected";
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue(undefined);
+    const task = ops.createTask("server-a", "safe", "model");
+    task.status = "cancelled";
+    task.currentRoundId = "round-current";
+    task.rootGoal = "部署服务";
+    task.messages = [
+      { id: "original", role: "user", kind: "message", content: "部署服务", requirementRelation: "new_goal",
+        createdAt: "2026-09-06T01:00:00.000Z" },
+      { id: "previous-continue", role: "user", kind: "message", content: "继续处理", requirementRelation: "continue",
+        createdAt: "2026-09-06T01:02:00.000Z" },
+    ];
+    task.plan = [{ id: "old-step", title: "未完成步骤", description: "保留原计划", command: "true", expected: "done",
+      validation: "", risk: "low", status: "skipped" }];
+    // A prior phase may legitimately contain the same persisted step id. Only
+    // the phase anchored to this submission can replace the provisional card.
+    task.phaseHistory = [{
+      id: "previous-phase", roundId: task.currentRoundId,
+      requirement: "部署服务", reason: "replan", plan: task.plan.map(step => ({ ...step })),
+      createdAt: "2026-09-06T01:01:00.000Z", completedAt: task.messages[1].createdAt,
+    }];
+    let fail!: () => void;
+    let pushSubmittedMessage!: () => void;
+    vi.spyOn(ops, "submitRequirement").mockImplementation((_serverId, content) => {
+      task.requirementProcessing = true;
+      pushSubmittedMessage = () => { ops.pushMessage(task, { role: "user", kind: "message", content }); };
+      return new Promise<void>((_resolve, reject) => {
+        fail = () => {
+          task.requirementProcessing = false;
+          reject(new Error("规划服务暂时不可用"));
+        };
+      });
+    });
+    useAgentWorkspaceStore(pinia).updateServer("server-a", {
+      activeTaskId: task.id, automationEnabled: true, modelId: "model", draft: "继续执行",
+    });
+
+    const app = createApp(AgentConsole, { serverId: "server-a" }).use(pinia).use(i18n);
+    app.mount(host);
+    try {
+      await nextTick();
+      host.querySelector<HTMLFormElement>(".composer")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      await nextTick();
+      const timeline = host.querySelector<HTMLElement>(".agent-timeline")!;
+      // Before submitRequirement creates the new message, a legacy phase with
+      // no anchor must not satisfy undefined === undefined and hide the snapshot.
+      expect(timeline.querySelectorAll(".phase-history-card")).toHaveLength(2);
+      expect(timeline.querySelector(".current-plan-card")).toBeNull();
+      pushSubmittedMessage();
+      await nextTick();
+      const phases = [...timeline.querySelectorAll<HTMLElement>(".phase-history-card")];
+      const phase = phases[phases.length - 1];
+      const continuation = [...timeline.querySelectorAll<HTMLElement>(".task-message.user")]
+        .find(element => element.textContent?.includes("继续执行"))!;
+      expect(phase).toBeDefined();
+      expect(continuation).toBeDefined();
+      expect([...timeline.children].indexOf(phase)).toBeLessThan([...timeline.children].indexOf(continuation));
+      expect(host.querySelector(".current-plan-card")).toBeNull();
+      expect(phases).toHaveLength(2);
+      fail();
+      await vi.waitFor(() => expect(host.querySelector('[role="alert"]')?.textContent).toContain("规划服务暂时不可用"));
+      expect(host.querySelectorAll(".phase-history-card")).toHaveLength(1);
+      expect(host.querySelectorAll(".current-plan-card")).toHaveLength(1);
+    } finally { app.unmount(); }
+  });
+
   it("长任务标题在标题栏和任务列表中保留全文与悬停提示", async () => {
     const pinia = createPinia();
     const ops = useOpsStore(pinia);
@@ -599,7 +1210,7 @@ describe("AgentConsole 服务器工作区隔离", () => {
     app.mount(host);
     await nextTick();
     expect(host.textContent).toContain("正在等待终端恢复");
-    expect(host.textContent).not.toContain("正在生成调整方案");
+    expect(host.textContent).not.toContain("正在重新规划");
     task.managedAdjustmentPhase = "manual_required";
     task.managedStopReason = "transport_recovery";
     task.autoAdjustmentSeconds = undefined;
@@ -673,7 +1284,7 @@ describe("AgentConsole 服务器工作区隔离", () => {
     await nextTick();
 
     expect(host.querySelector(".terminate-business")).toBeNull();
-    expect(host.textContent).toContain("生成调整方案");
+    expect(host.textContent).toContain("重新规划");
     app.unmount();
   });
 
@@ -763,6 +1374,7 @@ describe("AgentConsole 服务器工作区隔离", () => {
     expect(host.textContent).toContain("当前检查结果和已完成步骤已保留");
     expect(host.textContent).not.toContain("生成失败");
     expect(host.textContent).not.toContain("证据校验未通过，任务已暂停");
+    expect(host.querySelector(".approval-bar .button.primary")?.textContent).toBe("重试生成计划");
     app.unmount();
   });
 
@@ -911,8 +1523,8 @@ describe("AgentConsole 服务器工作区隔离", () => {
     expect(host.textContent).toContain("执行方案待完善");
     expect(host.textContent).toContain("当前检查结果和已完成步骤已保留");
     expect(host.textContent).not.toContain("协议校验");
-    expect(host.textContent).toContain("重试规划");
-    expect([...host.querySelectorAll("button")].some((button) => button.textContent?.includes("生成调整方案"))).toBe(false);
+    expect(host.textContent).toContain("重试生成计划");
+    expect([...host.querySelectorAll("button")].some((button) => button.textContent?.includes("重新规划"))).toBe(false);
     expect(host.querySelector(".managed-approval-countdown")).toBeNull();
     app.unmount();
   });
@@ -943,8 +1555,8 @@ describe("AgentConsole 服务器工作区隔离", () => {
     app.mount(host);
     await nextTick();
 
-    expect(host.textContent).toContain("正在生成调整方案…");
-    expect([...host.querySelectorAll("button")].some((button) => button.textContent?.includes("生成调整方案"))).toBe(false);
+    expect(host.textContent).toContain("正在重新规划…");
+    expect([...host.querySelectorAll("button")].some((button) => button.textContent?.includes("重新规划"))).toBe(false);
 
     task.adjustmentInProgress = false;
     task.adjustmentIncident = {
@@ -964,7 +1576,7 @@ describe("AgentConsole 服务器工作区隔离", () => {
     await nextTick();
 
     expect(host.textContent).toContain("正在等待终端恢复…");
-    expect([...host.querySelectorAll("button")].some((button) => button.textContent?.includes("生成调整方案"))).toBe(false);
+    expect([...host.querySelectorAll("button")].some((button) => button.textContent?.includes("重新规划"))).toBe(false);
     app.unmount();
   });
 
@@ -1030,7 +1642,7 @@ describe("AgentConsole 服务器工作区隔离", () => {
       task.pauseReason = "终端已恢复，业务问题需用户确认";
       await nextTick();
       expect(host.textContent).not.toContain("检查终端恢复");
-      expect(host.querySelector(".approval-bar.warning .button.primary")?.textContent).toContain("生成调整方案");
+      expect(host.querySelector(".approval-bar.warning .button.primary")?.textContent).toContain("重新规划");
       expect(host.querySelector(".managed-approval-countdown")).toBeNull();
     } finally { app.unmount(); }
   });

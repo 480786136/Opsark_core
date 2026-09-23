@@ -179,7 +179,8 @@ describe("review context", () => {
     const current = currentTask.plan[1];
     const remaining = [currentTask.plan[2]];
 
-    expect(buildPreconditionReviewContext(currentTask, current, currentTask.plan[0]).reviewPolicy.preconditionGate).toBe(true);
+    expect(buildPreconditionReviewContext(currentTask, current, currentTask.plan[0]).reviewPolicy)
+      .toMatchObject({ authorizationBoundaryOnly: true, recoveryRelationIsAdvisory: true });
     expect(buildExecutionFailureReviewContext(currentTask, current, remaining).reviewPolicy.commandExecutionFailed).toBe(true);
     expect(buildEvidenceReviewContext(currentTask, current, remaining, true).reviewPolicy?.postconditionFailed).toBe(true);
     expect(buildLongRunningReviewContext({

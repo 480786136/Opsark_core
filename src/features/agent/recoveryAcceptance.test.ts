@@ -36,7 +36,17 @@ function observed(step: PlanStep, context: string, output: string, exitCode = 0,
   return classified;
 }
 
-describe("recovery acceptance is stronger than command completion", () => {
+describe("conservative historical proof recognition is stronger than command completion", () => {
+  it("offers old and supplemental verification as references, not immutable acceptance rules", () => {
+    const { failed } = fixture("command -v sh || echo absent");
+    const reference = recoveryVerificationContract(failed);
+    expect(reference).toMatchObject({ usage: "historical_reference", allowsRevisedVerification: true });
+    expect(reference.acceptanceInstruction).toContain("可根据用户目标和新证据修正验收命令、expected 或执行方式");
+    expect(reference.acceptanceInstruction).toContain("不是唯一允许的验收方法");
+    expect(reference.acceptanceInstruction).not.toContain("原查询、expected 和目标不变");
+    expect(failed.validation).toBe("command -v sh || echo absent");
+  });
+
   it.each([
     "echo absent", "printf '%s\\n' absent", "command -v missing || echo absent", "pwd",
     "custom-state-query", "test -d /opt/app; echo finished", "test 1 = 1", "true", "set -e; printf healthy",
@@ -130,7 +140,7 @@ describe("recovery acceptance is stronger than command completion", () => {
     expect(execution.status).not.toBe(0);
   });
 
-  it("rejects a changed expected state, target, query, omitted check, or unaudited supplement", () => {
+  it("does not automatically equate changed expected states, targets or queries with historical proof", () => {
     const original = "command -v sh || echo absent; command -v printf || echo absent";
     const { failed, verify, context } = fixture(original);
     const supplement = recoveryVerificationContract(failed).supplementalVerification!;
@@ -155,12 +165,12 @@ describe("recovery acceptance is stronger than command completion", () => {
     expect(recoveryVerificationContract(failed).validationScope).toBe("fresh_login_shell");
   });
 
-  it.each([selectAdjustmentSteps, selectContinuationSteps])("keeps pre-repair and post-repair verification but removes immediate duplicates", select => {
+  it.each([selectAdjustmentSteps, selectContinuationSteps])("preserves the model's complete recovery proposal", select => {
     const { failed, verify, repair, context } = fixture();
     const duplicate = { ...verify, id: "duplicate" };
     const after = { ...verify, id: "after-repair" };
     expect(select([failed], [verify, duplicate, repair, after], context).map(step => step.id))
-      .toEqual([verify.id, repair.id, after.id]);
+      .toEqual([verify.id, duplicate.id, repair.id, after.id]);
   });
 
   it("requires fresh verification after the latest repair, including stale evidence attached to a later step", () => {

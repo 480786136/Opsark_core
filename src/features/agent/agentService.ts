@@ -1,27 +1,28 @@
-import { backend, modelServiceError, PlanProtocolError } from "@/services/backend";
+import { backend, PlanProtocolError } from "@/services/backend";
+import { protocolRejectionFingerprint } from "@/services/planProtocolRepair";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { workflowLifetime, StaleWorkflowError } from "./workflowLifetime";
-import { activeProtocolRepair, freshProtocolReplanSteps } from "./protocolReplan";
+import { activeProtocolRepair, freshProtocolReplanSteps, protocolReplanContext } from "./protocolReplan";
 import { markProtocolReplanApprovals } from "./protocolReplanApproval";
 import { normalizePlanPreconditions } from "./planNormalizer";
 import { DECISION_EVIDENCE_INSTRUCTION } from "./decisionEvidence";
 import type { RuntimeModel } from "@/services/backend";
 import { createRuntimeModel } from "@/features/agent/modelRuntime";
 import { modelLogContext } from "./modelLogContext";
+import { refreshTaskKnowledge } from "@/features/knowledge/retrieval";
 import {
   buildAdjustmentContext,
   buildContinuationContext,
   buildNextStageContext,
+  GOAL_DIRECTED_RECOVERY_INSTRUCTION,
 } from "@/features/agent/agentContext";
 import {
   latestTaskRequirement,
-  selectBusinessReplanSteps,
   selectAdjustmentSteps,
   selectContinuationSteps,
 } from "@/features/agent/taskProgression";
 import { activeRoundSteps } from "@/features/agent/taskGoal";
-import { assertTaskPlanAuthorization, ExecutionPolicyError, recoveryHistory, validateRecoveryReferences } from "./recoveryContract";
-import { buildGoalCompletedSummary, completionSummaryContradictsGoal } from "@/features/agent/executionSummary";
+import { assertTaskPlanAuthorization, recoveryHistory, validateRecoveryReferences } from "./recoveryContract";
 import { buildSkillContext } from "@/features/skills/skillRegistry";
 import { compactReviewText } from "@/features/agent/longRunningReviewOutput";
 import { buildTaskDecisionSnapshot } from "@/features/agent/taskDecisionSnapshot";
@@ -84,7 +85,6 @@ export interface PlanTaskAdjustmentInput {
   adjustmentReason?: string;
   /** An explicit user-directed retry may replay an unchanged failed attempt. */
   allowUnchangedFailureRetry?: boolean;
-  replanAfterProtocolFailure?: boolean;
 }
 
 export interface CompletionSummaryRequest {
@@ -115,6 +115,8 @@ export interface ReviewTaskGoalInput {
 }
 
 export interface DecideTaskNextStageInput extends ReviewTaskGoalInput {
+  /** Ordinary adjustment has no outer protocol handoff; recover in this call. */
+  recoverProtocolFailures?: boolean;
   server?: ServerProfile;
   metrics?: Metrics;
   tools: ToolDefinition[];
@@ -295,7 +297,7 @@ export async function reviewTaskGoal(
     trigger: "overall_goal_completion",
     baseSnapshot: snapshot,
     activeSkillAcceptance: activeSkills,
-    instruction: `用外层用户目标、baseSnapshot 的真实输出与结构化结果和 activeSkillAcceptance 判断整体目标。阶段总结不等于成功证据；缺少最终验收证据时必须 adjust。若返回 adjust，reason 和 summary 必须指出未满足条件，区分未采集与上下文省略。${DECISION_EVIDENCE_INSTRUCTION}`,
+    instruction: `用外层用户目标、baseSnapshot 的真实输出与结构化结果和 activeSkillAcceptance 判断整体目标。阶段总结不等于成功证据；缺少最终验收证据时必须 adjust。若返回 adjust，reason 和 summary 必须指出未满足条件，区分未采集与上下文省略。${GOAL_DIRECTED_RECOVERY_INSTRUCTION}${DECISION_EVIDENCE_INSTRUCTION}`,
   };
   const decision = await review(
     requirement,
@@ -309,13 +311,14 @@ export async function reviewTaskGoal(
 
 /**
  * Performs the overall-goal decision and next-stage planning in one model
- * request. The former review-only path remains a fail-closed compatibility
- * fallback while desktop versions roll forward independently.
+ * request. Proposals remain atomic. Protocol recovery allows at most two fresh
+ * proposals, including when an opted-in adjustment first encounters rejection.
+ * Service failures and stale workflows never enter this recovery loop.
  */
 export async function decideTaskNextStage(
   input: DecideTaskNextStageInput,
   decide: NextStageDecider = backend.decideNextStage.bind(backend),
-  fallbackReview: GoalReviewer = backend.reviewGoal.bind(backend),
+  _fallbackReview: GoalReviewer = backend.reviewGoal.bind(backend),
 ) {
   const lifetime = workflowLifetime(input.task);
   const assertCurrent = () => {
@@ -323,7 +326,9 @@ export async function decideTaskNextStage(
   };
   assertCurrent();
   const requirement = latestTaskRequirement(input.task);
-  const context = buildNextStageContext({
+  if (input.model) await refreshTaskKnowledge(input.task.id, () => lifetime.current() && !input.isCancelled?.());
+  assertCurrent();
+  let context = buildNextStageContext({
     server: input.server,
     metrics: input.metrics,
     task: input.task,
@@ -332,27 +337,84 @@ export async function decideTaskNextStage(
     skills: input.skills,
   });
   if (!input.model) {
-    const fallback = await reviewTaskGoal(input, fallbackReview);
+    const decision: NextStageDecision = {
+      decision: "adjust",
+      reason: "所选模型配置不存在，Core 不会代替模型裁决整体目标是否完成。",
+      summary: "已保留执行证据，当前进入 blocked/no_action。",
+      source: "rules",
+      steps: [],
+    };
     return {
-      ...fallback,
-      nextPlan: undefined,
+      requirement,
+      snapshot: context.baseSnapshot,
+      context,
+      decision,
+      complete: false,
+      nextPlan: [] as PlanStep[],
       policyFingerprint: context.policyFingerprint,
-      combinedError: "所选模型配置不存在，已回退整体目标复核",
+      combinedError: "所选模型配置不存在，未进行业务语义兜底裁决",
     };
   }
   try {
-    const decision = await decide(
-      requirement,
-      input.model.provider === "Built-in"
-        ? undefined
-        : createRuntimeModel(
-          input.model,
-          input.apiKey,
-          JSON.stringify(context),
-          input.generationSettings,
-        ),
-    );
+    const previousFailure = activeProtocolRepair(input.task);
+    const seenPlans = new Set(previousFailure
+      ? [protocolRejectionFingerprint(previousFailure.repair)] : []);
+    const maxProposals = previousFailure ? 2 : input.recoverProtocolFailures ? 3 : 1;
+    let protocolRecovered = Boolean(previousFailure);
+    let decision: NextStageDecision | undefined;
+    for (let attempt = 0; attempt < maxProposals; attempt += 1) {
+      assertCurrent();
+      try {
+        decision = await decide(requirement, input.model.provider === "Built-in" ? undefined
+          : createRuntimeModel(input.model, input.apiKey, JSON.stringify({ ...context,
+            ...(protocolRecovered ? { protocolRepairBudget: { remainingModelCalls: 1 } } : {}),
+          }), input.generationSettings));
+        break;
+      } catch (error) {
+        assertCurrent();
+        if (!(error instanceof PlanProtocolError)) throw error;
+        const fingerprint = protocolRejectionFingerprint(error.repair);
+        if (maxProposals > 1 && (seenPlans.has(fingerprint) || attempt + 1 >= maxProposals)) {
+          error.repair.businessReplanProgress = {
+            attemptCount: attempt + (previousFailure ? 1 : 0),
+            stopReason: seenPlans.has(fingerprint) ? "no_progress" : "budget_exhausted",
+          };
+          throw error;
+        }
+        if (attempt + 1 >= maxProposals) throw error;
+        protocolRecovered = true;
+        seenPlans.add(fingerprint);
+        // Only the proposal changes: evidence, target and authority stay pinned.
+        // Model requests log each rejection; no rejected step enters task.plan.
+        context = { ...context, protocolReplan: protocolReplanContext({
+          ...input.task,
+          protocolRepair: { roundId: input.task.currentRoundId,
+            serverId: input.task.executionTargetServerId ?? input.task.serverId,
+            repair: error.repair, repairError: error.repairError },
+        }) };
+      }
+    }
+    if (!decision) throw new Error("协议恢复未返回阶段决策");
     assertCurrent();
+    if (decision.source !== "model") {
+      const noAction: NextStageDecision = {
+        decision: "adjust",
+        reason: "下一阶段模型决策不可用，Core 不会代替模型裁决整体目标。",
+        summary: "已保留执行证据，当前进入 blocked/no_action。",
+        source: "rules",
+        steps: [],
+      };
+      return {
+        requirement,
+        snapshot: context.baseSnapshot,
+        context,
+        decision: noAction,
+        complete: false,
+        nextPlan: [] as PlanStep[],
+        policyFingerprint: context.policyFingerprint,
+        combinedError: decision.reason,
+      };
+    }
     if (!matchesNextStageDecision(decision.decision)) {
       throw new Error("下一阶段联合决策返回了不支持的 decision");
     }
@@ -368,10 +430,16 @@ export async function decideTaskNextStage(
         policyFingerprint: context.policyFingerprint,
       };
     }
-    const nextPlan = selectContinuationSteps(recoveryHistory(input.task), decision.steps, taskAttemptContext(input.task));
+    const proposedSteps = protocolRecovered
+      ? markProtocolReplanApprovals(input.task,
+        normalizePlanPreconditions(freshProtocolReplanSteps(decision.steps), requirement, input.tools))
+      : decision.steps;
+    const nextPlan = selectContinuationSteps(recoveryHistory(input.task), proposedSteps, taskAttemptContext(input.task));
     assertTaskPlanAuthorization(input.task, nextPlan);
     validateRecoveryReferences(recoveryHistory(input.task), nextPlan, taskAttemptContext(input.task));
-    if (!nextPlan.length) throw new Error("下一阶段联合决策没有返回新的可执行步骤");
+    if (decision.decision === "continue" && !nextPlan.length) {
+      throw new Error("continue 决策必须返回新的可执行步骤");
+    }
     return {
       requirement,
       snapshot: context.baseSnapshot,
@@ -383,15 +451,7 @@ export async function decideTaskNextStage(
     };
   } catch (combinedError) {
     assertCurrent();
-    if (combinedError instanceof PlanProtocolError || combinedError instanceof ExecutionPolicyError
-      || modelServiceError(combinedError)) throw combinedError;
-    const fallback = await reviewTaskGoal(input, fallbackReview);
-    return {
-      ...fallback,
-      nextPlan: undefined,
-      policyFingerprint: context.policyFingerprint,
-      combinedError: String(combinedError),
-    };
+    throw combinedError;
   }
 }
 
@@ -401,13 +461,16 @@ function matchesNextStageDecision(value: string): value is NextStageDecision["de
 
 /**
  * Generates the next bounded continuation after a discovery or standalone Skill stage.
- * Existing and duplicate commands are removed so evidence collection is not repeated.
+ * The model proposal is preserved as one unit before hard authorization and
+ * recovery-metadata shape checks are applied.
  */
 export async function planDiscoveryContinuation(
   input: PlanDiscoveryContinuationInput,
   generatePlan: PlanGenerator = backend.generatePlan.bind(backend),
 ) {
   const lifetime = workflowLifetime(input.task);
+  await refreshTaskKnowledge(input.task.id, () => lifetime.current());
+  lifetime.assertCurrent();
   const context = JSON.stringify(buildContinuationContext({
     server: input.server,
     metrics: input.metrics,
@@ -440,9 +503,9 @@ export async function planTaskAdjustment(
   generatePlan: PlanGenerator = backend.generatePlan.bind(backend),
 ) {
   const lifetime = workflowLifetime(input.task);
-  const businessReplan = input.replanAfterProtocolFailure === true;
-  if (businessReplan && !activeProtocolRepair(input.task)) {
-    throw new Error("原协议事故已不属于当前目标或轮次，请基于当前任务重新规划");
+  if (!activeProtocolRepair(input.task) && input.failedStep?.result?.facts.category !== "plan_safety_rejection") {
+    await refreshTaskKnowledge(input.task.id, () => lifetime.current());
+    lifetime.assertCurrent();
   }
   const requirement = latestTaskRequirement(input.task);
   const context = buildAdjustmentContext({
@@ -456,9 +519,8 @@ export async function planTaskAdjustment(
     sharedSnapshot: input.sharedSnapshot,
     reviewDecision: input.reviewDecision,
     adjustmentReason: input.adjustmentReason,
-    replanAfterProtocolFailure: businessReplan,
   });
-  const safetyFacts = !businessReplan && input.failedStep?.result?.facts.category === "plan_safety_rejection"
+  const safetyFacts = input.failedStep?.result?.facts.category === "plan_safety_rejection"
     ? input.failedStep.result.facts
     : undefined;
   const safetyFields = safetyFacts
@@ -466,24 +528,18 @@ export async function planTaskAdjustment(
       .map((finding) => (finding as Record<string, unknown>)?.field)
       .filter((field): field is "command" | "validation" => field === "command" || field === "validation"))]
     : [];
-  const adjustmentInstruction = businessReplan
-    ? "原方案在执行前被拒绝，现在需要生成新的业务调整方案，而非继续修补旧计划字段。依据真实证据规划剩余目标，重新评估每个新步骤的操作类型、风险和验收；不继承旧步骤批准，不扩大用户授权。"
-    : safetyFields.length
+  const adjustmentInstruction = safetyFields.length
     ? `上一步在发送服务器前被安全门禁拦截。只修复该步骤的 ${safetyFields.join("、")} 字段并且只返回一个完整替代步骤；不得改写其他字段或扩大任务范围。`
     : input.failedStep
-    ? "上次执行未达到预期，请仅为未完成目标生成安全的调整计划。"
+    ? "上次执行未达到预期，请根据失败事实与最新证据，为未完成目标生成安全的调整计划。按影响范围修正失败步骤、补充前置检查或重规划剩余目标；模型先前生成的验收方法可修正，但不得降低用户明确要求的验收标准或扩大授权。保留历史失败，不要求被替代的旧路径逐条重试成功。"
     : "当前阶段已成功完成，但整体目标尚未验收；请仅规划剩余目标，不得将已成功步骤改写为失败或重复执行。";
-  let replacement = await generatePlan(
+  const replacement = await generatePlan(
     `${requirement}\n\n${adjustmentInstruction}`,
     input.model.provider === "Built-in"
       ? undefined
       : createRuntimeModel(input.model, input.apiKey, JSON.stringify(context), input.generationSettings),
   );
   lifetime.assertCurrent();
-  if (businessReplan) {
-    replacement = markProtocolReplanApprovals(input.task,
-      normalizePlanPreconditions(freshProtocolReplanSteps(replacement), requirement, input.tools));
-  }
   if (safetyFields.length && input.failedStep) {
     if (replacement.length !== 1) {
       throw new Error("安全门禁局部调整只能返回一个替代步骤");
@@ -500,9 +556,7 @@ export async function planTaskAdjustment(
       }
     }
   }
-  const selected = businessReplan
-    ? selectBusinessReplanSteps(recoveryHistory(input.task), replacement, taskAttemptContext(input.task))
-    : input.allowUnchangedFailureRetry
+  const selected = input.allowUnchangedFailureRetry
     ? selectContinuationSteps(
       recoveryHistory(input.task).filter((step) => step.status === "completed"),
       replacement,
@@ -540,10 +594,7 @@ export async function summarizeTaskExecution(
       })),
     });
   }
-  const generated = await generateSummary(requirement, steps, model);
-  const summary = completionSummaryContradictsGoal(generated)
-    ? buildGoalCompletedSummary(requirement, steps)
-    : generated;
+  const summary = await generateSummary(requirement, steps, model);
   return { summary, requirement, usedModel: model !== undefined };
 }
 

@@ -3,8 +3,9 @@ import { createPinia, setActivePinia } from "pinia";
 import { useConnectionStore } from "@/features/connection/connectionStore";
 import { confirmedInputScope } from "@/features/agent/confirmedUserInputs";
 import { backend, PlanProtocolError, type PlanNormalizationRepair } from "@/services/backend";
-import type { OpsTask, PermissionLevel, PlanStep, ServerProfile } from "@/types";
+import type { NextStageDecision, OpsTask, PermissionLevel, PlanStep, ServerProfile } from "@/types";
 import { useOpsStore } from "./ops";
+import missingSteps from "@/services/fixtures/next-stage-missing-steps.json";
 
 const server: ServerProfile = {
   id: "protocol-server", name: "协议重规划测试", host: "protocol.example.invalid", port: 22,
@@ -22,6 +23,18 @@ const change = (risk: PlanStep["risk"] = "medium") => step({
   id: "replacement-change", title: "启用内核转发", description: "按授权调整转发参数并独立验证",
   kind: "change", command: "sysctl -w net.ipv4.ip_forward=1",
   validation: "test \"$(sysctl -n net.ipv4.ip_forward)\" = 1", risk,
+});
+
+const nextStage = (
+  steps: PlanStep[] = [change(), step()],
+  overrides: Partial<NextStageDecision> = {},
+): NextStageDecision => ({
+  decision: "adjust",
+  source: "model",
+  steps,
+  reason: "整体目标尚未完成，需要进入下一阶段",
+  summary: "根据现有证据调整后续执行方案",
+  ...overrides,
 });
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
@@ -65,11 +78,11 @@ function fixture(permission: PermissionLevel = "safe"): { store: ReturnType<type
 }
 
 function generatedContext(index = 0) {
-  const call = vi.mocked(backend.generatePlan).mock.calls[index];
+  const call = vi.mocked(backend.decideNextStage).mock.calls[index];
   return JSON.parse(call?.[1]?.context || "{}");
 }
 
-function discoveryFixture(permission: PermissionLevel = "safe") {
+function completedPhaseFixture(permission: PermissionLevel = "safe") {
   const current = fixture(permission);
   const repair = clone(current.task.protocolRepair!.repair);
   current.task.protocolRepair = undefined;
@@ -105,6 +118,7 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     vi.spyOn(backend, "deleteCredential").mockResolvedValue(undefined);
     vi.spyOn(backend, "checkSshConnection").mockResolvedValue(undefined);
     vi.spyOn(backend, "generatePlan").mockResolvedValue([change(), step()]);
+    vi.spyOn(backend, "decideNextStage").mockResolvedValue(nextStage());
     vi.spyOn(backend, "executeCommand").mockRejectedValue(new Error("unexpected command dispatch"));
     vi.spyOn(backend, "executeAgentCommand").mockRejectedValue(new Error("unexpected Agent command dispatch"));
     await useConnectionStore().connect(server.id, {
@@ -117,6 +131,26 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     vi.restoreAllMocks();
   });
 
+  it("普通调整首次遇到退出码协议错误时自动重规划并保留证据与审批", async () => {
+    const { store, task, repair } = completedPhaseFixture();
+    task.status = "needs_adjustment";
+    const completed = clone(task.plan[0]);
+    const rejected = { ...repair, diagnostic: undefined,
+      validationError: "PIPELINE_STATUS_LOST / steps[0].command",
+      previousModelOutput: [step({ command: "git ls-remote https://example.invalid/app.git | head -n 20" })],
+    };
+    vi.mocked(backend.decideNextStage).mockRejectedValueOnce(new PlanProtocolError(rejected, "PROTOCOL_REPAIR_SCOPE_UNKNOWN"));
+
+    await store.beginAdjustment(task.id, true);
+
+    expect(backend.decideNextStage).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(generatedContext(1).protocolReplan)).toContain("PIPELINE_STATUS_LOST");
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(task.phaseHistory?.flatMap(phase => phase.plan)).toContainEqual(completed);
+    expect(task.plan.map(item => item.command)).not.toContain(rejected.previousModelOutput[0].command);
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
   it("人工调整创建新的变更与验证步骤，保留原轮次、目标、输入及已完成证据并等待计划审批", async () => {
     const { store, task } = fixture();
     const originalRepair = clone(task.protocolRepair);
@@ -125,7 +159,8 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
 
     await store.requestAdjustment(task.id);
 
-    expect(backend.generatePlan).toHaveBeenCalledTimes(1);
+    expect(backend.decideNextStage).toHaveBeenCalledTimes(1);
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(task.status).toBe("awaiting_plan_approval");
     expect(task.currentRoundId).toBe("protocol-round");
     expect(task.rootGoal).toBe(rootGoal);
@@ -141,8 +176,7 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
       replacementStepIds: task.plan.map(item => item.id),
     });
     const context = generatedContext();
-    expect(context.workflowPhase).toBe("business_replan_after_protocol_failure");
-    expect(context.planGenerationRepair).toBeUndefined();
+    expect(context.workflowPhase).toBe("decide_after_protocol_failure");
     expect(context.protocolReplan).toMatchObject({ rejectedPlanExecuted: false });
     expect(context.baseSnapshot).toBeDefined();
     expect(context.taskGoal.rootGoal).toBe(rootGoal);
@@ -151,15 +185,74 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     expect(backend.executeAgentCommand).not.toHaveBeenCalled();
   });
 
+  it("协议事故后的联合决策允许直接判定目标完成，不再强制生成替代步骤", async () => {
+    const { store, task } = fixture();
+    const originalPlan = clone(task.plan);
+    vi.mocked(backend.decideNextStage).mockResolvedValueOnce(nextStage([], {
+      decision: "complete",
+      reason: "既有执行证据已经满足整体目标",
+      summary: "控制平面已经完成验收，无需执行额外步骤。",
+    }));
+
+    await store.requestAdjustment(task.id);
+
+    expect(task.status).toBe("completed");
+    expect(task.summary).toBe("控制平面已经完成验收，无需执行额外步骤。");
+    expect(task.plan).toEqual(originalPlan);
+    expect(task.protocolRepair).toBeUndefined();
+    expect(task.protocolRepairHistory?.[0]).toMatchObject({
+      status: "accepted",
+      replacementStepIds: [],
+      outcome: "控制平面已经完成验收，无需执行额外步骤。",
+    });
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it("协议事故后的 adjust 加空步骤进入 blocked/no_action，不循环要求生成计划", async () => {
+    const { store, task } = fixture("managed");
+    const originalPlan = clone(task.plan);
+    vi.mocked(backend.decideNextStage).mockResolvedValueOnce(nextStage([], {
+      reason: "当前缺少继续操作所需的用户授权",
+      summary: "没有可执行的安全动作，等待用户补充授权。",
+    }));
+
+    await store.requestAdjustment(task.id);
+
+    expect(task.status).toBe("awaiting_continuation");
+    expect(task.pauseReason).toBe("没有可执行的安全动作，等待用户补充授权。");
+    expect(task.plan).toEqual(originalPlan);
+    expect(task.protocolRepair).toBeUndefined();
+    expect(task.latestGoalReview).toMatchObject({
+      decision: { decision: "adjust", source: "model" },
+      nextPlan: [],
+    });
+    expect(task.protocolRepairHistory?.[0]).toMatchObject({
+      status: "accepted",
+      replacementStepIds: [],
+      outcome: "blocked/no_action: 没有可执行的安全动作，等待用户补充授权。",
+    });
+    expect(task.managedAdjustmentPhase).toBe("manual_required");
+    expect(task.managedStopReason).toBe("no_action");
+    expect(task.autoAdjustmentSeconds).toBeUndefined();
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
   it("托管模式按新步骤的高风险等待逐步审批，不继承旧 observe 的低风险", async () => {
     const { store, task } = fixture("managed");
-    vi.mocked(backend.generatePlan).mockResolvedValueOnce([change("high"), step()]);
+    vi.mocked(backend.decideNextStage).mockResolvedValueOnce(nextStage([change("high"), step()]));
 
     await store.requestAdjustment(task.id);
 
     expect(task.status, task.pauseReason ?? JSON.stringify(task.messages)).toBe("awaiting_step_approval");
     expect(task.plan[0]).toMatchObject({ kind: "change", risk: "high", status: "awaiting_approval" });
     expect(task.protocolRepair).toBeUndefined();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(backend.executeCommand).not.toHaveBeenCalled();
     expect(backend.executeAgentCommand).not.toHaveBeenCalled();
   });
@@ -185,13 +278,13 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     const candidate = change("high");
     const approval = { command: candidate.command, validation: candidate.validation, risk: candidate.risk,
       executionScope: candidate.executionScope };
-    vi.mocked(backend.generatePlan).mockResolvedValueOnce([{
+    vi.mocked(backend.decideNextStage).mockResolvedValueOnce(nextStage([{
       ...candidate, id: "completed-inspection", status: "completed", output: "model claimed success",
       result: clone(task.plan[0].result), evidence: clone(task.plan[0].evidence),
       attemptContext: "old-context", startedAt: "2026-09-15T00:00:00Z", elapsedSeconds: 300,
       approvedSafetySnapshot: approval, safetyApprovalSnapshot: approval,
       authenticationGate: { fingerprint: "old-authentication", reason: "old permission", approved: true },
-    }]);
+    }]));
 
     await store.requestAdjustment(task.id);
 
@@ -213,7 +306,7 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
       groupId: "deployment-scope", groupTitle: "部署范围", submittedAt: "2026-09-16T00:00:00Z",
       scope: confirmedInputScope(task, "completed-input"),
     };
-    vi.mocked(backend.generatePlan).mockResolvedValueOnce([change("low")]);
+    vi.mocked(backend.decideNextStage).mockResolvedValueOnce(nextStage([change("low")]));
 
     await store.requestAdjustment(task.id);
 
@@ -231,11 +324,12 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     const originalRepair = clone(task.protocolRepair);
     task.executionConstraints = { changePolicy: "read_only", environmentPolicy: "preserve", failurePolicy: "strict",
       prohibitedActions: ["不得修改系统配置"], requiredConditions: [], userDirectives: ["仅检查现状"] };
-    vi.mocked(backend.generatePlan).mockResolvedValueOnce([change("low")]);
+    vi.mocked(backend.decideNextStage).mockResolvedValueOnce(nextStage([change("low")]));
 
     await store.requestAdjustment(task.id);
 
-    expect(backend.generatePlan).toHaveBeenCalledTimes(1);
+    expect(backend.decideNextStage).toHaveBeenCalledTimes(1);
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(generatedContext().executionConstraints.changePolicy).toBe("read_only");
     expect(task.status).toBe("needs_adjustment");
     expect(task.pauseReason).toContain("只读授权");
@@ -254,6 +348,7 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     await store.beginAdjustment(task.id, true);
     await store.queueManagedAdjustment(task.id);
 
+    expect(backend.decideNextStage).not.toHaveBeenCalled();
     expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(task.protocolRepair).toEqual(originalRepair);
     expect(task.protocolRepairHistory ?? []).toHaveLength(0);
@@ -261,19 +356,111 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     expect(backend.executeCommand).not.toHaveBeenCalled();
   });
 
-  it("发现阶段协议失败后由系统自动重规划，safe 低风险步骤直接衔接且不展示技术错误", async () => {
-    const { store, task, repair } = discoveryFixture("safe");
+  it("普通观察阶段结束后尊重模型无行动决定，不因旧 discovery 标记自动编造下一步", async () => {
+    const { store, task } = completedPhaseFixture("managed");
+    const originalPlan = clone(task.plan);
+    vi.mocked(backend.decideNextStage).mockResolvedValueOnce(nextStage([], {
+      reason: "缺少继续执行所需的事实或用户决定",
+      summary: "当前没有可执行的后续步骤，保留证据等待补充",
+    }));
+    const runStep = vi.spyOn(store, "runStep");
+
+    await store.advanceTask(task.id);
+    await store.advanceTask(task.id);
+
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(task.status).toBe("awaiting_continuation");
+    expect(task.latestGoalReview?.decision).toMatchObject({ decision: "adjust", source: "model" });
+    expect(task.latestGoalReview?.nextPlan).toEqual([]);
+    expect(task.plan).toEqual(originalPlan);
+    expect(task.protocolRepair).toBeUndefined();
+    expect(task.protocolRepairHistory ?? []).toHaveLength(0);
+    expect(runStep).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it("联合决策服务失败时保留执行记录并暂停，不自动生成替代业务行动", async () => {
+    const { store, task } = completedPhaseFixture("managed");
+    const originalPlan = clone(task.plan);
+    vi.mocked(backend.decideNextStage).mockRejectedValueOnce(new Error("next-stage service unavailable"));
+    const runStep = vi.spyOn(store, "runStep");
+
+    await store.advanceTask(task.id);
+    await store.advanceTask(task.id);
+
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.plan).toEqual(originalPlan);
+    expect(task.protocolRepair).toBeUndefined();
+    expect(task.protocolRepairHistory ?? []).toHaveLength(0);
+    expect(runStep).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it("真实缺 steps 响应自动进入恢复，生成提问后等待用户且不执行远程命令", async () => {
+    const { store, task } = completedPhaseFixture("safe");
+    const completed = clone(task.plan[0]);
+    const error = new PlanProtocolError({
+      errorCode: "next_stage_response_invalid", validationError: "阶段联合决策结构解析失败：missing field steps",
+      previousModelOutput: [], rawModelResponse: JSON.stringify(missingSteps), instruction: "返回完整联合决策",
+    }, "响应无法解析");
+    const question = step({ command: 'opsark-tool user.request_input {"title":"部署方式","description":"确认部署方式","fields":[{"key":"deployment","label":"部署方式","description":"请选择部署方式","type":"select","required":true,"options":[{"value":"host","label":"主机服务"},{"value":"container","label":"容器"}]}]}',
+      validation: "true" });
+    vi.mocked(backend.decideNextStage).mockRejectedValueOnce(error).mockResolvedValueOnce(nextStage([question]));
+
+    await store.advanceTask(task.id);
+
+    expect(backend.decideNextStage).toHaveBeenCalledTimes(2);
+    expect(task.status).toBe("awaiting_input");
+    expect(task.plan[0].status).toBe("awaiting_input");
+    expect(task.phaseHistory?.flatMap(phase => phase.plan)).toContainEqual(completed);
+    expect(task.protocolRepairHistory?.[0]).toMatchObject({
+      status: "accepted", repair: { rawModelResponse: JSON.stringify(missingSteps) },
+    });
+    expect(generatedContext(1).protocolReplan.rejectedResponse.content).toContain("本轮仅提交一个提问步骤");
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it("重复缺步骤响应有界暂停并保留原阶段证据，不降级为虚假的空计划", async () => {
+    const { store, task } = completedPhaseFixture("managed");
+    const original = clone(task.plan);
+    const error = new PlanProtocolError({
+      errorCode: "next_stage_response_invalid", validationError: "阶段联合决策结构解析失败：missing field steps",
+      previousModelOutput: [], rawModelResponse: JSON.stringify(missingSteps), instruction: "返回完整联合决策",
+    }, "响应无法解析");
+    vi.mocked(backend.decideNextStage).mockRejectedValue(error);
+    await store.advanceTask(task.id);
+    await store.advanceTask(task.id);
+    expect(backend.decideNextStage).toHaveBeenCalledTimes(2);
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.managedAdjustmentPhase).toBe("manual_required");
+    expect(task.pauseReason).toContain("响应格式不完整或不正确");
+    expect(task.plan).toEqual(original);
+    expect(task.protocolRepair?.repair.rawModelResponse).toBe(JSON.stringify(missingSteps));
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it("阶段联合决策协议失败后由系统自动重规划，safe 低风险步骤直接衔接且不展示技术错误", async () => {
+    const { store, task, repair } = completedPhaseFixture("safe");
     task.submittedInputs = undefined;
     const protocolError = new PlanProtocolError(repair, "PROTOCOL_REPAIR_SCOPE_VIOLATION: fixture detail");
     const replacement = change("low");
-    vi.mocked(backend.generatePlan)
+    vi.mocked(backend.decideNextStage)
       .mockRejectedValueOnce(protocolError)
-      .mockResolvedValueOnce([replacement]);
+      .mockResolvedValueOnce(nextStage([replacement]));
     const runStep = vi.spyOn(store, "runStep").mockResolvedValue(undefined);
 
     await store.advanceTask(task.id);
 
-    expect(backend.generatePlan).toHaveBeenCalledTimes(2);
+    expect(backend.decideNextStage).toHaveBeenCalledTimes(2);
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(task.protocolRepair).toBeUndefined();
     expect(task.protocolRepairHistory).toHaveLength(1);
     expect(task.protocolRepairHistory?.[0]).toMatchObject({
@@ -299,22 +486,23 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
       detail: expect.stringContaining('"triggerSource":"system_continuation"'),
     }));
     expect(store.developerLogs).toContainEqual(expect.objectContaining({
-      operation: "discovery_refinement",
+      operation: "workflow_progression",
       error: expect.stringContaining("PROTOCOL_REPAIR_SCOPE_VIOLATION"),
     }));
   });
 
   it("系统协议重规划在 managed 高风险步骤前停下等待具体步骤确认", async () => {
-    const { store, task, repair } = discoveryFixture("managed");
+    const { store, task, repair } = completedPhaseFixture("managed");
     const protocolError = new PlanProtocolError(repair, "PROTOCOL_REPAIR_SCOPE_VIOLATION: fixture detail");
-    vi.mocked(backend.generatePlan)
+    vi.mocked(backend.decideNextStage)
       .mockRejectedValueOnce(protocolError)
-      .mockResolvedValueOnce([change("high")]);
+      .mockResolvedValueOnce(nextStage([change("high")]));
     const runStep = vi.spyOn(store, "runStep");
 
     await store.advanceTask(task.id);
 
-    expect(backend.generatePlan).toHaveBeenCalledTimes(2);
+    expect(backend.decideNextStage).toHaveBeenCalledTimes(2);
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(task.status, task.pauseReason ?? JSON.stringify(task.messages)).toBe("awaiting_step_approval");
     expect(task.plan[0]).toMatchObject({ kind: "change", risk: "high", status: "awaiting_approval" });
     expect(store.needsApproval("managed", task.plan[0])).toBe(true);
@@ -326,21 +514,22 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
   });
 
   it("整体目标复核产生的后续方案协议阻断也会自动重新整理", async () => {
-    const { store, task, repair } = discoveryFixture("safe");
+    const { store, task, repair } = completedPhaseFixture("safe");
     task.discoveryRefined = true;
     task.refinementCount = 1;
     const protocolError = new PlanProtocolError(repair, "PROTOCOL_REPAIR_SCOPE_VIOLATION: next-stage fixture");
-    const decide = vi.spyOn(backend, "decideNextStage").mockRejectedValueOnce(protocolError);
-    vi.mocked(backend.generatePlan).mockResolvedValueOnce([step({
-      id: "next-stage-replacement",
-      command: "cat /proc/sys/net/ipv4/ip_forward",
-    })]);
+    vi.mocked(backend.decideNextStage)
+      .mockRejectedValueOnce(protocolError)
+      .mockResolvedValueOnce(nextStage([step({
+        id: "next-stage-replacement",
+        command: "cat /proc/sys/net/ipv4/ip_forward",
+      })]));
     const runStep = vi.spyOn(store, "runStep").mockResolvedValue(undefined);
 
     await store.advanceTask(task.id);
 
-    expect(decide).toHaveBeenCalledOnce();
-    expect(backend.generatePlan).toHaveBeenCalledOnce();
+    expect(backend.decideNextStage).toHaveBeenCalledTimes(2);
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(task.status).toBe("running");
     expect(task.protocolRepair).toBeUndefined();
     expect(task.protocolRepairHistory?.[0]).toMatchObject({ status: "accepted" });
@@ -354,18 +543,18 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     expect(visible).not.toContain("next-stage fixture");
   });
 
-  it("连续两个发现阶段的协议阻断不会被上一轮调整锁吞掉", async () => {
-    const { store, task, repair } = discoveryFixture("managed");
+  it("连续两个阶段联合决策的协议阻断不会被上一轮调整锁吞掉", async () => {
+    const { store, task, repair } = completedPhaseFixture("managed");
     const secondRepair: PlanNormalizationRepair = {
       ...clone(repair),
       validationError: "OBSERVE_COMMAND_MUTATION / steps[1].command / matchedToken=redirect",
       previousModelOutput: [step({ id: "second-rejected", command: "printf data >/tmp/second-rejected" })],
     };
-    vi.mocked(backend.generatePlan)
-      .mockRejectedValueOnce(new PlanProtocolError(repair, "first discovery protocol stop"))
-      .mockResolvedValueOnce([step({ id: "phase-one", command: "cat /proc/version" })])
-      .mockRejectedValueOnce(new PlanProtocolError(secondRepair, "second discovery protocol stop"))
-      .mockResolvedValueOnce([step({ id: "phase-two", command: "cat /proc/uptime" })]);
+    vi.mocked(backend.decideNextStage)
+      .mockRejectedValueOnce(new PlanProtocolError(repair, "first next-stage protocol stop"))
+      .mockResolvedValueOnce(nextStage([step({ id: "phase-one", command: "cat /proc/version" })]))
+      .mockRejectedValueOnce(new PlanProtocolError(secondRepair, "second next-stage protocol stop"))
+      .mockResolvedValueOnce(nextStage([step({ id: "phase-two", command: "cat /proc/uptime" })]));
     const runStep = vi.spyOn(store, "runStep").mockImplementation(async (_taskId, stepId) => {
       if (runStep.mock.calls.length !== 1) return;
       const completed = task.plan.find(candidate => candidate.id === stepId)!;
@@ -385,7 +574,8 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
 
     await store.advanceTask(task.id);
 
-    expect(backend.generatePlan).toHaveBeenCalledTimes(4);
+    expect(backend.decideNextStage).toHaveBeenCalledTimes(4);
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(task.protocolRepair).toBeUndefined();
     expect(task.protocolRepairHistory?.map(record => record.status)).toEqual(["accepted", "accepted"]);
     expect(task.status).toBe("running");
@@ -397,22 +587,23 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
   });
 
   it("系统业务重规划再次违反协议时有界停止，拒绝计划与旧计划都不会远程执行", async () => {
-    const { store, task, repair } = discoveryFixture("safe");
-    const discoveryError = new PlanProtocolError(repair, "first protocol repair rejected");
+    const { store, task, repair } = completedPhaseFixture("safe");
+    const nextStageError = new PlanProtocolError(repair, "first protocol repair rejected");
     const rejectedAgain = {
       ...repair,
       validationError: "OBSERVE_COMMAND_MUTATION / steps[2].command / matchedToken=redirect",
       previousModelOutput: [change("low")],
     };
     const replanError = new PlanProtocolError(rejectedAgain, "PROTOCOL_REPAIR_SCOPE_VIOLATION: bounded stop");
-    vi.mocked(backend.generatePlan)
-      .mockRejectedValueOnce(discoveryError)
-      .mockRejectedValueOnce(replanError);
+    vi.mocked(backend.decideNextStage)
+      .mockRejectedValueOnce(nextStageError)
+      .mockRejectedValue(replanError);
     const runStep = vi.spyOn(store, "runStep");
 
     await store.advanceTask(task.id);
 
-    expect(backend.generatePlan).toHaveBeenCalledTimes(2);
+    expect(backend.decideNextStage).toHaveBeenCalledTimes(3);
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(task.status).toBe("needs_adjustment");
     expect(task.managedAdjustmentPhase).toBe("manual_required");
     expect(task.protocolRepair?.repair.validationError).toBe(rejectedAgain.validationError);
@@ -435,7 +626,7 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     const { store, task } = fixture();
     const originalPlan = clone(task.plan);
     const originalRepair = clone(task.protocolRepair);
-    vi.mocked(backend.generatePlan).mockRejectedValueOnce(new Error("fixture planner unavailable"));
+    vi.mocked(backend.decideNextStage).mockRejectedValueOnce(new Error("fixture planner unavailable"));
 
     await store.requestAdjustment(task.id);
 
@@ -447,9 +638,9 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
 
     await store.requestAdjustment(task.id);
 
-    expect(backend.generatePlan).toHaveBeenCalledTimes(2);
-    expect(generatedContext(1).workflowPhase).toBe("business_replan_after_protocol_failure");
-    expect(generatedContext(1).planGenerationRepair).toBeUndefined();
+    expect(backend.decideNextStage).toHaveBeenCalledTimes(2);
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(generatedContext(1).workflowPhase).toBe("decide_after_protocol_failure");
     expect(task.status).toBe("awaiting_plan_approval");
     expect(task.protocolRepair).toBeUndefined();
     expect(task.protocolRepairHistory?.map(item => item.status)).toEqual(["failed", "accepted"]);
@@ -458,17 +649,20 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
 
   it("人工重复点击只产生一个在途新计划和一条协议审计记录", async () => {
     const { store, task } = fixture();
-    let finish!: (steps: PlanStep[]) => void;
-    vi.mocked(backend.generatePlan).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    let finish!: (decision: NextStageDecision) => void;
+    vi.mocked(backend.decideNextStage).mockImplementationOnce(
+      () => new Promise<NextStageDecision>(resolve => { finish = resolve; }),
+    );
     const first = store.requestAdjustment(task.id);
-    await vi.waitFor(() => expect(backend.generatePlan).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(backend.decideNextStage).toHaveBeenCalledTimes(1));
     expect(task.protocolRepairHistory?.[0].status).toBe("planning");
 
     await store.requestAdjustment(task.id);
-    finish([change(), step()]);
+    finish(nextStage());
     await first;
 
-    expect(backend.generatePlan).toHaveBeenCalledTimes(1);
+    expect(backend.decideNextStage).toHaveBeenCalledTimes(1);
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(task.protocolRepairHistory).toHaveLength(1);
     expect(task.protocolRepairHistory?.[0].status).toBe("accepted");
     expect(task.status).toBe("awaiting_plan_approval");
@@ -479,13 +673,15 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     const { store, task } = fixture();
     const originalPlan = clone(task.plan);
     const originalRepair = clone(task.protocolRepair);
-    let finish!: (steps: PlanStep[]) => void;
-    vi.mocked(backend.generatePlan).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    let finish!: (decision: NextStageDecision) => void;
+    vi.mocked(backend.decideNextStage).mockImplementationOnce(
+      () => new Promise<NextStageDecision>(resolve => { finish = resolve; }),
+    );
     const pending = store.requestAdjustment(task.id);
-    await vi.waitFor(() => expect(backend.generatePlan).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(backend.decideNextStage).toHaveBeenCalledTimes(1));
 
     task.submittedInputs!.k8s_version.value = "1.32";
-    finish([change(), step()]);
+    finish(nextStage());
     await pending;
 
     expect(task.status).toBe("needs_adjustment");
@@ -503,9 +699,11 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     const originalPlan = clone(task.plan);
     const originalRepair = clone(task.protocolRepair)!;
     let reject!: (reason: unknown) => void;
-    vi.mocked(backend.generatePlan).mockImplementationOnce(() => new Promise((_resolve, no) => { reject = no; }));
+    vi.mocked(backend.decideNextStage).mockImplementationOnce(
+      () => new Promise<NextStageDecision>((_resolve, no) => { reject = no; }),
+    );
     const pending = store.requestAdjustment(task.id);
-    await vi.waitFor(() => expect(backend.generatePlan).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(backend.decideNextStage).toHaveBeenCalledTimes(1));
 
     task.executionTargetServerId = "different-server";
     reject(new PlanProtocolError({ ...originalRepair.repair, validationError: "new response from old target" }, "late failure"));
@@ -547,6 +745,7 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     expect(restored.protocolRepairHistory?.[0]).toMatchObject({
       ...originalRepair, status: "failed", outcome: expect.stringContaining("应用重启中断规划"),
     });
+    expect(backend.decideNextStage).not.toHaveBeenCalled();
     expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(backend.executeCommand).not.toHaveBeenCalled();
     expect(backend.executeAgentCommand).not.toHaveBeenCalled();

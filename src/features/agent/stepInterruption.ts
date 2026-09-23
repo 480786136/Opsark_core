@@ -42,7 +42,7 @@ export function failToolCommandParsing(step: PlanStep, error: unknown): StepFail
 
 /** Prevents a saved credential from being silently reused for a different service. */
 export function failSecretPurposeMismatch(step: PlanStep, key: string, description: string): StepFailureOutcome {
-  const pauseReason = `敏感变量 ${key} 的已保存用途为“${description}”，与步骤“${step.title}”所需凭据不一致。系统已阻止复用；请生成调整方案并使用语义明确的新变量收集正确凭据。`;
+  const pauseReason = `敏感变量 ${key} 的已保存用途为“${description}”，与步骤“${step.title}”所需凭据不一致。系统已阻止复用；请重新规划并使用语义明确的新变量收集正确凭据。`;
   transitionStep(step, "failed");
   step.progressMessage = "敏感变量用途不匹配";
   step.result = {

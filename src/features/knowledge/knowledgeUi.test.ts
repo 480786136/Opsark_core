@@ -34,9 +34,9 @@ it("keeps the preview destination visible and blocks upload after configuration 
 });
 it("renders safe defaults and the browser-only warning on the settings page",async()=>{
   const pinia=createPinia();app=createApp(KnowledgeSettings).use(pinia).use(i18n);app.mount(host);await nextTick();
-  expect(host.textContent).toContain("当前为浏览器预览");expect(host.textContent).toContain("尚未接入 Agent");
+  expect(host.textContent).toContain("当前为浏览器预览");expect(host.textContent).toContain("向所选知识库发送脱敏查询");
   expect(Array.from(host.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')).every(i=>!i.checked)).toBe(true);
   expect(knowledgeRequest).not.toHaveBeenCalled();
   i18n.global.locale.value="en-US";await nextTick();
-  expect(host.textContent).toContain("Browser preview");expect(host.textContent).toContain("Agent retrieval and document sending are not connected yet");
+  expect(host.textContent).toContain("Browser preview");expect(host.textContent).toContain("sends a redacted query");
 });

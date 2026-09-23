@@ -167,12 +167,30 @@ export function openAdjustmentIncident(
 ): AdjustmentIncident {
   return {
     ...snapshot,
+    planningAttemptCount: 0,
     executionAttemptCount: 0,
     generationFailureCount: 0,
     automatic,
     createdAt: timestamp,
     updatedAt: timestamp,
   };
+}
+
+/** Planning and execution have separate budgets; neither rewrites failed attempts. */
+export function recordAdjustmentPlan(incident: AdjustmentIncident, steps: PlanStep[], timestamp: string) {
+  incident.planningAttemptCount = (incident.planningAttemptCount ?? 0) + 1;
+  incident.activePlan = { stepIds: steps.map(step => step.id), executionCounted: false };
+  incident.updatedAt = timestamp;
+}
+
+/** Call only on execution evidence, or after submission with an unknown outcome. */
+export function recordAdjustmentExecution(incident: AdjustmentIncident | undefined, stepId: string, timestamp: string) {
+  const active = incident?.activePlan;
+  if (!incident || !active || active.executionCounted || !active.stepIds.includes(stepId)) return false;
+  active.executionCounted = true;
+  incident.executionAttemptCount += 1;
+  incident.updatedAt = timestamp;
+  return true;
 }
 
 export function isSameAdjustmentIncident(

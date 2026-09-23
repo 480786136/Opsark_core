@@ -397,6 +397,12 @@ onMounted(async () => {
   terminal.loadAddon(new WebLinksAddon());
   terminal.open(terminalHost.value!);
   terminal.attachCustomKeyEventHandler((event) => {
+    // Returning false only skips xterm handling; it does not cancel WebView
+    // navigation. Keep held delete keys inside the terminal during reconnects.
+    if (!canWrite.value || event.key === "Backspace" || event.key === "Delete") {
+      event.preventDefault();
+      event.stopPropagation();
+    }
     if (matchesTerminalShortcut(event, "find", preferences.terminalShortcutPreset)) { toggleSearch(); return false; }
     if (matchesTerminalShortcut(event, "history", preferences.terminalShortcutPreset)) { toggleHistory(); return false; }
     if (matchesTerminalShortcut(event, "copy", preferences.terminalShortcutPreset)) { void copySelection(); return false; }

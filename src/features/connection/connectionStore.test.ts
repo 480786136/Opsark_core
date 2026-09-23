@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { computed } from "vue";
 import type { RuntimeConnection } from "@/services/backend";
-import { connectionErrorMessage, useConnectionStore } from "./connectionStore";
+import { connectionErrorMessage, isConnectionTransportFailure, useConnectionStore } from "./connectionStore";
 
 const { checkSshConnection } = vi.hoisted(() => ({ checkSshConnection: vi.fn() }));
 vi.mock("@/services/backend", () => ({ backend: { checkSshConnection } }));
@@ -375,5 +375,14 @@ describe("server connection coordinator", () => {
     expect(store.state("server").status).toBe("reconnecting");
     expect(store.isConnected("other")).toBe(true);
     expect(store.connection("other")?.host).toBe("other.example.invalid");
+  });
+});
+
+describe("terminal transport failure classification", () => {
+  it.each([
+    "终端输出读取失败：transport read",
+    "终端输入发送失败：Failure while draining incoming flow",
+  ])("recognizes %s so the coordinator can recover", (reason) => {
+    expect(isConnectionTransportFailure(reason)).toBe(true);
   });
 });

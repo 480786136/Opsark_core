@@ -5,6 +5,16 @@ import type { OpsTask } from "@/types";
 
 const resources = import.meta.glob<string>("./definitions/**/*.{json,md}", { query: "?raw", import: "default", eager: true });
 describe("file-backed Skill definitions", () => {
+  it("keeps every system Skill advisory, recoverable and free of tool policies", () => {
+    for (const skill of loadBuiltInSkills()) {
+      expect(skill.instructions).toContain("不是工具权限或固定状态机");
+      expect(skill.instructions).toContain("保留整体目标与已完成证据");
+      expect(skill.instructions).toContain("不绕过授权、凭据保护或执行隔离");
+      expect(skill.instructions.length).toBeLessThanOrEqual(8000);
+      for (const key of ["allowShell", "allowedToolIds", "forbiddenToolIds"]) expect(skill).not.toHaveProperty(key);
+      for (const stage of skill.planningContract?.stages ?? []) expect(stage).not.toHaveProperty("allowedToolIds");
+    }
+  });
   it("keeps source identity stable across Windows line endings", () => {
     expect(skillSourceFingerprint("one\r\ntwo")).toBe(skillSourceFingerprint("one\ntwo"));
   });

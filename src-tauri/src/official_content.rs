@@ -35,7 +35,7 @@ fn verify(value: &Value, kind: &str, id: &str) -> Result<(), String> {
         return Err("官方内容完整性校验失败，继续使用本地版本".into());
     }
     let bundle: Value = serde_json::from_str(content).map_err(|_| "官方内容格式无效")?;
-    if !(bundle["schema_version"] == 1 || (kind == "tools" && bundle["schema_version"] == 2))
+    if !(bundle["schema_version"] == 1 || bundle["schema_version"] == 2)
         || bundle["kind"] != kind
         || bundle["version"] != value["version"]
         || bundle["min_core_version"] != value["min_core_version"]
@@ -175,7 +175,8 @@ mod tests {
             ("tools", 2, true),
             ("tools", 3, false),
             ("skills", 1, true),
-            ("skills", 2, false),
+            ("skills", 2, true),
+            ("skills", 3, false),
         ] {
             let mut value = fixture();
             let mut bundle: Value =

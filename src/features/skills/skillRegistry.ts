@@ -235,10 +235,8 @@ export function resolveTaskSkills(task: OpsTask, catalog: SkillDefinition[] = bu
 }
 
 export function buildSkillContext(skills: SkillDefinition[]): ModelSkillDefinition[] {
-  return skills.map(({ id, name, description, version, instructions, allowedToolIds, forbiddenToolIds }) => ({
+  return skills.map(({ id, name, description, version, instructions }) => ({
     id, name, description, version, instructions,
-    ...(allowedToolIds ? { allowedToolIds: [...allowedToolIds] } : {}),
-    forbiddenToolIds: [...(forbiddenToolIds ?? [])],
   }));
 }
 

@@ -5,10 +5,7 @@ import {
   backend,
   buildPlanNormalizationRepair,
   normalizePlanPreconditions,
-  PlanProtocolError,
 } from "@/services/backend";
-import { textFingerprint } from "@/features/agent/longRunningReviewOutput";
-import { planCommandIdentity } from "@/features/agent/taskProgression";
 import type { PlanStep } from "@/types";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -34,17 +31,9 @@ function observe(id: string, command: string): PlanStep {
 
 const readBatch = ["containerd", "kubeadm", "kubelet", "kubectl"].map((name) =>
   observe(`software-${name}`, `opsark-tool software.check {"names":["${name}"],"includeVersions":true}`));
-const shellBatch = [
-  "uname -a",
-  "cat /etc/os-release",
-  "swapon --show",
-  "sysctl net.ipv4.ip_forward",
-  "free -m",
-  "df -h /",
-  "id -u",
-].map((command, index) => observe(`shell-${index}`, command));
+const shellBatch = ["uname -a", "cat /etc/os-release"].map((command, index) => observe(`shell-${index}`, command));
 const standalone = observe("resolve-worker", 'opsark-tool server.resolve_connection {"host":"10.213.81.53","port":22}');
-const loggedPlan = [...readBatch, ...shellBatch];
+const mixedPlan = [...readBatch, ...shellBatch];
 
 function runtime(context: Record<string, unknown> = {}) {
   return {
@@ -55,11 +44,7 @@ function runtime(context: Record<string, unknown> = {}) {
   };
 }
 
-function completedFingerprints(steps: PlanStep[]) {
-  return steps.map((step) => textFingerprint(planCommandIdentity(step.command)));
-}
-
-function savedRepair(steps: PlanStep[] = loggedPlan) {
+function savedRepair(steps: PlanStep[] = mixedPlan) {
   return buildPlanNormalizationRepair(new Error(legacyConflict), structuredClone(steps));
 }
 
@@ -71,275 +56,129 @@ afterEach(() => {
   vi.resetAllMocks();
 });
 
-describe("deterministic read-batch stage repair", () => {
-  it("classifies the logged mixed read-batch plan as a stage conflict without relaxing validation", () => {
-    let error: unknown;
-    try { normalizePlanPreconditions(structuredClone(loggedPlan), requirement); } catch (caught) { error = caught; }
-
-    expect(error).toBeInstanceOf(Error);
-    expect(String(error)).toContain("只读批次不能混入");
-    expect(buildPlanNormalizationRepair(error, loggedPlan)).toMatchObject({
-      errorCode: "plan_normalization_failed",
-      repairStrategy: { type: "read_batch_stage_split" },
-      fieldPath: "steps",
-      previousModelOutput: loggedPlan,
-    });
+describe("ordered mixed plans and standalone boundaries", () => {
+  it("preserves the entire mixed plan and its order", () => {
+    const result = normalizePlanPreconditions(structuredClone(mixedPlan), requirement);
+    expect(result.map(step => step.command)).toEqual(mixedPlan.map(step => step.command));
   });
 
-  it("keeps all four software checks from the 4-tool + 7-Shell plan with one model call", async () => {
-    const original = structuredClone(loggedPlan);
+  it("accepts the complete mixed plan instead of extracting its read_batch prefix", async () => {
+    const original = structuredClone(mixedPlan);
     vi.mocked(invoke).mockResolvedValueOnce(original);
 
-    const plan = await backend.generatePlan(requirement, runtime());
-
-    expect(plan).toHaveLength(4);
-    expect(plan).toMatchObject(readBatch);
-    expect(original).toEqual(loggedPlan);
+    expect((await backend.generatePlan(requirement, runtime())).map(step => step.command))
+      .toEqual(mixedPlan.map(step => step.command));
+    expect(original).toEqual(mixedPlan);
     expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).toEqual(["generate_ai_plan"]);
-    expect(invoke).toHaveBeenCalledWith("generate_ai_plan", expect.objectContaining({ requirement }));
   });
 
-  it("keeps the contiguous Shell prefix when the mixed plan starts with Shell", async () => {
-    vi.mocked(invoke).mockResolvedValueOnce(structuredClone([...shellBatch, ...readBatch]));
+  it("accepts a Shell prefix followed by read_batch tools", async () => {
+    const original = [...shellBatch, ...readBatch];
+    vi.mocked(invoke).mockResolvedValueOnce(structuredClone(original));
 
-    const plan = await backend.generatePlan(requirement, runtime());
-
-    expect(plan).toHaveLength(7);
-    expect(plan).toMatchObject(shellBatch);
+    expect((await backend.generatePlan(requirement, runtime())).map(step => step.command))
+      .toEqual(original.map(step => step.command));
     expect(invoke).toHaveBeenCalledOnce();
   });
 
-  it("uses catalog planMode for different read tools instead of software-specific matching", async () => {
+  it("uses catalog planMode rather than software-specific matching", async () => {
     const readTools = [
       observe("structure", 'opsark-tool files.get_structure {"rootPath":"/srv/app"}'),
       observe("readme", 'opsark-tool files.read_content {"path":"/srv/app/README.md"}'),
-      observe("software", 'opsark-tool software.check {"names":["node"]}'),
     ];
-    vi.mocked(invoke).mockResolvedValueOnce(structuredClone([...readTools, ...shellBatch]));
+    const original = [...readTools, ...shellBatch];
+    vi.mocked(invoke).mockResolvedValueOnce(structuredClone(original));
 
-    const plan = await backend.generatePlan("检查应用运行条件", runtime());
-
-    expect(plan).toHaveLength(3);
-    expect(plan).toMatchObject(readTools);
+    expect((await backend.generatePlan("检查应用运行条件", runtime())).map(step => step.command))
+      .toEqual(original.map(step => step.command));
     expect(invoke).toHaveBeenCalledOnce();
   });
 
-  it("advances through read-batch, standalone, Shell, and a second read-batch using trusted prefix evidence", async () => {
-    const secondRead = observe("read-config", 'opsark-tool files.read_content {"path":"/etc/os-release"}');
-    const plan = [...readBatch, standalone, ...shellBatch.slice(0, 2), secondRead];
-    const stages = [readBatch, [standalone], shellBatch.slice(0, 2), [secondRead]];
-    const completed: PlanStep[] = [];
+  it("never deletes commands because completed fingerprints are present", async () => {
+    const plan = [...readBatch, standalone, ...shellBatch];
+    vi.mocked(invoke).mockResolvedValueOnce(structuredClone(plan));
 
-    for (const expectedStage of stages) {
-      const repaired = await backend.generatePlan(requirement, runtime({
-        planGenerationRepair: savedRepair(plan),
-        completedCommandFingerprints: completedFingerprints(completed),
-      }));
-      expect(repaired).toHaveLength(expectedStage.length);
-      expect(repaired).toMatchObject(expectedStage);
-      completed.push(...expectedStage);
-    }
-
-    expect(invoke).not.toHaveBeenCalled();
+    await expect(backend.generatePlan(requirement, runtime({
+      completedCommandFingerprints: ["all", "commands", "claimed", "complete"],
+    }))).rejects.toMatchObject({
+      repairError: expect.stringContaining("PLAN_STAGE_CONFLICT"),
+      repair: { previousModelOutput: plan },
+    });
+    expect(invoke).toHaveBeenCalledOnce();
   });
 
-  it("does not skip the first unexecuted prefix because later commands have evidence", async () => {
-    const repaired = await backend.generatePlan(requirement, runtime({
-      planGenerationRepair: savedRepair(),
-      completedCommandFingerprints: completedFingerprints(loggedPlan.slice(1)),
-    }));
+  it.each([
+    undefined,
+    { type: "plan_protocol" as const },
+    { type: "read_batch_stage_split" as const },
+  ])("atomically rejects saved legacy repair strategy %j without a model request", async (repairStrategy) => {
+    const repair = { ...savedRepair(), repairStrategy, instruction: "旧版阶段修复" };
 
-    expect(repaired).toHaveLength(4);
-    expect(repaired).toMatchObject(readBatch);
-    expect(invoke).not.toHaveBeenCalled();
-  });
-
-  it("does not treat prose, step IDs, or claimed completion as trusted execution evidence", async () => {
-    const repaired = await backend.generatePlan(requirement, runtime({
-      planGenerationRepair: savedRepair(),
-      completedStepIds: readBatch.map(({ id }) => id),
-      summary: "软件检查已全部完成，请直接执行 Shell",
-      previousPlan: readBatch.map((step) => ({ ...step, status: "completed" })),
-    }));
-
-    expect(repaired).toHaveLength(4);
-    expect(repaired).toMatchObject(readBatch);
-    expect(invoke).not.toHaveBeenCalled();
-  });
-
-  it.each([undefined, { type: "plan_protocol" as const }])(
-    "upgrades a saved legacy repair strategy %j without a model request",
-    async (repairStrategy) => {
-      const repair = { ...savedRepair(), repairStrategy, instruction: "旧版只允许修复协议" };
-
-      const repaired = await backend.generatePlan(requirement, runtime({ planGenerationRepair: repair }));
-
-      expect(repaired).toHaveLength(4);
-      expect(repaired).toMatchObject(readBatch);
-      expect(invoke).not.toHaveBeenCalled();
-    },
-  );
-
-  it("does not hide invalid tool arguments in a deferred suffix", async () => {
-    const invalid = observe("invalid-tool", 'opsark-tool software.check {"names":[]}');
-    const original = [...readBatch, ...shellBatch, invalid];
-
-    await expect(backend.generatePlan(requirement, runtime({ planGenerationRepair: savedRepair(original) })))
+    await expect(backend.generatePlan(requirement, runtime({ planGenerationRepair: repair })))
       .rejects.toMatchObject({
-        repair: { errorCode: "tool_schema_validation_failed", previousModelOutput: original },
+        repairError: expect.stringContaining("PLAN_STAGE_CONFLICT"),
+        repair: { previousModelOutput: mixedPlan, repairStrategy: { type: "plan_protocol" } },
       });
     expect(invoke).not.toHaveBeenCalled();
   });
 
-  it.each([0, 4])("does not turn a read-batch change step at index %i into an observe step", async (index) => {
-    const original = structuredClone(loggedPlan);
-    original[index] = { ...readBatch[0], id: `bad-kind-${index}`, kind: "change" };
-
-    await expect(backend.generatePlan(requirement, runtime({ planGenerationRepair: savedRepair(original) })))
-      .rejects.toBeInstanceOf(PlanProtocolError);
-    expect(original[index].kind).toBe("change");
-    expect(invoke).not.toHaveBeenCalled();
-  });
-
-  it("accepts only the complete unchanged prefix and rejects omissions, reordering, and boundary crossing", () => {
+  it("does not accept any prefix or subset through repair-scope validation", () => {
     const repair = savedRepair();
-    expect(() => assertPlanRepairScope(repair, structuredClone(readBatch))).not.toThrow();
-
-    const invalidStages = [
-      [],
-      readBatch.slice(0, 3),
-      [...readBatch].reverse(),
-      [readBatch[0], readBatch[2], readBatch[3]],
-      [...readBatch, shellBatch[0]],
-      shellBatch,
-    ];
-    for (const candidate of invalidStages) {
-      expect(() => assertPlanRepairScope(repair, structuredClone(candidate))).toThrow();
+    for (const candidate of [readBatch, readBatch.slice(0, 3), shellBatch, [], mixedPlan]) {
+      expect(() => assertPlanRepairScope(repair, structuredClone(candidate)))
+        .toThrow("PLAN_STAGE_CONFLICT");
     }
   });
 
-  it("rejects semantic field changes even when the changed plan is independently valid", () => {
-    const repair = savedRepair();
-    const edits: Partial<PlanStep>[] = [
-      { id: "replacement" },
-      { kind: "change" },
-      { title: "改换业务目标" },
-      { description: "扩大业务范围" },
-      { command: 'opsark-tool software.check {"names":["mysql"]}' },
-      { expected: "改换验收条件" },
-      { validation: "true" },
-      { risk: "high" },
-      { executionScope: "isolated_exec" },
-      { runtimeClass: "progressive" },
-      { status: "completed" },
-    ];
-    for (const edit of edits) {
-      const candidate = structuredClone(readBatch);
-      candidate[0] = { ...candidate[0], ...edit };
-      expect(() => assertPlanRepairScope(repair, candidate)).toThrow();
-    }
-  });
-
-  it("preserves the initial intent, goal relation, Skill selection, and original requirement", async () => {
-    const selectedSkillIds = ["general-software-installation"];
-    vi.mocked(invoke).mockResolvedValueOnce({
-      intent: "execute",
-      relation: "new_goal",
-      selectedSkillIds,
-      plan: structuredClone(loggedPlan),
-    });
+  it("preserves requirement classification while accepting the entire mixed plan", async () => {
+    const result = {
+      intent: "execute" as const,
+      relation: "new_goal" as const,
+      selectedSkillIds: ["general-software-installation"],
+      plan: structuredClone(mixedPlan),
+    };
+    vi.mocked(invoke).mockResolvedValueOnce(result);
 
     const processed = await backend.processRequirement(requirement, runtime(), []);
-
-    expect(processed).toMatchObject({ intent: "execute", relation: "new_goal", selectedSkillIds });
-    expect(processed.plan).toHaveLength(4);
-    expect(processed.plan).toMatchObject(readBatch);
+    expect(processed.intent).toBe("execute");
+    expect(processed.plan?.map(step => step.command)).toEqual(mixedPlan.map(step => step.command));
     expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).toEqual(["process_ai_requirement"]);
-    expect(invoke).toHaveBeenCalledWith("process_ai_requirement", expect.objectContaining({ requirement }));
   });
 
-  it("preserves a next-stage decision while advancing past the verified read-batch prefix", async () => {
-    const plan = [...readBatch, standalone, ...shellBatch];
-    const decisionFields = { decision: "continue", reason: "下一阶段查询连接资料", summary: "软件检查已完成，整体目标尚未完成" };
-    vi.mocked(invoke).mockResolvedValueOnce({ ...decisionFields, steps: structuredClone(plan) });
+  it("preserves the next-stage decision while rejecting all of its conflicting steps", async () => {
+    const plan = [...readBatch, standalone];
+    const decision = { decision: "continue" as const, reason: "仍需检查", summary: "继续下一阶段", steps: plan };
+    vi.mocked(invoke).mockResolvedValueOnce(structuredClone(decision));
 
-    const decision = await backend.decideNextStage(requirement, runtime({
-      completedCommandFingerprints: completedFingerprints(readBatch),
-    }));
-
-    expect(decision).toMatchObject({ ...decisionFields, source: "model" });
-    expect(decision.steps).toHaveLength(1);
-    expect(decision.steps).toMatchObject([standalone]);
+    await expect(backend.decideNextStage(requirement, runtime({
+      completedCommandFingerprints: ["claimed-complete"],
+    }))).rejects.toMatchObject({
+      repair: {
+        previousModelOutput: plan,
+        nextStageDecision: { decision: "continue", reason: decision.reason, summary: decision.summary },
+      },
+    });
     expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).toEqual(["decide_ai_next_stage"]);
   });
 
-  it("stage-splits after a necessary field-local repair succeeds without requesting another repair", async () => {
+  it("keeps the full mixed plan after repairing one invalid tool argument", async () => {
     const malformed = observe("schema-first", 'opsark-tool software.check {"names":[]}');
     const corrected = { ...malformed, command: 'opsark-tool software.check {"names":["node"]}' };
+    const correctedPlan = [corrected, ...structuredClone(shellBatch)];
     vi.mocked(invoke)
       .mockResolvedValueOnce([malformed, ...structuredClone(shellBatch)])
-      .mockResolvedValueOnce([corrected, ...structuredClone(shellBatch)]);
+      .mockResolvedValueOnce(correctedPlan);
 
-    const plan = await backend.generatePlan("检查应用运行条件", runtime());
-
-    expect(plan).toHaveLength(1);
-    expect(plan).toMatchObject([corrected]);
+    expect((await backend.generatePlan("检查应用运行条件", runtime())).map(step => step.command))
+      .toEqual(correctedPlan.map(step => step.command));
     expect(vi.mocked(invoke).mock.calls.map(([command]) => command))
       .toEqual(["generate_ai_plan", "generate_ai_plan"]);
-    expect(vi.mocked(invoke).mock.calls[1][1]).toMatchObject({
-      requirement: expect.stringContaining("只修复"),
-    });
   });
 
-  it("stage-splits a saved field-local repair response without rerunning initial classification", async () => {
-    const malformed = observe("saved-schema-first", 'opsark-tool software.check {"names":[]}');
-    const corrected = { ...malformed, command: 'opsark-tool software.check {"names":["node"]}' };
-    const original = [malformed, ...structuredClone(shellBatch)];
-    const repair = buildPlanNormalizationRepair(
-      new Error("第 1 个计划步骤的工具参数无效：names 至少需要 1 项"), original,
-    );
-    vi.mocked(invoke).mockResolvedValueOnce([corrected, ...structuredClone(shellBatch)]);
+  it("still accepts a complete homogeneous read_batch plan", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce(structuredClone(readBatch));
 
-    const plan = await backend.generatePlan("检查应用运行条件", runtime({ planGenerationRepair: repair }));
-
-    expect(plan).toHaveLength(1);
-    expect(plan).toMatchObject([corrected]);
-    expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).toEqual(["generate_ai_plan"]);
+    await expect(backend.generatePlan("检查软件", runtime())).resolves.toMatchObject(readBatch);
+    expect(invoke).toHaveBeenCalledOnce();
   });
-
-  it.each(["new", "saved"])(
-    "persists the corrected plan and current scope failure after %s field-local repair",
-    async (entry) => {
-      const malformed = observe("schema-before-scope", 'opsark-tool software.check {"names":[]}');
-      const corrected = { ...malformed, command: 'opsark-tool software.check {"names":["node"]}' };
-      const invalidScope: PlanStep = {
-        ...shellBatch[0],
-        executionScope: "isolated_exec",
-        sessionContextChange: { cwd: "/srv/app" },
-      };
-      const original = [malformed, invalidScope];
-      const correctedPlan = [corrected, invalidScope];
-      const previousRepair = buildPlanNormalizationRepair(
-        new Error("第 1 个计划步骤的工具参数无效：names 至少需要 1 项"), original,
-      );
-      if (entry === "new") vi.mocked(invoke).mockResolvedValueOnce(structuredClone(original));
-      vi.mocked(invoke).mockResolvedValueOnce(structuredClone(correctedPlan));
-
-      let error: unknown;
-      try {
-        await backend.generatePlan("检查应用运行条件", runtime(
-          entry === "saved" ? { planGenerationRepair: previousRepair } : {},
-        ));
-      } catch (caught) { error = caught; }
-
-      expect(error).toBeInstanceOf(PlanProtocolError);
-      const currentRepair = (error as PlanProtocolError).repair;
-      expect(currentRepair.previousModelOutput).toEqual(correctedPlan);
-      expect(currentRepair.validationError).toContain("只有 agent_session 步骤可以更新 AgentSessionContext");
-      expect(currentRepair.validationError).not.toContain("names");
-      expect(currentRepair.errorCode).toBe("plan_normalization_failed");
-      expect(vi.mocked(invoke).mock.calls.map(([command]) => command))
-        .toEqual(entry === "new" ? ["generate_ai_plan", "generate_ai_plan"] : ["generate_ai_plan"]);
-    },
-  );
 });

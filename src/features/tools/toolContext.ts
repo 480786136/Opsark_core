@@ -40,36 +40,20 @@ export function buildToolContext(tools: ToolDefinition[]): ModelToolDefinition[]
 }
 
 /**
- * Applies the trusted Skill-level tool policy before full schemas enter a
- * model request. Legacy/custom Skills without an allow-list deliberately keep
- * the complete planner-visible catalog so an optimization cannot remove an
- * unknown business capability.
+ * Skills describe workflows, not capabilities. Keep the optional argument for
+ * callers carrying legacy Skill snapshots; only live product grants and tool
+ * visibility determine the model's capability directory.
  */
 export function selectPlanningTools(
   tools: ToolDefinition[],
-  skills: SkillDefinition[] = [],
+  _skills: SkillDefinition[] = [],
 ): ToolDefinition[] {
-  const forbidden = new Set(skills.filter((skill) => skill.builtIn).flatMap((skill) => skill.forbiddenToolIds ?? []));
-  const policySkills = skills.filter((skill) => skill.builtIn);
-  const restrictToAllowLists = policySkills.length > 0
-    && policySkills.every((skill) => skill.allowedToolIds !== undefined);
-  const allowed = restrictToAllowLists
-    ? new Set(policySkills.flatMap((skill) => skill.allowedToolIds ?? []))
-    : undefined;
-  if (skills.some((skill) => skill.planningContract)) allowed?.add("context.expand");
-  allowed?.add("evidence.read");
-  // Clarification stays available when a Skill omits the basic interaction.
-  allowed?.add("user.request_input");
   const granted = new Set(readExecutionPermissions().toolIds);
   return tools.filter((tool) => (
     tool.enabled
     && officialToolEnabled(tool.id)
     && granted.has(tool.id)
-    && skills.every(skill => !skill.builtIn || !skill.allowedToolIds || skill.allowedToolIds.includes(tool.id)
-      || tool.id === "user.request_input" || tool.id === "evidence.read")
     && (tool.modelExposure ?? "planner") === "planner"
-    && !forbidden.has(tool.id)
-    && (!allowed || allowed.has(tool.id))
   ));
 }
 

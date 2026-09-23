@@ -84,6 +84,18 @@ describe("execution scope contract", () => {
   });
 
   it.each([
+    "在当前终端前台执行克隆，将仓库获取到 /opt/report。",
+    "以及当前会话对 /opt 是否可写（opt-write-test: yes/no）",
+    "Execute git clone in the current terminal.",
+  ])("does not confuse executor context with user PTY ownership: %s", (description) => {
+    expect(validatePlanStepExecutionScope(step({
+      description,
+      command: "git clone -- https://gitee.com/belief-team/report.git /opt/report",
+      validation: "git -C /opt/report rev-parse --verify HEAD",
+    })).executionScope).toBe("isolated_exec");
+  });
+
+  it.each([
     ["只读获取当前负载、运行时长与登录会话概况，作为运行状态基线。", "uptime && who"],
     ["只读查看当前登录会话、最近登录记录与关键目录权限提示，评估访问安全性。", "who; w; last -n 5; uptime; date"],
     ["Read the current shell environment and list existing sessions.", "printenv; who"],

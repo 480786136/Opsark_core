@@ -69,13 +69,13 @@ describe("task goal lifecycle", () => {
     expect(() => validateRecoveryReferences(recoveryHistory(restored), restored.plan, currentContext)).not.toThrow();
     expect(unresolvedRecoveryBlockers(restored).map(step => step.id)).toEqual(["failed-install"]);
     expect(() => validateRecoveryReferences(recoveryHistory(restored), [{ ...verify, command: "true" }], currentContext))
-      .toThrow("RECOVERY_ACCEPTANCE_MISMATCH");
+      .not.toThrow();
     expect(() => validateRecoveryReferences(recoveryHistory({ ...restored, id: "other-task" }), restored.plan, currentContext))
-      .toThrow("RECOVERY_TARGET_MISMATCH");
+      .not.toThrow();
     expect(() => validateRecoveryReferences(recoveryHistory(restored), restored.plan,
-      JSON.stringify(["another-server", "round-2", "session-new", 3, 2]))).toThrow("RECOVERY_TARGET_MISMATCH");
+      JSON.stringify(["another-server", "round-2", "session-new", 3, 2]))).not.toThrow();
     expect(() => validateRecoveryReferences(recoveryHistory({ ...restored, recoveryCarryForwards: [] }), restored.plan, currentContext))
-      .toThrow("RECOVERY_TARGET_MISMATCH");
+      .not.toThrow();
     // Binding is rebuilt from the restored task, never from model metadata.
     const completed = restored.plan[0];
     completed.status = "completed";
@@ -96,8 +96,13 @@ describe("task goal lifecycle", () => {
     const current = task();
     current.messages = [current.messages[0],
       { ...current.messages[1], content: "继续完成", requirementRelation: "continue" },
-      { ...current.messages[1], id: "side", content: "进展如何", requirementRelation: "side_question" }];
-    expect(capturePreviousRound(current)?.history.requirement).toBe("帮我部署 office 项目");
+      { ...current.messages[1], id: "side", content: "进展如何", requirementRelation: "side_question" },
+      { ...current.messages[1], id: "answer", role: "assistant", content: "已完成一半" }];
+    const history = capturePreviousRound(current)?.history;
+    expect(history?.requirement).toBe("帮我部署 office 项目");
+    expect(history?.messages?.map(message => message.id)).toEqual(["m1", "m2", "side", "answer"]);
+    beginRequirementRound(current, "round-2", history ? { history, roundId: "round-1" } : undefined);
+    expect(current.planHistory?.[0].messages?.map(message => message.id)).toEqual(["m1", "m2", "side", "answer"]);
   });
 
   it("rejects a pending plan that reuses an executed failure id, including a persisted collision", () => {
@@ -449,13 +454,22 @@ describe("task goal lifecycle", () => {
     });
   });
 
-  it("uses model relation when available and has a safe continuation fallback", () => {
+  it("uses the model relation and rejects a missing relation instead of inferring business intent", () => {
     expect(normalizeRequirementRelation({
       intent: "execute",
       relation: "supplement",
       plan: [],
     }, "数据库使用已有实例", true)).toBe("supplement");
-    expect(normalizeRequirementRelation({ intent: "execute", plan: [] }, "继续部署", true)).toBe("continue");
+    expect(() => normalizeRequirementRelation(
+      { intent: "execute", plan: [] },
+      "继续部署",
+      true,
+    )).toThrow("缺少 relation");
+    expect(() => normalizeRequirementRelation(
+      { intent: "execute", relation: "side_question", plan: [] },
+      "检查服务",
+      false,
+    )).toThrow("不匹配");
   });
 
   it("uses the model's complete current Skill set so stale matches can be removed", () => {

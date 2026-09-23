@@ -293,7 +293,7 @@ fn clarification_uses_one_tool_step_in_the_existing_next_stage_contract() {
     let raw: AiNextStageDecision = parse_model_json(&response.to_string()).unwrap();
     let visible = HashSet::from(["user.request_input".to_string()]);
     let converted = validate_and_convert_ai_next_stage(
-        raw, &AiGenerationSettings::default(), &HashSet::new(), Some(&visible),
+        raw, &AiGenerationSettings::default(), Some(&visible),
     ).unwrap();
     assert_eq!(converted.decision, "adjust");
     assert_eq!(converted.steps.len(), 1);
@@ -321,7 +321,6 @@ fn review_routes_missing_user_decisions_to_planning_without_adding_steps() {
 #[test]
 fn next_stage_complete_requires_empty_steps_and_serializes_the_public_contract() {
     let settings = AiGenerationSettings::default();
-    let forbidden = HashSet::new();
     let complete = AiNextStageDecision {
         decision: " complete ".into(),
         reason: " 已有作用域匹配的结构化证据 ".into(),
@@ -330,7 +329,7 @@ fn next_stage_complete_requires_empty_steps_and_serializes_the_public_contract()
     };
 
     let converted =
-        validate_and_convert_ai_next_stage(complete, &settings, &forbidden, None).unwrap();
+        validate_and_convert_ai_next_stage(complete, &settings, None).unwrap();
     assert_eq!(converted.decision, "complete");
     assert!(converted.steps.is_empty());
     let value = serde_json::to_value(converted).unwrap();
@@ -356,50 +355,62 @@ fn next_stage_complete_requires_empty_steps_and_serializes_the_public_contract()
         steps: vec![AiPlanStep::default()],
     };
     assert!(
-        validate_and_convert_ai_next_stage(invalid, &settings, &forbidden, None)
+        validate_and_convert_ai_next_stage(invalid, &settings, None)
             .unwrap_err()
             .contains("complete 时 steps 必须为空数组")
     );
 }
 
 #[test]
-fn next_stage_non_complete_decisions_require_a_valid_plan() {
+fn next_stage_continue_requires_a_plan_but_adjust_can_report_no_action() {
     let settings = AiGenerationSettings::default();
-    for decision in ["continue", "adjust"] {
-        let empty = AiNextStageDecision {
-            decision: decision.into(),
-            reason: "目标尚未完成".into(),
-            summary: "需要下一阶段".into(),
-            steps: Vec::new(),
-        };
-        let error = validate_and_convert_ai_next_stage(empty, &settings, &HashSet::new(), None)
-            .unwrap_err();
-        assert!(error.contains("steps 至少需要 1 个元素"), "{error}");
-    }
+    let empty_continue = AiNextStageDecision {
+        decision: "continue".into(),
+        reason: "目标尚未完成".into(),
+        summary: "需要下一阶段".into(),
+        steps: Vec::new(),
+    };
+    let error = validate_and_convert_ai_next_stage(
+        empty_continue, &settings, None,
+    ).unwrap_err();
+    assert!(error.contains("steps 至少需要 1 个元素"), "{error}");
+
+    let no_action = AiNextStageDecision {
+        decision: "adjust".into(),
+        reason: "当前没有合法且有意义的可执行动作".into(),
+        summary: "保留现有证据并停止生成步骤".into(),
+        steps: Vec::new(),
+    };
+    let converted = validate_and_convert_ai_next_stage(
+        no_action, &settings, None,
+    ).unwrap();
+    assert_eq!(converted.decision, "adjust");
+    assert!(converted.steps.is_empty());
 
     let response = r#"{"decision":"continue","reason":"还需读取目录","summary":"进入最小发现阶段","steps":[{"kind":"observe","title":"读取项目结构","description":"获取项目目录树","command":"opsark-tool files.get_structure {\"rootPath\":\"/opt/app\"}","expected":"获得项目目录树","validation":true,"risk":"low"}]}"#;
     let raw: AiNextStageDecision = parse_model_json(response).unwrap();
     assert_eq!(raw.steps[0].validation, "true");
     let converted =
-        validate_and_convert_ai_next_stage(raw, &settings, &HashSet::new(), None).unwrap();
+        validate_and_convert_ai_next_stage(raw, &settings, None).unwrap();
     assert_eq!(converted.decision, "continue");
     assert_eq!(converted.steps.len(), 1);
     assert_eq!(converted.steps[0].validation, "true");
 }
 
 #[test]
-fn next_stage_reuses_shell_validation_and_active_skill_tool_gates() {
+fn next_stage_reuses_shell_validation_and_visible_tool_gates() {
     let settings = AiGenerationSettings::default();
     let tool_response = r#"{"decision":"adjust","reason":"需要改用 Skill 允许的凭据通道","summary":"当前工具被禁用","steps":[{"kind":"observe","title":"解析连接","description":"解析目标服务器连接","command":"opsark-tool server.resolve_connection {\"serverId\":\"server-1\"}","expected":"获得连接信息","validation":"true","risk":"low"}]}"#;
     let raw: AiNextStageDecision = parse_model_json(tool_response).unwrap();
-    let forbidden = HashSet::from(["server.resolve_connection".to_string()]);
-    let error = validate_and_convert_ai_next_stage(raw, &settings, &forbidden, None).unwrap_err();
-    assert!(error.contains("active Skill 禁止工具"), "{error}");
+    let visible = HashSet::from(["user.request_input".to_string()]);
+    let error = validate_and_convert_ai_next_stage(raw, &settings, Some(&visible)).unwrap_err();
+    let envelope: Value = serde_json::from_str(&error).unwrap_or(json!(null));
+    assert!(error.contains("当前规划上下文未开放工具"), "{envelope}: {error}");
 
     let shell_response = r#"{"decision":"continue","reason":"还需创建结果文件","summary":"执行变更阶段","steps":[{"kind":"change","title":"创建文件","description":"创建结果文件","command":"touch /tmp/opsark-result","expected":"结果文件存在","validation":true,"risk":"low"}]}"#;
     let raw: AiNextStageDecision = parse_model_json(shell_response).unwrap();
     let error =
-        validate_and_convert_ai_next_stage(raw, &settings, &HashSet::new(), None).unwrap_err();
+        validate_and_convert_ai_next_stage(raw, &settings, None).unwrap_err();
     assert!(error.contains("无业务意义的 validation"), "{error}");
 }
 
@@ -415,12 +426,13 @@ fn next_stage_request_has_an_explicit_evidence_gate_and_opt_in_token_limit() {
     assert!(body.get("max_tokens").is_none());
     let system = body["messages"][0]["content"].as_str().unwrap();
     assert!(system.contains(GENERAL_PLAN_SYSTEM));
-    assert!(system.contains("完成证据门禁"));
+    assert!(system.contains("完成证据指引"));
     assert!(system.contains(
         "计划文字、步骤标题、expected、阶段 summary、模型 review、指令和待执行步骤都不是完成证据"
     ));
     assert!(system.contains(r#""validation":"true""#));
     assert!(system.contains("decision=complete 时 steps 必须严格为空数组"));
+    assert!(system.contains("blocked/no_action"));
 
     let limited = AiGenerationSettings {
         limit_output: true,
@@ -438,78 +450,34 @@ fn next_stage_request_has_an_explicit_evidence_gate_and_opt_in_token_limit() {
 }
 
 #[test]
-fn rejects_tools_forbidden_by_active_skills_without_blocking_shell_or_allowed_tools() {
-    let context = r#"{
-        "activeSkills": [
-            {
-                "id": "project-source-acquisition",
-                "forbiddenToolIds": ["server.resolve_connection", "server.connect"]
-            },
-            {
-                "id": "another-skill",
-                "forbiddenToolIds": ["server.connect", ""]
-            }
-        ]
-    }"#;
-    let forbidden = active_skill_forbidden_tool_ids(context).unwrap();
-    assert_eq!(forbidden.len(), 2);
-    assert!(forbidden.contains("server.resolve_connection"));
-    assert!(forbidden.contains("server.connect"));
-
-    let step = |command: &str, validation: &str| AiPlanStep {
-        kind: "change".into(),
-        title: "执行步骤".into(),
-        description: "根据 active Skill 执行最小流程".into(),
-        command: command.into(),
-        expected: "获得可验证结果".into(),
-        validation: validation.into(),
-        risk: Some("low".into()),
-        ..AiPlanStep::default()
-    };
-
-    let blocked = step(
-        r#"opsark-tool server.resolve_connection {"serverId":"server-1"}"#,
-        "true",
-    );
-    let error = validate_active_skill_tool_policy(&[blocked], &forbidden).unwrap_err();
-    assert!(error.contains("第 1 个计划步骤"), "{error}");
-    assert!(error.contains("active Skill 禁止工具"), "{error}");
-    assert!(error.contains("server.resolve_connection"), "{error}");
-    let repair = plan_repair_instruction(&error, None);
-    assert!(repair.contains("activeSkills.instructions"));
-    assert!(repair.contains("凭据通道"));
-    assert!(repair.contains("必要能力不存在"));
-
-    let blocked_legacy_syntax = step(
-        r#"opsark-tool --server.connect {"credentialRef":"credential-1"}"#,
-        "true",
-    );
-    assert!(validate_active_skill_tool_policy(&[blocked_legacy_syntax], &forbidden).is_err());
-
-    let allowed_tool = step(
-        r#"opsark-tool user.request_input {"title":"凭据","description":"收集凭据","fields":[]}"#,
-        "true",
-    );
-    let shell = step(
-        "git ls-remote https://gitee.com/example/repo.git",
-        "test -d /opt",
-    );
-    assert!(validate_active_skill_tool_policy(&[allowed_tool, shell], &forbidden).is_ok());
-}
-
-#[test]
-fn validates_active_skill_tool_policy_context_shape() {
-    assert!(active_skill_forbidden_tool_ids(r#"{"otherContext":true}"#)
-        .unwrap()
-        .is_empty());
-    assert!(active_skill_forbidden_tool_ids(r#"{"activeSkills":{}}"#)
-        .unwrap_err()
-        .contains("activeSkills 必须是数组"));
-    assert!(active_skill_forbidden_tool_ids(
-        r#"{"activeSkills":[{"forbiddenToolIds":"server.connect"}]}"#
-    )
-    .unwrap_err()
-    .contains("forbiddenToolIds 必须是数组"));
+fn missing_steps_uses_focused_schema_repair_and_never_accepts_empty_completion() {
+    let context = json!({"_log":{"taskId":"format-task"},
+        "protocolReplan":{"errorCode":"next_stage_response_invalid","rule":"missing field `steps`",
+            "rejectedResponse":{"content":"{\"decision\":\"continue\",\"reason\":\"need inspect\",\"summary\":\"not complete\"}"}},
+        "tools":[{"id":"files.get_structure"}],"executionConstraints":{"changePolicy":"readonly"},
+        "activeSkills":["omitted skill text"],"baseSnapshot":{"historyCheckpoint":"omitted old history"}}).to_string();
+    let settings = AiGenerationSettings::default();
+    let body = build_next_stage_request_body("model", "deploy", &context, &settings);
+    assert_eq!(body["response_format"]["type"], "json_schema");
+    assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+    assert!(!body.to_string().contains("omitted skill text"));
+    assert!(!body.to_string().contains("omitted old history"));
+    let (prepared, log) = prompt_layers::prepare_request(&body);
+    assert_eq!(log["taskId"], "format-task");
+    assert!(prepared.to_string().contains("files.get_structure"));
+    for decision in ["complete", "continue", "adjust"] {
+        let payload = json!({"choices":[{"message":{"content":json!({"decision":decision,"reason":"done","summary":"done","steps":[]}).to_string()}}]});
+        let error = parse_next_stage_with_format_guard(&payload, &context).unwrap_err();
+        assert!(error.contains("非空 steps"));
+    }
+    let step = json!({"kind":"observe","title":"inspect","description":"read actual state",
+        "command":"pwd","validation":"","risk":"low","expected":"path"});
+    let payload = json!({"choices":[{"message":{"content":json!({"decision":"continue","reason":"inspect","summary":"unfinished","steps":[step]}).to_string()}}]});
+    let decision = parse_next_stage_with_format_guard(&payload, &context).unwrap();
+    assert!(validate_next_stage_preserving_recovery(decision, &settings, None).is_ok());
+    // A normal, evidence-backed complete decision remains legal outside format repair.
+    let payload = json!({"choices":[{"message":{"content":"{\"decision\":\"complete\",\"reason\":\"verified\",\"summary\":\"done\",\"steps\":[]}"}}]});
+    assert!(parse_next_stage_with_format_guard(&payload, "{}").is_ok());
 }
 
 #[test]
@@ -547,7 +515,7 @@ fn rejects_tools_not_exposed_in_the_current_planning_context() {
 
 #[test]
 fn repairs_missing_presentational_plan_fields_but_rejects_missing_execution_fields() {
-    let missing_title = r#"{"steps":[{"kind":"change","description":"检查目标是否正常。","command":"custom-tool inspect","expected":"","validation":"custom-tool inspect >/dev/null","risk":"low"}]}"#;
+    let missing_title = r#"{"steps":[{"kind":"change","description":"检查目标是否正常。","command":"custom-tool inspect","expected":"返回真实状态","validation":"custom-tool inspect >/dev/null","risk":"low"}]}"#;
     let repairable = parse_model_array_field(missing_title, "steps").unwrap();
     assert!(
         validate_ai_plan_contract(&repairable, &AiGenerationSettings::default())
@@ -556,7 +524,12 @@ fn repairs_missing_presentational_plan_fields_but_rejects_missing_execution_fiel
     );
     let normalized = convert_ai_plan_steps(repairable).unwrap();
     assert_eq!(normalized[0].title, "检查目标是否正常");
-    assert!(!normalized[0].expected.is_empty());
+    assert_eq!(normalized[0].expected, "返回真实状态");
+
+    let missing_expected = r#"{"steps":[{"kind":"change","title":"检查","description":"检查目标","command":"custom-tool inspect","expected":"","validation":"custom-tool inspect >/dev/null","risk":"low"}]}"#;
+    let error = convert_ai_plan_steps(parse_model_array_field(missing_expected, "steps").unwrap())
+        .unwrap_err();
+    assert!(error.contains("expected"));
 
     let missing_command = r#"{"steps":[{"kind":"change","title":"检查","description":"检查目标","expected":"返回状态","validation":"custom-tool inspect >/dev/null","risk":"low"}]}"#;
     let error = convert_ai_plan_steps(parse_model_array_field(missing_command, "steps").unwrap())
@@ -880,6 +853,34 @@ fn rejects_credential_bound_git_step_that_disables_pty_prompts() {
     assert!(instruction.contains("GIT_TERMINAL_PROMPT=1"));
     assert!(instruction.contains("不得重新索取凭据"));
     assert!(instruction.contains("server-credential"));
+}
+
+#[test]
+fn permits_anonymous_git_probe_without_inventing_credential_binding() {
+    let step = AiPlanStep {
+        kind: "observe".into(),
+        title: "匿名探测仓库可读性".into(),
+        description: "命令不使用凭据、不修改 URL 协议。".into(),
+        command: "GIT_TERMINAL_PROMPT=0 git ls-remote --heads --tags https://gitee.com/belief-team/report.git; rc=$?; echo \"ls-remote-exit:$rc\"; exit $rc".into(),
+        expected: "返回远端引用或真实错误和退出码".into(),
+        validation: "".into(),
+        risk: Some("low".into()),
+        ..AiPlanStep::default()
+    };
+    assert!(validate_ai_plan_contract(
+        std::slice::from_ref(&step),
+        &AiGenerationSettings::default(),
+    )
+    .is_ok());
+    for reference in ["server-credential:credential-git", "${secret.GIT_HTTP_CREDENTIAL}"] {
+        let bound = AiPlanStep {
+            description: reference.into(),
+            ..step.clone()
+        };
+        assert!(validate_ai_plan_contract(&[bound], &AiGenerationSettings::default())
+            .unwrap_err()
+            .contains("禁用了交互认证提示"));
+    }
 }
 
 #[test]
@@ -1880,8 +1881,8 @@ fn loads_only_model_selected_skills_into_plan_context() {
             description: "获取代码项目".into(),
             version: 1,
             instructions: "SOURCE_WORKFLOW".into(),
-            allowed_tool_ids: Some(vec!["user.request_input".into()]),
-            forbidden_tool_ids: vec!["server.resolve_connection".into()],
+            _legacy_allowed_tool_ids: Some(vec!["user.request_input".into()]),
+            _legacy_forbidden_tool_ids: vec!["server.resolve_connection".into()],
         },
         ModelSkillDefinition {
             id: "project-build".into(),
@@ -1889,8 +1890,8 @@ fn loads_only_model_selected_skills_into_plan_context() {
             description: "构建代码项目".into(),
             version: 1,
             instructions: "BUILD_WORKFLOW".into(),
-            allowed_tool_ids: Some(vec!["files.read_content".into()]),
-            forbidden_tool_ids: Vec::new(),
+            _legacy_allowed_tool_ids: Some(vec!["files.read_content".into()]),
+            _legacy_forbidden_tool_ids: Vec::new(),
         },
     ];
     let context = r#"{"skillDirectory":[{"id":"project-source-acquisition"},{"id":"project-build"}],"activeSkills":[],"tools":[{"id":"server.resolve_connection"},{"id":"files.read_content"}]}"#;
@@ -1919,21 +1920,19 @@ fn loads_only_model_selected_skills_into_plan_context() {
     assert_eq!(value["activeSkills"][1]["id"], "project-source-acquisition");
     assert_eq!(value["activeSkills"][0]["instructions"], "BUILD_WORKFLOW");
     assert_eq!(value["executionConstraints"]["changePolicy"], "read_only");
-    assert_eq!(
-        value["activeSkills"][1]["forbiddenToolIds"],
-        json!(["server.resolve_connection"])
-    );
-    assert_eq!(value["tools"], json!([{"id":"files.read_content"}]));
+    assert!(value["activeSkills"][1].get("forbiddenToolIds").is_none());
+    assert!(value["activeSkills"][1].get("allowedToolIds").is_none());
+    assert_eq!(value["tools"], json!([{"id":"server.resolve_connection"},{"id":"files.read_content"}]));
 }
 
 #[test]
-fn skill_allow_lists_preserve_visible_clarification_without_overriding_tool_blocks() {
+fn legacy_skill_metadata_does_not_change_the_live_capability_directory() {
     let mut skill = ModelSkillDefinition {
         id: "bounded-workflow".into(), name: "有限工作流".into(),
         description: "仅允许读取指定内容".into(), version: 1,
         instructions: "按已确认目标读取内容".into(),
-        allowed_tool_ids: Some(vec!["files.read_content".into()]),
-        forbidden_tool_ids: Vec::new(),
+        _legacy_allowed_tool_ids: Some(vec!["files.read_content".into()]),
+        _legacy_forbidden_tool_ids: Vec::new(),
     };
     let selected = vec![skill.id.clone()];
     let context = r#"{"tools":[{"id":"files.read_content"},{"id":"user.request_input"},{"id":"evidence.read"},{"id":"files.get_structure"}]}"#;
@@ -1946,6 +1945,7 @@ fn skill_allow_lists_preserve_visible_clarification_without_overriding_tool_bloc
     let visible = context_visible_tool_ids(&enriched).unwrap().unwrap();
     assert_eq!(visible, HashSet::from([
         "files.read_content".to_string(), "user.request_input".to_string(), "evidence.read".to_string(),
+        "files.get_structure".to_string(),
     ]));
     assert!(validate_visible_tool_policy(std::slice::from_ref(&question), Some(&visible)).is_ok());
 
@@ -1957,13 +1957,11 @@ fn skill_allow_lists_preserve_visible_clarification_without_overriding_tool_bloc
     assert!(!visible.contains("user.request_input"));
     assert!(validate_visible_tool_policy(std::slice::from_ref(&question), Some(&visible)).is_err());
 
-    skill.forbidden_tool_ids.push("user.request_input".into());
+    skill._legacy_forbidden_tool_ids.push("user.request_input".into());
     let enriched = context_with_selected_skills(context, &[skill], &selected, None).unwrap();
     let visible = context_visible_tool_ids(&enriched).unwrap().unwrap();
-    assert!(!visible.contains("user.request_input"));
-    let forbidden = active_skill_forbidden_tool_ids(&enriched).unwrap();
-    assert!(validate_active_skill_tool_policy(std::slice::from_ref(&question), &forbidden).is_err());
-    assert!(validate_visible_tool_policy(&[question], Some(&visible)).is_err());
+    assert!(visible.contains("user.request_input"));
+    assert!(validate_visible_tool_policy(&[question], Some(&visible)).is_ok());
 }
 
 #[test]
@@ -2018,51 +2016,17 @@ fn build_blockers_cannot_plan_deployment_before_artifact_evidence() {
 }
 
 #[test]
-fn initial_readonly_classification_repairs_only_a_proven_fresh_task() {
+fn initial_readonly_classification_is_rejected_without_core_relation_rewrite() {
     let response = json!({"intent":"execute","relation":"side_question","answer":"",
         "constraints":{"changePolicy":"read_only","environmentPolicy":"unspecified","failurePolicy":"unspecified",
             "prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},
         "terminalContextLines":0,"selectedSkillIds":[]});
-    let fresh = json!({"conversationHistory":[],"knownExecutionFacts":{"completedSteps":[]}});
-    let mut decision: AiRequirementDecision = serde_json::from_value(response.clone()).unwrap();
+    let decision: AiRequirementDecision = serde_json::from_value(response.clone()).unwrap();
     let error = classification_contract_error(&decision, None).unwrap();
     assert!(error.contains("execute.relation"));
     assert!(!error.contains("constraints 必须"));
-    assert!(normalize_initial_readonly_relation(
-        &mut decision,
-        &fresh.to_string()
-    ));
-    assert_eq!(decision.relation.as_deref(), Some("new_goal"));
+    assert_eq!(decision.relation.as_deref(), Some("side_question"));
     assert_eq!(decision.constraints, response["constraints"]);
-    assert!(classification_contract_error(&decision, None).is_none());
-
-    for context in [
-        json!({}),
-        json!({"conversationHistory":[]}),
-        json!({"conversationHistory":[{"role":"user","content":"prior"}],"knownExecutionFacts":{"completedSteps":[]}}),
-        json!({"conversationHistory":[],"knownExecutionFacts":{"completedSteps":[{"id":"old"}]}}),
-        json!({"taskGoal":{"rootGoal":"deploy"},"conversationHistory":[],"knownExecutionFacts":{"completedSteps":[]}}),
-        json!({"previousExecution":{},"conversationHistory":[],"knownExecutionFacts":{"completedSteps":[]}}),
-    ] {
-        let mut decision: AiRequirementDecision = serde_json::from_value(response.clone()).unwrap();
-        assert!(!normalize_initial_readonly_relation(
-            &mut decision,
-            &context.to_string()
-        ));
-        assert_eq!(decision.relation.as_deref(), Some("side_question"));
-    }
-    for policy in [
-        "unspecified",
-        "requested_changes_only",
-        "allow_necessary_changes",
-    ] {
-        let mut decision: AiRequirementDecision = serde_json::from_value(response.clone()).unwrap();
-        decision.constraints["changePolicy"] = json!(policy);
-        assert!(!normalize_initial_readonly_relation(
-            &mut decision,
-            &fresh.to_string()
-        ));
-    }
 }
 
 #[test]

@@ -26,7 +26,10 @@ export function collectPlanningEvidence(task: OpsTask, adapters: Array<"project_
       facts: item.facts,
     };
     // A newer partial observation also supersedes a previous complete one.
-    resources.set(JSON.stringify([evidence.toolId, evidence.kind, evidence.scope]), { evidence, rawOutput: item.rawOutput });
+    // Missing and present are mutually exclusive observations of the same path.
+    const resourceKind = evidence.toolId === "files.get_structure"
+      && ["directory_structure", "path_state"].includes(evidence.kind) ? "path_state" : evidence.kind;
+    resources.set(JSON.stringify([evidence.toolId, resourceKind, evidence.scope]), { evidence, rawOutput: item.rawOutput });
   }
   const result: SkillPlanningEvidence[] = [];
   for (const { evidence, rawOutput } of resources.values()) {

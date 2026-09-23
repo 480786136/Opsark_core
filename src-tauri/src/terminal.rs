@@ -52,23 +52,13 @@ enum TerminalWriteProgress {
 /// Advances the first queued data message without ever discarding an unwritten
 /// suffix. `ssh2::Channel` is non-blocking in terminal sessions, so both a
 /// partial write and `WouldBlock` are normal and must be resumed on a later
-/// loop iteration. A pending flush is completed before a following resize or
-/// close operation, preserving the order in which inputs were submitted.
+/// loop iteration. Do not call `ssh2::Channel::flush`: it discards incoming
+/// output via libssh2_channel_flush_ex instead of flushing outgoing writes.
+/// Writes already send their payload directly to the SSH transport.
 fn advance_terminal_write<W: Write>(
     writer: &mut W,
     pending: &mut VecDeque<QueuedTerminalInput>,
-    flush_pending: &mut bool,
 ) -> std::io::Result<TerminalWriteProgress> {
-    if *flush_pending {
-        match writer.flush() {
-            Ok(()) => *flush_pending = false,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                return Ok(TerminalWriteProgress::Blocked);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
     let Some(front) = pending.front_mut() else {
         return Ok(TerminalWriteProgress::Idle);
     };
@@ -88,7 +78,6 @@ fn advance_terminal_write<W: Write>(
         )),
         Ok(size) => {
             *written += size;
-            *flush_pending = true;
             if *written == data.len() {
                 pending.pop_front();
             }
@@ -224,6 +213,7 @@ fn is_retryable_terminal_error(error: &str) -> bool {
         "socket",
         "network",
         "transport",
+        "failure while draining incoming flow",
     ]
     .iter()
     .any(|needle| message.contains(needle))
@@ -278,7 +268,6 @@ fn run_terminal_session(
 
     let mut buffer = [0_u8; 8192];
     let mut pending_inputs = VecDeque::<QueuedTerminalInput>::new();
-    let mut input_flush_pending = false;
     let mut receiver_disconnected = false;
     loop {
         // Bound each drain so a continuously typing producer cannot starve
@@ -302,11 +291,7 @@ fn run_terminal_session(
         // partial data write remains at the front and is resumed next tick.
         // The work budget keeps terminal output responsive during large pastes.
         for _ in 0..256 {
-            match advance_terminal_write(
-                &mut channel,
-                &mut pending_inputs,
-                &mut input_flush_pending,
-            ) {
+            match advance_terminal_write(&mut channel, &mut pending_inputs) {
                 Ok(TerminalWriteProgress::Progressed) => continue,
                 Ok(TerminalWriteProgress::Blocked | TerminalWriteProgress::Idle) => break,
                 Ok(TerminalWriteProgress::ControlReady) => match pending_inputs.pop_front() {
@@ -501,7 +486,6 @@ mod tests {
 
     struct ScriptedWriter {
         write_attempts: VecDeque<WriteAttempt>,
-        flush_attempts: VecDeque<std::io::Result<()>>,
         accepted: Vec<u8>,
     }
 
@@ -509,7 +493,6 @@ mod tests {
         fn new(write_attempts: impl IntoIterator<Item = WriteAttempt>) -> Self {
             Self {
                 write_attempts: write_attempts.into_iter().collect(),
-                flush_attempts: VecDeque::new(),
                 accepted: Vec::new(),
             }
         }
@@ -534,7 +517,7 @@ mod tests {
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
-            self.flush_attempts.pop_front().unwrap_or(Ok(()))
+            panic!("SSH flush discards unread output and must never be called")
         }
     }
 
@@ -583,6 +566,12 @@ mod tests {
     #[test]
     fn retries_network_failures_but_not_authentication_failures() {
         assert!(is_retryable_terminal_error("连接超时"));
+        assert!(is_retryable_terminal_error(
+            "终端输出读取失败：transport read"
+        ));
+        assert!(is_retryable_terminal_error(
+            "终端输入发送失败：Failure while draining incoming flow"
+        ));
         assert!(!is_retryable_terminal_error("SSH 身份认证失败"));
         assert!(!is_retryable_terminal_error(
             "无法申请远程 PTY：administratively prohibited"
@@ -669,10 +658,9 @@ mod tests {
             },
             QueuedTerminalInput::Close,
         ]);
-        let mut flush_pending = false;
 
         assert_eq!(
-            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            advance_terminal_write(&mut writer, &mut pending).unwrap(),
             TerminalWriteProgress::Progressed
         );
         assert_eq!(writer.accepted, b"ab");
@@ -682,7 +670,7 @@ mod tests {
         ));
 
         assert_eq!(
-            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            advance_terminal_write(&mut writer, &mut pending).unwrap(),
             TerminalWriteProgress::Blocked
         );
         assert_eq!(writer.accepted, b"ab");
@@ -692,7 +680,7 @@ mod tests {
         ));
 
         assert_eq!(
-            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            advance_terminal_write(&mut writer, &mut pending).unwrap(),
             TerminalWriteProgress::Progressed
         );
         assert_eq!(writer.accepted, b"abcdef");
@@ -702,7 +690,7 @@ mod tests {
         ));
 
         assert_eq!(
-            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            advance_terminal_write(&mut writer, &mut pending).unwrap(),
             TerminalWriteProgress::ControlReady
         );
         assert!(matches!(
@@ -711,49 +699,40 @@ mod tests {
         ));
 
         assert_eq!(
-            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            advance_terminal_write(&mut writer, &mut pending).unwrap(),
             TerminalWriteProgress::Progressed
         );
         assert_eq!(writer.accepted, b"abcdefghi");
         assert_eq!(
-            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            advance_terminal_write(&mut writer, &mut pending).unwrap(),
             TerminalWriteProgress::ControlReady
         );
         assert!(matches!(pending.front(), Some(QueuedTerminalInput::Close)));
     }
 
     #[test]
-    fn retries_a_blocked_flush_before_allowing_close() {
-        let mut writer = ScriptedWriter::new([WriteAttempt::Accept(3)]);
-        writer
-            .flush_attempts
-            .push_back(Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)));
-        writer.flush_attempts.push_back(Ok(()));
-        let mut pending = VecDeque::from([
-            QueuedTerminalInput::Data {
-                data: b"bye".to_vec(),
+    fn rapid_input_preserves_byte_and_control_order_without_flushing() {
+        let mut writer = ScriptedWriter::new([]);
+        let input = b"abc\x1b[D\x1b[C\x7f".repeat(1_000);
+        let mut pending: VecDeque<_> = input
+            .iter()
+            .map(|byte| QueuedTerminalInput::Data {
+                data: vec![*byte],
                 written: 0,
-            },
-            QueuedTerminalInput::Close,
-        ]);
-        let mut flush_pending = false;
-
+            })
+            .collect();
+        pending.push_back(QueuedTerminalInput::Close);
+        for _ in 0..input.len() {
+            assert_eq!(
+                advance_terminal_write(&mut writer, &mut pending).unwrap(),
+                TerminalWriteProgress::Progressed
+            );
+        }
+        assert_eq!(writer.accepted, input);
         assert_eq!(
-            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
-            TerminalWriteProgress::Progressed
-        );
-        assert_eq!(
-            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
-            TerminalWriteProgress::Blocked
-        );
-        assert!(flush_pending);
-        assert!(matches!(pending.front(), Some(QueuedTerminalInput::Close)));
-
-        assert_eq!(
-            advance_terminal_write(&mut writer, &mut pending, &mut flush_pending).unwrap(),
+            advance_terminal_write(&mut writer, &mut pending).unwrap(),
             TerminalWriteProgress::ControlReady
         );
-        assert!(!flush_pending);
-        assert_eq!(writer.accepted, b"bye");
+        assert!(matches!(pending.front(), Some(QueuedTerminalInput::Close)));
     }
 }

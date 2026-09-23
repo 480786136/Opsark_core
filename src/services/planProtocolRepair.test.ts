@@ -4,7 +4,9 @@ import type { PlanStep } from "@/types";
 import { backend, buildPlanNormalizationRepair, assertPlanRepairScope, PlanProtocolError } from "./backend";
 import { normalizePlanPreconditions } from "@/features/agent/planNormalizer";
 import { compactProtocolRepairContext, planSemanticFingerprint } from "./planProtocolRepair";
+import { RecoveryProtocolError, RECOVERY_RULE_VERSION } from "./recoveryRules";
 import incident from "./fixtures/recovery-20260915.json";
+import missingSteps from "./fixtures/next-stage-missing-steps.json";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -24,13 +26,86 @@ function runtime(extra: Record<string, unknown> = {}) {
   return { apiKey: "fixture", endpoint: "https://test.invalid", model: "fixture",
     context: JSON.stringify({ taskGoal: { rootGoal: "部署应用" }, permission: "safe",
       executionConstraints: { changePolicy: "read_only" },
-      recovery: { currentTargetContext: '["host","round","session",1,0]', blockers: [] }, ...extra }) };
+      recovery: { currentTargetContext: '["host","round","session",1,0]', failedAttempts: [] }, ...extra }) };
 }
 
 beforeEach(() => Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true }));
 afterEach(() => { Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); vi.resetAllMocks(); });
 
 describe("bounded protocol repair", () => {
+  it.each([JSON.stringify(missingSteps), '{"decision":"adjust","steps":{}}', '{"decision":'])(
+    "preserves an unparsed next-stage response without manufacturing a no-action decision: %s", async rawResponse => {
+      vi.mocked(invoke).mockRejectedValueOnce("OPSARK_MODEL_TRACE_V1:" + JSON.stringify({
+        message: JSON.stringify({ kind: "next_stage_response_invalid",
+          validationError: "阶段联合决策结构解析失败：missing field steps", rawResponse, rejectedPlanExecuted: false }),
+        developerTrace: { attempts: [] },
+      }));
+      const error = await backend.decideNextStage("继续部署", runtime()).catch(error => error);
+      expect(error).toBeInstanceOf(PlanProtocolError);
+      expect(error.repair).toMatchObject({
+        errorCode: "next_stage_response_invalid", rawModelResponse: rawResponse, previousModelOutput: [],
+      });
+      expect(error.repair.nextStageDecision).toBeUndefined();
+      expect(error.userMessage).toContain("响应格式不完整或不正确");
+      expect(error.userMessage).not.toContain("证据校验未通过");
+      expect(error.developerTrace).toEqual({ attempts: [] });
+      // Business replanning owns the bounded retry, not field-local generation.
+      expect(invoke).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("classifies a backend capability rejection as recoverable planning feedback, not a service outage", async () => {
+    const steps = [{ ...diagnose("opsark-tool hidden.read {}"), recovery: undefined }];
+    const decision = { decision: "continue", reason: "缺少声明原文", summary: "补读已有证据" };
+    vi.mocked(invoke).mockRejectedValueOnce(`OPSARK_MODEL_TRACE_V1:${JSON.stringify({
+      message: JSON.stringify({ kind: "plan_protocol_failure", steps,
+        validationError: "第 1 个计划步骤调用了当前规划上下文未开放工具 hidden.read；只能使用 context.tools 中明确提供的工具或 Shell 流程",
+        nextStageDecision: decision, rejectedPlanExecuted: false }),
+      developerTrace: { attempts: [] },
+    })}`);
+
+    const error = await backend.decideNextStage("继续部署", runtime()).catch(error => error);
+    expect(error).toBeInstanceOf(PlanProtocolError);
+    expect(error.repair.previousModelOutput).toEqual(steps);
+    expect(error.repair.nextStageDecision).toEqual(decision);
+    expect(error.userMessage).toContain("未开放的工具 hidden.read");
+    expect(error.userMessage).not.toContain("稍后重试");
+    expect(error.developerTrace).toEqual({ attempts: [] });
+    expect(invoke).toHaveBeenCalledOnce();
+  });
+
+  it("revalidates a persisted retired acceptance-copy rejection without calling the model", async () => {
+    const candidate = { ...diagnose("test -s /opt/report/build/report.zip"),
+      expected: "实际构建产物存在且非空", recovery: { ...diagnose().recovery!, purpose: "verify" as const } };
+    const repair = buildPlanNormalizationRepair(new RecoveryProtocolError({
+      code: "RECOVERY_ACCEPTANCE_MISMATCH", stepIndex: 0, fieldPath: "steps[0].recovery",
+      expected: "旧版本要求逐字复制失败步骤的验收", allowedRepairPaths: [], ruleVersion: RECOVERY_RULE_VERSION,
+    }), [candidate]);
+    repair.progress = { scopeFingerprint: "legacy", attemptedFingerprints: [], seenPlans: [],
+      attemptCount: 1, stopCode: "PROTOCOL_REPAIR_SCOPE_UNKNOWN" };
+    const original = structuredClone(repair);
+
+    const result = await backend.generatePlan("继续验收构建结果", runtime({ planGenerationRepair: repair }));
+
+    expect(result).toEqual(normalizePlanPreconditions([candidate]));
+    expect(result[0].status).toBe("pending");
+    expect(result[0].result).toBeUndefined();
+    expect(repair).toEqual(original);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("retired acceptance-copy feedback still rechecks current recovery metadata", async () => {
+    const candidate = { ...diagnose("uname -a"), recovery: { ...diagnose().recovery!, failedStepId: "" } };
+    const repair = buildPlanNormalizationRepair(new RecoveryProtocolError({
+      code: "RECOVERY_ACCEPTANCE_MISMATCH", stepIndex: 0, fieldPath: "steps[0].recovery",
+      expected: "旧版本验收错误", allowedRepairPaths: [], ruleVersion: RECOVERY_RULE_VERSION,
+    }), [candidate]);
+
+    await expect(backend.generatePlan("继续", runtime({ planGenerationRepair: repair })))
+      .rejects.toThrow("PROTOCOL_REPAIR_SCOPE_UNKNOWN");
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
   it("does not resend the preserved next-stage decision with a rejected field", () => {
     const repair = { ...repairOf(), nextStageDecision: {
       reason: "OLD_DECISION".repeat(5_000), steps: [diagnose()],
@@ -194,12 +269,12 @@ describe("bounded protocol repair", () => {
       .toThrow("validationScope");
   });
 
-  it("keeps protocol context independent of history size while retaining nested authority and the original blocker", () => {
+  it("keeps protocol context independent of history size while retaining the referenced failed attempt", () => {
     const repair = repairOf();
     const make = (history: string) => compactProtocolRepairContext(JSON.stringify({
       baseSnapshot: { task: { permission: "safe" }, executionConstraints: { changePolicy: "read_only" }, rootGoal: "部署应用", output: history },
       conversationHistory: [{ role: "assistant", content: history }], previousExecution: { output: history },
-      recovery: { blockers: [{ failedStepId: "real-failed-step", verification: { command: "test -s /status" } },
+      recovery: { failedAttempts: [{ failedStepId: "real-failed-step", verification: { command: "test -s /status" } },
         { failedStepId: "unrelated", output: history }] },
       tools: [{ id: "software.check", inputSchema: { large: history } }],
     }), repair);
@@ -209,9 +284,23 @@ describe("bounded protocol repair", () => {
     expect(projected.permission).toBe("safe");
     expect(projected.executionConstraints.changePolicy).toBe("read_only");
     expect(projected.taskGoal.rootGoal).toBe("部署应用");
-    expect(projected.recovery.blockers).toHaveLength(1);
-    expect(projected.recovery.blockers[0].verification.command).toBe("test -s /status");
+    expect(projected.recovery.failedAttempts).toHaveLength(1);
+    expect(projected.recovery.failedAttempts[0].verification.command).toBe("test -s /status");
     expect(projected.tools).toEqual([]);
+  });
+
+  it("maps legacy recovery blockers to failedAttempts without restoring a blocker gate", () => {
+    const projected = JSON.parse(compactProtocolRepairContext(JSON.stringify({
+      recovery: { blockers: [
+        { failedStepId: "real-failed-step", output: "legacy evidence" },
+        { failedStepId: "unrelated", output: "ignore" },
+      ] },
+    }), repairOf()));
+
+    expect(projected.recovery.blockers).toBeUndefined();
+    expect(projected.recovery.failedAttempts).toEqual([
+      { failedStepId: "real-failed-step", output: "legacy evidence" },
+    ]);
   });
 
   it("does not call the model when no field-local repair scope is known", async () => {

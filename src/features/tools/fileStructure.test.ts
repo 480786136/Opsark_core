@@ -18,6 +18,23 @@ describe("file structure tool", () => {
     expect(normalizeFileStructureRequest({ rootPath: "//opt///app//" }).rootPath).toBe("/opt/app");
   });
 
+  it("accepts canonical absolute excludes located below the remote root", () => {
+    const rootRequest = normalizeFileStructureRequest({
+      rootPath: "/",
+      excludeDirectories: ["/proc", " //proc/ ", "//sys/", "/dev", " /run// ", "/var/lib/docker/overlay2"],
+    });
+    expect(rootRequest.excludeDirectories).toEqual(expect.arrayContaining([
+      "/proc", "/sys", "/dev", "/run", "/var/lib/docker/overlay2",
+    ]));
+    expect(rootRequest.excludeDirectories.filter((item) => item === "/proc")).toHaveLength(1);
+
+    const nestedRequest = normalizeFileStructureRequest({
+      rootPath: "/opt/app",
+      excludeDirectories: ["/opt/app/storage/cache/"],
+    });
+    expect(nestedRequest.excludeDirectories).toContain("/opt/app/storage/cache");
+  });
+
   it("rejects unsafe paths and out-of-range limits", () => {
     expect(() => normalizeFileStructureRequest({ rootPath: "opt/app" })).toThrow("绝对目录");
     expect(() => normalizeFileStructureRequest({ rootPath: "C:\\opt\\app" })).toThrow("POSIX");
@@ -25,6 +42,10 @@ describe("file structure tool", () => {
     expect(() => normalizeFileStructureRequest({ rootPath: "/opt/./app" })).toThrow("路径段");
     expect(() => normalizeFileStructureRequest({ rootPath: "/opt/app", excludeDirectories: ["../etc"] })).toThrow("排除目录");
     expect(() => normalizeFileStructureRequest({ rootPath: "/opt/app", excludeDirectories: ["..\\etc"] })).toThrow("排除目录");
+    expect(() => normalizeFileStructureRequest({ rootPath: "/opt/app", excludeDirectories: ["/opt/app/../etc"] })).toThrow("排除目录");
+    expect(() => normalizeFileStructureRequest({ rootPath: "/opt/app", excludeDirectories: ["/opt/application/cache"] })).toThrow("必须位于根路径");
+    expect(() => normalizeFileStructureRequest({ rootPath: "/opt/app", excludeDirectories: ["/opt/app"] })).toThrow("不能与根路径相同");
+    expect(() => normalizeFileStructureRequest({ rootPath: "/", excludeDirectories: ["/"] })).toThrow("不能与根路径相同");
     expect(() => normalizeFileStructureRequest({ rootPath: "/opt/app", maxDepth: 21 })).toThrow("遍历深度");
     expect(() => normalizeFileStructureRequest({ rootPath: "/opt/app", maxNodes: 0 })).toThrow("节点数量");
   });

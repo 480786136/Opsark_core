@@ -6,7 +6,7 @@ export interface ToolDefinition {
   usageInstructions: string;
   inputSchema: Record<string, unknown>;
   outputDescription: string;
-  /** Controls whether this atomic tool must be the only step in a generated plan. */
+  /** standalone is a planning boundary; read_batch observations can join ordered mixed plans. */
   planMode?: "regular" | "standalone" | "read_batch";
   /** Tells the generic orchestrator what to do after a successful tool call. */
   completionMode?: "continue" | "refine" | "complete";
@@ -156,6 +156,8 @@ export interface FileStructureRequest {
 }
 
 export interface FileStructureResult {
+  /** Missing is a successful path observation, not an empty directory listing. */
+  pathStatus?: "directory" | "missing";
   tree: string;
   rootPath?: string;
   truncated?: boolean;

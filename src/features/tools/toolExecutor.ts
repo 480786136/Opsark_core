@@ -184,6 +184,12 @@ function validateToolArguments(tool: ToolDefinition, value: Record<string, unkno
 /** Validates built-in atomic tool contracts before a plan reaches execution. */
 function normalizeKnownToolArguments(toolId: string, value: Record<string, unknown>) {
   if (toolId === "server.connect") return { ...parseServerConnectArguments(value) };
+  if (toolId === "files.get_structure") {
+    // Keep the model-authored spelling in the plan, but reject semantic path
+    // errors before the step reaches execution or opens an SSH/SFTP session.
+    parseFileStructureArguments(value);
+    return value;
+  }
   if (toolId === "user.request_input") {
     // A declared credential username must use protected input/storage. This
     // local promotion changes neither the account nor its target or purpose.
@@ -378,27 +384,38 @@ export function parseUserInputArguments(value: Record<string, unknown>): UserInp
 
 function parseFileStructureArguments(argumentsValue: Record<string, unknown>): FileStructureRequest {
   const rootPath = argumentsValue.rootPath;
-  if (typeof rootPath !== "string") throw new Error("rootPath 必须是字符串");
+  if (typeof rootPath !== "string") throw new ToolArgumentValidationError("rootPath 必须是字符串", "rootPath");
   const excludeDirectories = argumentsValue.excludeDirectories;
   if (excludeDirectories !== undefined && (
     !Array.isArray(excludeDirectories)
     || excludeDirectories.some((item) => typeof item !== "string")
-  )) throw new Error("excludeDirectories 必须是字符串数组");
+  )) throw new ToolArgumentValidationError("excludeDirectories 必须是字符串数组", "excludeDirectories");
   const numericValue = (key: "maxDepth" | "maxNodes") => {
     const value = argumentsValue[key];
-    if (value !== undefined && typeof value !== "number") throw new Error(`${key} 必须是数字`);
+    if (value !== undefined && typeof value !== "number") throw new ToolArgumentValidationError(`${key} 必须是数字`, key);
     return value as number | undefined;
   };
   if (argumentsValue.includeHidden !== undefined && typeof argumentsValue.includeHidden !== "boolean") {
-    throw new Error("includeHidden 必须是布尔值");
+    throw new ToolArgumentValidationError("includeHidden 必须是布尔值", "includeHidden");
   }
-  return normalizeFileStructureRequest({
-    rootPath,
-    excludeDirectories: excludeDirectories as string[] | undefined,
-    maxDepth: numericValue("maxDepth"),
-    maxNodes: numericValue("maxNodes"),
-    includeHidden: argumentsValue.includeHidden as boolean | undefined,
-  });
+  const maxDepth = numericValue("maxDepth");
+  const maxNodes = numericValue("maxNodes");
+  try {
+    normalizeFileStructureRequest({ rootPath });
+  } catch (error) {
+    throw new ToolArgumentValidationError(error instanceof Error ? error.message : String(error), "rootPath");
+  }
+  try {
+    return normalizeFileStructureRequest({
+      rootPath,
+      excludeDirectories: excludeDirectories as string[] | undefined,
+      maxDepth,
+      maxNodes,
+      includeHidden: argumentsValue.includeHidden as boolean | undefined,
+    });
+  } catch (error) {
+    throw new ToolArgumentValidationError(error instanceof Error ? error.message : String(error), "excludeDirectories");
+  }
 }
 
 export async function executeToolCall(
@@ -459,6 +476,7 @@ export async function executeToolCall(
       const data = await dependencies.getRemoteFileStructure(request);
       const modelData: FileStructureResult = {
         tree: data.tree, rootPath: request.rootPath, truncated: data.truncated, warnings: data.warnings,
+        ...(data.pathStatus ? { pathStatus: data.pathStatus } : {}),
       };
       return { callId: call.id, toolId: call.toolId, success: true, data: modelData, truncated: data.truncated };
     }

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useConnectionStore } from "@/features/connection/connectionStore";
 import { backend, buildPlanNormalizationRepair, PlanProtocolError } from "@/services/backend";
-import type { OpsTask, PlanStep, ServerProfile } from "@/types";
+import type { NextStageDecision, OpsTask, PlanStep, ServerProfile } from "@/types";
 import { useOpsStore } from "./ops";
 import { confirmedInputScope, confirmedUserInputsContext } from "@/features/agent/confirmedUserInputs";
 
@@ -47,6 +47,16 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+function continuation(steps: PlanStep[]): NextStageDecision {
+  return {
+    decision: "adjust",
+    reason: "已收到用户回答，需要进入下一阶段",
+    summary: "根据已确认输入继续。",
+    source: "model",
+    steps,
+  };
+}
+
 function createTask(): { store: ReturnType<typeof useOpsStore>; task: OpsTask } {
   const store = useOpsStore();
   const task = store.createTask(server.id, "safe", "clarification-model");
@@ -86,7 +96,9 @@ describe("通用澄清与审批的单次恢复", () => {
     vi.spyOn(backend, "deleteCredential").mockResolvedValue(undefined);
     vi.spyOn(backend, "checkSshConnection").mockResolvedValue(undefined);
     vi.spyOn(backend, "generatePlan").mockResolvedValue([step()]);
-    vi.spyOn(backend, "processRequirement").mockResolvedValue({ intent: "execute", plan: [inputStep()] });
+    vi.spyOn(backend, "processRequirement").mockResolvedValue({
+      intent: "execute", relation: "new_goal", plan: [inputStep()],
+    });
     vi.spyOn(backend, "executeCommand").mockResolvedValue({ success: true, simulated: true, output: "READY", exitCode: 0 });
     vi.spyOn(backend, "validateStep").mockResolvedValue({ passed: true, detail: "校验通过" });
     vi.spyOn(backend, "reviewStep").mockResolvedValue({ decision: "continue", reason: "证据一致", summary: "已确认", source: "model" });
@@ -142,6 +154,7 @@ describe("通用澄清与审批的单次恢复", () => {
     protocolError.processed = { intent: "execute", relation: "new_goal", plan: [original],
       selectedSkillIds: ["database-inspection-operations"] };
     vi.mocked(backend.processRequirement).mockRejectedValueOnce(protocolError);
+    vi.mocked(backend.decideNextStage).mockResolvedValueOnce(continuation([step()]));
     task.status = "draft";
     await store.submitRequirement(server.id, "检查目标信息", "safe", "clarification-model", task.id);
     const replanned = store.tasks.find(item => item.rootGoal === "检查目标信息");
@@ -154,7 +167,8 @@ describe("通用澄清与审批的单次恢复", () => {
       status: "accepted",
       repair: expect.objectContaining({ previousModelOutput: [original] }),
     });
-    expect(backend.generatePlan).toHaveBeenCalledOnce();
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(replanned!.messages.map(message => message.content).join("\n")).not.toContain("字段错误");
     expect(replanned!.messages.map(message => message.content).join("\n")).not.toContain("description");
     expect(store.developerLogs).toContainEqual(expect.objectContaining({
@@ -240,19 +254,22 @@ describe("通用澄清与审批的单次恢复", () => {
 
   it("同一个澄清请求重复提交只保存一份回答并生成一次后续计划", async () => {
     const { store, task, request } = await awaitingInputTask();
-    const nextPlan = deferred<PlanStep[]>();
-    vi.mocked(backend.generatePlan).mockReturnValueOnce(nextPlan.promise);
+    const nextStage = deferred<NextStageDecision>();
+    vi.mocked(backend.decideNextStage).mockReturnValueOnce(nextStage.promise);
 
     const first = store.provideUserInput(task.id, { TARGET: "target-a" }, request.callId);
     const repeated = store.provideUserInput(task.id, { TARGET: "target-b" }, request.callId);
-    await vi.waitFor(() => expect(backend.generatePlan).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(backend.decideNextStage).toHaveBeenCalledTimes(1));
     expect(task.submittedInputs?.TARGET.value).toBe("target-a");
-    nextPlan.resolve([step({ id: "after-confirmation" })]);
+    nextStage.resolve(continuation([step({ id: "after-confirmation" })]));
     const results = await Promise.all([first, repeated]);
+    await store.requestAdjustment(task.id);
 
     expect(results.filter(Boolean)).toHaveLength(1);
-    expect(backend.generatePlan).toHaveBeenCalledTimes(1);
-    expect(task.plan.find(item => item.id === "clarification-step")?.evidence).toHaveLength(1);
+    expect(backend.decideNextStage).toHaveBeenCalledTimes(1);
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(task.phaseHistory?.flatMap(phase => phase.plan)
+      .find(item => item.id === "clarification-step")?.evidence).toHaveLength(1);
     expect(task.messages.filter(item => item.role === "user" && item.content.startsWith("已提交参数："))).toHaveLength(1);
     expect(store.pendingUserInputs.some(item => item.taskId === task.id)).toBe(false);
     expect(task.status).toBe("awaiting_plan_approval");
@@ -281,23 +298,24 @@ describe("通用澄清与审批的单次恢复", () => {
     await store.runStep(task.id, "clarification-step");
     const request = store.pendingUserInputs.find(item => item.taskId === task.id)!;
     const saving = deferred<void>();
-    const nextPlan = deferred<PlanStep[]>();
+    const nextStage = deferred<NextStageDecision>();
     vi.mocked(backend.saveCredential).mockReturnValueOnce(saving.promise);
-    vi.mocked(backend.generatePlan).mockReturnValueOnce(nextPlan.promise);
+    vi.mocked(backend.decideNextStage).mockReturnValueOnce(nextStage.promise);
 
     const first = store.provideUserInput(task.id, { TARGET: "target-a", ACCESS_TOKEN: "fixture-first-token" }, request.callId);
     await vi.waitFor(() => expect(backend.saveCredential).toHaveBeenCalledTimes(1));
     const repeated = store.provideUserInput(task.id, { TARGET: "target-b", ACCESS_TOKEN: "fixture-second-token" }, request.callId);
     const submissions = Promise.allSettled([first, repeated]);
     saving.resolve();
-    await vi.waitFor(() => expect(backend.generatePlan).toHaveBeenCalledTimes(1));
-    nextPlan.resolve([step({ id: "after-protected-input" })]);
+    await vi.waitFor(() => expect(backend.decideNextStage).toHaveBeenCalledTimes(1));
+    nextStage.resolve(continuation([step({ id: "after-protected-input" })]));
     const results = await submissions;
 
     expect(results.every(result => result.status === "fulfilled")).toBe(true);
     expect(results.filter(result => result.status === "fulfilled" && result.value)).toHaveLength(1);
     expect(backend.saveCredential).toHaveBeenCalledTimes(1);
-    expect(backend.generatePlan).toHaveBeenCalledTimes(1);
+    expect(backend.decideNextStage).toHaveBeenCalledTimes(1);
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(task.submittedInputs?.TARGET.value).toBe("target-a");
     expect(task.plan.find(item => item.id === "clarification-step")?.evidence).toHaveLength(1);
     expect(JSON.stringify(task.messages)).not.toContain("fixture-first-token");
@@ -429,12 +447,18 @@ describe("通用澄清与审批的单次恢复", () => {
     task.refinementCount = 8;
     task.executionConstraints = { changePolicy: "read_only", environmentPolicy: "preserve", failurePolicy: "strict",
       prohibitedActions: [], requiredConditions: [], userDirectives: [] };
+    vi.mocked(backend.decideNextStage).mockResolvedValueOnce(continuation([
+      step({ id: "read-only-follow-up", kind: "observe", command: "pwd", validation: "" }),
+    ]));
     expect(await store.provideUserInput(task.id, { TARGET: "target-a" }, request.callId)).toBe(true);
     expect(task.executionConstraints.changePolicy).toBe("read_only");
     expect(task.refinementCount).toBe(8);
+    expect(task.status).toBe("awaiting_continuation");
+    await store.requestAdjustment(task.id);
     expect(task.status).toBe("awaiting_plan_approval");
     expect(task.plan[task.plan.length - 1]?.kind).toBe("observe");
-    expect(backend.generatePlan).toHaveBeenCalledOnce();
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(backend.executeCommand).not.toHaveBeenCalled();
   });
 
@@ -472,17 +496,18 @@ describe("通用澄清与审批的单次恢复", () => {
     expect(persisted).toBe("new-fixture-token");
     expect(task.submittedInputs?.TARGET.value).toBe("new-target");
     expect(task.plan[0].evidence).toHaveLength(1);
-    expect(backend.generatePlan).toHaveBeenCalledOnce();
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(backend.executeCommand).not.toHaveBeenCalled();
   });
 
   it("回答后仍有新的必要问题，直接展示新表单且不执行或循环规划", async () => {
     const { store, task, request } = await awaitingInputTask();
-    vi.mocked(backend.generatePlan).mockResolvedValueOnce([inputStep({
+    vi.mocked(backend.decideNextStage).mockResolvedValueOnce(continuation([inputStep({
       id: "second-question", command: `opsark-tool user.request_input ${JSON.stringify({
         title: "确认影响范围", fields: [{ key: "SCOPE", label: "范围", description: "允许影响哪些对象", type: "text", required: true }],
       })}`,
-    })]);
+    })]));
     expect(await store.provideUserInput(task.id, { TARGET: "target-a" }, request.callId)).toBe(true);
     expect(task.status).toBe("awaiting_input");
     expect(store.pendingUserInputs).toHaveLength(1);
@@ -490,7 +515,8 @@ describe("通用澄清与审批的单次恢复", () => {
     expect(store.pendingUserInputs[0].callId).not.toBe(request.callId);
     await store.advanceTask(task.id);
     await store.queueManagedAdjustment(task.id, 0);
-    expect(backend.generatePlan).toHaveBeenCalledOnce();
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(backend.executeCommand).not.toHaveBeenCalled();
   });
 
@@ -541,7 +567,8 @@ describe("通用澄清与审批的单次恢复", () => {
     expect(confirmedUserInputsContext(task)?.items.some(item => item.value === "target-b")).toBe(true);
     expect(task.plan[0].output).toContain("target-b");
     expect(task.plan[0].evidence).toHaveLength(1);
-    expect(backend.generatePlan).toHaveBeenCalledOnce();
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(backend.executeCommand).not.toHaveBeenCalled();
     store.persist(true);
     setActivePinia(createPinia());
@@ -576,7 +603,8 @@ describe("通用澄清与审批的单次恢复", () => {
     }, request.callId)).toBe(true);
     expect(task.submittedInputs?.TARGET).toMatchObject({ type: "select", value: "" });
     expect(task.plan[0].output).not.toContain("target-a");
-    expect(backend.generatePlan).toHaveBeenCalledOnce();
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(backend.executeCommand).not.toHaveBeenCalled();
   });
 
@@ -595,7 +623,7 @@ describe("通用澄清与审批的单次恢复", () => {
     expect(await store.provideUserInput(task.id, { OPTIONAL: "" }, request.callId)).toBe(true);
     expect(task.submittedInputs?.OPTIONAL).toBeUndefined();
     expect(confirmedUserInputsContext(task)).toBeUndefined();
-    const sent = JSON.stringify(vi.mocked(backend.generatePlan).mock.calls);
+    const sent = JSON.stringify(vi.mocked(backend.decideNextStage).mock.calls);
     expect(sent).not.toContain("OLD_OPTIONAL_VALUE");
     expect(sent).not.toContain("65432");
   });

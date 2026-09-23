@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
+  ArrowRight,
   Bot,
   Check,
   CheckCircle2,
@@ -28,16 +29,23 @@ import {
 import { useI18n } from "vue-i18n";
 import { useRouter } from "vue-router";
 import { useOpsStore } from "@/stores/ops";
-import type { ObservationStatus, OpsTask, PlanStep, TaskPlanHistory } from "@/types";
+import type { ObservationStatus, OpsTask, PlanStep, TaskExecutionPhase, TaskPlanHistory } from "@/types";
 import type { PendingUserInput } from "@/features/tools/types";
 import AgentExecutionPhase from "@/components/AgentExecutionPhase.vue";
 import ModelSettingsModal from "@/components/ModelSettingsModal.vue";
 import ParameterSelect from "@/components/ParameterSelect.vue";
 import TaskKnowledgeUpload from "@/features/knowledge/TaskKnowledgeUpload.vue";
-import { isAdjustmentProgressMessage, isPlanProgressMessage } from "@/features/agent/taskMessages";
+import TaskKnowledgeReferences from "@/features/knowledge/TaskKnowledgeReferences.vue";
+import { isAdjustmentProgressMessage } from "@/features/agent/taskMessages";
+import { isNormalContinuation, planAction } from "@/features/agent/planPresentation";
 import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
 import { useWorkspaceLinkStore } from "@/features/workspace/workspaceLinkStore";
-import { conversationHistoryRounds } from "@/features/agent/conversationHistory";
+import {
+  archivedConversationTimeline,
+  conversationHistoryRounds,
+  currentConversationRoundStartIndex,
+  currentConversationTimeline,
+} from "@/features/agent/conversationHistory";
 import { localizeCoreText } from "@/features/preferences/coreText";
 import { useAccountStore } from "@/features/account/accountStore";
 import { useOfficialCatalogStore } from "@/features/account/officialCatalogStore";
@@ -69,7 +77,6 @@ const permission = persistedField("permission");
 const modelId = persistedField("modelId");
 const automationEnabled = persistedField("automationEnabled");
 const checkingModels = ref(false);
-const submissionError = ref("");
 const showModelSettings = ref(false);
 const showTasks = persistedField("showTasks");
 const expandedSteps = ref<string[]>([]);
@@ -81,7 +88,20 @@ const userInputValues = ref<Record<string, string>>({});
 const submittingUserInputs = ref(new Set<PendingUserInput>());
 const submittingApprovals = ref(new Set<string>());
 const timeline = ref<HTMLElement>();
-const pendingFreshRequirement = ref("");
+type PendingPreviousPlan = {
+  taskId: string;
+  messageIds: string[];
+  phase: TaskExecutionPhase;
+};
+type RequirementSubmissionUi = {
+  token: symbol;
+  taskId: string;
+  requirement: string;
+  previousPlan?: PendingPreviousPlan;
+};
+const requirementSubmissions = ref(new Map<string, RequirementSubmissionUi>());
+const activeSubmissionOwner = ref<Pick<RequirementSubmissionUi, "token" | "taskId">>();
+const submissionErrorState = ref<{ taskId: string; message: string }>();
 const modelOptions = computed(() => [
   ...store.models.map((model) => ({
     value: model.id,
@@ -107,34 +127,68 @@ const coreText = (value?: string | null) => localizeCoreText(value, locale.value
 
 const serverTasks = computed(() => store.tasks.filter((task) => task.serverId === props.serverId));
 const task = computed(() => serverTasks.value.find((item) => item.id === workspaceState.activeTaskId));
+const currentRequirementSubmission = computed(() => task.value
+  ? requirementSubmissions.value.get(task.value.id)
+  : undefined);
+const pendingFreshRequirement = computed(() => currentRequirementSubmission.value?.requirement ?? "");
+const pendingPreviousPlan = computed(() => currentRequirementSubmission.value?.previousPlan);
+const submissionError = computed(() => {
+  const error = submissionErrorState.value;
+  return error && error.taskId === task.value?.id ? error.message : "";
+});
 const filteredTasks = computed(() => serverTasks.value.filter(item => item.title.toLowerCase().includes(taskQuery.value.toLowerCase())));
 const conversationRounds = computed(() => task.value ? conversationHistoryRounds(serverTasks.value, task.value) : []);
 const canApprovePlan = computed(() => Boolean(task.value
   && task.value.status === "awaiting_plan_approval"
   && !task.value.cancelRequested
+  && !task.value.requirementProcessing
   && !task.value.adjustmentInProgress));
 const pendingApproval = computed(() => task.value?.status === "awaiting_step_approval"
-  && !task.value.cancelRequested && !task.value.adjustmentInProgress
+  && !task.value.cancelRequested && !task.value.requirementProcessing && !task.value.adjustmentInProgress
   ? task.value.plan.find((step) => step.status === "awaiting_approval")
   : undefined);
 const failedStep = computed(() => task.value?.plan.find((step) => step.status === "failed"));
+const modelCreditsTitle = computed(() => task.value?.modelPlanningBlocker
+  ? t(task.value.modelPlanningBlocker.error.code === "CREDITS_RECONCILIATION_REQUIRED"
+    ? "agent.modelCreditsReconciliation" : "agent.modelCreditsPaused")
+  : "");
+const usesOfficialModel = computed(() => store.models.find(model => model.id === task.value?.modelId)?.source === "official");
+const currentPlanAction = computed(() => task.value ? planAction(task.value) : "continuation");
+const normalContinuation = computed(() => Boolean(task.value && isNormalContinuation(task.value)));
+const planningCopy = computed(() => ({
+  continuation: { button: "agent.generateNextPlan", progress: "agent.generatingNextPlan", countdown: "agent.managedContinuationCountdown" },
+  replan: { button: "agent.generateAdjustment", progress: "agent.generatingAdjustment", countdown: "agent.managedAdjustmentCountdown" },
+  retry: { button: "agent.retryPlanning", progress: "agent.retryingPlanning", countdown: "agent.managedRetryCountdown" },
+  blocked: { button: "agent.reassessNextPlan", progress: "agent.reassessingNextPlan", countdown: "agent.managedAdjustmentCountdown" },
+  transport: { button: "agent.checkTerminalRecovery", progress: "agent.waitingTerminalRecovery", countdown: "agent.managedAdjustmentCountdown" },
+})[currentPlanAction.value]);
 const adjustmentLabel = computed(() =>
-  task.value?.status === "awaiting_continuation"
-    ? t("agent.continuationRequired")
-    : task.value?.protocolRepair
+  modelCreditsTitle.value ? modelCreditsTitle.value
+    : currentPlanAction.value === "transport"
+    ? t("agent.terminalRecoveryRequired")
+    : currentPlanAction.value === "blocked"
+    ? t("agent.nextStepBlocked")
+    : task.value?.protocolRepair?.repair.errorCode === "next_stage_response_invalid"
+      || !failedStep.value && /阶段联合决策结构解析失败/.test(task.value?.pauseReason ?? "")
+    ? t("agent.nextStageResponsePaused")
+    : currentPlanAction.value === "retry"
     ? t("agent.planAdjustmentPaused")
-    : !failedStep.value && /(?:调整|后续)计划生成失败|计划生成未通过/.test(task.value?.pauseReason ?? "")
-    ? t("agent.planAdjustmentPaused")
+    : normalContinuation.value
+    ? t(task.value!.plan.length && task.value!.plan.every(step => step.status === "completed")
+      ? "agent.continuationRequired" : "agent.nextPlanReadyToGenerate")
     : failedStep.value?.result?.executionStatus === "failed"
     ? t("agent.executionPaused")
-    : t("agent.validationPaused"),
+    : failedStep.value ? t("agent.validationPaused") : t("agent.taskPaused"),
 );
 const pendingSecretRequest = computed(() =>
-  store.pendingSecret?.taskId === task.value?.id ? store.pendingSecret : undefined,
+  !task.value?.requirementProcessing && store.pendingSecret?.taskId === task.value?.id
+    ? store.pendingSecret
+    : undefined,
 );
 const pendingUserInputRequest = computed(() => {
   const current = task.value;
-  if (!current || current.status !== "awaiting_input" || current.cancelRequested || current.adjustmentInProgress) return undefined;
+  if (!current || current.status !== "awaiting_input" || current.cancelRequested
+    || current.requirementProcessing || current.adjustmentInProgress) return undefined;
   return store.pendingUserInputs.find((request) => {
     const step = current.plan.find((item) => item.id === request.stepId);
     return request.taskId === current.id && step?.status === "awaiting_input"
@@ -163,7 +217,8 @@ const isBusy = computed(() => task.value && (
 ));
 const canTerminate = computed(() =>
   Boolean(task.value && (
-    task.value.currentExecutionId
+    task.value.requirementProcessing
+    || task.value.currentExecutionId
     || ["planning", "running", "validating", "awaiting_input"].includes(task.value.status)
   )),
 );
@@ -249,7 +304,8 @@ watch(() => [task.value?.id, task.value?.currentRoundId, pendingUserInputRequest
 async function submitUserInput() {
   const current = task.value;
   const request = pendingUserInputRequest.value;
-  if (!current || !request || submittingUserInputs.value.has(request) || isUserInputIncomplete.value) return;
+  if (!current || current.requirementProcessing || !request
+    || submittingUserInputs.value.has(request) || isUserInputIncomplete.value) return;
   const values = userInputValues.value;
   const roundId = current.currentRoundId;
   submittingUserInputs.value.add(request);
@@ -268,7 +324,7 @@ async function submitApproval() {
   const current = task.value;
   const key = approvalKey.value;
   const step = pendingApproval.value;
-  if (!current || !key || submittingApprovals.value.has(key)) return;
+  if (!current || current.requirementProcessing || !key || submittingApprovals.value.has(key)) return;
   submittingApprovals.value.add(key);
   try {
     if (step) await store.approveStep(current.id, step.id);
@@ -279,33 +335,48 @@ async function submitApproval() {
 }
 
 async function submitSecret() {
-  if (!secretInput.value) return;
+  if (!secretInput.value || task.value?.requirementProcessing || !pendingSecretRequest.value) return;
   const submitted = await store.provideSecret(secretInput.value);
   if (submitted) secretInput.value = "";
 }
-const currentConversationMessages = computed(() => {
-  if (!task.value) return [];
-  const start = task.value.messages
-    .map((message, index) => ({ message, index }))
-    .reverse()
-    .find(({ message }) => message.role === "user" && message.kind === "message")?.index ?? 0;
-  const messages = task.value.messages.slice(start).filter((message) => message.kind === "message");
-  let latestPlanProgressIndex = -1;
-  messages.forEach((message, index) => {
-    if (isPlanProgressMessage(message.content)) latestPlanProgressIndex = index;
-  });
-  return messages.filter((message, index) => (
-    !isPlanProgressMessage(message.content) || index === latestPlanProgressIndex
+const pendingPreviousPlanAnchor = computed(() => {
+  const current = task.value;
+  const pending = pendingPreviousPlan.value;
+  if (!current || !pending || pending.taskId !== current.id) return undefined;
+  const previousMessageIds = new Set(pending.messageIds);
+  return current.messages.find(message => (
+    message.role === "user" && message.kind === "message" && !previousMessageIds.has(message.id)
   ));
 });
-const currentPhases = computed(() => pendingFreshRequirement.value ? [] : (task.value?.phaseHistory ?? [])
-  .filter((phase) => phase.roundId === task.value?.currentRoundId));
+const pendingPreviousPlanIsCurrent = computed(() => {
+  const current = task.value;
+  const pending = pendingPreviousPlan.value;
+  const anchor = pendingPreviousPlanAnchor.value;
+  const hasArchivedCurrentSubmission = Boolean(anchor && (current?.phaseHistory ?? []).some(phase => (
+    phase.roundId === current?.currentRoundId
+    && phase.archivedBeforeMessageId === anchor.id
+  )));
+  return Boolean(current && pending?.taskId === current.id
+    && current.plan.length === pending.phase.plan.length
+    && current.plan.every((step, index) => step.id === pending.phase.plan[index]?.id)
+    && !hasArchivedCurrentSubmission);
+});
+const currentTimeline = computed(() => {
+  const current = task.value;
+  const pending = pendingPreviousPlan.value;
+  if (!current || !pending || pending.taskId !== current.id || !pendingPreviousPlanIsCurrent.value) {
+    return current ? currentConversationTimeline(current) : [];
+  }
+  const anchor = pendingPreviousPlanAnchor.value;
+  return currentConversationTimeline(current, [{
+    ...pending.phase,
+    archivedBeforeMessageId: anchor?.id,
+    completedAt: anchor?.createdAt ?? pending.phase.completedAt,
+  }]);
+});
 const currentRecords = computed(() => {
   if (!task.value) return [];
-  const start = task.value.messages
-    .map((message, index) => ({ message, index }))
-    .reverse()
-    .find(({ message }) => message.role === "user" && message.kind === "message")?.index ?? -1;
+  const start = currentConversationRoundStartIndex(task.value);
   return task.value.messages.slice(start + 1).filter((message) => message.kind === "event");
 });
 const activeRecordId = computed(() => isBusy.value
@@ -379,20 +450,73 @@ function toggleStep(id: string) {
     : [...expandedSteps.value, id];
 }
 
+function ownsLatestSubmission(submission: RequirementSubmissionUi) {
+  return activeSubmissionOwner.value?.token === submission.token
+    && activeSubmissionOwner.value.taskId === submission.taskId;
+}
+
+function ownsActiveSubmissionUi(submission: RequirementSubmissionUi) {
+  return ownsLatestSubmission(submission) && workspaceState.activeTaskId === submission.taskId;
+}
+
+async function terminateCurrentRequirement() {
+  const current = task.value;
+  if (!current) return;
+  const submission = requirementSubmissions.value.get(current.id);
+  if (submission) {
+    requirementSubmissions.value.delete(current.id);
+    if (activeSubmissionOwner.value?.token === submission.token
+      && activeSubmissionOwner.value.taskId === submission.taskId) {
+      activeSubmissionOwner.value = undefined;
+    }
+  }
+  if (submissionErrorState.value?.taskId === current.id) submissionErrorState.value = undefined;
+  await store.terminateTask(current.id);
+}
+
 async function submit() {
   const value = input.value.trim();
   if (!value || !automationEnabled.value || isBusy.value || !modelId.value || !store.connectedServerIds.includes(props.serverId)) return;
-  submissionError.value = "";
   showTasks.value = false;
   let selectedTask = task.value;
   if (!selectedTask) {
     selectedTask = store.createTask(props.serverId, permission.value, modelId.value);
     agentWorkspaces.updateServer(props.serverId, { activeTaskId: selectedTask.id });
   }
+  if (submissionErrorState.value?.taskId === selectedTask.id) submissionErrorState.value = undefined;
   const startsAfterFinishedTask = ["completed", "failed", "cancelled"].includes(selectedTask.status);
+  let previousPlan: PendingPreviousPlan | undefined;
   if (startsAfterFinishedTask) {
-    pendingFreshRequirement.value = value;
+    if (selectedTask.plan.length) {
+      const capturedAt = new Date().toISOString();
+      previousPlan = {
+        taskId: selectedTask.id,
+        messageIds: selectedTask.messages.map(message => message.id),
+        phase: {
+          id: `pending-phase-${selectedTask.id}-${selectedTask.workflowEpoch ?? 0}`,
+          roundId: selectedTask.currentRoundId ?? `pending-round-${selectedTask.id}`,
+          requirement: selectedTask.currentInstruction || selectedTask.rootGoal || selectedTask.title,
+          reason: "replan",
+          // Pinia wraps plan rows in proxies, which structuredClone cannot copy.
+          // Planning replaces the plan array rather than mutating these rows, so
+          // shallow row snapshots are sufficient for this short-lived UI entry.
+          plan: selectedTask.plan.map(step => ({ ...step })),
+          summary: selectedTask.summary ?? selectedTask.pauseReason,
+          createdAt: selectedTask.plan.find(step => step.startedAt)?.startedAt ?? selectedTask.updatedAt,
+          completedAt: capturedAt,
+        },
+      };
+    }
   }
+  const submission: RequirementSubmissionUi = {
+    token: Symbol(`requirement-${selectedTask.id}`),
+    taskId: selectedTask.id,
+    requirement: startsAfterFinishedTask ? value : "",
+    previousPlan,
+  };
+  const referencedTerminal = terminalReference.value;
+  requirementSubmissions.value.set(selectedTask.id, submission);
+  activeSubmissionOwner.value = submission;
   input.value = "";
   try {
     await store.submitRequirement(
@@ -400,20 +524,32 @@ async function submit() {
       value,
       permission.value,
       modelId.value,
-      terminalReference.value,
+      referencedTerminal,
       selectedTask.id,
     );
-    if (store.activeTaskId && store.activeTaskId !== workspaceState.activeTaskId) {
-      agentWorkspaces.updateServer(props.serverId, { activeTaskId: store.activeTaskId });
+    if (ownsActiveSubmissionUi(submission)) {
+      if (terminalReference.value === referencedTerminal) terminalReference.value = "";
+      if (store.activeTaskId && store.activeTaskId !== workspaceState.activeTaskId) {
+        agentWorkspaces.updateServer(props.serverId, { activeTaskId: store.activeTaskId });
+      }
     }
   } catch (error) {
-    if (!input.value) input.value = value;
-    submissionError.value = error instanceof Error ? error.message : String(error);
+    if (ownsActiveSubmissionUi(submission)) {
+      if (!input.value) input.value = value;
+      submissionErrorState.value = {
+        taskId: submission.taskId,
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
     return;
   } finally {
-    pendingFreshRequirement.value = "";
+    if (requirementSubmissions.value.get(submission.taskId)?.token === submission.token) {
+      requirementSubmissions.value.delete(submission.taskId);
+    }
+    if (ownsLatestSubmission(submission)) {
+      activeSubmissionOwner.value = undefined;
+    }
   }
-  terminalReference.value = "";
 }
 
 async function retryPlanning() {
@@ -612,6 +748,13 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
         <span class="agent-title-copy"><strong>{{ t("agent.title") }}</strong><small v-if="pendingFreshRequirement" :title="pendingFreshRequirement">{{ t("agent.recognizingRequirement", { requirement: pendingFreshRequirement }) }}</small><small v-else-if="task" :title="task.title">{{ task.title }}</small></span>
         <span class="beta">CORE</span>
         <span v-if="isBusy" class="agent-activity"><i></i>{{ statusText(task?.status) }}</span>
+        <button
+          v-if="task?.requirementProcessing && currentRequirementSubmission"
+          class="terminate-business requirement-processing-terminate"
+          type="button"
+          :title="t('agent.terminateTitle')"
+          @click.stop="terminateCurrentRequirement"
+        ><Square :size="11" />{{ t("agent.terminate") }}</button>
       </div>
       <button ref="taskMenuTrigger" :class="['text-icon-button', 'task-menu-trigger', { active: showTasks }]" @click="showTasks = !showTasks">
         <span class="task-menu-trigger-icon"><History :size="14" /></span>
@@ -673,6 +816,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
 
       <div ref="timeline" class="agent-timeline">
         <TaskKnowledgeUpload v-if="showDevelopmentFeatures && task && !pendingFreshRequirement" :key="task.id" :task="task" />
+        <TaskKnowledgeReferences v-if="task && !pendingFreshRequirement" :task-id="task.id" />
         <div v-if="!task" class="empty-agent">
           <div class="mini-orb"><Bot :size="22" /></div>
           <h3>{{ t("agent.emptyTitle") }}</h3>
@@ -683,32 +827,54 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
 
         <template v-else>
           <template v-for="round in conversationRounds" :key="round.id">
-            <div class="task-message user message user-aligned">
-              <div class="message-body">
-                <div class="message-meta">
-                  <strong>{{ t("agent.you") }}</strong>
-                  <time>{{ new Date(round.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
+            <template v-if="round.messages?.length">
+              <template v-for="entry in archivedConversationTimeline(round)" :key="`${round.id}:${entry.key}`">
+                <div
+                  v-if="entry.type === 'message'"
+                  :class="['task-message', entry.message.role, entry.message.kind, { 'user-aligned': entry.message.role === 'user' }]"
+                >
+                  <div v-if="entry.message.role !== 'user'" class="message-avatar">
+                    <Bot v-if="entry.message.role === 'assistant'" :size="15" />
+                    <TerminalSquare v-else :size="15" />
+                  </div>
+                  <div class="message-body">
+                    <div class="message-meta">
+                      <strong>{{ messageAuthor(entry.message.role) }}</strong>
+                      <time>{{ new Date(entry.message.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
+                    </div>
+                    <p>{{ conversationMessageContent(entry.message.content) }}</p>
+                  </div>
                 </div>
-                <p>{{ round.requirement }}</p>
-              </div>
-            </div>
-            <div class="task-message assistant message">
-              <div class="message-avatar"><Bot :size="15" /></div>
-              <div class="message-body">
-                <div class="message-meta">
-                  <strong>Opsark</strong>
-                  <time>{{ new Date(round.response?.createdAt ?? round.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
+                <AgentExecutionPhase v-else :phase="entry.phase" :index="entry.index" />
+              </template>
+            </template>
+            <template v-else>
+              <div class="task-message user message user-aligned">
+                <div class="message-body">
+                  <div class="message-meta">
+                    <strong>{{ t("agent.you") }}</strong>
+                    <time>{{ new Date(round.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
+                  </div>
+                  <p>{{ round.requirement }}</p>
                 </div>
-                <p>{{ archivedRoundResponse(round) }}</p>
               </div>
-            </div>
-
-            <AgentExecutionPhase
-              v-for="(phase, phaseIndex) in round.phases ?? []"
-              :key="phase.id"
-              :phase="phase"
-              :index="phaseIndex + 1"
-            />
+              <div class="task-message assistant message">
+                <div class="message-avatar"><Bot :size="15" /></div>
+                <div class="message-body">
+                  <div class="message-meta">
+                    <strong>Opsark</strong>
+                    <time>{{ new Date(round.response?.createdAt ?? round.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
+                  </div>
+                  <p>{{ archivedRoundResponse(round) }}</p>
+                </div>
+              </div>
+              <AgentExecutionPhase
+                v-for="(phase, phaseIndex) in round.phases ?? []"
+                :key="phase.id"
+                :phase="phase"
+                :index="phaseIndex + 1"
+              />
+            </template>
 
             <div v-if="archivedFinalPlan(round).length" :class="['plan-card', 'archived-plan', `task-card-${round.status}`]">
               <button class="plan-card-head archived-head" @click="toggleRound(round.id)">
@@ -721,7 +887,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                 </span>
                 <span>
                   <span class="history-time">{{ new Date(round.completedAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</span>
-                  <span :class="['task-state-pill', round.status]">{{ statusText(round.status) }}</span>
+                  <span :class="['task-state-pill', round.status, { continuation: isNormalContinuation(round) }]">{{ statusText(round.status) }}</span>
                   <ChevronDown v-if="expandedRounds.includes(round.id)" :size="15" />
                   <ChevronRight v-else :size="15" />
                 </span>
@@ -774,10 +940,11 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
 
             <div
               v-if="(round.summary || round.pauseReason) && ['completed', 'failed', 'cancelled', 'needs_adjustment', 'awaiting_continuation', 'planning_failed'].includes(round.status)"
-              :class="['summary-card', 'archived-summary', `summary-${round.status}`]"
+              :class="['summary-card', 'archived-summary', `summary-${round.status}`, { 'summary-progress': isNormalContinuation(round) }]"
             >
               <div class="summary-card-icon">
                 <Sparkles v-if="round.status === 'completed'" :size="17" />
+                <ArrowRight v-else-if="isNormalContinuation(round)" :size="17" />
                 <ShieldAlert v-else-if="['failed', 'needs_adjustment', 'awaiting_continuation', 'planning_failed'].includes(round.status)" :size="17" />
                 <Square v-else :size="15" />
               </div>
@@ -794,45 +961,45 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
             </div>
           </template>
 
-          <div
-            v-for="message in currentConversationMessages"
-            :key="message.id"
-            :class="['task-message', message.role, message.kind, { 'user-aligned': message.role === 'user' }]"
-          >
-            <div v-if="message.role !== 'user'" class="message-avatar">
-              <Bot v-if="message.role === 'assistant'" :size="15" />
-              <TerminalSquare v-else :size="15" />
-            </div>
-            <div class="message-body">
-              <div class="message-meta">
-                <strong>{{ messageAuthor(message.role) }}</strong>
-                <time>{{ new Date(message.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
+          <template v-for="entry in currentTimeline" :key="entry.key">
+            <div
+              v-if="entry.type === 'message'"
+              :class="['task-message', entry.message.role, entry.message.kind, { 'user-aligned': entry.message.role === 'user' }]"
+            >
+              <div v-if="entry.message.role !== 'user'" class="message-avatar">
+                <Bot v-if="entry.message.role === 'assistant'" :size="15" />
+                <TerminalSquare v-else :size="15" />
               </div>
-              <p>{{ conversationMessageContent(message.content) }}</p>
+              <div class="message-body">
+                <div class="message-meta">
+                  <strong>{{ messageAuthor(entry.message.role) }}</strong>
+                  <time>{{ new Date(entry.message.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
+                </div>
+                <p>{{ conversationMessageContent(entry.message.content) }}</p>
+              </div>
             </div>
-          </div>
+            <AgentExecutionPhase
+              v-else
+              :phase="entry.phase"
+              :index="entry.index"
+            />
+          </template>
 
-          <AgentExecutionPhase
-            v-for="(phase, phaseIndex) in currentPhases"
-            :key="phase.id"
-            :phase="phase"
-            :index="phaseIndex + 1"
-          />
-
-          <div v-if="(task.plan.length || hasTransportRecovery || needsUserAction) && !pendingFreshRequirement" :class="['plan-card', 'current-plan-card', `task-card-${task.status}`]">
+          <div v-if="(task.plan.length || hasTransportRecovery || needsUserAction) && !pendingPreviousPlanIsCurrent" :class="['plan-card', 'current-plan-card', `task-card-${task.status}`]">
             <div class="plan-card-head">
               <span class="plan-title-block">
                 <span class="plan-title-line">
                   <LoaderCircle v-if="isBusy" class="spin plan-title-loading" :size="15" />
                   <strong>{{ t("agent.currentPlan") }}</strong>
-                  <span v-if="!isBusy" :class="['task-state-pill', task.status]">
-                    <Clock3 v-if="task.status.includes('awaiting')" :size="13" />
+                  <span v-if="!isBusy" :class="['task-state-pill', task.status, { continuation: normalContinuation }]">
+                    <ArrowRight v-if="normalContinuation" :size="13" />
+                    <Clock3 v-else-if="task.status.includes('awaiting')" :size="13" />
                     <CheckCircle2 v-else-if="task.status === 'completed'" :size="13" />
                     {{ statusText(task.status) }}
                   </span>
                   <small class="plan-processed">{{ planProgressText(task) }}</small>
                   <button
-                    v-if="canTerminate"
+                    v-if="canTerminate && !task.requirementProcessing"
                     class="terminate-business"
                     type="button"
                     :title="t('agent.terminateTitle')"
@@ -961,34 +1128,42 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                 <button class="button primary" type="submit" :disabled="!secretInput">{{ t("agent.submitSecret") }}</button>
               </div>
             </form>
-            <div v-else-if="task.status === 'planning_failed'" class="approval-bar warning">
+            <div v-else-if="task.status === 'planning_failed'" class="approval-bar warning" :role="modelCreditsTitle ? 'alert' : undefined">
               <span class="adjustment-copy">
                 <ShieldAlert :size="15" />
-                <span><strong>{{ t("agent.summaryPlanningFailed") }}</strong><small v-if="task.pauseReason">{{ coreText(task.pauseReason) }}</small></span>
+                <span><strong>{{ modelCreditsTitle || t("agent.summaryPlanningFailed") }}</strong><small v-if="task.pauseReason">{{ coreText(task.pauseReason) }}</small></span>
               </span>
               <button class="button secondary" @click="store.rejectTask(task.id)">{{ t("agent.endTask") }}</button>
+              <button v-if="modelCreditsTitle" class="button secondary" @click="router.push(usesOfficialModel ? '/account' : '/models')">{{ t(usesOfficialModel ? 'agent.manageModelCredits' : 'agent.manageModels') }}</button>
               <button class="button primary" @click="retryPlanning">{{ t("agent.retryPlanning") }}</button>
             </div>
-            <div v-else-if="['needs_adjustment', 'awaiting_continuation'].includes(task.status)" class="approval-bar warning">
+            <div v-else-if="['needs_adjustment', 'awaiting_continuation'].includes(task.status)" :class="['approval-bar', normalContinuation ? 'continuation' : 'warning']" :role="modelCreditsTitle ? 'alert' : undefined">
               <span class="adjustment-copy">
-                <ShieldAlert :size="15" />
-                <span><strong>{{ adjustmentLabel }}</strong><small v-if="task.pauseReason">{{ coreText(task.pauseReason) }}</small></span>
+                <ArrowRight v-if="normalContinuation" :size="15" />
+                <ShieldAlert v-else :size="15" />
+                <span>
+                  <strong>{{ adjustmentLabel }}</strong>
+                  <small v-if="task.pauseReason">{{ coreText(task.pauseReason) }}</small>
+                  <small v-if="normalContinuation">{{ t('agent.nextPlanHint') }}</small>
+                  <small v-else-if="currentPlanAction === 'blocked'">{{ t('agent.nextStepBlockedHint') }}</small>
+                </span>
               </span>
               <button class="button secondary" @click="store.rejectTask(task.id)">{{ t(task.protocolRepair ? "agent.keepResultsAndEnd" : "agent.endTask") }}</button>
+              <button v-if="modelCreditsTitle" class="button secondary" @click="router.push(usesOfficialModel ? '/account' : '/models')">{{ t(usesOfficialModel ? 'agent.manageModelCredits' : 'agent.manageModels') }}</button>
               <span v-if="isWaitingForTerminalRecovery" class="managed-approval-countdown">
                 <LoaderCircle class="spin" :size="13" />{{ t('agent.waitingTerminalRecovery') }}
               </span>
               <span v-else-if="task.autoAdjustmentSeconds && !needsTransportRecoveryCheck" class="managed-approval-countdown">
-                <LoaderCircle class="spin" :size="13" />{{ t('agent.managedAdjustmentCountdown', { seconds: task.autoAdjustmentSeconds }) }}
+                <LoaderCircle class="spin" :size="13" />{{ t(planningCopy.countdown, { seconds: task.autoAdjustmentSeconds }) }}
               </span>
               <span v-else-if="task.adjustmentInProgress || task.managedAdjustmentPhase === 'generating'" class="managed-approval-countdown">
-                <LoaderCircle class="spin" :size="13" />{{ t('agent.generatingAdjustment') }}
+                <LoaderCircle class="spin" :size="13" />{{ t(planningCopy.progress) }}
               </span>
               <span v-else-if="task.permission === 'managed' && !showManualAdjustmentButton" class="managed-approval-countdown">
                 <LoaderCircle class="spin" :size="13" />{{ t('agent.managedAutoContinuing') }}
               </span>
               <button v-else-if="canRequestAdjustment" class="button primary" @click="requestTaskAdjustment">
-                {{ t(needsTransportRecoveryCheck ? 'agent.checkTerminalRecovery' : task.protocolRepair ? 'agent.generateBusinessReplan' : 'agent.generateAdjustment') }}
+                {{ t(needsTransportRecoveryCheck ? 'agent.checkTerminalRecovery' : planningCopy.button) }}
               </button>
             </div>
           </div>
@@ -1017,10 +1192,11 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
 
           <div
             v-if="(task.summary || task.pauseReason) && ['completed', 'failed', 'cancelled', 'needs_adjustment', 'awaiting_continuation', 'planning_failed'].includes(task.status)"
-            :class="['summary-card', `summary-${task.status}`]"
+            :class="['summary-card', `summary-${task.status}`, { 'summary-progress': normalContinuation }]"
           >
             <div class="summary-card-icon">
               <Sparkles v-if="task.status === 'completed'" :size="17" />
+              <ArrowRight v-else-if="normalContinuation" :size="17" />
               <ShieldAlert v-else-if="['failed', 'needs_adjustment', 'awaiting_continuation', 'planning_failed'].includes(task.status)" :size="17" />
               <Square v-else :size="15" />
             </div>

@@ -67,8 +67,13 @@ export const useSkillAutoSyncStore = defineStore("skillAutoSync", () => {
   const account = useAccountStore(), ops = useOpsStore();
   const owner = computed(() => account.current?.user.id);
   const busy = ref(false), error = ref(""), notice = ref("");
+  const downloadNotice = ref<{ message: string } | null>(null);
   const cloudSkills = ref<CloudSkill[]>([]), syncVersion = ref(0);
   const conflicts = ref<Conflict[]>([]);
+  function clearFeedback() {
+    error.value = "";
+    notice.value = "";
+  }
   let generation = 0, applying = false, requested = false, resolving = false, timer: ReturnType<typeof setTimeout> | undefined;
   let running: Promise<void> | undefined;
   const localSkill = (id: string) => ops.skills.find(skill => skill.id === id && !skill.builtIn);
@@ -213,7 +218,7 @@ export const useSkillAutoSyncStore = defineStore("skillAutoSync", () => {
       while (requested && owner.value) {
         requested = false;
         const id = owner.value, epoch = generation;
-        error.value = "";
+        clearFeedback();
         try { await synchronize(id, epoch); }
         catch (e) { if (owner.value === id && generation === epoch) error.value = `自动同步未完成：${String(e)}。本地内容保留，可重试。`; }
       }
@@ -223,7 +228,7 @@ export const useSkillAutoSyncStore = defineStore("skillAutoSync", () => {
   async function refreshCloudSkills() {
     const id = owner.value;
     if (!id || busy.value) return;
-    busy.value = true; error.value = "";
+    busy.value = true; clearFeedback();
     try {
       const items: CloudSkill[] = [], cursors = new Set<string>();
       let cursor: string | null = "";
@@ -240,7 +245,7 @@ export const useSkillAutoSyncStore = defineStore("skillAutoSync", () => {
   async function deleteCloudSkill(skillId: string) {
     const id = owner.value, item = cloudSkills.value.find(skill => skill.id === skillId && !skill.deleted);
     if (!id || !item || busy.value) return;
-    busy.value = true; error.value = "";
+    busy.value = true; clearFeedback();
     try {
       const result = await write(id, generation, skillId, null, item.revision);
       cloudSkills.value = cloudSkills.value.map(skill => skill.id === skillId
@@ -253,12 +258,14 @@ export const useSkillAutoSyncStore = defineStore("skillAutoSync", () => {
   async function downloadCloudSkill(skillId: string) {
     const id = owner.value, item = cloudSkills.value.find(skill => skill.id === skillId && !skill.deleted);
     if (!id || !item || busy.value) return;
-    busy.value = true; error.value = "";
+    busy.value = true; clearFeedback(); downloadNotice.value = null;
     try {
       const expected = fingerprint(localSkill(skillId));
       applyRemote(item, expected);
       acknowledge(id, skillId, item.revision, fingerprint(fromRemote(item)));
       notice.value = `Skill“${item.content?.name || skillId}”已下载到本地。`;
+      // A new object also notifies the UI when the same Skill is downloaded again.
+      downloadNotice.value = { message: notice.value };
     } catch (e) { error.value = `下载未完成：${String(e)}`; }
     finally { busy.value = false; }
   }
@@ -277,7 +284,7 @@ export const useSkillAutoSyncStore = defineStore("skillAutoSync", () => {
   const syncSkill = async (skillId: string) => {
     const id = owner.value;
     if (!id || busy.value) return;
-    busy.value = true; error.value = "";
+    busy.value = true; clearFeedback();
     try {
       await synchronize(id, generation, skillId);
       if (!conflicts.value.some(item => item.id === skillId) && !error.value) notice.value = "此 Skill 已同步";
@@ -289,6 +296,7 @@ export const useSkillAutoSyncStore = defineStore("skillAutoSync", () => {
     if (!id || !item || busy.value) return;
     resolving = true;
     busy.value = true;
+    clearFeedback();
     try {
       if (fingerprint(localSkill(skillId)) !== item.localFingerprint) throw new Error("本地内容已变化，请先重新同步");
       if (choice === "local") {
@@ -306,7 +314,7 @@ export const useSkillAutoSyncStore = defineStore("skillAutoSync", () => {
     finally { resolving = false; busy.value = false; if (requested) void syncNow(); }
   }
   watch(owner, () => {
-    generation++; error.value = ""; notice.value = ""; conflicts.value = []; cloudSkills.value = [];
+    generation++; clearFeedback(); downloadNotice.value = null; conflicts.value = []; cloudSkills.value = [];
     if (timer) { clearTimeout(timer); timer = undefined; }
     if (owner.value) {
       try { claim(owner.value); } catch (e) { error.value = String(e); return; }
@@ -322,6 +330,6 @@ export const useSkillAutoSyncStore = defineStore("skillAutoSync", () => {
   const online = () => { void syncNow(); };
   window.addEventListener("online", online);
   onScopeDispose(() => { generation++; requested = false; if (timer) clearTimeout(timer); window.removeEventListener("online", online); });
-  return { busy, error, notice, conflicts, cloudSkills, syncedSkillIds, isSynced,
+  return { busy, error, notice, downloadNotice, conflicts, cloudSkills, syncedSkillIds, isSynced,
     syncNow, syncSkill, refreshCloudSkills, downloadCloudSkill, deleteCloudSkill, resolveConflict };
 });

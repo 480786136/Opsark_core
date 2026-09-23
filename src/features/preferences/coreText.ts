@@ -19,6 +19,7 @@ const credentialErrorKeys = [
 const messages: ReadonlyArray<readonly [string, string]> = [
   ...knowledgeErrorKeys.map(key => [uiMessages["zh-CN"].knowledge[key], uiMessages["en-US"].knowledge[key]] as const),
   ...credentialErrorKeys.map(key => [uiMessages["zh-CN"].settings[key], uiMessages["en-US"].settings[key]] as const),
+  ["完全托管模式倒计时结束，开始生成后续计划；生成后将自动继续，高风险步骤仍需单独确认。", "The managed-mode countdown has ended. Generating the follow-up plan and continuing automatically; high-risk steps still require approval."],
   ["等待连接", "Waiting to connect"],
   ["身份验证失败", "Authentication failed"],
   ["等待手动重连", "Waiting for manual reconnection"],
@@ -113,6 +114,7 @@ export function localizeCoreText(value: string | undefined | null, locale: strin
   if (exact) return exact;
   // Anchored templates emitted by Core forms; dynamic field names remain original.
   const patterns: Array<[RegExp, (match: RegExpMatchArray) => string]> = [
+    [/^(观察模式|安全模式)下，请查看已有结果并手动生成后续计划。$/, m => `In ${m[1] === "观察模式" ? "step-by-step" : "safe"} mode, review the available results and generate the follow-up plan manually.`],
     [/^请选择必填参数“(.+)”$/, m => `Select a value for the required field “${m[1]}”`],
     [/^请填写必填参数“(.+)”$/, m => `Complete the required field “${m[1]}”`],
     [/^参数“(.+)”必须选择当前候选项中的有效选项$/, m => `Select a valid option for “${m[1]}”`],

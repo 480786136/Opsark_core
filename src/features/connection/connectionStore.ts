@@ -33,7 +33,7 @@ export function isAuthenticationFailure(reason: string) {
 }
 
 export function isConnectionTransportFailure(reason: string) {
-  return /SSH_(?:NETWORK|TIMEOUT|DNS|HANDSHAKE|AUTH)|SSH 网络|SSH 握手|身份认证|身份验证|用户名或密码|连接超时|连接已断|connection (?:timed out|reset|refused|closed)|host is down|no route to host|network (?:is unreachable|unreachable)|broken pipe|socket|transport|连接.*失败|服务器.*失联|session.*disconnect/i.test(reason);
+  return /SSH_(?:NETWORK|TIMEOUT|DNS|HANDSHAKE|AUTH)|SSH 网络|SSH 握手|身份认证|身份验证|用户名或密码|连接超时|连接已断|connection (?:timed out|reset|refused|closed)|host is down|no route to host|network (?:is unreachable|unreachable)|broken pipe|socket|transport|failure while draining incoming flow|连接.*失败|服务器.*失联|session.*disconnect/i.test(reason);
 }
 
 export function connectionErrorMessage(error: unknown) {

@@ -15,6 +15,7 @@ mod file_tree;
 mod json_contract;
 mod local_terminal;
 mod model_parameters;
+mod next_stage_format;
 mod knowledge;
 mod metrics;
 mod model;
@@ -158,27 +159,28 @@ struct CommandOutputEvent {
 const STRICT_JSON_OUTPUT_RULE: &str = "输出格式是强制协议：必须只返回一个完整、可由标准 JSON 解析器直接解析的对象；禁止 Markdown 代码块、前后说明、注释、尾随逗号、NaN/Infinity 和未转义的反斜杠。必须严格使用系统消息指定的字段、类型和枚举值，不得增加或省略必填字段。返回前请自检 JSON 语法和结构。";
 const PLAN_STEP_OUTPUT_CONTRACT: &str = r#"输出必须是 {"steps":[...]} 对象，steps 必须至少有 1 个元素。
 每个元素必须严格包含：{"kind":"observe|change","title":"非空字符串","description":"非空字符串","command":"非空字符串","expected":"非空字符串","validation":"字符串","risk":"low|medium|high"}。可选字段只允许 executionScope、validationScope、runtimeClass、sessionContextChange 和 recovery；省略时程序使用安全默认值。executionScope 可为 agent_session|isolated_exec|managed_service|user_action；validationScope 可为 isolated_exec|fresh_interactive_shell|fresh_login_shell；runtimeClass 可为 bounded|progressive|persistent_service。sessionContextChange 仅能与 agent_session 同时使用，可包含绝对 cwd、非敏感 environment、绝对 sourceFiles 和 bash|sh|zsh shell；禁止放入凭据或 ${secret.NAME}。
-recovery 格式为 {"failedStepId":"上下文中既有失败 ID","targetContext":"该失败的原始目标上下文","purpose":"diagnose|repair|verify"}。存在 recovery.blockers 时，下一步必须先关联诊断、修复或复验，不能先执行依赖业务再把恢复放在后面。diagnose 必须 observe，repair 必须 change。verify 必须执行 blocker.verification.command 原文（change 的原 validation，observe 的原观察命令），expected 保留原值，不得换成更弱检查；默认 observe 且 validation 为空，并保留 verification.executionScope。原 verification.validationScope 为 fresh_* 时使用 change 并保留原 validation 和 validationScope，此选项仍需变更授权。修复命令成功不表示阻断解除，必须以同一目标与轮次上的真实关联复验成功验收，重连或更换凭据后要重新取得实际证据。不得编造关联 ID/上下文，不得用命令名称、共享路径或恢复关键词代替关联；recovery 关系本身不授权变更。
+recovery 是可选的历史关联元数据，格式为 {"failedStepId":"上下文中既有失败 ID","targetContext":"该失败的原始目标上下文","purpose":"diagnose|repair|verify"}。只有当某步确实针对特定失败进行诊断、修复或复验时才提供；普通只读诊断无需为了通过 Core 门禁而附加 recovery。diagnose 必须 observe 且只读，repair 必须 change。历史失败的命令、expected、退出码和输出是不可改写的执行事实，不是后续计划必须逐字复制的验收方法。你可以依据用户目标、当前证据和授权调整后续步骤、剩余计划及验收方法；verify 应说明新证据如何证明目标，不能仅靠修复命令成功宣告目标已验收。Core 不会根据 recovery 关系裁决业务是否完成；不得编造关联 ID/上下文，recovery 关系本身不授权变更，仍须通过安全、授权和真实执行证据检查。
 observe 表示只读查询或诊断：主命令输出和退出状态就是观察证据，validation 必须为空字符串，不得生成第二条重复查询。change 表示会改变目标状态：validation 必须是非空、独立、只读的后置条件。command 和 validation 可以包含换行，但必须按标准 JSON 规则转义。
 diagnose 的 command 必须真正无副作用，禁止 mktemp、写入/删除临时文件和刷新包缓存。不要生成“mktemp→输出落盘→rm”诊断链，修复时需整体移除创建、写入和清理；不能只删 rm，也不能改为 repair 绕过授权。需要截断输出时使用 set -o pipefail，或 out=$(只读命令 2>&1); rc=$?; printf '%s\n' "$out"; exit "$rc"，保留真实退出码。允许 /dev/null 和文件描述符输出；dnf/yum 查询必须使用 --cacheonly/-C，避免刷新缓存。
 模型工具例外：工具命令必须严格写成 opsark-tool <toolId> <JSON参数对象>，toolId 前不得添加 --，且必须按工具 inputSchema 提供必填参数；禁止只输出 opsark-tool、缺少参数或使用数组参数。当 command 以 opsark-tool 开头时，validation 必须固定为 JSON 字符串 "true"，即输出 "validation":"true"；禁止输出 JSON 布尔值 true。该字符串是工具协议占位，不会被当作远端校验命令执行。工具上下文中 planMode=standalone 的工具必须是 steps 中唯一的步骤，完成后系统会依据 completionMode 继续编排。
-planMode=read_batch 的工具可以组成纯只读批次：所有步骤 kind=observe，参数必须已经由用户或真实证据确定，不能依赖本批次尚未返回的结果；不能混入 Shell、变更或 standalone 工具。程序逐项执行，失败即停止，整批结束再分析结果。context.expand 只展开活动 Skill 规则，不证明任何业务目标完成。
+同一计划可按顺序包含 Shell、变更及 read_batch 只读工具，例如克隆成功并验收后读取已知最终路径。read_batch 是只读批次能力，不是整个计划的限制；这些工具仍必须 kind=observe。程序串行执行并逐步审批，前置失败停止后续步骤，不把混合计划当作并行批次。参数必须已知，未知路径或配置取决于前项输出时先取得结果再规划，不能猜测。standalone 工具仍必须单独规划，等待输入或上下文变化后续接。context.expand 只补充说明，不证明业务完成。
 Shell 反斜杠在 JSON 字符串内必须写成双反斜杠，例如 Shell 的 \( 必须输出为 \\( 的 JSON 文本。
 输出前逐个检查七个字段，必须保证整个 JSON 对象完整闭合，不得截断任何字段。"#;
 const NEXT_STAGE_DECISION_SYSTEM: &str = r#"本调用把阶段结束后的整体完成判断和下一阶段规划合并为一次决策。GENERAL_PLAN_SYSTEM 的全部证据、安全、授权、Skill 和最小计划规则仍然生效；仅以本联合输出契约替代其中“只返回计划对象”的输出要求。
 
-完成证据门禁：
-- 必须先把用户整体目标逐项与 context.baseSnapshot 中作用域匹配的结构化 result/evidence，以及全部 context.activeSkills 的最终验收要求进行比较。
+完成证据指引：
+- 必须先把用户整体目标逐项与 context.baseSnapshot 中作用域匹配的结构化 result/evidence 进行比较；context.activeSkills 的验收方法仅作参考，可说明理由后替换，不得降低用户明确要求。
 - 计划文字、步骤标题、expected、阶段 summary、模型 review、指令和待执行步骤都不是完成证据；历史证据只能证明其自身 scope，不能外推当前状态。
-- 任一目标尚无证据、证据过期或作用域不匹配，或者存在未恢复的执行失败、安全拦截、审批/输入阻断、冲突证据或未满足的 Skill 验收条件时，禁止返回 complete。
+- 执行失败、安全拦截、审批/输入等待和冲突证据都必须如实纳入判断，但单个历史失败或 Core 记录的 recovery 关系不自动决定整体目标未完成；是否完成由你结合用户目标和全部新旧证据判断，不得改写任何失败事实。
 - 只有结构化成功证据已经充分证明整体目标及全部最终验收条件时才能返回 complete，并且 steps 必须为空数组。
-- 尚未完成时必须在同一个响应中返回至少一个当前证据允许的最小下一阶段步骤。当前阶段正常结束且可直接推进时返回 continue；需要因失败、阻断、证据缺口或错误假设改变方案时返回 adjust。不得重复已经有结构化完成证据的工作。
+- 尚未完成且有合法、有意义的下一步时，在同一个响应中返回当前证据允许的最小下一阶段。可直接推进时返回 continue；需要改变方案时返回 adjust。如果目标未完成但当前没有允许或有意义的可执行动作，返回 adjust 且 steps=[]，表示 blocked/no_action，reason 和 summary 必须说明原因；不得为满足非空计划而编造或重复步骤。
 - 缺少必须由用户作出的决定时返回 adjust，steps 中只能有一个 user.request_input 步骤；已有未回答问题时复用原问题，reason 和 summary 说明具体待决事项与等待原因。等待用户不是业务执行失败，不得据此改换目标或生成绕过问题的恢复方案；用户回答只解决对应决定，不证明整体目标完成。"#;
 const NEXT_STAGE_OUTPUT_CONTRACT: &str = r#"输出必须严格为 {"decision":"complete|continue|adjust","reason":"非空字符串","summary":"非空字符串","steps":[]}，顶层不得增加其他字段。
-decision=complete 时 steps 必须严格为空数组。decision=continue 或 adjust 时 steps 必须至少有 1 个元素。
+decision=complete 时 steps 必须严格为空数组。decision=continue 时 steps 必须至少有 1 个元素。decision=adjust 可以返回非空调整计划，也可以在当前无合法动作时返回空 steps；空 steps 表示 blocked/no_action，Core 将停止继续生成步骤。
 每个步骤必须严格包含：{"kind":"observe|change","title":"非空字符串","description":"非空字符串","command":"非空字符串","expected":"非空字符串","validation":"字符串","risk":"low|medium|high"}。可选字段只允许 executionScope、validationScope、runtimeClass、sessionContextChange 和 recovery；其枚举、作用域、独立校验、恢复关系、长任务和进程跟踪要求与 GENERAL_PLAN_SYSTEM 相同。
-observe 的 validation 必须为空字符串；change 的 validation 必须是非空、独立、只读的后置条件。工具命令必须严格写成 opsark-tool <toolId> <JSON参数对象> 并符合 context.tools 的 inputSchema。当 command 以 opsark-tool 开头时，validation 必须固定为 JSON 字符串 "true"，即输出 "validation":"true"；禁止输出 JSON 布尔值 true。context.activeSkills 禁止的工具不得出现在 steps 中。工具上下文中 planMode=standalone 的工具必须是 steps 中唯一的步骤。
-planMode=read_batch 允许参数已经确定的纯 observe 工具批次；不能混入 Shell、变更或 standalone，也不能预设前一步工具输出。整批结束后再判断下一阶段。planMode、completionMode、executionMode 是工具目录元数据，由编排器读取，禁止复制到 steps 的对象字段中；步骤只能使用输出协议声明的字段。
+observe 的 validation 必须为空字符串；change 的 validation 必须是非空、独立、只读的后置条件。工具命令必须严格写成 opsark-tool <toolId> <JSON参数对象> 并符合 context.tools 的 inputSchema。当 command 以 opsark-tool 开头时，validation 必须固定为 JSON 字符串 "true"，即输出 "validation":"true"；禁止输出 JSON 布尔值 true。Skill 是流程参考，不是工具权限；只能从 context.tools 选择可用工具。工具上下文中 planMode=standalone 的工具必须是 steps 中唯一的步骤。
+planMode=read_batch 的 observe 工具允许和 Shell、变更在同一计划中按顺序执行，不能并行跨越依赖；前置执行及验收成功后再执行后续步骤，失败立即停止。参数依赖未知输出时另行规划，不预设结果。standalone 工具仍是唯一待执行步骤。planMode、completionMode、executionMode 是工具目录元数据，由编排器读取，禁止复制到 steps 的对象字段中；步骤只能使用输出协议声明的字段。
+opsark-tool 仅是 Core 的独立工具调用协议，不是远端可执行程序；禁止在 Shell 脚本、条件分支、管道、命令替换或 validation 中嵌入，必须拆为独立步骤。
 command 和 validation 中的换行及反斜杠必须按标准 JSON 规则转义。返回前必须同时自检决策分支、所有计划字段和完整 JSON 结构。"#;
 const REQUIREMENT_CLASSIFICATION_CONTRACT: &str = r#"本阶段只做需求分类、任务关系判断、终端上下文判断、执行约束提取和 Skill 选择，禁止输出 steps、command、validation 或执行计划。context.taskGoal.rootGoal 是当前任务长期绑定的整体目标，currentInstruction 只是上一轮指令。必须判断本次输入与整体目标的关系：new_goal=独立的新执行目标；continue=继续/重试原目标；supplement=为原目标补充条件；side_question=临时咨询且不改变原目标；replace_goal=用户明确放弃原目标并替换；cancel_goal=明确取消原目标。不得仅因用户提出另一个问题就隐式覆盖原目标；新执行目标使用 new_goal，只有明确“改为/不要原目标/替换为”才用 replace_goal。必须先判断回答或计划是否依赖用户之前的终端输入/输出：如依赖且 terminalContext.content 未提供或范围不够，返回 terminal_context，terminalContextLines 必须大于当前 includedLines，且不超过 totalLines 和 400；不依赖则不得请求终端内容。对 execute，constraints.changePolicy 是本轮权威的只读/变更边界：查询现状、列表、检查和定位故障必须为 read_only；用户明确要求安装、修改、构建、部署、传输或其他环境变更时为 requested_changes_only；只有用户明确允许为达成目标执行必要的附加变更时才为 allow_necessary_changes。execute 不得返回 unspecified。environmentPolicy、failurePolicy、prohibitedActions、requiredConditions 和 userDirectives 只能来自用户明确表达，不得猜测或自行增加。context.skillDirectory 中的名称、description 和 selectionHints 用于语义选择；category 只用于管理和导航，不得触发 Skill。只选择直接适用于整体目标、本轮显式子目标或已有证据证明必需阶段的 Skill，允许复合需求选择多个 Skill；不得因为目录中存在相近领域或关键词局部相似而强行匹配。零匹配是正常且合法的结果，此时 selectedSkillIds=[]，后续使用通用流程。selectedSkillIds 是本轮完整集合，continue/supplement 也必须移除不再适用或上轮误选的 Skill，程序不会自动并集。咨询类必须严格输出：{"intent":"answer","relation":"side_question|cancel_goal","answer":"非空回答","constraints":null,"terminalContextLines":0,"selectedSkillIds":[]}。执行类必须严格输出：{"intent":"execute","relation":"new_goal|continue|supplement|replace_goal","answer":"","constraints":{"changePolicy":"read_only|requested_changes_only|allow_necessary_changes","environmentPolicy":"unspecified|preserve|allow_isolated_changes|allow_host_changes","failurePolicy":"unspecified|strict|best_effort","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},"terminalContextLines":0,"selectedSkillIds":[]}。需要更多终端内容时必须严格输出：{"intent":"terminal_context","relation":null,"answer":"","constraints":null,"terminalContextLines":80,"selectedSkillIds":[]}。顶层只允许 intent、relation、answer、constraints、terminalContextLines、selectedSkillIds 六个字段。"#;
 const SECRET_PLACEHOLDER_RULE: &str = "敏感变量规则：${secret.NAME} 是 Opsark 的执行时传输占位符，不是要保留在远端文件里的字面量。必须原样写成 ${secret.NAME}，绝对不得在美元符号前添加反斜杠。程序会在 SSH 执行前注入真实值，并在输出、日志和模型上下文中脱敏。模型看到的 •••••••• 只表示真实值已被脱敏：它既不是远端文件的实际内容，也不能证明具体密码正确或错误，更不能据此声称占位符未解析。选择变量时名称和说明必须与目标凭据语义一致；若现有变量无法区分目标账户或用途，应使用新的、用途明确的变量名，由界面向用户索取，不能静默借用含义模糊的旧值。写入远端配置后应使用不泄露秘密的功能性后置条件校验；校验命令中仍可使用同一占位符供程序注入。不得要求远端保留 Opsark 占位符，也不得因脱敏标记判定泄露、写入失败或密码错误。除非用户明确禁止持久化密码，不得自行增加该限制。";
@@ -196,7 +198,7 @@ const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
    提问必须按 context.tools 中 user.request_input 的 inputSchema 构造，只收集阻止当前推进的最少必要决定，并说明已知事实、待决事项和相关影响。已知有限候选，尤其只读发现已给出候选时，优先使用 select 字段；options 必须是 1 至 100 个 {value,label} 对象，value 和 label 为非空字符串，value 按原值精确唯一。开放信息使用 text，敏感值使用 password；候选未知时不得编造 options。所有字段不得设置默认值或预选项，必须等待用户明确输入或选择；重大操作的确认或授权须独立保留，不能由目标选择代替，不得默认同意。
    例如仅当现有证据已经列出目标 A、目标 B 时，可按当前 inputSchema 生成字段 {"key":"target","label":"操作目标","description":"请选择本次操作的目标。","type":"select","required":true,"options":[{"value":"target-a","label":"目标 A"},{"value":"target-b","label":"目标 B"}]}；实际候选及其标识必须来自已知事实，示例不替代 context.tools 中的 schema。
    已明确回答且仍适用于同一目标的问题必须复用，不得重复索取。已有未回答问题时复用原问题并保持等待，不得追加发现或业务步骤来绕过它；“继续、托管、批准”不替代未回答的具体问题。等待用户不是业务执行失败，不得以此重拟替代目标或恢复方案。
-   user.request_input 只收集输入，不改变目标环境，应使用 kind=observe。该工具未开放、被禁用或被当前 Skill 明确禁止时，必须保持真实阻断；不得用 Shell 模拟提问、猜测回答、编造完成证据或改选替代方案继续。
+   user.request_input 只收集输入，不改变目标环境，应使用 kind=observe。该工具未开放或被禁用时，必须保持真实阻断；不得用 Shell 模拟提问、猜测回答、编造完成证据或改选替代方案继续。
    在上述用户决定和授权已明确的前提下，当当前阻断发生在依赖解析、编译、打包或镜像构建阶段时，本阶段只能生成修复构建及验收构建产物的最少步骤。构建产物未经结构化程序证据确认前，不得生成启动、后台运行、部署、端口探测或应用健康检查步骤；待产物验收成功后再续接独立部署阶段。
 4. 证据充足且必要用户决定已明确时，按“必要确认→变更→最终验收”生成最少必要的计划。
 5. 默认每步在独立非交互 Shell 中运行，所需目录和环境必须在当步建立。只有后续步骤确实需要复用工作目录、非敏感环境变量或 source 文件时，才可选用 executionScope=agent_session 并用 sessionContextChange 明确记录可重放状态；主 command 仍必须自行建立它当次依赖的环境。
@@ -204,7 +206,7 @@ const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
 7. 下载、安装、构建等可能长时间运行的命令必须保留实时标准输出和真实退出码；不得将整个主命令直接管道给非跟随模式的 tail/head 以截断输出。如需限制展示，应在主命令完成并保存真实退出状态后处理日志。
 8. 用户给出的明确命令、地址、标识符或协议必须保持语义不变。真实证据证明不可用只能作为阻断证据；若替代方案改变用户指定的目标、约束或授权范围，必须先通过 user.request_input 取得用户决定，不能仅说明替代原因就直接执行。
 9. 所有远程命令步骤都必须由执行器跟踪到真实退出；不得使用未受管的单独 &、disown、setsid -f 或伪造轮询让进程脱离执行生命周期，也不得用 || true、末尾 ; true 或失败分支 exit 0 掩盖主命令和校验的真实失败。有限操作必须前台执行；长驻进程应使用环境已有的受管机制，并通过独立只读证据校验状态。不得重复已完成的输入、发现、变更或验收步骤。
-10. context.activeSkills 是需求理解阶段从已启用目录中选出的领域工作流。存在多个 Skill 时，必须同时遵循全部 Skill 的阶段、工具选择和验收要求，将相容阶段合并且不得静默丢弃任一 Skill；如指令冲突，必须优先满足用户明确约束和核心安全规则，并仅规划可安全确定的阶段。没有激活 Skill 时仅使用通用最小证据流程。工具只能按 context.tools 中的输入协议、planMode 和 completionMode 调用，不得猜测工具能力。需要敏感变量时使用语义明确的 ${secret.NAME} 占位符，禁止把真实值写入计划。不同目标系统、账户、身份或用途的凭据不得静默复用；用途不一致时必须由对应 Skill 指定语义化变量并向用户收集。
+10. context.activeSkills 是领域流程参考，不是权限或固定执行路径。可根据用户目标和真实证据调整推荐阶段、步骤顺序、工具和验收方法，并说明偏离原因；多个 Skill 不得互相收窄工具范围。旧版 allowedToolIds、forbiddenToolIds、allowShell 不构成授权或禁令，Skill 文本中的工具偏好也不替代当前能力目录。不得降低用户明确验收要求，用户约束、系统安全和审批始终有效。没有激活 Skill 时使用通用最小证据流程。工具只能按 context.tools 中的输入协议、planMode 和 completionMode 调用，不得猜测工具能力。需要敏感变量时使用语义明确的 ${secret.NAME} 占位符，禁止把真实值写入计划。不同目标系统、账户、身份或用途的凭据不得静默复用；用途不一致时按目标、账户和用途命名新的语义化变量，通过系统安全输入收集；不以激活某个 Skill 为前置条件。
 11. 用户提供的路径、文件名和其他可能包含空格、括号、通配符或非 ASCII 字符的值，作为 Shell 参数时必须逐项完整安全引用，并在命令支持时使用 -- 结束选项；不得依赖未引用文本恰好能被当前 Shell 解析。
 12. 必须先根据步骤本身的副作用选择 kind：只读查询、环境发现和故障诊断是 observe，主命令结果直接作为证据，不生成重复 validation；写入、安装、启停、构建、传输等是 change，必须用独立 validation 验收变更后状态。change 的 validation 运行在独立 Shell，不能读取 command 的变量或标准输出。command 若从配置动态解析目标，validation 必须重新读取同一配置，不得硬编码未证明值。只有 opsark-tool 步骤允许使用 JSON 字符串 "true" 作为 validation，即输出 "validation":"true"；不得输出 JSON 布尔值 true。
 13. 下载、包安装、依赖解析、编译和镜像构建可标记 runtimeClass=progressive；受系统服务管理器托管的长驻进程使用 executionScope=managed_service 与 runtimeClass=persistent_service。不确定时省略这些可选字段，由执行器安全分类。
@@ -413,10 +415,11 @@ struct ModelSkillDefinition {
     description: String,
     version: usize,
     instructions: String,
-    #[serde(default)]
-    allowed_tool_ids: Option<Vec<String>>,
-    #[serde(default)]
-    forbidden_tool_ids: Vec<String>,
+    // Legacy Skill metadata is accepted, but never serialized as capability policy.
+    #[serde(default, skip_serializing, rename = "allowedToolIds")]
+    _legacy_allowed_tool_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing, rename = "forbiddenToolIds")]
+    _legacy_forbidden_tool_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -613,34 +616,6 @@ fn context_with_selected_skills(
                 .is_some_and(|id| selected_skill_ids.iter().any(|selected| selected == id))
         });
     }
-    if let Some(Value::Array(tools)) = object.get_mut("tools") {
-        // A missing allow-list means a legacy/custom Skill whose capabilities
-        // are unknown. Keep the planner-visible catalog in that case so prompt
-        // optimization cannot silently remove a required custom capability.
-        let restrict_to_allow_lists = !selected.is_empty()
-            && selected
-                .iter()
-                .all(|skill| skill.allowed_tool_ids.is_some());
-        let allowed_tool_ids = selected
-            .iter()
-            .flat_map(|skill| skill.allowed_tool_ids.iter().flatten())
-            .cloned()
-            .collect::<HashSet<_>>();
-        tools.retain(|tool| {
-            tool.get("id")
-                .and_then(Value::as_str)
-                .map(|id| {
-                    let forbidden = selected
-                        .iter()
-                        .any(|skill| skill.forbidden_tool_ids.iter().any(|item| item == id));
-                    !forbidden
-                        && (!restrict_to_allow_lists
-                            || allowed_tool_ids.contains(id)
-                            || matches!(id, "evidence.read" | "user.request_input"))
-                })
-                .unwrap_or(true)
-        });
-    }
     object.insert(
         "skillSelection".to_string(),
         json!({
@@ -782,43 +757,6 @@ fn classification_contract_error(
         }
 }
 
-/// A fresh read-only request cannot be a side question to a nonexistent goal.
-/// Never infer a new relation when any prior task context is present or unknown.
-fn normalize_initial_readonly_relation(
-    decision: &mut AiRequirementDecision,
-    context: &str,
-) -> bool {
-    if decision.intent != "execute"
-        || decision.relation.as_deref() != Some("side_question")
-        || !decision.answer.trim().is_empty()
-        || decision.terminal_context_lines != 0
-        || !execute_constraints_match_contract(&decision.constraints)
-        || decision.constraints["changePolicy"] != "read_only"
-    {
-        return false;
-    }
-    let Ok(value) = serde_json::from_str::<Value>(context) else {
-        return false;
-    };
-    let absent = |key: &str| value.get(key).is_none_or(Value::is_null);
-    let empty_array = |pointer: &str| {
-        value
-            .pointer(pointer)
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
-    };
-    if !value.is_object()
-        || !absent("taskGoal")
-        || !absent("previousExecution")
-        || !empty_array("/conversationHistory")
-        || !empty_array("/knownExecutionFacts/completedSteps")
-    {
-        return false;
-    }
-    decision.relation = Some("new_goal".into());
-    true
-}
-
 fn execute_constraints_match_contract(value: &Value) -> bool {
     let Ok(constraints) = serde_json::from_value::<ExecutionConstraints>(value.clone()) else {
         return false;
@@ -885,42 +823,6 @@ fn model_tool_id(command: &str) -> Option<&str> {
         .filter(|tool_id| !tool_id.is_empty())
 }
 
-fn active_skill_forbidden_tool_ids(context: &str) -> Result<HashSet<String>, String> {
-    let value: Value = serde_json::from_str(context)
-        .map_err(|error| format!("active Skill 工具策略上下文无效：{error}"))?;
-    let Some(active_skills) = value.get("activeSkills") else {
-        return Ok(HashSet::new());
-    };
-    let active_skills = active_skills
-        .as_array()
-        .ok_or_else(|| "active Skill 工具策略上下文无效：activeSkills 必须是数组".to_string())?;
-    let mut forbidden_tool_ids = HashSet::new();
-    for (skill_index, skill) in active_skills.iter().enumerate() {
-        let Some(raw_tool_ids) = skill.get("forbiddenToolIds") else {
-            continue;
-        };
-        let raw_tool_ids = raw_tool_ids.as_array().ok_or_else(|| {
-            format!(
-                "active Skill 工具策略上下文无效：第 {} 个 activeSkills.forbiddenToolIds 必须是数组",
-                skill_index + 1,
-            )
-        })?;
-        for raw_tool_id in raw_tool_ids {
-            let tool_id = raw_tool_id.as_str().ok_or_else(|| {
-                format!(
-                    "active Skill 工具策略上下文无效：第 {} 个 activeSkills.forbiddenToolIds 只能包含字符串",
-                    skill_index + 1,
-                )
-            })?;
-            let tool_id = tool_id.trim();
-            if !tool_id.is_empty() {
-                forbidden_tool_ids.insert(tool_id.to_string());
-            }
-        }
-    }
-    Ok(forbidden_tool_ids)
-}
-
 fn context_visible_tool_ids(context: &str) -> Result<Option<HashSet<String>>, String> {
     let value: Value =
         serde_json::from_str(context).map_err(|error| format!("规划工具上下文无效：{error}"))?;
@@ -950,24 +852,6 @@ fn context_visible_tool_ids(context: &str) -> Result<Option<HashSet<String>>, St
         tool_ids.insert(tool_id.to_string());
     }
     Ok(Some(tool_ids))
-}
-
-fn validate_active_skill_tool_policy(
-    raw_steps: &[AiPlanStep],
-    forbidden_tool_ids: &HashSet<String>,
-) -> Result<(), String> {
-    for (index, step) in raw_steps.iter().enumerate() {
-        let Some(tool_id) = model_tool_id(step.command.trim()) else {
-            continue;
-        };
-        if forbidden_tool_ids.contains(tool_id) {
-            return Err(format!(
-                "第 {} 个计划步骤调用了 active Skill 禁止工具 {tool_id}；必须按 active Skill 的工具策略改用允许的工具或 Shell 流程",
-                index + 1,
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn validate_visible_tool_policy(
@@ -1064,6 +948,9 @@ fn convert_ai_plan_steps(raw_steps: Vec<AiPlanStep>) -> Result<Vec<PlanStep>, St
                     index + 1
                 ));
             }
+            if item.expected.trim().is_empty() {
+                return Err(format!("第 {} 个计划步骤的 expected 不能为空", index + 1));
+            }
             let description = if item.description.trim().is_empty() {
                 item.title.trim().to_string()
             } else {
@@ -1088,11 +975,7 @@ fn convert_ai_plan_steps(raw_steps: Vec<AiPlanStep>) -> Result<Vec<PlanStep>, St
             } else {
                 description
             };
-            let expected = if item.expected.trim().is_empty() {
-                "获得可用于判断用户目标的执行证据".to_string()
-            } else {
-                item.expected.trim().to_string()
-            };
+            let expected = item.expected.trim().to_string();
             let computed = risk_for(&item.command);
             let supplied = item
                 .risk
@@ -1264,12 +1147,11 @@ fn validate_ai_plan_contract(
             item.expected.to_ascii_lowercase(),
         );
         let command_lower = command.to_ascii_lowercase();
+        // Credential binding comes from machine-recognizable references, not
+        // prose such as “不使用凭据”. Runtime binding/transport checks remain authoritative.
         let git_credential_bound = command_lower.contains("git")
             && (credential_context.contains("server-credential:")
-                || credential_context.contains("${secret.")
-                || credential_context.contains("已保存凭据")
-                || credential_context.contains("已选凭据")
-                || credential_context.contains("使用凭据"));
+                || credential_context.contains("${secret."));
         if git_credential_bound && command_lower.contains("git_terminal_prompt=0") {
             return Err(format!(
                 "第 {} 个计划步骤引用了 Git HTTPS 凭据但禁用了交互认证提示；必须使用 GIT_TERMINAL_PROMPT=1 和受控 PTY 凭据通道",
@@ -1383,6 +1265,16 @@ fn build_next_stage_request_body(
     settings: &AiGenerationSettings,
 ) -> Value {
     let limit_rule = next_stage_limit_rule(settings);
+    if let Some(compact) = next_stage_format::repair_context(context) {
+        let mut body = json!({"_opsarkContext": compact.to_string(), "model":model,
+            "messages":[
+                {"role":"system", "content":format!("你在修复缺少 steps 的阶段响应，不是从头规划任务。被拒响应仅供修复，不能作为执行证据。保留 requiredDecision，必须返回非空 steps；证据不足时生成最小只读诊断或真实提问，不得编造事实或扩大授权。只使用基础步骤字段，特殊作用域留待后续完整规划。opsark-tool 必须独立成步，不能嵌入 Shell 或 validation。{NEXT_STAGE_OUTPUT_CONTRACT}\n{limit_rule}\n{SECRET_PLACEHOLDER_RULE}\n{STRICT_JSON_OUTPUT_RULE}")},
+                {"role":"user", "content":format!("整体用户目标：\n{requirement}\n\n阶段结束决策上下文：\n{compact}")}
+            ], "thinking":{"type":"disabled"},
+            "response_format":next_stage_format::response_format(&compact["formatRepair"]["requiredDecision"])});
+        if settings.limit_output { body["max_tokens"] = json!(settings.max_output_tokens); }
+        return body;
+    }
     let mut body = json!({
         "_opsarkContext": context,
         "model": model,
@@ -1412,7 +1304,6 @@ fn build_next_stage_request_body(
 fn validate_and_convert_ai_next_stage(
     raw: AiNextStageDecision,
     settings: &AiGenerationSettings,
-    forbidden_tool_ids: &HashSet<String>,
     visible_tool_ids: Option<&HashSet<String>>,
 ) -> Result<AiNextStageResult, String> {
     let AiNextStageDecision {
@@ -1438,15 +1329,15 @@ fn validate_and_convert_ai_next_stage(
         }
         Vec::new()
     } else {
+        if decision == "continue" && steps.is_empty() {
+            return Err("阶段联合决策为 continue 时 steps 至少需要 1 个元素".into());
+        }
         if steps.is_empty() {
-            return Err(format!(
-                "阶段联合决策为 {decision} 时 steps 至少需要 1 个元素"
-            ));
+            return Ok(AiNextStageResult { decision, reason, summary, steps: Vec::new() });
         }
         normalize_model_tool_validations(&mut steps);
         normalize_recoverable_plan_failure_masks(&mut steps);
         validate_ai_plan_contract(&steps, settings)?;
-        validate_active_skill_tool_policy(&steps, forbidden_tool_ids)?;
         validate_visible_tool_policy(&steps, visible_tool_ids)?;
         convert_ai_plan_steps(steps)?
     };
@@ -1465,8 +1356,6 @@ fn plan_repair_instruction(error: &str, previous_steps: Option<&[AiPlanStep]>) -
     }
     let targeted = if error.contains("当前规划上下文未开放工具") {
         "上次计划调用了 context.tools 未开放的工具。只修复命中的工具步骤：只能从当前 context.tools 选择真实可用工具；若当前阶段不需要工具则改用真实可执行的 Shell 流程，不得猜测隐藏工具或重新扩大工具目录。"
-    } else if error.contains("active Skill 禁止工具") {
-        "上次计划调用了当前 active Skill 明确禁止的工具。只修复命中的工具步骤：删除该工具调用，并严格按 activeSkills.instructions 中声明的允许工具、凭据通道和处理阶段重建。不得用目录中的另一个工具猜测替代方案；必要能力不存在时，应返回真实阻断。"
     } else if error.contains("禁用了交互认证提示") {
         "上次计划已引用已保存的 Git HTTPS 凭据，却同时设置 GIT_TERMINAL_PROMPT=0，使执行器无法通过受控 PTY 回答 Username/Password。仅修复该认证步骤：改为 GIT_TERMINAL_PROMPT=1，保留原始裸 HTTPS URL、credential.helper= 和同一 server-credential 引用；不得重新索取凭据，不得改用 AskPass、URL userinfo、stdin 管道或凭据文件。"
     } else if error.contains("ASKPASS_CREDENTIAL_SCRIPT") {
@@ -1695,7 +1584,6 @@ fn focused_plan_repair_context(
         "executionConstraints",
         "authentication",
         "confirmedUserInputs",
-        "completedCommandFingerprints",
         "recovery",
         "planGenerationRepair",
         "adjustmentTrigger",
@@ -1838,14 +1726,55 @@ fn recovery_failure_envelope(error: &str, steps: &[AiPlanStep], budget: &PlanRep
         "modelCalls":budget.total_model_calls,"focusedRepairCalls":budget.focused_repair_calls}).to_string())
 }
 
+/// Parsing failures have no executable plan. Preserve the response separately
+/// so recovery can ask for a complete decision without inventing empty steps.
+fn parse_next_stage_response(payload: &Value) -> Result<AiNextStageDecision, String> {
+    let content = message_content(payload, "模型响应缺少阶段联合决策内容");
+    content.and_then(parse_model_json::<AiNextStageDecision>).map_err(|error| {
+        json!({
+            "kind": "next_stage_response_invalid",
+            "validationError": format!("阶段联合决策结构解析失败：{error}"),
+            "rawResponse": payload.pointer("/choices/0/message/content").and_then(Value::as_str).unwrap_or(""),
+            "rejectedPlanExecuted": false,
+        }).to_string()
+    })
+}
+
+fn parse_next_stage_with_format_guard(payload: &Value, context: &str) -> Result<AiNextStageDecision, String> {
+    let decision = parse_next_stage_response(payload)?;
+    if let Some(compact) = next_stage_format::repair_context(context) {
+        if decision.steps.is_empty() || json!(&decision.decision) != compact["formatRepair"]["requiredDecision"] {
+            return Err(json!({"kind":"next_stage_response_invalid",
+                "validationError":"精简格式修复必须保留原决策并提供非空 steps，不能通过空数组或改判完成掩盖缺失计划",
+                "rawResponse":payload.pointer("/choices/0/message/content").and_then(Value::as_str).unwrap_or(""),
+                "rejectedPlanExecuted":false}).to_string());
+        }
+    }
+    Ok(decision)
+}
+
 fn validate_next_stage_preserving_recovery(
     decision: AiNextStageDecision, settings: &AiGenerationSettings,
-    forbidden_tool_ids: &HashSet<String>, visible_tool_ids: Option<&HashSet<String>>,
+    visible_tool_ids: Option<&HashSet<String>>,
 ) -> Result<AiNextStageResult, String> {
     let original = decision.clone();
-    validate_and_convert_ai_next_stage(decision, settings, forbidden_tool_ids, visible_tool_ids).map_err(|error| {
+    validate_and_convert_ai_next_stage(decision, settings, visible_tool_ids).map_err(|error| {
         let budget = PlanRepairBudget { total_model_calls: 1, ..Default::default() };
-        let Some(envelope) = recovery_failure_envelope(&error, &original.steps, &budget) else { return error; };
+        let Some(envelope) = recovery_failure_envelope(&error, &original.steps, &budget) else {
+            // A valid JSON response can still violate the capability or plan
+            // contract. Preserve it as planning feedback, not a service outage.
+            let steps: Vec<Value> = original.steps.iter().enumerate().map(|(index, step)| {
+                let mut value = serde_json::to_value(step).unwrap();
+                value["id"] = json!(next_plan_step_id("rejected-step", index));
+                value["status"] = json!("pending");
+                value
+            }).collect();
+            return json!({
+                "kind": "plan_protocol_failure", "validationError": error, "steps": steps,
+                "nextStageDecision": {"decision": original.decision, "reason": original.reason, "summary": original.summary},
+                "rejectedPlanExecuted": false,
+            }).to_string();
+        };
         let mut preserved: Value = serde_json::from_str(&envelope).unwrap();
         preserved["nextStageDecision"] = json!({"decision":original.decision,"reason":original.reason,"summary":original.summary});
         preserved.to_string()
@@ -2828,7 +2757,6 @@ async fn generate_ai_plan_with_trace(
     developer_log_path: Option<&Path>,
 ) -> Result<Vec<PlanStep>, String> {
     let generation_settings = generation_settings.unwrap_or_default();
-    let forbidden_tool_ids = active_skill_forbidden_tool_ids(&context)?;
     let visible_tool_ids = context_visible_tool_ids(&context)?;
     let limit_rule = if generation_settings.limit_output {
         format!(
@@ -2997,9 +2925,6 @@ async fn generate_ai_plan_with_trace(
                 last_repairable_steps = Some(raw_steps.clone());
                 match validate_ai_plan_contract(&raw_steps, &generation_settings)
                     .and_then(|_| {
-                        validate_active_skill_tool_policy(&raw_steps, &forbidden_tool_ids)
-                    })
-                    .and_then(|_| {
                         validate_visible_tool_policy(&raw_steps, visible_tool_ids.as_ref())
                     })
                     .and_then(|_| convert_ai_plan_steps(raw_steps))
@@ -3065,6 +2990,7 @@ async fn generate_ai_plan_with_trace(
         if let Some(error) = recovery_failure_envelope(&last_error, original_recovery_rejection.as_ref().unwrap_or(&raw_steps), &repair_budget) { return Err(error); }
         let only_presentational_fields_missing = raw_steps.iter().all(|item| {
             !item.command.trim().is_empty()
+                && !item.expected.trim().is_empty()
                 && matches!(item.kind.trim(), "observe" | "change")
                 && ((item.kind.trim() == "observe"
                     && (item.validation.trim().is_empty()
@@ -3084,7 +3010,7 @@ async fn generate_ai_plan_with_trace(
                     && model_tool_protocol_error(item.command.trim()).is_none()
                     && plan_safety_issue(item.command.trim(), "command").is_none()
                     && plan_safety_issue(item.validation.trim(), "validation").is_none()
-            }) && validate_active_skill_tool_policy(&raw_steps, &forbidden_tool_ids).is_ok()
+            })
                 && validate_visible_tool_policy(&raw_steps, visible_tool_ids.as_ref()).is_ok();
         let within_enabled_limits = !generation_settings.limit_output
             || (raw_steps.len() <= generation_settings.max_plan_steps.max(1)
@@ -3125,16 +3051,15 @@ async fn decide_ai_next_stage(
     let timeout_seconds = normalize_model_timeout(timeout_seconds);
     let generation_settings = generation_settings.unwrap_or_default();
     let mut developer_trace = ModelDeveloperTrace::default();
-    let forbidden_tool_ids = active_skill_forbidden_tool_ids(&context)
-        .map_err(|error| traced_model_error(error, &developer_trace))?;
     let visible_tool_ids = context_visible_tool_ids(&context)
         .map_err(|error| traced_model_error(error, &developer_trace))?;
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
-    let body = build_next_stage_request_body(&model, &requirement, &context, &generation_settings);
-    let request_snapshot = body.clone();
-    let started_at = Instant::now();
+    let mut body = build_next_stage_request_body(&model, &requirement, &context, &generation_settings);
+    let mut request_snapshot = body.clone();
+    let mut started_at = Instant::now();
+    let mut request_attempt = 1;
     let developer_log_path = developer_model_log_path(&app);
-    let payload = match post_model_request(
+    let mut response = post_model_request(
         &url,
         &api_key,
         &body,
@@ -3142,14 +3067,26 @@ async fn decide_ai_next_stage(
         timeout_seconds,
         developer_log_path.as_deref(),
     )
-    .await
-    {
+    .await;
+    if body["response_format"]["type"] == "json_schema"
+        && response.as_ref().err().is_some_and(|error| next_stage_format::schema_unsupported(error)) {
+        record_model_attempt(&mut developer_trace, "next_stage_format_capability", 1,
+            started_at, request_snapshot, None, response.as_ref().err().cloned());
+        // Exactly one capability downgrade. No retry for auth/billing/server errors.
+        body["response_format"] = json!({"type":"json_object"});
+        request_snapshot = body.clone();
+        request_attempt = 2;
+        started_at = Instant::now();
+        response = post_model_request(&url, &api_key, &body, "阶段格式修复（兼容模式）",
+            timeout_seconds, developer_log_path.as_deref()).await;
+    }
+    let payload = match response {
         Ok(payload) => payload,
         Err(error) => {
             record_model_attempt(
                 &mut developer_trace,
                 "next_stage_decision",
-                1,
+                request_attempt,
                 started_at,
                 request_snapshot,
                 None,
@@ -3174,7 +3111,7 @@ async fn decide_ai_next_stage(
         record_model_attempt(
             &mut developer_trace,
             "next_stage_decision",
-            1,
+            request_attempt,
             started_at,
             request_snapshot,
             Some(payload),
@@ -3183,16 +3120,11 @@ async fn decide_ai_next_stage(
         return Err(traced_model_error(error, &developer_trace));
     }
 
-    let result = message_content(&payload, "模型响应缺少阶段联合决策内容")
-        .and_then(|content| {
-            parse_model_json::<AiNextStageDecision>(content)
-                .map_err(|error| format!("阶段联合决策结构解析失败：{error}"))
-        })
+    let result = parse_next_stage_with_format_guard(&payload, &context)
         .and_then(|decision| {
             validate_next_stage_preserving_recovery(
                 decision,
                 &generation_settings,
-                &forbidden_tool_ids,
                 visible_tool_ids.as_ref(),
             )
         });
@@ -3202,7 +3134,7 @@ async fn decide_ai_next_stage(
             record_model_attempt(
                 &mut developer_trace,
                 "next_stage_decision",
-                1,
+                request_attempt,
                 started_at,
                 request_snapshot,
                 Some(payload),
@@ -3214,7 +3146,7 @@ async fn decide_ai_next_stage(
             record_model_attempt(
                 &mut developer_trace,
                 "next_stage_decision",
-                1,
+                request_attempt,
                 started_at,
                 request_snapshot,
                 Some(payload),
@@ -3294,7 +3226,7 @@ async fn process_ai_requirement(
         let parsed = message_content(&payload, "模型响应缺少需求理解结果").and_then(|content| {
             parse_model_json(content).map_err(|error| format!("需求理解结构解析失败：{error}"))
         });
-        let mut decision: AiRequirementDecision = match parsed {
+        let decision: AiRequirementDecision = match parsed {
             Ok(decision) => decision,
             Err(error) => {
                 last_error = error;
@@ -3328,11 +3260,6 @@ async fn process_ai_requirement(
                 .find(|id| !available_skill_ids.contains(id.as_str()))
                 .map(|id| format!("selectedSkillIds 包含未启用或不存在的 Skill：{id}"))
         };
-        if skill_selection_error.is_none()
-            && normalize_initial_readonly_relation(&mut decision, &context)
-        {
-            developer_trace.normalizations.push("首次只读执行且无历史目标：relation 从 side_question 规范为 new_goal；原始模型响应保留。".into());
-        }
         let contract_error = classification_contract_error(&decision, skill_selection_error);
         if let Some(error) = contract_error {
             last_error = error;
@@ -3518,7 +3445,7 @@ async fn generate_ai_skill(
     let system = r#"你是 OpsArk Skill 编写助手。Skill 是用户用自然语言描述的领域工作流，用来指导后续模型理解需求、安排阶段、识别阻断条件并验收结果。
 只返回一个 JSON 对象，字段必须且只能是：name、category、description、matchRules、instructions。
 category 只能是 connectivity、source-control、environment、build、data、deployment、transfer、other 之一。matchRules 是简短的自然语言选择提示数组，也可包含以 regex: 开头的表达式。
-instructions 应清晰描述目标、执行阶段、关键判断、失败处理和完成标准。不要选择、枚举或限制工具，不要输出工具 ID、allowedToolIds、allowShell、权限或密钥；实际工具由任务模型在用户已授权范围内选择。不要声称已经执行任何操作。不要使用 Markdown 代码块。"#;
+instructions 应清晰描述目标、建议阶段、关键判断、失败处理和完成标准。阶段是参考，不是固定状态机；复用已有证据，允许有依据的等价实现。失败时针对错误调整当前步骤或剩余计划；遵循系统重试预算，保留目标和证据，无法继续时说明可操作原因，不用无限重试兜底。不要选择、枚举或限制工具，不要输出工具 ID、allowedToolIds、allowShell、权限或密钥；实际工具由任务模型在用户已授权范围内选择。不要声称已经执行任何操作。不要使用 Markdown 代码块。"#;
     let user = match current {
         Some(current) => format!("任务：{action}\n\n用户补充需求：\n{requirement}\n\n当前 Skill 表单：\n{current}\n\n返回完整的优化后 Skill JSON。"),
         None => format!("任务：{action}\n\n用户需求：\n{requirement}\n\n返回完整的 Skill JSON。"),

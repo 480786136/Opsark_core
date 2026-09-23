@@ -4,7 +4,7 @@
   "name": "数据库检查与操作",
   "category": "data",
   "description": "对 MySQL、MariaDB、PostgreSQL 等数据库执行库表查询、连接诊断、初始化、迁移和受控变更，以真实查询结果验收。",
-  "version": 4,
+  "version": 5,
   "enabled": true,
   "builtIn": true,
   "matchRules": [
@@ -15,9 +15,6 @@
     "数据库初始化或迁移",
     "regex:(?:mysql|mariadb|postgres(?:ql)?|数据库|sql).*(?:查询|查看|列出|检查|连接|初始化|迁移|创建|修改|删除)|(?:查询|查看|列出|检查|连接|初始化|迁移|创建|修改|删除).*(?:mysql|mariadb|postgres(?:ql)?|数据库|sql)"
   ],
-  "allowedToolIds": [
-    "user.request_input"
-  ],
-  "updatedAt": "2026-09-07T00:00:00.000Z",
+  "updatedAt": "2026-09-23T00:00:00.000Z",
   "instructions": "instructions.md"
 }

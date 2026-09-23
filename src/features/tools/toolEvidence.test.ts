@@ -16,6 +16,20 @@ const structureCall = call("files.get_structure", { rootPath: "/opt/app" });
 const structureData = { rootPath: "/opt/app", tree: "/opt/app/\n└── package.json", truncated: false, warnings: [] };
 
 describe("tool evidence products", () => {
+  it("records explicit absence without claiming a directory scan or accepting ambiguous failures", () => {
+    const missing = { ...structureData, pathStatus: "missing", tree: "" };
+    expect(buildToolEvidenceFacts(structureCall, result(structureCall, missing))).toMatchObject({
+      evidenceKind: "path_state", evidenceScope: "/opt/app", evidenceComplete: true, pathExists: false,
+    });
+    for (const data of [
+      { ...missing, rootPath: "/other" }, { ...missing, tree: "/opt/app/" },
+      { ...missing, warnings: ["permission denied"] }, { ...missing, truncated: true },
+      { ...missing, pathStatus: "unknown" }, { ...missing, pathStatus: undefined },
+    ]) expect(buildToolEvidenceFacts(structureCall, result(structureCall, data)).evidenceComplete).toBe(false);
+    expect(buildToolEvidenceFacts(structureCall, result(structureCall, missing, { success: false })))
+      .toEqual({ evidenceComplete: false });
+  });
+
   it("requires actual file content and complete read metadata", () => {
     expect(buildToolEvidenceFacts(fileCall, result(fileCall, fileData))).toMatchObject({
       evidenceKind: "file_content", evidenceScope: fileData.path, evidenceComplete: true, evidenceNonEmpty: true,

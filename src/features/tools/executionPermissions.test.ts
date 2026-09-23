@@ -37,6 +37,16 @@ it("global revocation overrides already pinned task permissions without changing
   expect(executionCapabilityBlocker(task, shell, [])).toContain("Shell");
   expect(executionCapabilityBlocker(task, command, [])).toContain("未授权");
 });
+it("ignores built-in Skill restrictions but preserves live grants for pinned tasks", () => {
+  const skill = { ...createCustomSkill("legacy-built-in"), builtIn: true, allowShell: false,
+    allowedToolIds: [], forbiddenToolIds: ["files.read_content"] };
+  const task = { activeSkillIds: [skill.id], skillSnapshot: [skill] } as unknown as OpsTask;
+  expect(executionCapabilityBlocker(task, command, [])).toBeUndefined();
+  expect(executionCapabilityBlocker(task, shell, [])).toBeUndefined();
+  saveExecutionPermissions({ allowShell: false, toolIds: [] });
+  expect(executionCapabilityBlocker(task, command, [])).toContain("未授权");
+  expect(executionCapabilityBlocker(task, shell, [])).toContain("Shell");
+});
 it("leaves malformed protocol errors to the existing non-executing failure handler", () => {
   expect(executionCapabilityBlocker({ activeSkillIds: [] } as unknown as OpsTask, { command: "opsark-tool ???", validation: "true" }, [])).toBeUndefined();
 });

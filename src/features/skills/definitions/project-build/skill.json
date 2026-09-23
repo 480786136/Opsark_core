@@ -4,7 +4,7 @@
   "name": "项目依赖与构建",
   "category": "build",
   "description": "按项目证据分阶段完成工具链确认、依赖安装、构建和产物验收，并根据真实错误恢复。",
-  "version": 5,
+  "version": 6,
   "enabled": true,
   "builtIn": true,
   "matchRules": [
@@ -14,13 +14,7 @@
     "生成构建产物或安装包",
     "regex:(?:构建|编译|build|compile|package).*(?:项目|源码|代码|产物)|(?:项目|源码|代码|产物).*(?:构建|编译|build|compile|package)"
   ],
-  "allowedToolIds": [
-    "files.get_structure",
-    "files.read_content",
-    "software.check",
-    "user.request_input"
-  ],
-  "updatedAt": "2026-09-06T00:00:00.000Z",
+  "updatedAt": "2026-09-23T00:00:00.000Z",
   "instructions": "instructions.md",
   "planningContract": {
     "evidenceAdapters": [
@@ -34,11 +28,6 @@
         "id": "discover",
         "title": "识别项目与构建入口",
         "requiresTools": [],
-        "allowedToolIds": [
-          "files.get_structure",
-          "files.read_content",
-          "user.request_input"
-        ],
         "producesEvidence": [
           "经内容解析的项目声明及其文件路径"
         ],
@@ -69,12 +58,6 @@
             "complete": true
           }
         ],
-        "allowedToolIds": [
-          "files.get_structure",
-          "files.read_content",
-          "software.check",
-          "user.request_input"
-        ],
         "producesEvidence": [
           "实际工具链状态、依赖验收、构建与产物证据"
         ],
@@ -82,6 +65,6 @@
         "instructions": "stages/prepare.md"
       }
     ],
-    "sourceFingerprint": "fnv1a:1396:65e68d6d"
+    "sourceFingerprint": "fnv1a:1780:ac5b39ab"
   }
 }

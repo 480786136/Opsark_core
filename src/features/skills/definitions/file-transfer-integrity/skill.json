@@ -4,7 +4,7 @@
   "name": "文件传输与完整性验证",
   "category": "transfer",
   "description": "在服务器之间安全传输文件；目标缺少受管凭据时向用户收集 SSH 登录信息，并使用字节数和 SHA-256 证据确认完整性。",
-  "version": 5,
+  "version": 6,
   "enabled": true,
   "builtIn": true,
   "matchRules": [
@@ -14,11 +14,6 @@
     "SHA-256 文件完整性校验",
     "regex:(?:传输|发送|复制|拷贝|同步).*(?:文件|安装包|备份|产物)|(?:文件|安装包|备份|产物).*(?:传输|发送|复制|拷贝|同步)"
   ],
-  "allowedToolIds": [
-    "server.resolve_connection",
-    "user.request_input",
-    "files.transfer_between_servers"
-  ],
-  "updatedAt": "2026-08-24T00:00:00.000Z",
+  "updatedAt": "2026-09-23T00:00:00.000Z",
   "instructions": "instructions.md"
 }

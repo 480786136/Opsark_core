@@ -25,6 +25,7 @@ async function remove(id: string, name: string) {
         <div class="cloud-skill-toolbar"><button class="button primary" :disabled="sync.busy" @click="sync.syncNow"><RefreshCw :size="14" :class="{ spin: sync.busy }"/>一键同步</button><button class="button secondary" :disabled="sync.busy" @click="sync.refreshCloudSkills">刷新列表</button></div>
         <p class="cloud-skill-hint">按 Skill ID 和最后修改时间对齐：云端缺少的上传，本地缺少的下载，较新的版本更新到另一端。</p>
         <p v-if="sync.error" class="cloud-skill-error" role="alert">{{ sync.error }}</p>
+        <p v-else-if="sync.notice" class="cloud-skill-notice">{{ sync.notice }}</p>
         <div class="cloud-skill-list">
           <article v-for="item in activeSkills" :key="item.id"><div><strong>{{ item.content?.name || item.id }}</strong><code>{{ item.id }}</code><small>云端版本 {{ item.revision }} · {{ new Date(item.updated_at * 1000).toLocaleString() }}</small></div><button class="icon-button" :title="'下载到本地'" :disabled="sync.busy" @click="sync.downloadCloudSkill(item.id)"><Download :size="16"/></button><button class="icon-button danger" title="删除云端 Skill" :disabled="sync.busy" @click="remove(item.id, item.content?.name || item.id)"><Trash2 :size="16"/></button></article>
           <p v-if="!activeSkills.length && !sync.busy" class="cloud-skill-empty">云端暂无个人 Skill</p>

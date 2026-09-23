@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { executeToolCall, parseToolCommand, parseUserInputArguments } from "@/features/tools/toolExecutor";
+import { ToolArgumentValidationError } from "@/features/tools/toolArgumentProtocol";
 import { resolveToolRegistry } from "@/features/tools/toolRegistry";
 
 describe("tool executor", () => {
@@ -161,11 +162,22 @@ describe("tool executor", () => {
       'opsark-tool --files.get_structure {"rootPath":"/opt/app"}',
       "call-legacy",
     )?.toolId).toBe("files.get_structure");
+    expect(parseToolCommand(
+      'opsark-tool files.get_structure {"rootPath":"/","maxDepth":3,"maxNodes":600,"includeHidden":false,"excludeDirectories":["/proc","/sys","/dev","/run","/var/lib/docker/overlay2"]}',
+      "call-root-scan",
+    )?.arguments.excludeDirectories).toEqual(["/proc", "/sys", "/dev", "/run", "/var/lib/docker/overlay2"]);
     expect(parseToolCommand("uname -a", "call-2")).toBeUndefined();
     expect(() => parseToolCommand("opsark-tool files.get_structure []", "call-3")).toThrow("JSON 对象");
     expect(() => parseToolCommand("opsark-tool files.get_structure", "call-4")).toThrow("唯一工具 ID");
     expect(() => parseToolCommand('opsark-tool unknown.tool {"value":1}', "call-5")).toThrow("不存在或未注册");
     expect(() => parseToolCommand('opsark-tool files.get_structure {"rootPath":"/opt/app","unknown":1}', "call-6")).toThrow("不支持字段");
+    try {
+      parseToolCommand('opsark-tool files.get_structure {"rootPath":"/opt/app","excludeDirectories":["/proc"]}', "call-outside");
+      expect.unreachable("根路径外的绝对排除项应在计划预检时被拒绝");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ToolArgumentValidationError);
+      expect((error as ToolArgumentValidationError).argumentPath).toBe("excludeDirectories");
+    }
     expect(() => parseToolCommand('opsark-tool user.request_input {"title":"凭据","fields":[{"key":"PASSWORD","label":"密码","description":"用途","type":"password","required":true,"extra":1}]}', "call-7")).toThrow("不支持字段");
   });
 
@@ -357,6 +369,47 @@ describe("tool executor", () => {
     }));
   });
 
+  it("preserves typed absence and leaves permission or transport errors as failures", async () => {
+    const call = { id: "path-state", toolId: "files.get_structure", arguments: { rootPath: "/opt/app" } };
+    const getRemoteFileStructure = vi.fn().mockResolvedValue({ pathStatus: "missing", tree: "", truncated: false, warnings: [] });
+    const missing = await executeToolCall(call, resolveToolRegistry([]), { getRemoteFileStructure });
+    expect(missing).toMatchObject({ success: true, data: { pathStatus: "missing", rootPath: "/opt/app" } });
+    for (const message of ["[SFTP(3)] permission denied", "connection lost", "no such file (untyped error)"]) {
+      getRemoteFileStructure.mockRejectedValueOnce(new Error(message));
+      const failed = await executeToolCall(call, resolveToolRegistry([]), { getRemoteFileStructure });
+      expect(failed).toMatchObject({ success: false, error: { message: expect.stringContaining(message) } });
+      expect(failed.data).toBeUndefined();
+    }
+  });
+
+  it("routes root scans with absolute virtual-filesystem exclusions", async () => {
+    const getRemoteFileStructure = vi.fn().mockResolvedValue({
+      tree: "/\n├── opt/\n└── var/",
+      truncated: false,
+      warnings: [],
+    });
+
+    const result = await executeToolCall({
+      id: "call-root-scan",
+      toolId: "files.get_structure",
+      arguments: {
+        rootPath: "/",
+        maxDepth: 3,
+        maxNodes: 600,
+        includeHidden: false,
+        excludeDirectories: ["/proc", "/sys", "/dev", "/run", "/var/lib/docker/overlay2"],
+      },
+    }, resolveToolRegistry([]), { getRemoteFileStructure });
+
+    expect(result.success).toBe(true);
+    expect(getRemoteFileStructure).toHaveBeenCalledWith(expect.objectContaining({
+      rootPath: "/",
+      excludeDirectories: expect.arrayContaining([
+        "/proc", "/sys", "/dev", "/run", "/var/lib/docker/overlay2",
+      ]),
+    }));
+  });
+
   it("requires a readable name and purpose for every user input parameter", async () => {
     const request = parseUserInputArguments({
       title: "补充部署信息",
@@ -477,9 +530,15 @@ describe("tool executor", () => {
       toolId: "files.get_structure",
       arguments: { rootPath: "relative" },
     }, resolveToolRegistry([]), dependency);
+    const outsideExcludeResult = await executeToolCall({
+      id: "call-4",
+      toolId: "files.get_structure",
+      arguments: { rootPath: "/opt/app", excludeDirectories: ["/proc"] },
+    }, resolveToolRegistry([]), dependency);
 
     expect(disabledResult.error?.code).toBe("TOOL_DISABLED");
     expect(invalidResult.error?.code).toBe("TOOL_EXECUTION_FAILED");
+    expect(outsideExcludeResult.error?.code).toBe("TOOL_EXECUTION_FAILED");
     expect(dependency.getRemoteFileStructure).not.toHaveBeenCalled();
   });
 });

@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
+import { ModelInvocationError } from "@/services/backend";
 import {
   acceptsLongRunningDecision,
   classifyLongRunningWorkload,
   startLongRunningMonitor,
 } from "@/features/agent/longRunningMonitor";
 import type { LongRunningMonitorScheduler, StartLongRunningMonitorInput } from "@/features/agent/longRunningMonitor";
-import type { OpsTask, PlanStep, StepReview } from "@/types";
+import type { ModelServiceError, OpsTask, PlanStep, StepReview } from "@/types";
 
 const review = (decision: StepReview["decision"], source: StepReview["source"]): StepReview => ({
   decision,
@@ -38,6 +39,77 @@ function progressiveMonitor(overrides: Partial<StartLongRunningMonitorInput> = {
 }
 
 describe("longRunningMonitor", () => {
+  it.each(["INSUFFICIENT_CREDITS", "CREDITS_RECONCILIATION_REQUIRED"])(
+    "reports %s once and keeps monitoring the running command without further model calls",
+    async (code) => {
+      const serviceError: ModelServiceError = {
+        httpStatus: 402, code, message: "账户额度不足", retryable: false,
+        details: { billing_mode: "direct", available_tokens: 0 },
+      };
+      const reviewer = vi.fn().mockRejectedValue(new ModelInvocationError("quota", undefined, serviceError));
+      const sampleRuntimeProgress = vi.fn().mockResolvedValue({ active: true, processCount: 2, cpuPercent: 0, ioBytes: 0 });
+      let output = "";
+      const { input, monitor, advance } = progressiveMonitor({
+        reviewStep: reviewer, sampleRuntimeProgress, getStreamedOutput: () => output,
+      });
+
+      await advance(30_000);
+      expect(monitor.getState()).toMatchObject({ modelServiceError: serviceError, modelReviewCount: 1 });
+      expect(input.onEvent).toHaveBeenCalledWith("system", expect.stringContaining("待命令真实退出后暂停后续任务"));
+      for (const elapsed of [60_000, 120_000, 300_000, 600_000]) {
+        output += `Downloaded ${elapsed} bytes\n`;
+        await advance(elapsed);
+      }
+
+      expect(reviewer).toHaveBeenCalledOnce();
+      expect(sampleRuntimeProgress).toHaveBeenCalledTimes(5);
+      expect(input.onHeartbeat).toHaveBeenLastCalledWith(600, expect.stringContaining("仍在运行"));
+      expect(vi.mocked(input.onEvent).mock.calls.filter(([, message]) => message.includes("长任务模型复核已暂停"))).toHaveLength(1);
+      expect(input.onError).toHaveBeenCalledOnce();
+      expect(input.onAudit).not.toHaveBeenCalled();
+      expect(input.cancelExecution).not.toHaveBeenCalled();
+      expect(monitor.getState()).toMatchObject({
+        modelServiceError: serviceError, skippedModelReviewCount: 4,
+        runtimeSamplingStatus: "healthy", validationPassed: false,
+      });
+      expect(monitor.getState().decision).toBeUndefined();
+      monitor.stop();
+    },
+  );
+
+  it("continues enforcing the execution deadline after model credits are exhausted", async () => {
+    const serviceError: ModelServiceError = {
+      httpStatus: 402, code: "INSUFFICIENT_CREDITS", message: "账户额度不足", retryable: false,
+    };
+    const { input, monitor, advance } = progressiveMonitor({
+      executionDeadlineAt: 180_000,
+      reviewStep: vi.fn().mockRejectedValue(new ModelInvocationError("quota", undefined, serviceError)),
+    });
+    await advance(30_000);
+    expect(input.cancelExecution).not.toHaveBeenCalled();
+    await advance(180_000);
+    await advance(240_000);
+    expect(input.cancelExecution).toHaveBeenCalledOnce();
+    expect(monitor.getState()).toMatchObject({
+      modelServiceError: serviceError, decision: { decision: "adjust", source: "rules" },
+    });
+    monitor.stop();
+  });
+
+  it("keeps ordinary transient review failures retryable without announcing exhausted credits", async () => {
+    const reviewer = vi.fn().mockRejectedValueOnce(new Error("network unavailable"))
+      .mockResolvedValue(review("continue", "model"));
+    const { input, monitor, advance } = progressiveMonitor({ reviewStep: reviewer });
+    await advance(30_000);
+    await advance(150_000);
+    expect(reviewer).toHaveBeenCalledTimes(2);
+    expect(monitor.getState().modelServiceError).toBeUndefined();
+    expect(monitor.getState().decision).toMatchObject({ decision: "continue", source: "model" });
+    expect(vi.mocked(input.onEvent).mock.calls.some(([, message]) => message.includes("长任务模型复核已暂停"))).toBe(false);
+    expect(input.cancelExecution).not.toHaveBeenCalled();
+    monitor.stop();
+  });
+
   it("distinguishes bounded checks from downloads, builds and installs", () => {
     const classify = (command: string) => classifyLongRunningWorkload({
       title: "step",
@@ -412,7 +484,7 @@ describe("longRunningMonitor", () => {
     controller.stop();
   });
 
-  it("reviews idle child processes but rejects a stop based only on idle telemetry", async () => {
+  it("accepts the model's adjust decision for an idle progressive process", async () => {
     let now = 0;
     let tick: () => void = () => {};
     const step = { id: "idle", title: "build", description: "build", command: "npm run build",
@@ -432,7 +504,8 @@ describe("longRunningMonitor", () => {
     tick();
     await vi.waitFor(() => expect(reviewer).toHaveBeenCalledOnce());
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(cancelExecution).not.toHaveBeenCalled();
+    expect(cancelExecution).toHaveBeenCalledOnce();
+    expect(monitor.getState().decision).toMatchObject({ decision: "adjust", source: "model" });
     expect(monitor.getState().skippedModelReviewCount).toBe(0);
     monitor.stop();
   });
@@ -484,7 +557,7 @@ describe("longRunningMonitor", () => {
       .mockRejectedValueOnce(new Error("sampling transport unavailable"))
       .mockResolvedValue({ active: true, processCount: 2, cpuPercent: 0, ioBytes: 500 });
     const { input, monitor, advance } = progressiveMonitor({ sampleRuntimeProgress,
-      reviewStep: vi.fn().mockResolvedValue(review("adjust", "model")) });
+      reviewStep: vi.fn().mockResolvedValue(review("continue", "model")) });
     for (const elapsed of [30_000, 60_000, 90_000, 120_000]) await advance(elapsed);
     expect(input.cancelExecution).not.toHaveBeenCalled();
     expect(monitor.getState()).toMatchObject({
@@ -492,7 +565,7 @@ describe("longRunningMonitor", () => {
       runtimeSamplingStatus: "failed", consecutiveRuntimeSampleFailures: 1,
       lastRuntimeProgressAt: new Date(90_000).toISOString(),
     });
-    expect(input.onAudit).toHaveBeenCalledWith(expect.objectContaining({ acceptedDecision: false }));
+    expect(input.onAudit).toHaveBeenCalledWith(expect.objectContaining({ acceptedDecision: true }));
     await advance(150_000);
     expect(monitor.getState()).toMatchObject({ runtimeSamplingStatus: "healthy",
       noProgressSeconds: 0, noProgressReviewRounds: 0, consecutiveRuntimeSampleFailures: 0 });
@@ -560,7 +633,7 @@ describe("longRunningMonitor", () => {
     monitor.stop();
   });
 
-  it("does not mistake a persistent service's quiet or handed-off process for a stuck download", async () => {
+  it("accepts the model's adjust decision for a quiet persistent service", async () => {
     const step = { id: "service", title: "start service", description: "start service", command: "node server.js",
       validation: "curl -fsS http://localhost/health", expected: "healthy", risk: "low", status: "running",
       runtimeClass: "persistent_service" } satisfies PlanStep;
@@ -569,8 +642,12 @@ describe("longRunningMonitor", () => {
       reviewStep: vi.fn().mockResolvedValue(review("adjust", "model")),
     });
     for (let elapsed = 30_000; elapsed <= 300_000; elapsed += 30_000) await advance(elapsed);
-    expect(input.cancelExecution).not.toHaveBeenCalled();
-    expect(monitor.getState()).toMatchObject({ workload: "persistent_service", validationPassed: false });
+    expect(input.cancelExecution).toHaveBeenCalledOnce();
+    expect(monitor.getState()).toMatchObject({
+      workload: "persistent_service",
+      validationPassed: false,
+      decision: { decision: "adjust", source: "model" },
+    });
     monitor.stop();
   });
 

@@ -4,7 +4,10 @@ import { afterEach, expect, it, vi } from "vitest";
 import AccountView from "./AccountView.vue";
 import { useAccountStore } from "@/features/account/accountStore";
 
-vi.mock("vue-i18n", () => ({ useI18n: () => ({ locale: { value: "zh-CN" } }) }));
+vi.mock("vue-i18n", async (importOriginal) => ({
+  ...await importOriginal<typeof import("vue-i18n")>(),
+  useI18n: () => ({ locale: { value: "zh-CN" } }),
+}));
 vi.mock("@/features/account/cloudClient", () => ({ cloudRequest: vi.fn().mockResolvedValue({ enabled: true }) }));
 
 afterEach(() => { document.body.innerHTML = ""; });

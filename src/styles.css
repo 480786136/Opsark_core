@@ -480,8 +480,12 @@ button:disabled, input:disabled, textarea:disabled, select:disabled { opacity: v
 .approval-bar { padding: 8px 10px; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; background: var(--raised); }
 .approval-bar .button { min-height: 28px; padding: 0 9px; font-size: 8px; }
 .managed-approval-countdown { margin-right: auto; display: inline-flex; align-items: center; gap: 5px; color: var(--accent); font-size: 7.5px; }
-.approval-bar.warning { align-items: center; }
-.approval-bar.warning > span { margin-right: auto; display: flex; align-items: center; gap: 5px; color: var(--orange); font-size: 7.5px; }
+.approval-bar.warning, .approval-bar.continuation { align-items: center; }
+.approval-bar.warning > span, .approval-bar.continuation > span { margin-right: auto; display: flex; align-items: center; gap: 5px; color: var(--orange); font-size: 7.5px; }
+.approval-bar.continuation { background: color-mix(in srgb, var(--accent) 5%, var(--raised)); }
+.approval-bar.continuation > span, .approval-bar.continuation .adjustment-copy strong { color: var(--accent); }
+.adjustment-copy > svg { flex-shrink: 0; }
+.adjustment-copy small { overflow-wrap: anywhere; }
 .secret-unlock-card { margin: 0 10px 10px; padding: 12px; display: grid; gap: 11px; border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--panel) 92%, var(--accent) 8%); }
 .secret-unlock-head { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; gap: 9px; align-items: start; }
 .secret-unlock-head > span { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 7px; color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, transparent); }
@@ -1289,6 +1293,7 @@ button:disabled, input:disabled, textarea:disabled, select:disabled { opacity: v
 .task-state-pill { border: 1px solid color-mix(in srgb, var(--orange) 30%, transparent); color: var(--orange); background: color-mix(in srgb, var(--orange) 10%, transparent); }
 .task-state-pill.completed { border-color: color-mix(in srgb, var(--green) 30%, transparent); color: var(--green); background: color-mix(in srgb, var(--green) 10%, transparent); }
 .task-state-pill.failed { border-color: color-mix(in srgb, var(--red) 30%, transparent); color: var(--red); background: color-mix(in srgb, var(--red) 10%, transparent); }
+.task-state-pill.continuation { border-color: var(--accent-border); color: var(--accent); background: var(--accent-soft); }
 .plan-step { position: relative; transition: background-color .15s ease; }
 .plan-step.running::before, .plan-step.validating::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 2px; background: var(--blue); animation: active-step-glow 1.5s ease-in-out infinite; }
 .step-copy strong { color: var(--text); }
@@ -1321,6 +1326,15 @@ button:disabled, input:disabled, textarea:disabled, select:disabled { opacity: v
 .summary-card.summary-failed::before { background: var(--red); }
 .summary-card.summary-cancelled::before { background: var(--muted); }
 .summary-card.summary-needs_adjustment::before, .summary-card.summary-awaiting_continuation::before, .summary-card.summary-planning_failed::before { background: var(--orange); }
+.summary-card.summary-awaiting_continuation { border-color: var(--warning-border); background: color-mix(in srgb, var(--panel) 94%, var(--orange) 6%); box-shadow: none; }
+.summary-awaiting_continuation .summary-card-icon { border-color: var(--warning-border); color: var(--orange); background: var(--warning-soft); }
+.summary-awaiting_continuation .summary-eyebrow { color: var(--orange); }
+.summary-card.summary-progress { border-color: var(--accent-border); background: color-mix(in srgb, var(--panel) 96%, var(--accent) 4%); }
+.summary-card.summary-progress::before { background: var(--accent); }
+.summary-progress .summary-card-icon { border-color: var(--accent-border); color: var(--accent); background: var(--accent-soft); }
+.summary-progress .summary-eyebrow { color: var(--accent); }
+.summary-progress .summary-content ul { border-color: var(--accent-border); background: var(--accent-soft); }
+.summary-progress .summary-content li::marker { color: var(--accent); }
 .composer { margin: 0 14px 14px; border-color: var(--border); border-radius: 9px; background: var(--raised); box-shadow: 0 8px 26px var(--shadow-color-soft); transition: border-color var(--motion-fast) var(--ease-standard), box-shadow var(--motion-fast) var(--ease-standard), transform var(--motion-fast) var(--ease-standard); }
 .composer:focus-within { border-color: var(--accent-border); box-shadow: 0 0 0 3px var(--accent-soft), 0 10px 30px var(--shadow-color-soft); transform: translateY(-1px); }
 .composer textarea { color: var(--text); }
@@ -1369,7 +1383,7 @@ button:disabled, input:disabled, textarea:disabled, select:disabled { opacity: v
   .execution-event-row { grid-template-columns: 38px minmax(0, 1fr); }
   .execution-preview-row { align-items: start; }
   .approval-bar { align-items: stretch; }
-  .approval-bar.warning > span { width: 100%; margin: 0 0 3px; }
+  .approval-bar.warning > span, .approval-bar.continuation > span { width: 100%; margin: 0 0 3px; }
   .approval-bar .button { flex: 1 1 auto; }
   .composer { margin-inline: 10px; }
 }

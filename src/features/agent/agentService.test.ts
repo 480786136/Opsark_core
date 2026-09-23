@@ -13,6 +13,7 @@ import type { ModelProfile, OpsTask, PlanStep } from "@/types";
 import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 import { ModelInvocationError, PlanProtocolError } from "@/services/backend";
 import { confirmedInputScope } from "@/features/agent/confirmedUserInputs";
+import { taskAttemptContext } from "@/features/agent/attemptState";
 
 const model: ModelProfile = {
   id: "model-1",
@@ -108,16 +109,12 @@ describe("agentService", () => {
     expect(fallbackReview).not.toHaveBeenCalled();
   });
 
-  it("falls back to the existing goal review when the combined endpoint is unavailable", async () => {
-    const decide = vi.fn().mockRejectedValue(new Error("unknown command"));
-    const fallbackReview = vi.fn().mockResolvedValue({
-      decision: "adjust",
-      reason: "最终验收缺失",
-      summary: "需要继续规划",
-      source: "model",
-    });
+  it("surfaces a combined-endpoint error without asking for a second goal decision", async () => {
+    const error = new Error("unknown command");
+    const decide = vi.fn().mockRejectedValue(error);
+    const fallbackReview = vi.fn();
 
-    const result = await decideTaskNextStage({
+    await expect(decideTaskNextStage({
       task: task(),
       model,
       apiKey: "secret-key",
@@ -126,11 +123,85 @@ describe("agentService", () => {
       secretMetadata: [],
       generationSettings,
       skills: [],
+    }, decide, fallbackReview)).rejects.toBe(error);
+
+    expect(fallbackReview).not.toHaveBeenCalled();
+  });
+
+  it("accepts adjust with no steps as a blocked/no-action decision", async () => {
+    const decide = vi.fn().mockResolvedValue({
+      decision: "adjust",
+      reason: "缺少必要的用户决策",
+      summary: "当前无法生成可执行步骤",
+      source: "model",
+      steps: [],
+    });
+    const fallbackReview = vi.fn();
+
+    const result = await decideTaskNextStage({
+      task: task(), model, apiKey: "secret-key", tools: [], secretMetadata: [], generationSettings, skills: [],
     }, decide, fallbackReview);
 
     expect(result.complete).toBe(false);
-    expect(result.nextPlan).toBeUndefined();
-    expect(fallbackReview).toHaveBeenCalledTimes(1);
+    expect(result.nextPlan).toEqual([]);
+    expect(result.decision.decision).toBe("adjust");
+    expect(fallbackReview).not.toHaveBeenCalled();
+  });
+
+  it("uses blocked/no_action instead of a Core goal decision when the model is unavailable", async () => {
+    const decide = vi.fn();
+    const fallbackReview = vi.fn();
+
+    const result = await decideTaskNextStage({
+      task: task(), model: undefined, tools: [], secretMetadata: [], generationSettings, skills: [],
+    }, decide, fallbackReview);
+
+    expect(result).toMatchObject({
+      complete: false,
+      nextPlan: [],
+      decision: { decision: "adjust", source: "rules", steps: [] },
+    });
+    expect(result.decision.summary).toContain("blocked/no_action");
+    expect(decide).not.toHaveBeenCalled();
+    expect(fallbackReview).not.toHaveBeenCalled();
+  });
+
+  it("does not accept a rules fallback as the model's next-stage business decision", async () => {
+    const decide = vi.fn().mockResolvedValue({
+      decision: "complete",
+      reason: "model endpoint unavailable",
+      summary: "fallback complete",
+      source: "rules",
+      steps: [],
+    });
+
+    const result = await decideTaskNextStage({
+      task: task(), model, apiKey: "secret-key", tools: [], secretMetadata: [], generationSettings, skills: [],
+    }, decide, vi.fn());
+
+    expect(result).toMatchObject({
+      complete: false,
+      nextPlan: [],
+      decision: { decision: "adjust", source: "rules", steps: [] },
+    });
+    expect(result.decision.summary).toContain("blocked/no_action");
+  });
+
+  it("rejects continue with no steps without asking for a second goal decision", async () => {
+    const decide = vi.fn().mockResolvedValue({
+      decision: "continue",
+      reason: "需要继续",
+      summary: "继续执行",
+      source: "model",
+      steps: [],
+    });
+    const fallbackReview = vi.fn();
+
+    await expect(decideTaskNextStage({
+      task: task(), model, apiKey: "secret-key", tools: [], secretMetadata: [], generationSettings, skills: [],
+    }, decide, fallbackReview)).rejects.toThrow("continue 决策必须返回新的可执行步骤");
+
+    expect(fallbackReview).not.toHaveBeenCalled();
   });
 
   it("does not hide a plan protocol failure behind the legacy goal-review fallback", async () => {
@@ -157,7 +228,7 @@ describe("agentService", () => {
     expect(fallbackReview).not.toHaveBeenCalled();
   });
 
-  it("builds discovery context and removes repeated continuation commands", async () => {
+  it("builds discovery context and preserves repeated continuation commands", async () => {
     const generatePlan = vi.fn().mockResolvedValue([
       step("duplicate", " pwd ", "pending"),
       step("deploy", "npm run deploy", "pending"),
@@ -173,7 +244,7 @@ describe("agentService", () => {
       generationSettings,
     }, generatePlan);
 
-    expect(continuation.map((item) => item.id)).toEqual(["deploy"]);
+    expect(continuation.map((item) => item.id)).toEqual(["duplicate", "deploy"]);
     expect(generatePlan).toHaveBeenCalledWith(
       expect.stringContaining("当前阶段已完成"),
       expect.objectContaining({ apiKey: "secret-key", context: expect.stringContaining("continue_after_discovery") }),
@@ -225,8 +296,9 @@ describe("agentService", () => {
     expect(context.instruction).toContain("已完成且仍有效的步骤");
   });
 
-  it("rejects a continuation that contains no new executable command", async () => {
-    await expect(planDiscoveryContinuation({
+  it("accepts a model continuation even when its command matches completed history", async () => {
+    const duplicate = step("duplicate", "pwd", "pending");
+    const continuation = await planDiscoveryContinuation({
       task: task(),
       requirement: "Deploy",
       metrics: { cpu: 1, memory: 2, disk: 3, networkIn: 0, networkOut: 0, sampledAt: "now" },
@@ -235,9 +307,9 @@ describe("agentService", () => {
       model,
       apiKey: "secret-key",
       generationSettings,
-    }, vi.fn().mockResolvedValue([step("duplicate", "pwd", "pending")]))).rejects.toThrow(
-      "模型未返回可执行的后续步骤",
-    );
+    }, vi.fn().mockResolvedValue([duplicate]));
+
+    expect(continuation).toEqual([duplicate]);
   });
 
   it("generates an adjustment plan without re-queueing completed evidence", async () => {
@@ -281,13 +353,14 @@ describe("agentService", () => {
     });
   });
 
-  it("rejects an unchanged failed attempt before it can be executed again", async () => {
+  it("preserves an unchanged failed-attempt proposal for the executor's hard checks", async () => {
     const currentTask = task();
     const failed = step("failed-tool", 'opsark-tool files.get_structure {"rootPath":"/opt/app"}', "failed");
     failed.validation = "true";
     currentTask.plan = [failed];
 
-    await expect(planTaskAdjustment({
+    const unchanged = { ...failed, id: "unchanged", status: "pending" as const };
+    const result = await planTaskAdjustment({
       task: currentTask,
       failedStep: failed,
       metrics: { cpu: 1, memory: 2, disk: 3, networkIn: 0, networkOut: 0, sampledAt: "now" },
@@ -296,7 +369,102 @@ describe("agentService", () => {
       model,
       apiKey: "secret-key",
       generationSettings,
-    }, vi.fn().mockResolvedValue([{ ...failed, id: "unchanged", status: "pending" }]))).rejects.toThrow();
+    }, vi.fn().mockResolvedValue([unchanged]));
+
+    expect(result.plan).toEqual([unchanged]);
+  });
+
+  it("accepts the build.sh fix and a revised independent acceptance without replacing failed attempts", async () => {
+    const currentTask = task();
+    currentTask.currentRoundId = "round-build";
+    const targetContext = taskAttemptContext(currentTask);
+    const failed: PlanStep = {
+      ...step("failed-build", "cd /opt/report && bash build.sh --legacy-peer-deps", "failed"),
+      kind: "change", attemptContext: targetContext,
+      expected: "构建成功", validation: "test -f /opt/report/build/aj-report-*.zip && echo built",
+      output: "npm ERR! ERESOLVE unable to resolve dependency tree\n[exit: 1]",
+      result: { executionStatus: "failed", observationStatus: "unknown", exitCode: 1,
+        facts: {}, warnings: [], evidenceIds: [], failureReason: "依赖解析失败" },
+    };
+    currentTask.plan = [failed];
+    currentTask.phaseHistory = [{ id: "first-build", roundId: "round-build", requirement: "部署应用",
+      reason: "adjustment", createdAt: "now", completedAt: "now",
+      plan: [{ ...failed, id: "first-failure", command: "cd /opt/report && bash build.sh" }] }];
+    const previousPlan = structuredClone(currentTask.plan);
+    const previousPhases = structuredClone(currentTask.phaseHistory);
+    const proposed: PlanStep[] = [{
+      ...step("repair-build", "cd /opt/report && npm_config_legacy_peer_deps=true bash build.sh", "pending"),
+      kind: "change", validation: "", expected: "构建命令成功，并输出本次生成的归档路径",
+      recovery: { failedStepId: failed.id, targetContext, purpose: "repair" },
+    }, {
+      ...step("verify-build", "test -s /opt/report/build/aj-report-1.0.zip && unzip -t /opt/report/build/aj-report-1.0.zip", "pending"),
+      kind: "observe", validation: "", expected: "本次构建输出确认的归档存在且完整性检查通过",
+      recovery: { failedStepId: failed.id, targetContext, purpose: "verify" },
+    }];
+    const generatePlan = vi.fn().mockResolvedValue(proposed);
+
+    const result = await planTaskAdjustment({
+      task: currentTask, failedStep: failed, tools: [], secretMetadata: [], model,
+      generationSettings, apiKey: "fixture",
+    }, generatePlan);
+
+    expect(result.plan).toEqual(proposed);
+    expect(result.plan[1].command).not.toBe(failed.validation);
+    expect(currentTask.plan).toEqual(previousPlan);
+    expect(currentTask.phaseHistory).toEqual(previousPhases);
+    expect(generatePlan.mock.calls[0][0]).toContain("重规划剩余目标");
+    const context = JSON.parse(generatePlan.mock.calls[0][1].context);
+    expect(context.baseSnapshot.currentIncident).toMatchObject({
+      stepId: failed.id, command: failed.command, result: { executionStatus: "failed", exitCode: 1 },
+      output: { content: failed.output },
+    });
+    expect(context.recovery.failedAttempts.map((attempt: { failedStepId: string }) => attempt.failedStepId))
+      .toEqual(expect.arrayContaining(["first-failure", "failed-build"]));
+  });
+
+  it("does not let goal-directed recovery expand read-only authorization", async () => {
+    const currentTask = task();
+    currentTask.executionConstraints = { changePolicy: "read_only", environmentPolicy: "preserve",
+      failurePolicy: "strict", prohibitedActions: [], requiredConditions: [], userDirectives: [] };
+    const failed = { ...step("failed-inspection", "test -f /opt/report/build.sh", "failed"), kind: "observe" as const };
+    currentTask.plan = [failed];
+    const before = structuredClone(currentTask.plan);
+    const proposed = { ...step("repair-build", "cd /opt/report && npm_config_legacy_peer_deps=true bash build.sh", "pending"),
+      kind: "change" as const, recovery: { failedStepId: failed.id, targetContext: taskAttemptContext(currentTask), purpose: "repair" as const } };
+
+    await expect(planTaskAdjustment({
+      task: currentTask, failedStep: failed, tools: [], secretMetadata: [], model, generationSettings,
+    }, vi.fn().mockResolvedValue([proposed]))).rejects.toThrow("只读授权不允许执行变更步骤");
+    expect(currentTask.plan).toEqual(before);
+  });
+
+  it("allows completion on evidence from a replacement route while preserving the old failed route", async () => {
+    const currentTask = task();
+    currentTask.currentRoundId = "round-1";
+    currentTask.rootGoal = "部署应用并确认 HTTP 可用";
+    const failed = { ...step("old-route", "bash old-build.sh", "failed"),
+      result: { executionStatus: "failed" as const, observationStatus: "unknown" as const,
+        exitCode: 1, facts: {}, warnings: [], evidenceIds: [], failureReason: "旧构建方案不可用" } };
+    currentTask.phaseHistory = [{ id: "old-phase", roundId: "round-1", requirement: currentTask.rootGoal,
+      reason: "adjustment", plan: [failed], createdAt: "now", completedAt: "now" }];
+    currentTask.plan = [{ ...step("acceptance", "curl -fsS http://localhost:8080/health"),
+      output: '{"status":"UP"}', result: { executionStatus: "success", observationStatus: "matched",
+        exitCode: 0, facts: { httpStatus: 200, status: "UP" }, warnings: [], evidenceIds: ["http-check"] } }];
+    const before = structuredClone(currentTask.phaseHistory);
+    const decide = vi.fn().mockResolvedValue({ decision: "complete", source: "model", steps: [],
+      reason: "替代部署方案已执行，HTTP 验收证据确认当前目标完成", summary: "应用可用" });
+
+    const result = await decideTaskNextStage({
+      task: currentTask, model, apiKey: "fixture", tools: [], secretMetadata: [], generationSettings,
+    }, decide);
+
+    expect(result.complete).toBe(true);
+    expect(currentTask.phaseHistory).toEqual(before);
+    const context = JSON.parse(decide.mock.calls[0][1].context);
+    expect(context.baseSnapshot.recentPhases[0].steps[0].result.executionStatus).toBe("failed");
+    expect(context.baseSnapshot.currentPlan.steps[0].result.facts.httpStatus).toBe(200);
+    expect(context.instruction).toContain("旧路径被替代后无需逐条复验");
+    expect(context.instruction).toContain("真实执行与验收证据");
   });
 
   it("安全门禁局部调整只提交命中字段并接受单步精确修复", async () => {
@@ -417,16 +585,14 @@ describe("agentService", () => {
     );
   });
 
-  it("does not let a recovered historical failure contradict the completed goal gate", async () => {
+  it("does not let Core reinterpret a model-generated completion summary", async () => {
     const current = task();
     current.plan = [
       { ...step("old-proxy-check", "false", "failed"), result: { executionStatus: "failed", observationStatus: "unknown", exitCode: 1, facts: {}, warnings: [], evidenceIds: [] } },
       { ...step("clone-and-verify", "git clone repo target"), output: "clone complete\nHEAD=abc", result: { executionStatus: "success", observationStatus: "matched", exitCode: 0, facts: { validationPassed: true }, warnings: [], evidenceIds: [] } },
     ];
     const result = await summarizeTaskExecution({ task: current, model, apiKey: "secret-key" }, vi.fn().mockResolvedValue("本轮任务未完成。用户目标尚未完成。"));
-    expect(result.summary).toContain("已通过最终证据门禁");
-    expect(result.summary).toContain("早期失败已被后续恢复");
-    expect(result.summary).not.toContain("本轮任务未完成");
+    expect(result.summary).toBe("本轮任务未完成。用户目标尚未完成。");
   });
 
   it("combines a deterministic failure reason with the generated summary", async () => {

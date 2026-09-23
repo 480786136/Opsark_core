@@ -389,7 +389,7 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
       compactedSteps: checkpoint.sourceStepCount,
       fingerprint: checkpoint.sourceHistoryFingerprint,
     } : undefined,
-    instruction: `recentPhases 是最近两个执行阶段；historyCheckpoint 是更早历史，必须核对目标与时效。unresolvedIssueIndex 是完整未解决问题索引；unresolvedIssues 只展开相关或最近 16 条详情，正文省略不代表阻断已解决。ledgerRef 指向本地审计记录，只有标有 readTool 的 archiveReferences 可通过工具补读；migration.requiresReview 或 verificationState=needs_review 表示原始证据缺失，不能当作已解决。contentRef 指向同一证据唯一正文。只有 result/evidence 支持的内容属于已验证事实，计划描述和阶段总结不等于执行成功。${progression.rereadEvidence ? "本次补读内容已优先并入同 step 的 output；recoveredEvidence 仅列未在上述区域展示的旧 step。" : ""}${DECISION_EVIDENCE_INSTRUCTION}`,
+    instruction: `recentPhases 是最近两个执行阶段；historyCheckpoint 是更早历史，必须核对目标与时效。unresolvedIssueIndex/unresolvedIssues 是为兼容历史数据而保留的异常记录名称：它们表示曾出现过失败或不确定证据，不是 Core 对当前业务仍受阻的裁决；blocksExecution 仅记录当次执行信号。是否已由更新证据覆盖、是否影响整体目标，由你结合全部事实判断。unresolvedIssues 只展开相关或最近 16 条详情；正文省略不代表未采集。ledgerRef 指向本地审计记录，只有标有 readTool 的 archiveReferences 可通过工具补读；migration.requiresReview 或 verificationState=needs_review 表示原始证据缺失，不能当作成功证据。contentRef 指向同一证据唯一正文。只有 result/evidence 支持的内容属于已验证事实，计划描述和阶段总结不等于执行成功。${progression.rereadEvidence ? "本次补读内容已优先并入同 step 的 output；recoveredEvidence 仅列未在上述区域展示的旧 step。" : ""}${DECISION_EVIDENCE_INSTRUCTION}`,
   };
   return {
     ...body,

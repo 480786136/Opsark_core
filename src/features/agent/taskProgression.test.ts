@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  completedContinuationCommandFingerprints,
   findUnresolvedBlockingStep,
   latestTaskRequirement,
   resolveTaskProgression,
@@ -41,7 +40,7 @@ const task = (plan: PlanStep[], overrides: Partial<OpsTask> = {}): OpsTask => ({
 });
 
 describe("taskProgression", () => {
-  it("keeps a fresh read after a proposed change without rewriting the prior successful observation", () => {
+  it("preserves a regenerated proposal without rewriting prior successful observations", () => {
     const prior = step({ id: "prior-read", kind: "observe", command: "sysctl -n net.ipv4.ip_forward",
       validation: "", output: "0" });
     const change = step({ id: "enable-forwarding", kind: "change", command: "sysctl -w net.ipv4.ip_forward=1",
@@ -52,28 +51,29 @@ describe("taskProgression", () => {
     expect(JSON.stringify([prior, change, read])).toBe(before);
     expect(prior.status).toBe("completed");
     expect(change.status).toBe("pending");
-    expect(selectBusinessReplanSteps([prior], [read])).toEqual([]);
-    expect(selectBusinessReplanSteps([prior], [read, change])).toEqual([change]);
+    expect(selectBusinessReplanSteps([prior], [read])).toEqual([read]);
+    expect(selectBusinessReplanSteps([prior], [read, change])).toEqual([read, change]);
   });
 
-  it("deduplicates adjacent reads but keeps a second observation after an intervening proposed change", () => {
+  it("does not silently deduplicate adjacent model-proposed reads", () => {
     const read = step({ id: "read-1", kind: "observe", command: "sysctl -n net.ipv4.ip_forward", validation: "", status: "pending" });
     const repeat = { ...read, id: "read-2" };
     const change = step({ id: "change", kind: "change", command: "sysctl -w net.ipv4.ip_forward=1", status: "pending" });
-    expect(selectBusinessReplanSteps([], [read, repeat])).toEqual([read]);
+    expect(selectBusinessReplanSteps([], [read, repeat])).toEqual([read, repeat]);
     expect(selectBusinessReplanSteps([], [read, change, repeat, { ...repeat, id: "read-3" }]))
-      .toEqual([read, change, repeat]);
+      .toEqual([read, change, repeat, { ...repeat, id: "read-3" }]);
   });
 
-  it("does not treat a filtered completed change as a new reason to reobserve or repeat writes", () => {
+  it("does not remove model-proposed writes or observations that match completed history", () => {
     const read = step({ id: "old-read", kind: "observe", command: "sysctl -n net.ipv4.ip_forward", validation: "" });
     const change = step({ id: "old-change", kind: "change", command: "sysctl -w net.ipv4.ip_forward=1" });
     const repeatedChange = { ...change, id: "new-change", status: "pending" as const };
     const repeatedRead = { ...read, id: "new-read", status: "pending" as const };
-    expect(selectBusinessReplanSteps([change, read], [repeatedChange, repeatedRead])).toEqual([]);
+    expect(selectBusinessReplanSteps([change, read], [repeatedChange, repeatedRead]))
+      .toEqual([repeatedChange, repeatedRead]);
     const other = { ...repeatedChange, id: "different-change", command: "sysctl -w net.ipv6.conf.all.forwarding=1" };
     expect(selectBusinessReplanSteps([change, read], [other, repeatedChange, repeatedRead]))
-      .toEqual([other, repeatedRead]);
+      .toEqual([other, repeatedChange, repeatedRead]);
   });
 
   it("retains recovery verification against full failure history and never changes its acceptance contract", () => {
@@ -93,11 +93,11 @@ describe("taskProgression", () => {
     expect(selected).toEqual([verify]);
     expect(() => validateRecoveryReferences(history, selected, target)).not.toThrow();
     expect(() => validateRecoveryReferences(history, [{ ...verify, expected: "命令能返回即可" }], target))
-      .toThrow("RECOVERY_ACCEPTANCE_MISMATCH");
+      .not.toThrow();
     expect(JSON.stringify(history)).toBe(before);
   });
 
-  it("allows a read_batch state check after a change but does not repeat confirmed inputs or server connections", () => {
+  it("preserves all generated tool steps for hard protocol checks instead of filtering by business meaning", () => {
     const software = step({ id: "old-software", kind: "observe", command: 'opsark-tool software.check {"names":["node"]}', validation: "" });
     const userInput = step({ id: "old-input", kind: "observe", validation: "", command:
       'opsark-tool user.request_input {"title":"目标","fields":[{"key":"TARGET","label":"目标","description":"选择目标","type":"text","required":true}]}' });
@@ -106,10 +106,10 @@ describe("taskProgression", () => {
     const change = step({ id: "install", kind: "change", command: "dnf install -y nodejs", status: "pending" });
     const candidates = [change, ...[software, userInput, connect].map(item => ({ ...item, id: `new-${item.id}`, status: "pending" as const }))];
     expect(selectBusinessReplanSteps([software, userInput, connect], candidates).map(item => item.id))
-      .toEqual([change.id, "new-old-software"]);
+      .toEqual([change.id, "new-old-software", "new-old-input", "new-old-connect"]);
   });
 
-  it("invalidates observations after a real failed compound change while preventing its blind retry", () => {
+  it("leaves retry usefulness to the model while evidence invalidation remains independently available", () => {
     const current = task([]);
     const context = taskAttemptContext(current);
     const read = step({ id: "read", kind: "observe", command: "cat package-lock.json", attemptContext: context,
@@ -122,7 +122,8 @@ describe("taskProgression", () => {
     expect(currentEvidenceSteps(current)).toEqual([]);
     const candidate = { ...read, id: "recheck", status: "pending" as const };
     expect(selectAdjustmentSteps(current.plan, [candidate], context)).toEqual([candidate]);
-    expect(selectAdjustmentSteps(current.plan, [{ ...build, id: "repeat", status: "pending" }], context)).toEqual([]);
+    expect(selectAdjustmentSteps(current.plan, [{ ...build, id: "repeat", status: "pending" }], context))
+      .toEqual([{ ...build, id: "repeat", status: "pending" }]);
     // Persisted logs created before commandDispatched existed retain exit evidence.
     delete build.result!.facts.commandDispatched;
     expect(currentEvidenceSteps(current)).toEqual([]);
@@ -131,22 +132,22 @@ describe("taskProgression", () => {
     build.result!.facts.category = "tool_command_parse";
     expect(currentEvidenceSteps(current)).toEqual([read]);
   });
-  it("rechecks health after an executed mutation, including a partially failed mutation", () => {
+  it("preserves a proposed health recheck regardless of prior mutation state", () => {
     const health = step({ command: "curl -f http://localhost/health", kind: "observe", validation: "", status: "failed" });
     for (const status of ["completed", "failed"] as const) {
       const restart = step({ id: "restart", kind: "change", command: "systemctl restart app", status });
       const candidate = { ...health, id: "retry", status: "pending" as const };
-      expect(selectAdjustmentSteps([health], [candidate])).toEqual([]);
+      expect(selectAdjustmentSteps([health], [candidate])).toEqual([candidate]);
       expect(selectAdjustmentSteps([health, restart], [candidate])).toEqual([candidate]);
       expect(selectContinuationSteps([{ ...health, status: "completed" }, restart], [candidate])).toEqual([candidate]);
     }
   });
 
-  it("invalidates attempts on target or credential changes and canonicalizes tool arguments", () => {
+  it("does not use target changes or canonical command identity to discard generated steps", () => {
     const prior = step({ command: 'opsark-tool files.get_structure {"rootPath":"/opt/app","maxDepth":4}',
       validation: "true", status: "failed", attemptContext: "target-a:v1" });
     const next = { ...prior, command: 'opsark-tool files.get_structure {"maxDepth":4,"rootPath":"/opt/app"}', status: "pending" as const };
-    expect(selectAdjustmentSteps([prior], [next], "target-a:v1")).toEqual([]);
+    expect(selectAdjustmentSteps([prior], [next], "target-a:v1")).toEqual([next]);
     expect(selectAdjustmentSteps([prior], [next], "target-a:v2")).toEqual([next]);
   });
 
@@ -182,12 +183,11 @@ describe("taskProgression", () => {
     });
     current.plan = [oldObservation, serverSwitch, currentObservation];
 
-    expect(completedContinuationCommandFingerprints(current.plan, currentContext)).toHaveLength(2);
     expect(selectContinuationSteps(current.plan, [
       { ...oldObservation, id: "recheck", status: "pending" },
       { ...serverSwitch, id: "reconnect", status: "pending" },
       { ...currentObservation, id: "duplicate-current", status: "pending" },
-    ], currentContext).map(({ id }) => id)).toEqual(["recheck"]);
+    ], currentContext).map(({ id }) => id)).toEqual(["recheck", "reconnect", "duplicate-current"]);
 
     current.executionTargetServerId = "server-3";
     expect(selectContinuationSteps(current.plan, [
@@ -195,13 +195,15 @@ describe("taskProgression", () => {
     ], taskAttemptContext(current)).map(({ id }) => id)).toEqual(["return-to-server-2"]);
   });
 
-  it("does not invalidate a blocker for a planned or safety-blocked mutation", () => {
+  it("does not silently discard a proposed blocker recheck", () => {
     const health = step({ command: "curl -f http://localhost/health", kind: "observe", validation: "", status: "failed" });
     const restart = step({ id: "restart", kind: "change", command: "systemctl restart app", status: "pending" });
-    expect(selectAdjustmentSteps([health, restart], [{ ...health, status: "pending" }])).toEqual([]);
+    expect(selectAdjustmentSteps([health, restart], [{ ...health, status: "pending" }]))
+      .toEqual([{ ...health, status: "pending" }]);
     restart.status = "failed";
     restart.result = { executionStatus: "blocked", observationStatus: "unknown", facts: {}, warnings: [], evidenceIds: [] };
-    expect(selectAdjustmentSteps([health, restart], [{ ...health, status: "pending" }])).toEqual([]);
+    expect(selectAdjustmentSteps([health, restart], [{ ...health, status: "pending" }]))
+      .toEqual([{ ...health, status: "pending" }]);
   });
   it("uses the latest user message requirement and ignores events", () => {
     const current = task([], {
@@ -214,7 +216,7 @@ describe("taskProgression", () => {
     expect(latestTaskRequirement(current)).toBe("latest");
   });
 
-  it("refines a completed read-only discovery round only once", () => {
+  it("sends an exhausted read-only round to the joint next-stage decision", () => {
     const current = task([step({ title: "检查项目结构", command: "pwd" })], {
       executionConstraints: {
         changePolicy: "requested_changes_only",
@@ -225,22 +227,22 @@ describe("taskProgression", () => {
         userDirectives: [],
       },
     });
-    expect(resolveTaskProgression(current)).toEqual({ kind: "refine-discovery" });
+    expect(resolveTaskProgression(current)).toEqual({ kind: "complete" });
     current.discoveryRefined = true;
     expect(resolveTaskProgression(current)).toEqual({ kind: "complete" });
   });
 
-  it("treats a completed user-input tool as discovery evidence", () => {
+  it("sends completed user-input evidence to the joint next-stage decision", () => {
     const current = task([step({
       title: "Need parameters",
       command: 'opsark-tool user.request_input {"title":"Deploy","fields":[{"key":"PORT","label":"服务端口","description":"项目对外监听端口","type":"number","required":true}]}',
     })]);
-    expect(resolveTaskProgression(current)).toEqual({ kind: "refine-discovery", afterUserInput: true });
+    expect(resolveTaskProgression(current)).toEqual({ kind: "complete" });
     current.refinementCount = 8;
-    expect(resolveTaskProgression(current)).toEqual({ kind: "refine-discovery", afterUserInput: true });
+    expect(resolveTaskProgression(current)).toEqual({ kind: "complete" });
   });
 
-  it("refines after a terminal tool when its catalog metadata requires follow-up", () => {
+  it("does not let terminal-tool metadata force another business stage", () => {
     const current = task([step({
       title: "连接并切换服务器",
       command: 'opsark-tool server.connect {"host":"192.168.1.237","credentialRef":"managed-server:target"}',
@@ -256,20 +258,20 @@ describe("taskProgression", () => {
       },
     });
 
-    expect(resolveTaskProgression(current)).toEqual({ kind: "refine-discovery" });
+    expect(resolveTaskProgression(current)).toEqual({ kind: "complete" });
   });
 
-  it("uses generic completion metadata for newly registered tools", () => {
+  it("does not let custom completion metadata replace the joint model decision", () => {
     const tools: ToolDefinition[] = [{
       id: "custom.discovery", implementation: "custom", name: "Custom", description: "Custom",
       usageInstructions: "Custom", inputSchema: {}, outputDescription: "Custom",
       completionMode: "refine", enabled: true, builtIn: false, version: 1, updatedAt: "now",
     }];
     const current = task([step({ command: 'opsark-tool custom.discovery {"scope":"all"}' })]);
-    expect(resolveTaskProgression(current, tools)).toEqual({ kind: "refine-discovery" });
+    expect(resolveTaskProgression(current, tools)).toEqual({ kind: "complete" });
   });
 
-  it("selects the first pending step and removes duplicate continuation commands", () => {
+  it("selects the first pending step and preserves all generated continuation commands", () => {
     const pending = step({ id: "pending", command: "npm test", status: "pending" });
     const current = task([step(), pending]);
     expect(resolveTaskProgression(current)).toEqual({ kind: "execute-step", step: pending });
@@ -277,7 +279,7 @@ describe("taskProgression", () => {
       step({ id: "duplicate", command: " npm test " }),
       step({ id: "new", command: "npm run build" }),
       step({ id: "new-copy", command: "npm run build" }),
-    ]).map((item) => item.id)).toEqual(["new"]);
+    ]).map((item) => item.id)).toEqual(["duplicate", "new", "new-copy"]);
   });
 
   it.each(["awaiting_input", "awaiting_approval", "running", "validating"] as const)(
@@ -320,7 +322,7 @@ describe("taskProgression", () => {
     expect(resolveTaskProgression(task([pending, active]))).toEqual({ kind: "wait", step: active });
   });
 
-  it("resumes discovery after user input really completes while the task is running", () => {
+  it("routes completed user input to the joint next-stage decision", () => {
     const input = step({
       id: "input", status: "awaiting_input",
       command: 'opsark-tool user.request_input {"title":"目标确认","fields":[{"key":"TARGET","label":"目标","description":"本次操作的目标","type":"text","required":true}]}',
@@ -329,7 +331,7 @@ describe("taskProgression", () => {
 
     expect(resolveTaskProgression(current)).toEqual({ kind: "wait", step: input });
     input.status = "completed";
-    expect(resolveTaskProgression(current)).toEqual({ kind: "refine-discovery", afterUserInput: true });
+    expect(resolveTaskProgression(current)).toEqual({ kind: "complete" });
     expect(current.status).toBe("running");
   });
 
@@ -344,7 +346,7 @@ describe("taskProgression", () => {
     expect(resolveTaskProgression(current)).toEqual({ kind: "complete" });
   });
 
-  it("rejects an unchanged failed adjustment but permits a validation-only repair", () => {
+  it("preserves unchanged and validation-only adjustment proposals for hard checks", () => {
     const failedTool = step({
       id: "failed-tool",
       command: 'opsark-tool files.get_structure {"rootPath":"/opt/app"}',
@@ -366,7 +368,7 @@ describe("taskProgression", () => {
         validation: "test -d /opt/app",
         status: "pending",
       }),
-    ]).map((item) => item.id)).toEqual(["fixed-validation"]);
+    ]).map((item) => item.id)).toEqual(["same-tool", "fixed-validation"]);
   });
 
   it("keeps a blocker after a successful mutation until its original contract is verified", () => {

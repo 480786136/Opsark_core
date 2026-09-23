@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { activeProtocolRepair, freshProtocolReplanSteps, protocolReplanContext } from "./protocolReplan";
-import { buildAdjustmentContext } from "./agentContext";
+import { buildAdjustmentContext, buildNextStageContext } from "./agentContext";
 import type { OpsTask, PlanStep } from "@/types";
 
 const rejected: PlanStep = {
@@ -19,25 +19,29 @@ const fixture = (): OpsTask => ({
 });
 
 describe("protocol failure to business plan boundary", () => {
-  it("only an explicit business transition discards the local field repair contract", () => {
+  it("exposes a rejected protocol proposal to the joint business decision without treating it as execution", () => {
     const task = fixture();
     const input = { task, tools: [], secretMetadata: [] };
     const local = buildAdjustmentContext(input);
     expect(local.planGenerationRepair).toBe(task.protocolRepair!.repair);
     expect(local.baseSnapshot).toBeUndefined();
 
-    const business = buildAdjustmentContext(input, undefined, {
-      replanAfterProtocolFailure: true, sharedSnapshot: { staleCachedPlan: "must-not-reuse" },
-    });
-    expect(business.planGenerationRepair).toBeUndefined();
-    expect(business.workflowPhase).toBe("business_replan_after_protocol_failure");
+    const business = buildNextStageContext(input);
+    expect(business).not.toHaveProperty("planGenerationRepair");
+    expect(business.workflowPhase).toBe("decide_after_protocol_failure");
     expect(business.protocolReplan).toMatchObject({ source: "business_replan_after_protocol_failure",
       rejectedPlanExecuted: false, rejectedStepCount: 1,
       rejectedStep: { command: rejected.command }, errorCode: "OBSERVE_COMMAND_MUTATION" });
     expect(business.baseSnapshot).toBeDefined();
-    expect(JSON.stringify(business)).not.toContain("must-not-reuse");
-    expect(business.instruction).toContain("重新选择 kind");
-    expect(business.instruction).not.toContain("用户点击");
+    expect(business.instruction).toContain("根据整体目标和真实证据决定 complete、continue 或 adjust");
+    expect(business.instruction).toContain("该方案未执行");
+    expect(business.protocolReplan!.instruction).toContain("不是执行证据");
+    expect(business.protocolReplan!.instruction).toContain("重新选择 kind");
+    expect(business.protocolReplan!.instruction).toContain("可修正模型先前生成的不适用验收方法");
+    expect(business.protocolReplan!.instruction).toContain("保留真实历史命令、失败结果与证据");
+    expect(business.protocolReplan!.instruction).not.toContain("保留真实历史失败及其验收契约");
+    expect(business.protocolReplan!.instruction).toContain("不得降低用户明确要求的验收标准");
+    expect(business.protocolReplan!.instruction).not.toContain("用户点击");
     expect(task.protocolRepair!.repair.previousModelOutput).toEqual([rejected]);
   });
 

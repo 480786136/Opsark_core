@@ -57,7 +57,7 @@ describe("tool registry", () => {
     expect(context[0]).not.toHaveProperty("builtIn");
   });
 
-  it("retains basic interaction when a Skill allow-list omits it without exposing other tools", () => {
+  it("does not narrow the capability directory using a Skill allow-list", () => {
     const tools = resolveToolRegistry([]);
     const softwareSkill = {
       id: "software-installation",
@@ -73,11 +73,7 @@ describe("tool registry", () => {
       updatedAt: "now",
     };
 
-    expect(buildPlanningToolContext(tools, [softwareSkill]).map(({ id }) => id)).toEqual([
-      "user.request_input",
-      "evidence.read",
-      "software.check",
-    ]);
+    expect(buildPlanningToolContext(tools, [softwareSkill])).toEqual(buildPlanningToolContext(tools));
   });
 
   it.each(["disabled", "context", "internal"] as const)("respects %s clarification tool visibility", (visibility) => {
@@ -91,15 +87,23 @@ describe("tool registry", () => {
     expect(buildPlanningToolContext(tools, [skill]).map(({ id }) => id)).not.toContain("user.request_input");
   });
 
-  it("respects an explicit clarification ban from any active Skill", () => {
+  it("ignores legacy Skill bans without exposing internal tools", () => {
     const allowing = structuredClone(builtInSkillCatalog[0]);
     allowing.allowedToolIds = ["user.request_input"];
     const forbidding = { ...allowing, id: "forbidding", allowedToolIds: [], forbiddenToolIds: ["user.request_input"] };
 
     const ids = buildPlanningToolContext(resolveToolRegistry([]), [allowing, forbidding]).map(({ id }) => id);
-    expect(ids).not.toContain("user.request_input");
+    expect(ids).toContain("user.request_input");
     expect(ids).toContain("evidence.read");
-    expect(ids).not.toContain("server.connect");
+    expect(ids).toContain("server.connect");
+    expect(ids).not.toContain("secret.merge_command");
+  });
+
+  it("keeps deployment tools when combined with source-acquisition guidance", () => {
+    const skills = builtInSkillCatalog.filter(skill => ["project-source-acquisition", "application-deployment"].includes(skill.id));
+    expect(skills).toHaveLength(2);
+    const ids = buildPlanningToolContext(resolveToolRegistry([]), skills).map(tool => tool.id);
+    expect(ids).toEqual(expect.arrayContaining(["files.get_structure", "files.read_content", "evidence.read"]));
   });
 
   it("keeps planner-visible tools for legacy custom Skills without a declared policy", () => {

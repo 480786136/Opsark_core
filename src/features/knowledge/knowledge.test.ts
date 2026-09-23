@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import type { OpsTask } from "@/types";
+import type { OpsTask, ServerProfile } from "@/types";
 import { buildKnowledgeRecord, knowledgeExcerpt, redactKnowledgeText, serializeRecord } from "./record";
 import { normalizeEndpoint, knowledgeRequest, KnowledgeError } from "./service";
 import { useKnowledgeStore } from "./knowledgeStore";
@@ -133,6 +133,33 @@ describe("knowledge record",()=>{
     const t=task();t.title="😀".repeat(201);t.plan=Array(35).fill(t.plan[0]);
     const record=buildKnowledgeRecord(t,"kb-1",1,[]);expect(record.steps).toHaveLength(30);expect(Array.from(record.title)).toHaveLength(200);
     expect(()=>serializeRecord({...record,problem:"中".repeat(100000)})).toThrow("256 KiB");
+  });
+  it("keeps attempt and evidence IDs stable as the export window moves, and types expectations explicitly",()=>{
+    const t=task();t.plan=Array.from({length:31},(_,index)=>({...t.plan[0],id:`step-${index}`,expected:"HTTP 200",result:{...t.plan[0].result!,evidenceIds:[`main-${index}`]}}));
+    const first=buildKnowledgeRecord(t,"kb-1",1,[]);
+    t.plan.push({...t.plan[0],id:"step-31",result:{...t.plan[0].result!,evidenceIds:["main-31"]}});
+    const second=buildKnowledgeRecord(t,"kb-1",2,[]);
+    expect(first.steps[1].step_id).toBe(second.steps[0].step_id);
+    expect(first.steps[1].evidence.map(e=>e.evidence_id)).toEqual(second.steps[0].evidence.map(e=>e.evidence_id));
+    expect(second.steps[0].evidence.find(e=>e.summary.includes("预期验收标准"))?.kind).toBe("expectation");
+    expect(new Set(second.steps.map(step=>step.step_id)).size).toBe(30);
+    const nextAttempt={...t.plan[1],startedAt:"2026-09-23T01:02:03Z"};
+    t.plan.push(nextAttempt);
+    expect(buildKnowledgeRecord(t,"kb-1",3,[]).steps[29]?.step_id).not.toBe(first.steps[0].step_id);
+  });
+  it("exports only runtime collected from linked evidence and metadata of that exact target",()=>{
+    const t=task(),step=t.plan[0];step.result!.evidenceIds=["main"];
+    step.evidence=[{id:"main",source:"main",type:"command-output",rawOutput:"ok",facts:{},collectedAt:t.updatedAt,
+      scope:{targetId:"server-private",scope:"isolated_exec",shell:"bash",persistence:"command",doesNotProve:["不证明用户交互会话状态"]}}];
+    const server={id:"server-private",info:{os:"Ubuntu 24.04"},environment:["nginx 1.26.2","Docker","password=hidden"]} as ServerProfile;
+    const record=buildKnowledgeRecord(t,"kb-1",1,[],false,server);
+    expect(record.context).toMatchObject({runtime:{os:"Ubuntu 24.04",shell:"bash",scope:"isolated_exec",visibility:"不证明用户交互会话状态"},software:[{name:"nginx",version:"1.26.2"}]});
+    expect(serializeRecord(record)).not.toContain("server-private");expect(serializeRecord(record)).not.toContain("hidden");
+    expect(record.context?.runtime?.privilege).toBeUndefined();
+    const wrongServer=buildKnowledgeRecord(t,"kb-1",1,[],false,{...server,id:"other"});
+    expect(wrongServer.context?.runtime?.os).toBeUndefined();expect(wrongServer.context?.software).toBeUndefined();
+    step.result!.evidenceIds=[];
+    expect(buildKnowledgeRecord(t,"kb-1",1,[],false,server).context).toBeUndefined();
   });
 });
 

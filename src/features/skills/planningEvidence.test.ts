@@ -20,6 +20,23 @@ const manifests = (current: OpsTask) => collectPlanningEvidence(current, ["proje
   .filter(item => item.kind === "project_manifest");
 
 describe("planning evidence collection and matching", () => {
+  it("supersedes directory content with newer absence evidence and vice versa", () => {
+    const current = task();
+    const scans = ["directory", "missing", "directory"].map((pathStatus, index): PlanStep => {
+      const id = `scan-${index}`;
+      const call = { id, toolId: "files.get_structure", arguments: { rootPath: "/app" } };
+      return { ...read(current, id), ...buildToolStepOutcome({ call, completedAt: "now", evidenceId: `e-${id}`,
+        result: { callId: id, toolId: call.toolId, success: true, data: {
+          rootPath: "/app", pathStatus, tree: pathStatus === "missing" ? "" : "/app/", truncated: false, warnings: [],
+        } } }) };
+    });
+    current.plan = scans.slice(0, 2);
+    expect(collectPlanningEvidence(current).map(item => item.kind)).toEqual(["path_state"]);
+    expect(planningEvidenceSatisfies(collectPlanningEvidence(current), [{ kind: "directory_structure" }])).toBe(false);
+    current.plan = scans;
+    expect(collectPlanningEvidence(current).map(item => item.kind)).toEqual(["directory_structure"]);
+  });
+
   it("derives manifest facts only with an enabled adapter and keeps a source reference", () => {
     const current = task();
     current.plan = [read(current, "read")];

@@ -29,7 +29,7 @@ function prepare(){
     if(modelApiKey)secretValues.__MODEL_API_KEY__=modelApiKey;
     preview.value=buildKnowledgeRecord(props.task,knowledge.config.knowledgeBaseId,knowledge.nextRevision(props.task.id),{
       secretValues,redactIpAddresses:true,
-    },includeCommands.value);
+    },includeCommands.value,ops.servers.find(server=>server.id===(props.task.executionTargetServerId??props.task.serverId)));
     if(!preview.value.steps.length)throw new Error(t("knowledge.noExecutableSteps"));
     destination.value={...knowledge.config};
     previewBody.value=serializeRecord(preview.value);open.value=true;

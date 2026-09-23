@@ -3,7 +3,7 @@ import { normalizeSoftwareCheckRequest } from "@/features/tools/softwareCheck";
 import type { ToolCall, ToolResult } from "@/features/tools/types";
 
 export interface ToolEvidenceFacts extends Record<string, unknown> {
-  evidenceKind?: "directory_structure" | "file_content" | "software_check";
+  evidenceKind?: "directory_structure" | "path_state" | "file_content" | "software_check";
   evidenceScope?: string;
   evidenceComplete: boolean;
   evidenceNonEmpty?: boolean;
@@ -68,6 +68,17 @@ function fileContentFacts(call: ToolCall, result: ToolResult, data: Record<strin
 
 function directoryFacts(call: ToolCall, result: ToolResult, data: Record<string, unknown>): ToolEvidenceFacts {
   const scope = absolutePath(data.rootPath);
+  if (data.pathStatus === "missing") {
+    if (!scope || scope !== requestPath(call.arguments.rootPath) || data.tree !== ""
+      || result.truncated === true || data.truncated !== false
+      || !Array.isArray(data.warnings) || data.warnings.length !== 0) return { evidenceComplete: false };
+    return {
+      evidenceKind: "path_state", evidenceScope: scope, evidenceComplete: true,
+      pathStatus: "missing", pathExists: false,
+      evidenceFingerprint: observationFingerprint(JSON.stringify([scope, "missing"])),
+    };
+  }
+  if (data.pathStatus !== undefined && data.pathStatus !== "directory") return { evidenceComplete: false };
   if (!scope || scope !== requestPath(call.arguments.rootPath)
     || typeof data.tree !== "string" || !data.tree.trim()
     || typeof data.truncated !== "boolean"

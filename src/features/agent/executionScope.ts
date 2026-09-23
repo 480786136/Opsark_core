@@ -38,10 +38,17 @@ const FOLLOWUP_MUTATION_INTENT = new RegExp(
   "i",
 );
 
+// Generic “current terminal” can mean the executor's isolated context. Only
+// explicit user ownership or a promise to alter live shell state is actionable
+// prose evidence. Executable terminal injection is checked independently below.
+const USER_SHELL_OWNER = /用户|\buser(?:'s)?\b/i;
+const LIVE_SHELL_STATE_CHANGE = /(?:立即|即时)(?:加载|生效)|(?:注入|发送).*(?:命令|输入|按键)|(?:source|export)\s|(?:修改|更改|更新|设置|重载|刷新|切换).*(?:环境变量|环境|会话|shell)|\b(?:reload|source|export|inject)\b/i;
+
 function declaresLiveUserShellMutation(semantics: string) {
   return semantics.split(/[\n。；;！？!?，,]/).some((clause) => {
     const userClause = clause.replace(AGENT_OWNED_SHELL, "Agent-owned context");
     if (!LIVE_SHELL_TARGET.test(userClause)) return false;
+    if (!USER_SHELL_OWNER.test(userClause) && !LIVE_SHELL_STATE_CHANGE.test(userClause)) return false;
     // A question about an existing state does not promise to change that state.
     const intent = userClause
       .replace(/(?:检查|查看|确认|验证|检测)[^，,]*(?:是否|能否|已经|已)[^，,]*/g, "")

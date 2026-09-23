@@ -17,21 +17,18 @@ describe("execution dispatch", () => {
     });
   });
 
-  it("rejects a tool forbidden by the active Skill before dispatch", () => {
+  it("dispatches a connection tool when it is in the current capability directory", () => {
     const decision = resolveStepDispatch({
       command: 'opsark-tool server.resolve_connection {"host":"gitee.com","port":443}',
     }, [], "call-forbidden", undefined, [], ["server.resolve_connection", "server.connect"]);
 
-    expect(decision).toEqual({
-      kind: "invalid",
-      error: "当前激活 Skill 禁止调用工具：server.resolve_connection",
-    });
+    expect(decision).toMatchObject({ kind: "tool", call: { toolId: "server.resolve_connection" } });
   });
 
   it("rejects a tool that was not exposed to the current planning context", () => {
     const decision = resolveStepDispatch({
       command: 'opsark-tool files.get_structure {"rootPath":"/opt/app"}',
-    }, [], "call-hidden", undefined, [], [], ["software.check"]);
+    }, [], "call-hidden", undefined, [], ["software.check"]);
 
     expect(decision).toEqual({
       kind: "invalid",

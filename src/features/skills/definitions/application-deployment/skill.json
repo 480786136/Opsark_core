@@ -4,7 +4,7 @@
   "name": "应用部署与上线验收",
   "category": "deployment",
   "description": "将已有项目部署、启动或上线，并完成端到端验收。",
-  "version": 6,
+  "version": 8,
   "enabled": true,
   "builtIn": true,
   "matchRules": [
@@ -15,13 +15,7 @@
     "配置 Web 服务",
     "regex:(?:部署|上线|发布|运行|启动).*(?:项目|应用|网站|服务)|(?:项目|应用|网站|服务).*(?:部署|上线|发布)"
   ],
-  "allowedToolIds": [
-    "files.get_structure",
-    "files.read_content",
-    "software.check",
-    "user.request_input"
-  ],
-  "updatedAt": "2026-09-06T00:00:00.000Z",
+  "updatedAt": "2026-09-23T00:00:00.000Z",
   "instructions": "instructions.md",
   "planningContract": {
     "evidenceAdapters": [
@@ -35,11 +29,6 @@
         "id": "discover",
         "title": "项目发现",
         "requiresTools": [],
-        "allowedToolIds": [
-          "files.get_structure",
-          "files.read_content",
-          "user.request_input"
-        ],
         "exitRequirements": [
           {
             "kind": "project_manifest",
@@ -61,12 +50,6 @@
         "requiresTools": [
           "files.read_content"
         ],
-        "allowedToolIds": [
-          "files.get_structure",
-          "files.read_content",
-          "software.check",
-          "user.request_input"
-        ],
         "requiresEvidence": [
           {
             "kind": "project_manifest",
@@ -83,6 +66,6 @@
         "instructions": "stages/prepare.md"
       }
     ],
-    "sourceFingerprint": "fnv1a:1798:6b287078"
+    "sourceFingerprint": "fnv1a:2060:dce4f747"
   }
 }

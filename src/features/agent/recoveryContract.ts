@@ -17,7 +17,6 @@ export function assertTaskPlanAuthorization(task: OpsTask, steps: PlanStep[]) {
     if (reason) throw new ExecutionPolicyError(reason);
   }
 }
-const authorizedAttempts = new WeakMap<PlanStep, string>();
 const carriedTargets = new WeakMap<PlanStep, NonNullable<OpsTask["recoveryCarryForwards"]>>();
 
 function parsedRecoveryTarget(context?: string): unknown[] | undefined {
@@ -73,24 +72,6 @@ export function carryForwardRecoveryBlockers(task: OpsTask, nextRoundId: string)
   }
 }
 
-export function attemptAuthorizationFingerprint(task: OpsTask, step: PlanStep, blocker: PlanStep) {
-  return JSON.stringify([task.executionTargetServerId ?? task.serverId, task.currentRoundId,
-    task.agentSessionId, task.agentSessionGeneration, task.credentialRevision, task.rootGoal,
-    task.currentInstruction, task.permission, task.executionConstraints,
-    step.id, step.command, step.validation, step.kind, step.executionScope, step.validationScope,
-    step.sessionContextChange, step.startedAt, blocker.id, blocker.attemptContext, blocker.result,
-    unresolvedRecoveryBlockers(task, step).map(item => [item.id, item.attemptContext, item.result])]);
-}
-
-/** Executor-owned ephemeral permit; persisted/model-authored reviews never grant dispatch. */
-export function authorizeRiskAttempt(task: OpsTask, step: PlanStep, blocker: PlanStep) {
-  authorizedAttempts.set(step, attemptAuthorizationFingerprint(task, step, blocker));
-}
-
-export function hasRiskAttemptAuthorization(task: OpsTask, step: PlanStep, blocker: PlanStep) {
-  return authorizedAttempts.get(step) === attemptAuthorizationFingerprint(task, step, blocker);
-}
-
 /** Session/credential refresh changes freshness, not the failed resource's identity. */
 function sameRecoveryTarget(original: string, current: string) {
   if (original === current) return true;
@@ -125,23 +106,35 @@ export function permitsBestEffortRiskReview(task: OpsTask, blocker: PlanStep) {
     && !facts.validationProtocolIncomplete && !facts.platformIncompatible && !facts.networkFailure;
 }
 
+/**
+ * The legacy name and fields are retained for persisted history consumers.
+ * This is the failed attempt's original verification reference, not an
+ * immutable acceptance policy for a replacement plan or the user's goal.
+ */
 export function recoveryVerificationContract(failed: PlanStep) {
   const contract = failed.kind === "observe"
     ? { kind: failed.kind, expected: failed.expected, command: failed.command.trim(), executionScope: failed.executionScope ?? "isolated_exec", validationScope: "isolated_exec" }
     : { kind: failed.kind ?? "change", expected: failed.expected, command: failed.validation.trim(), executionScope: "isolated_exec", validationScope: failed.validationScope ?? "isolated_exec" };
   const supplementalVerification = isMutatingStepCommand(contract.command) || contract.validationScope !== "isolated_exec"
     ? undefined : supplementalRecoveryAcceptance(contract.command);
-  return { ...contract, supplementalVerification,
+  return { ...contract, usage: "historical_reference" as const, allowsRevisedVerification: true,
+    supplementalVerification,
     requiresAcceptanceEvidence: !validationHasAcceptanceCheck(contract.command) || undefined,
-    acceptanceInstruction: supplementalVerification
-      ? "原始查询只证明执行成功。使用 supplementalVerification.command 原文补验；原查询、expected 和目标不变，程序将记录追加断言的来源。"
+    acceptanceInstruction: "这是历史尝试的验收参考，不是后续计划的执行门禁。可根据用户目标和新证据修正验收命令、expected 或执行方式，并说明新检查如何证明用户要求的结果；不得改写历史记录或降低用户要求。"
+      + (supplementalVerification
+      ? "原始查询只证明执行成功；supplementalVerification 是一种可选的、保留来源的补验方法，不是唯一允许的验收方法。"
       : !validationHasAcceptanceCheck(contract.command)
-        ? "原始命令没有可证明预期状态的退出码断言；不得把 raw/exit 0 当作恢复。先补读原始验收证据或取得明确验收条件，再恢复；不得降级原 executionScope/validationScope。"
-        : undefined,
+        ? "原始命令没有可证明预期状态的退出码断言；raw/exit 0 不等于目标达成。可继续只读诊断、补充真实验收证据或设计新的目标相关检查；条件不明确时向用户确认。"
+        : "原检查成功可作为历史复验依据，但不自动代表整个用户目标完成。"),
   };
 }
 
-/** Only the exact referenced attempt may be recovered; shared names/paths prove nothing. */
+/**
+ * Conservative recognition of an explicitly linked historical recheck. A
+ * revised verification can still be executed and reviewed against the goal;
+ * failure to match here is not dispatch denial or a business-failure verdict.
+ * Shared names/paths alone must never rewrite the referenced attempt's facts.
+ */
 export function isRelatedRecoveryStep(failed: PlanStep, candidate: PlanStep, currentContext?: string) {
   const relation = candidate.recovery;
   if (!relation || relation.failedStepId !== failed.id || !failed.attemptContext
@@ -157,8 +150,8 @@ export function isRelatedRecoveryStep(failed: PlanStep, candidate: PlanStep, cur
   const supplementalAssertion = validation === contract.supplementalVerification?.command;
   if ((!originalAssertion && !supplementalAssertion)
     || isMutatingStepCommand(validation) || candidate.expected !== failed.expected || candidate.sessionContextChange) return false;
-  // The original postcondition is the acceptance contract. Fresh-shell checks
-  // retain their independent validation scope via a change-kind verify step.
+  // Automatic historical matching retains the old check's original scope.
+  // New verification methods are interpreted by goal review, not guessed here.
   const scope = contract.validationScope;
   return candidate.kind === "observe"
     ? scope === "isolated_exec" && (candidate.executionScope ?? "isolated_exec") === contract.executionScope
@@ -166,6 +159,7 @@ export function isRelatedRecoveryStep(failed: PlanStep, candidate: PlanStep, cur
       && (candidate.validationScope ?? "isolated_exec") === scope;
 }
 
+/** Recognizes exact historical proof only; false does not mean the goal is blocked. */
 export function hasVerifiedRecovery(failed: PlanStep, candidate: PlanStep, history: PlanStep[] = []) {
   const candidateIndex = history.findIndex(step => step.id === candidate.id);
   const repairs = history.filter(step => step.recovery?.purpose === "repair"
@@ -208,7 +202,7 @@ export function hasVerifiedRecovery(failed: PlanStep, candidate: PlanStep, histo
           && original.scope.shell === evidence.scope?.shell)) !== false) === true;
 }
 
-/** Persist only gate/acceptance data, never full outputs, for trimmed phases. */
+/** Persist the failed attempt's audit reference, never full outputs, for trimmed phases. */
 export function persistedRecoveryContract(step: PlanStep, roundId: string) {
   if (!isBlockingFailure(step)) return undefined;
   return { roundId, step: {
@@ -240,18 +234,18 @@ export function isNecessaryRecoveryVerification(history: PlanStep[], candidate: 
 }
 
 export function recoveryHistory(task: OpsTask) {
-  // Unresolved failures belong to the task. Visibility survives round changes;
-  // permission to reference them still requires an explicit executor handoff.
+  // Historical failures remain visible across rounds. A cross-round handoff
+  // only enables conservative historical proof matching, not execution rights.
   const persisted = (task.historyCheckpoint?.unresolvedIssues ?? []).flatMap(issue => {
     if (issue.blocksExecution === false) return [];
     if (issue.recoveryContract) return [issue.recoveryContract.step];
-    // Missing legacy acceptance evidence is a visible blocker, never an empty
-    // issue list. Its real contract must be recovered before execution resumes.
-    return [{ id: issue.stepId, title: issue.title, description: issue.reason ?? "原始验收契约缺失，需要补读证据",
+    // Keep missing legacy evidence visible without inventing an original check
+    // or requiring it to be reconstructed before safe diagnosis can proceed.
+    return [{ id: issue.stepId, title: issue.title, description: issue.reason ?? "历史验收记录缺失，可补读证据或根据用户目标重新设计检查",
       command: "", validation: "", expected: "", risk: "low", status: "failed", kind: "change",
       attemptContext: issue.attemptContext, result: { executionStatus: "blocked", observationStatus: "unknown",
         facts: { blockingSignal: true, recoveryContractMissing: true }, warnings: [], evidenceIds: [],
-        failureReason: "历史失败的原始验收契约缺失，需要补读原始证据后恢复规划。" },
+        failureReason: "历史失败的原始验收记录缺失；保留该事实，结合可用证据和用户目标调整后续计划。" },
     } satisfies PlanStep];
   });
   const steps = [...persisted, ...(task.planHistory ?? []).flatMap(round => round.plan), ...(task.phaseHistory ?? [])
@@ -266,6 +260,7 @@ export function recoveryHistory(task: OpsTask) {
   return [...byId.values()];
 }
 
+/** Legacy audit index: unmatched failures are context, not a gate on a new plan. */
 export function unresolvedRecoveryBlockers(task: OpsTask, beforeStep?: PlanStep) {
   const history = recoveryHistory(task);
   const end = beforeStep ? history.findIndex(step => step.id === beforeStep.id) : history.length;
@@ -275,11 +270,15 @@ export function unresolvedRecoveryBlockers(task: OpsTask, beforeStep?: PlanStep)
 }
 
 export function recoveryPlanningContext(task: OpsTask) {
+  // Expose recorded execution facts without asking Core to decide whether the
+  // business goal is still blocked or a later observation was sufficient.
+  // That interpretation belongs to the model's next-stage decision.
+  const failedAttempts = recoveryHistory(task).filter(isBlockingFailure);
   return {
     currentTargetContext: JSON.stringify([task.executionTargetServerId ?? task.serverId,
       task.currentRoundId ?? "", task.agentSessionId ?? "", task.agentSessionGeneration ?? 0,
       task.credentialRevision ?? 0]),
-    blockers: unresolvedRecoveryBlockers(task).map(step => ({
+    failedAttempts: failedAttempts.map(step => ({
       failedStepId: step.id, targetContext: step.attemptContext, title: step.title,
       carryForward: carriedTargets.get(step)?.filter(item => item.destinationRoundId === task.currentRoundId)
         .map(({ taskId, sourceRoundId, destinationRoundId, targetServerId }) =>
@@ -289,11 +288,16 @@ export function recoveryPlanningContext(task: OpsTask) {
       verificationContractMissing: step.result?.facts.recoveryContractMissing === true || undefined,
       recovery: step.recovery,
     })),
-    instruction: "有未解决阻断时，下一步必须显式关联 recovery={failedStepId,targetContext,purpose:diagnose|repair|verify}。先诊断/修复，再以 blocker.verification.command 原文执行 verify（change 的原 validation，observe 的原观察命令）；如果提供 supplementalVerification，则必须使用其 command 原文执行显式补验，保留全部原查询和 expected，不得自行改写追加断言。expected 保留 verification.expected；repair 成功不解除阻断，验收证据必须晚于最后一次 repair。raw 输出和 exit 0 只证明命令执行，缺少可靠验收时先补读原始契约。verify 默认 observe（validation 空）并保留 verification.executionScope；verification.validationScope 非 isolated_exec 时使用 change 并保留该 command 作为 validation 及原 validationScope，此形式仍需变更授权。未通过真实复验前不得执行后续业务或宣称完成；不要推测不存在的步骤 ID 或 targetContext；恢复关系不扩大授权。",
+    instruction: "failedAttempts 是 Core 如实保留的历史执行事实，不是 Core 对当前业务是否仍受阻的裁决。请结合用户目标、失败后的全部新证据和实际验收结果自行判断 complete、continue 或 adjust；不得改写历史失败事实。可替换失败步骤、插入前置步骤或重新规划剩余任务；被新方案替代的旧路径无需逐条执行成功。verification 仅为历史验收参考，可修正原验收命令和 expected，并说明新方法如何证明用户要求，不能降低用户要求或把命令退出 0 当作目标完成。recovery 是可选的审计关联，不是执行通行证；普通只读诊断或新方案不必附加。明确关联特定失败时可提供 recovery={failedStepId,targetContext,purpose:diagnose|repair|verify}，使用真实 ID 和 targetContext，diagnose 保持只读，repair 仍需变更授权。repair 成功本身不等于验收通过，recovery 关系不扩大授权。",
   };
 }
 
-export function validateRecoveryReferences(history: PlanStep[], candidates: PlanStep[], context: string) {
+/**
+ * Validates executor-owned protocol invariants only. Historical failures remain
+ * available to the model as evidence, but Core does not reject an otherwise
+ * executable proposal because it disagrees with the model's recovery relation.
+ */
+export function validateRecoveryReferences(history: PlanStep[], candidates: PlanStep[], _context: string) {
   candidates.forEach((candidate, stepIndex) => {
     const priorAttempt = history.find(step => step.id === candidate.id && step !== candidate && hasRecordedAttempt(step));
     if (priorAttempt) {
@@ -303,20 +307,6 @@ export function validateRecoveryReferences(history: PlanStep[], candidates: Plan
     }
     if (!candidate.recovery) return;
     validateRecoveryMetadata(candidate, stepIndex);
-    const failed = history.find(step => step.id === candidate.recovery!.failedStepId);
-    const missing = !failed || !isBlockingFailure(failed);
-    const wrongTarget = failed && (candidate.recovery.targetContext !== failed.attemptContext
-      || (!sameRecoveryTarget(candidate.recovery.targetContext, context) && !permitsCarriedTarget(failed, context)));
-    if (!missing && !wrongTarget && isRelatedRecoveryStep(failed!, candidate, context)) return;
-    throw new RecoveryProtocolError({
-      code: missing ? "RECOVERY_REFERENCE_MISSING" : wrongTarget ? "RECOVERY_TARGET_MISMATCH" : "RECOVERY_ACCEPTANCE_MISMATCH",
-      stepIndex, stepId: candidate.id,
-      fieldPath: `steps[${stepIndex}].recovery${missing ? ".failedStepId" : wrongTarget ? ".targetContext" : ""}`,
-      expected: missing ? "recovery 必须引用本 Task 权威历史中的既有失败，不能引用其他 Task 或模型上下文中的步骤。"
-        : wrongTarget ? "recovery 必须保留原 targetContext；跨 Round 需要同 Task、同资源的程序承接记录。"
-          : "recovery 必须保留既有失败的原始验收契约；缺失或需要修订时先补取权威证据。",
-      allowedRepairPaths: [], ruleVersion: RECOVERY_RULE_VERSION,
-    });
   });
 }
 

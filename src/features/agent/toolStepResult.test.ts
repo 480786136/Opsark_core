@@ -9,6 +9,17 @@ const call: ToolCall = {
 };
 
 describe("tool step result", () => {
+  it("completes an absence observation without treating it as deployment completion", () => {
+    const outcome = buildToolStepOutcome({ call, completedAt: "now", evidenceId: "missing-path",
+      result: { callId: call.id, toolId: call.toolId, success: true,
+        data: { rootPath: "/opt/app", pathStatus: "missing", tree: "", warnings: [], truncated: false } },
+    });
+    expect(outcome.status).toBe("completed");
+    expect(outcome.result.facts).toMatchObject({ evidenceKind: "path_state", pathExists: false });
+    expect(outcome.review?.summary).toContain("不是目录内容或部署完成证据");
+    expect(outcome.pauseReason).toBeUndefined();
+  });
+
   it("builds complete structured evidence for a successful call", () => {
     const outcome = buildToolStepOutcome({
       call,

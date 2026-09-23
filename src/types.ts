@@ -237,6 +237,8 @@ export interface TaskPlanHistory {
   plan: PlanStep[];
   finalPlan?: PlanStep[];
   phases?: TaskExecutionPhase[];
+  /** Complete user/assistant message stream for this round; absent on legacy records. */
+  messages?: TaskMessage[];
   response?: TaskMessage;
   records?: TaskMessage[];
   summary?: string;
@@ -249,6 +251,8 @@ export interface TaskPlanHistory {
 export interface TaskExecutionPhase {
   id: string;
   roundId: string;
+  /** User message immediately following this archived plan in the conversation timeline. */
+  archivedBeforeMessageId?: string;
   requirement: string;
   reason: "adjustment" | "replan";
   plan: PlanStep[];
@@ -339,8 +343,12 @@ export interface AdjustmentIncident {
   stepFingerprint: string;
   targetFingerprint: string;
   evidenceFingerprint: string;
-  /** Plans that passed generation/safety checks and were admitted for execution. */
+  /** Replacement plans admitted to approval; not evidence of execution. */
+  planningAttemptCount?: number;
+  /** Replacement phases with an actual execution or an unknown submitted result. */
   executionAttemptCount: number;
+  /** Count a multi-step replacement once, without counting its approval as execution. */
+  activePlan?: { stepIds: string[]; executionCounted: boolean };
   /** Model/contract/safety failures before a replacement plan was admitted. */
   generationFailureCount: number;
   /** @deprecated Persisted pre-split counter; migrated when saved tasks are loaded. */
@@ -366,6 +374,8 @@ export type ManagedAdjustmentPhase =
 export type ManagedStopReason =
   | "workflow_error"
   | "no_progress"
+  | "phase_budget_exhausted"
+  | "no_action"
   | "model_generation_failed"
   | "transport_recovery"
   | "retry_exhausted"
@@ -456,6 +466,8 @@ export interface OpsTask {
   managedAdjustmentPhase?: ManagedAdjustmentPhase;
   /** Present only when automatic continuation intentionally stopped. */
   managedStopReason?: ManagedStopReason;
+  /** Explicit continuation renews only the phase budget, never evidence or stagnation history. */
+  automaticPhaseBudget?: { roundId?: string; serverId: string; stepIds: string[]; renewedAt: string };
   summary?: string;
   pauseReason?: string;
   executionConstraints?: ExecutionConstraints;

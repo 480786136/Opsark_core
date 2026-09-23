@@ -78,6 +78,7 @@ export function archiveActivePhase(
   reason: TaskExecutionPhase["reason"],
   timestamp = new Date().toISOString(),
   summary = task.pauseReason,
+  archivedBeforeMessageId?: string,
 ) {
   if (!task.plan.length) return;
   task.currentRoundId ||= `round-${task.id}-${Date.parse(timestamp) || Date.now()}`;
@@ -85,6 +86,7 @@ export function archiveActivePhase(
   task.phaseHistory.push({
     id: `phase-${task.id}-${Date.now()}-${task.phaseHistory.length}`,
     roundId: task.currentRoundId,
+    archivedBeforeMessageId,
     requirement: task.currentInstruction || taskGoal(task),
     reason,
     plan: task.plan.map(cloneStep),
@@ -121,6 +123,10 @@ export function capturePreviousRound(task: OpsTask, timestamp = new Date().toISO
       plan: steps.map(cloneStep),
       finalPlan: task.plan.map(cloneStep),
       phases: phases.length ? phases : undefined,
+      messages: task.messages
+        .slice(indexed.index)
+        .filter((message) => message.kind === "message")
+        .map((message) => ({ ...message })),
       response: task.messages
         .slice(indexed.index + 1)
         .find((message) => message.role === "assistant" && message.kind === "message"),
@@ -156,19 +162,21 @@ export function beginRequirementRound(task: OpsTask, roundId: string, snapshot?:
 
 export function normalizeRequirementRelation(
   result: RequirementProcessingResult,
-  content: string,
-  hasRootGoal: boolean,
+  _content: string,
+  _hasRootGoal: boolean,
 ): RequirementRelation {
-  if (result.relation) return result.relation;
-  const normalized = content.trim().replace(/[。！!]+$/u, "");
-  if (!hasRootGoal) return "new_goal";
-  if (/^(?:请)?(?:继续执行|继续处理|继续部署|继续|重试|再试一次)/iu.test(normalized)) {
-    return "continue";
+  if (!result.relation) {
+    throw new Error("需求分类响应缺少 relation；Core 不会代替模型判断业务目标关系。");
   }
-  if (/^(?:取消|终止|放弃)(?:当前|这个)?(?:任务|目标)?$/iu.test(normalized)) return "cancel_goal";
-  // Missing classification is not evidence that the user abandoned or created
-  // another business goal. Preserve identity and treat it as a new requirement.
-  return result.intent === "answer" ? "side_question" : "supplement";
+  const valid = result.intent === "execute"
+    ? ["new_goal", "continue", "supplement", "replace_goal"].includes(result.relation)
+    : result.intent === "answer"
+      ? ["side_question", "cancel_goal"].includes(result.relation)
+      : false;
+  if (!valid) {
+    throw new Error(`需求分类响应的 intent=${result.intent} 与 relation=${result.relation} 不匹配。`);
+  }
+  return result.relation;
 }
 
 export function mergeTaskSkillIds(

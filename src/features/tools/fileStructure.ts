@@ -41,14 +41,30 @@ export function normalizeFileStructureRequest(
 
   const customExcludes = (request.excludeDirectories ?? []).flatMap((item) => {
     const normalizedItem = item.trim().replace(/\\/g, "/");
-    const value = normalizedItem.replace(/^\/+|\/+$/g, "");
-    if (!value) return [];
-    if (normalizedItem.startsWith("/")
-      || normalizedItem.includes("\0")
-      || value.split("/").some((segment) => segment === "." || segment === "..")) {
-      throw new Error(`排除目录必须是目录名或根目录下的相对路径：${item}`);
+    if (normalizedItem.includes("\0")) {
+      throw new Error(`排除目录不能包含 NUL 字符：${item}`);
     }
-    return [value];
+    const absolute = normalizedItem.startsWith("/");
+    const segments = normalizedItem.split("/").filter(Boolean);
+    if (segments.some((segment) => segment === "." || segment === "..")) {
+      throw new Error(`排除目录不能包含 . 或 .. 路径段：${item}`);
+    }
+    if (!segments.length) {
+      if (!absolute) return [];
+      throw new Error(`排除目录不能与根路径相同：${item}`);
+    }
+
+    const value = segments.join("/");
+    if (!absolute) return [value];
+
+    const absolutePath = `/${value}`;
+    if (absolutePath === rootPath) {
+      throw new Error(`排除目录不能与根路径相同：${item}`);
+    }
+    if (rootPath !== "/" && !absolutePath.startsWith(`${rootPath}/`)) {
+      throw new Error(`绝对排除路径必须位于根路径 ${rootPath} 下：${item}`);
+    }
+    return [absolutePath];
   });
   const maxDepth = Math.trunc(request.maxDepth ?? 4);
   const maxNodes = Math.trunc(request.maxNodes ?? 600);

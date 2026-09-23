@@ -71,6 +71,14 @@ function canonicalToolCommand(command: string) {
   return command;
 }
 
+/** Unparsed responses must not all collapse to the fingerprint of an empty plan. */
+export function protocolRejectionFingerprint(repair: { previousModelOutput: PlanStep[]; rawModelResponse?: string }) {
+  if (repair.rawModelResponse === undefined) return planSemanticFingerprint(repair.previousModelOutput);
+  let response = repair.rawModelResponse.trim();
+  try { response = stableProtocolValue(JSON.parse(response)); } catch { /* Keep malformed JSON as rejected text. */ }
+  return `response:${textFingerprint(response)}`;
+}
+
 function record(value: unknown): Record<string, any> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : {};
 }
@@ -133,14 +141,17 @@ export function compactProtocolRepairContext<T extends {
   const referencedTools = new Set(steps.flatMap(step => step.command.match(/^opsark-tool\s+(\S+)/)?.[1] ?? []));
   const failedIds = new Set(steps.flatMap(step => step.recovery?.failedStepId ?? []));
   const recovery = record(authority.recovery);
+  const failedAttempts = Array.isArray(recovery.failedAttempts)
+    ? recovery.failedAttempts
+    : Array.isArray(recovery.blockers) ? recovery.blockers : [];
   const { previousModelOutput: _fullPlan, progress: _progress, nextStageDecision: _decision, ...feedback } = repair;
   return JSON.stringify({
     ...authority,
     workflowPhase: "protocol_repair",
     recovery: {
       currentTargetContext: recovery.currentTargetContext,
-      blockers: Array.isArray(recovery.blockers)
-        ? recovery.blockers.filter((blocker: Record<string, unknown>) => failedIds.has(String(blocker.failedStepId))) : [],
+      failedAttempts: failedAttempts
+        .filter((attempt: Record<string, unknown>) => failedIds.has(String(attempt.failedStepId))),
       instruction: recovery.instruction,
     },
     tools: Array.isArray(source.tools)

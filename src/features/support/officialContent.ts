@@ -35,7 +35,7 @@ export function validateOfficialContent(envelope: Envelope): Loaded {
     || !/^[a-zA-Z0-9_-]{1,64}$/.test(envelope.id) || !/^[a-f0-9]{64}$/.test(envelope.sha256)
     || !compatible(envelope.min_core_version) || typeof envelope.content !== "string") throw new Error("官方内容与当前 Core 不兼容，请检查系统更新。");
   const data: unknown = JSON.parse(envelope.content);
-  if (!object(data) || (data.schema_version !== 1 && !(envelope.kind === "tools" && data.schema_version === 2)) || data.kind !== envelope.kind || data.version !== envelope.version
+  if (!object(data) || ![1, 2].includes(data.schema_version as number) || data.kind !== envelope.kind || data.version !== envelope.version
     || data.min_core_version !== envelope.min_core_version || !Array.isArray(data.items) || !data.items.length || data.items.length > 200) throw new Error("官方内容格式无效。");
   const ids = new Set<string>();
   for (const item of data.items) {
@@ -64,22 +64,23 @@ export function validateOfficialContent(envelope: Envelope): Loaded {
     return { release, tools: items };
   }
   if (!Array.isArray(data.required_tools) || data.required_tools.some(item => !object(item) || typeof item.id !== "string"
-    || !positive(item.min_implementation_version) || (tools.get(item.id)?.version ?? 0) < item.min_implementation_version)) throw new Error("官方 Skill 需要更新的工具实现，请先升级 Core。");
+    || !positive(item.min_implementation_version))) throw new Error("官方 Skill 工具参考格式无效。");
   const skills = data.items.map((item): SkillDefinition => {
     if (Object.keys(item).some(key => !skillFields.has(key)) || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(item.id) || item.id.startsWith("skill-")
-      || !positive(item.version) || typeof item.enabled !== "boolean" || typeof item.allowShell !== "boolean"
+      || !positive(item.version) || typeof item.enabled !== "boolean"
+      || (item.allowShell !== undefined && typeof item.allowShell !== "boolean")
       || !SKILL_CATEGORY_IDS.includes(item.category) || !strings(item.matchRules)
-      || !strings(item.allowedToolIds) || !strings(item.forbiddenToolIds)
+      || (item.allowedToolIds !== undefined && !strings(item.allowedToolIds))
+      || (item.forbiddenToolIds !== undefined && !strings(item.forbiddenToolIds))
       || ["name", "description", "instructions"].some(key => typeof item[key] !== "string" || !item[key].trim())
       || item.name.length > 80 || item.description.length > 1000 || item.instructions.length > 8000) throw new Error("官方 Skill 格式无效。");
-    if ([...item.allowedToolIds, ...item.forbiddenToolIds].some(id => !tools.has(id))) throw new Error("官方 Skill 需要当前 Core 尚未提供的工具，请先更新系统。");
     for (const rule of item.matchRules) { if (rule.startsWith("regex:")) new RegExp(rule.slice(6), "i"); }
     const base = builtInSkillCatalog.find(s => s.id === item.id);
-    const skill: SkillDefinition = { ...clone(item), source: "system", builtIn: true, updatedAt: base?.updatedAt ?? "" };
-    // Local contracts are valid only for their exact instructions and capability declarations.
-    if (base && base.instructions === item.instructions && (base.allowShell !== false) === item.allowShell
-      && JSON.stringify(base.allowedToolIds ?? []) === JSON.stringify(item.allowedToolIds)
-      && JSON.stringify(base.forbiddenToolIds ?? []) === JSON.stringify(item.forbiddenToolIds)) {
+    // Accept legacy wire fields, but never turn them into runtime policy.
+    const { allowShell: _shell, allowedToolIds: _allowed, forbiddenToolIds: _forbidden, ...guidance } = clone(item);
+    const skill: SkillDefinition = { ...guidance, source: "system", builtIn: true, updatedAt: base?.updatedAt ?? "" };
+    // Stage projections summarize exact prose; capability metadata is irrelevant.
+    if (base && base.instructions === item.instructions) {
       if (base.planningContract) skill.planningContract = clone(base.planningContract);
       if (base.suggestions) skill.suggestions = clone(base.suggestions);
     }

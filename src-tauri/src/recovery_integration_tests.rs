@@ -7,6 +7,44 @@ fn diagnosis(command: &str) -> AiPlanStep {
 }
 
 #[test]
+fn recovery_audit_is_optional_and_replanned_verification_can_change_method() {
+    let mut ordinary = diagnosis("uname -a");
+    ordinary.recovery = None;
+    let mut verification = diagnosis("test -s /opt/report/build/report.zip");
+    verification.expected = "A nonempty build artifact exists".into();
+    verification.recovery.as_mut().unwrap()["purpose"] = json!("verify");
+    let steps = vec![ordinary, verification.clone()];
+
+    validate_ai_plan_contract(&steps, &AiGenerationSettings::default()).unwrap();
+    let converted = convert_ai_plan_steps(steps).unwrap();
+    assert!(converted[0].recovery.is_none());
+    assert!(converted[0].recovery_rule_version.is_none());
+    assert_eq!(converted[1].command, verification.command);
+    assert_eq!(converted[1].expected, verification.expected);
+    assert_eq!(converted[1].recovery, verification.recovery);
+    assert_eq!(converted[1].status, "pending");
+}
+
+#[test]
+fn verification_audit_never_bypasses_observe_safety() {
+    let mut step = diagnosis("touch /tmp/forged-build-evidence");
+    step.recovery.as_mut().unwrap()["purpose"] = json!("verify");
+    let rejected = validate_ai_plan_contract(&[step.clone()], &AiGenerationSettings::default()).unwrap_err();
+    let converted = convert_ai_plan_steps(vec![step]).unwrap_err();
+    assert_eq!(rejected, converted);
+    assert_eq!(recovery_rules::decode_issue(&rejected).unwrap().code, "OBSERVE_COMMAND_MUTATION");
+}
+
+#[test]
+fn recovery_prompt_distinguishes_historical_facts_from_future_acceptance_methods() {
+    assert!(PLAN_STEP_OUTPUT_CONTRACT.contains("recovery 是可选的历史关联元数据"));
+    assert!(PLAN_STEP_OUTPUT_CONTRACT.contains("调整后续步骤、剩余计划及验收方法"));
+    assert!(PLAN_STEP_OUTPUT_CONTRACT.contains("不可改写的执行事实"));
+    assert!(PLAN_STEP_OUTPUT_CONTRACT.contains("仍须通过安全、授权和真实执行证据检查"));
+    assert!(!PLAN_STEP_OUTPUT_CONTRACT.contains("verify 应引用 failedAttempt.verification 中的验收契约"));
+}
+
+#[test]
 fn recovery_incident_is_rejected_before_conversion_with_exact_shared_issue() {
     let step = diagnosis("TMPD=$(mktemp -d); uname >\"$TMPD/info\"; rm -rf \"$TMPD\"");
     let rejected =
@@ -150,7 +188,6 @@ fn next_stage_recovery_failure_retains_original_business_decision_for_local_patc
     let error = validate_next_stage_preserving_recovery(
         decision,
         &AiGenerationSettings::default(),
-        &HashSet::new(),
         None,
     )
     .unwrap_err();
@@ -164,4 +201,69 @@ fn next_stage_recovery_failure_retains_original_business_decision_for_local_patc
     assert_eq!(envelope["repairAttempted"], false);
     assert_eq!(envelope["modelCalls"], 1);
     assert_eq!(envelope["issue"]["code"], "RECOVERY_DIAGNOSE_MUTATION");
+}
+
+#[test]
+fn next_stage_hidden_tool_failure_preserves_the_rejected_plan_for_business_replanning() {
+    let decision = AiNextStageDecision {
+        decision: "continue".into(), reason: "Read project declarations".into(),
+        summary: "Deployment is not complete".into(),
+        steps: vec![AiPlanStep {
+            kind: "observe".into(), title: "Read".into(), description: "Read evidence".into(),
+            command: "opsark-tool files.get_structure {\"rootPath\":\"/opt/report\"}".into(),
+            expected: "Project structure".into(), validation: "true".into(), risk: Some("low".into()),
+            ..AiPlanStep::default()
+        }],
+    };
+    let visible = HashSet::from(["evidence.read".to_string()]);
+    let error = validate_next_stage_preserving_recovery(decision, &AiGenerationSettings::default(), Some(&visible)).unwrap_err();
+    let envelope: Value = serde_json::from_str(&error).unwrap();
+    assert_eq!(envelope["kind"], "plan_protocol_failure");
+    assert_eq!(envelope["rejectedPlanExecuted"], false);
+    assert_eq!(envelope["steps"][0]["status"], "pending");
+    assert!(envelope["steps"][0]["id"].is_string());
+    assert_eq!(envelope["nextStageDecision"]["decision"], "continue");
+    assert!(envelope["validationError"].as_str().unwrap().contains("当前规划上下文未开放工具 files.get_structure"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("Skill 是领域流程参考") || GENERAL_PLAN_SYSTEM.contains("activeSkills 是领域流程参考"));
+}
+
+#[test]
+fn next_stage_parse_failures_preserve_raw_responses_without_inventing_steps() {
+    let incident = include_str!("../../src/services/fixtures/next-stage-missing-steps.json");
+    for content in [
+        incident,
+        r#"{"decision":"complete","reason":"claimed success","summary":"done"}"#,
+        r#"{"decision":"adjust","reason":"ask","summary":"waiting","steps":{}}"#,
+        r#"{"decision":"continue","reason":"read","summary":"next","steps":[{"command":42}]}"#,
+        r#"{"decision":"adjust","reason":null,"summary":"waiting","steps":[]}"#,
+        r#"{"decision":"adjust","#,
+        "",
+    ] {
+        let payload = json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]});
+        let error = parse_next_stage_response(&payload).unwrap_err();
+        let envelope: Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(envelope["kind"], "next_stage_response_invalid");
+        assert_eq!(envelope["rawResponse"], content);
+        assert_eq!(envelope["rejectedPlanExecuted"], false);
+        assert!(envelope.get("steps").is_none());
+        assert!(envelope.get("nextStageDecision").is_none());
+        assert!(envelope["validationError"].as_str().unwrap().contains("阶段联合决策结构解析失败"));
+    }
+    let missing_content: Value = serde_json::from_str(&parse_next_stage_response(&json!({})).unwrap_err()).unwrap();
+    assert_eq!(missing_content["kind"], "next_stage_response_invalid");
+    assert_eq!(missing_content["rawResponse"], "");
+}
+
+#[test]
+fn next_stage_explicit_empty_steps_still_requires_semantic_validation() {
+    for decision in ["complete", "adjust", "continue"] {
+        let content = json!({"decision":decision,"reason":"evidence-based reason","summary":"status","steps":[]}).to_string();
+        let parsed = parse_next_stage_response(&json!({"choices":[{"message":{"content":content}}]})).unwrap();
+        let result = validate_next_stage_preserving_recovery(parsed, &AiGenerationSettings::default(), None);
+        if decision == "continue" {
+            assert!(result.unwrap_err().contains("steps 至少需要 1 个元素"));
+        } else {
+            assert!(result.unwrap().steps.is_empty());
+        }
+    }
 }

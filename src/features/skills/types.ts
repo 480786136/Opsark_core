@@ -39,7 +39,7 @@ export interface SkillPlanningEvidence {
 
 export interface SkillDefinition {
   source?: "system" | "user";
-  /** A requested capability, never an execution grant. Missing preserves legacy Shell workflows. */
+  /** Legacy metadata accepted for compatibility; never grants or restricts Shell. */
   allowShell?: boolean;
   id: string;
   name: string;
@@ -71,7 +71,8 @@ export interface SkillDefinition {
       id: string;
       title: string;
       instructions: string;
-      allowedToolIds: string[];
+      /** Legacy metadata; ignored by planning and dispatch. */
+      allowedToolIds?: string[];
       /** Only executor-recorded successful tool results satisfy these conditions. */
       requiresTools: string[];
       /** Deterministic evidence products required before this stage is exposed. */
@@ -84,12 +85,11 @@ export interface SkillDefinition {
     }>;
   };
   /**
-   * Complete set of model-callable tools this Skill may need across its
-   * workflow. Missing means legacy/unrestricted for backward compatibility;
-   * an empty list means the Skill is intentionally Shell-only.
+   * Legacy catalog metadata retained for stored/official manifest compatibility.
+   * These fields never grant or restrict planning/execution capabilities.
    */
   allowedToolIds?: string[];
-  /** Tools that this workflow must never dispatch, even when a model emits them. */
+  /** Legacy metadata; not an execution prohibition. */
   forbiddenToolIds?: string[];
   suggestions?: SkillSuggestion[];
   updatedAt: string;
@@ -133,8 +133,6 @@ export interface ModelSkillDefinition {
   description: string;
   version: number;
   instructions: string;
-  allowedToolIds?: string[];
-  forbiddenToolIds: string[];
 }
 
 export interface ModelSkillDirectoryEntry {

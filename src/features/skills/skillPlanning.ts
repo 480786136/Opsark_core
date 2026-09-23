@@ -32,7 +32,7 @@ function validContract(contract: Contract) {
   return contract.stages.every((stage, index) => {
     if (!record(stage) || !nonempty(stage.id) || ids.has(stage.id) || !nonempty(stage.title)
       || !nonempty(stage.instructions) || !nonempty(stage.exitEvidence)
-      || !strings(stage.requiresTools) || !strings(stage.allowedToolIds)) return false;
+      || !strings(stage.requiresTools)) return false;
     ids.add(stage.id);
     for (const requirements of [stage.requiresEvidence, stage.exitRequirements]) {
       if (requirements !== undefined && (!Array.isArray(requirements) || !requirements.every(validRequirement))) return false;
@@ -51,7 +51,7 @@ export function planningSkills(task: OpsTask, skills: SkillDefinition[]): SkillD
   const tools = new Set(current.map(step => step.result?.facts.toolId));
   return skills.map(skill => {
     const contract = skill.planningContract;
-    if (!contract || contract.sourceInstructions !== skill.instructions || !skill.allowedToolIds
+    if (!contract || contract.sourceInstructions !== skill.instructions
       || !validContract(contract)) return skill;
     if (contract.initialOnly && history.some(step => ["completed", "failed"].includes(step.status))) return skill;
     const expanded = history.some(step => step.status === "completed"
@@ -86,14 +86,12 @@ export function planningSkills(task: OpsTask, skills: SkillDefinition[]): SkillD
       ...skill,
       planningEvidence: { stageId: stage.id,
         observed: [...matches.values()].map(({ evidenceId, kind, scope, facts }) => ({ evidenceId, kind, scope, facts })) },
-      allowedToolIds: [...new Set([...stage.allowedToolIds.filter(id => skill.allowedToolIds!.includes(id)),
-        "context.expand", "user.request_input"])].filter(id => !skill.forbiddenToolIds?.includes(id)),
-      instructions: [contract.globalInstructions, contract.acceptanceInstructions,
-        `当前阶段 ${stage.id}：\n${stage.instructions}`,
-        `阶段产物：${stage.exitEvidence}`,
-        `阶段条件：${JSON.stringify({ requires: stage.requiresEvidence, exits: stage.exitRequirements })}；匹配证据见上下文 skillEvidence。`,
+      instructions: ["以下阶段和验收方法为流程参考，不是硬性门禁或工具权限。可根据用户目标和真实证据调整，说明替代原因；用户明确要求、系统安全和授权仍必须遵守。",
+        contract.globalInstructions, contract.acceptanceInstructions,
+        `建议阶段 ${stage.id}：\n${stage.instructions}`,
+        `建议采集的证据：${stage.exitEvidence}；已有匹配证据见 skillEvidence。`,
         `阶段目录：\n${directory}`,
-        `阶段不代表整体完成，证据仅覆盖所列资源。版本兼容与执行方式仍需读取原文判断。Shell 证据、其他项目格式或规则不足时，用 context.expand {"skillId":"${skill.id}","reason":"缺失信息"} 展开完整规则和工具；权限不变。`,
+        `阶段不代表整体完成，证据仅覆盖所列资源。版本兼容与执行方式仍需读取原文判断。需要补充流程说明且 context.tools 提供 context.expand 时，可用 {"skillId":"${skill.id}","reason":"缺失信息"} 展开参考；这不会改变工具权限，也不是推进任务的前置条件。`,
       ].join("\n\n"),
     };
   });

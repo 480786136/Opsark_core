@@ -15,8 +15,7 @@ import {
 } from "@/features/agent/evidenceReview";
 import { latestTaskRequirement } from "@/features/agent/taskProgression";
 import type { ModelProfile, OpsTask, PlanStep, StepReview } from "@/types";
-import { attemptAuthorizationFingerprint, authorizeRiskAttempt, executionPolicyBlocker, isRelatedRecoveryStep, permitsBestEffortRiskReview, unresolvedRecoveryBlockers } from "./recoveryContract";
-import { taskAttemptContext } from "./attemptState";
+import { executionPolicyBlocker } from "./recoveryContract";
 
 type StepReviewer = (
   requirement: string,
@@ -47,10 +46,14 @@ export interface ReviewEvidenceInput extends ReviewStepInput {
   validationExitCode?: number;
 }
 
-/** A model cannot waive an unresolved prerequisite; only its explicit recovery may run. */
+/**
+ * Legacy precondition review now enforces only the task's hard authorization
+ * boundary. Whether a proposed step is the best semantic response to an older
+ * failure belongs to planning, not to a second Core decision before dispatch.
+ */
 export async function reviewPrecondition(
   input: ReviewPreconditionInput,
-  reviewStep: StepReviewer = backend.reviewStep.bind(backend),
+  _reviewStep: StepReviewer = backend.reviewStep.bind(backend),
 ) {
   const requirement = latestTaskRequirement(input.task);
   const context = buildPreconditionReviewContext(
@@ -59,34 +62,18 @@ export async function reviewPrecondition(
     input.blockerStep,
   );
   const policyBlocker = executionPolicyBlocker(input.task, input.step);
-  let allowed = !policyBlocker && isRelatedRecoveryStep(input.blockerStep, input.step, taskAttemptContext(input.task));
-  const mayAttempt = !allowed && input.blockerStep.status === "completed"
-    && !policyBlocker && permitsBestEffortRiskReview(input.task, input.blockerStep)
-    && unresolvedRecoveryBlockers(input.task, input.step).every(blocker =>
-      blocker.status === "completed" && permitsBestEffortRiskReview(input.task, blocker));
-  let modelDecision: StepReview | undefined;
-  if (mayAttempt) {
-    const fingerprint = attemptAuthorizationFingerprint(input.task, input.step, input.blockerStep);
-    modelDecision = await reviewStep(requirement, JSON.stringify(context), true,
-      createRuntimeModel(input.model, input.apiKey, ""));
-    allowed = modelDecision.source === "model" && modelDecision.decision === "continue"
-      && fingerprint === attemptAuthorizationFingerprint(input.task, input.step, input.blockerStep);
-    if (allowed) authorizeRiskAttempt(input.task, input.step, input.blockerStep);
-  }
-  const failureDetail = input.blockerStep.result?.failureReason || input.blockerStep.result?.warnings[0]
-    || input.blockerStep.title;
+  const allowed = !policyBlocker;
   const finalDecision: StepReview = {
     decision: allowed ? "continue" : "adjust",
-    reason: allowed ? (mayAttempt ? "用户明确允许 best_effort 尝试，模型已核验当前操作仍在授权范围；风险未解除。"
-      : "当前步骤明确关联失败及相同执行上下文，仅允许执行恢复阶段。")
-      : policyBlocker ?? `${failureDetail}；前置条件未解决：下一步骤缺少有效恢复关系或原始验收契约，不能由模型批准跳过。`,
-    summary: allowed ? "原阻断仍保留，真实执行结果不自动代替原始验收。" : "请生成关联诊断、修复和复验步骤。",
+    reason: policyBlocker
+      ?? "当前步骤已通过任务授权边界检查；历史失败作为规划证据保留，不构成执行前的恢复关系门禁。",
+    summary: allowed ? "继续交由执行器完成安全、能力和审批检查。" : "当前步骤超出任务授权范围。",
     source: "rules",
   };
-  return { requirement, context, modelDecision: modelDecision ?? finalDecision, finalDecision, allowed };
+  return { requirement, context, modelDecision: finalDecision, finalDecision, allowed };
 }
 
-/** Reviews a failed command while preserving deterministic failure and recovery rules. */
+/** Reviews a failed command without allowing Core to replace the model's business decision. */
 export async function reviewExecutionFailure(
   input: ReviewExecutionFailureInput,
   reviewStep: StepReviewer = backend.reviewStep.bind(backend),
@@ -105,21 +92,6 @@ export async function reviewExecutionFailure(
     remainingSteps,
     input.step,
   );
-  // Every possible review outcome is already constrained to adjustment here.
-  // Send the failure evidence directly to the adjustment planner once instead
-  // of asking a model to choose a branch that the local gate must override.
-  if (!diagnosticStep && !recoveryStepFound) {
-    const finalDecision: StepReview = {
-      decision: "adjust",
-      reason: `${input.failureReason}；剩余计划没有能够处理该失败原因的明确恢复步骤。`,
-      summary: "执行失败证据已保留，下一次规划将直接分析原因并生成恢复步骤。",
-      source: "rules",
-    };
-    return {
-      requirement, context, modelDecision: undefined, finalDecision,
-      remainingSteps, diagnosticStep, mutatingStep, recoveryStepFound,
-    };
-  }
   const modelDecision = await reviewStep(
     requirement,
     JSON.stringify(context),
@@ -132,20 +104,6 @@ export async function reviewExecutionFailure(
       decision: "adjust",
       reason: "主命令执行失败且模型复核不可用，程序不会使用兜底规则继续任务。",
       summary: "当前步骤执行失败，需要调整后再继续。",
-      source: "rules",
-    };
-  } else if (modelDecision.decision === "complete" && !diagnosticStep) {
-    finalDecision = {
-      decision: "adjust",
-      reason: "非诊断步骤执行失败，不能仅依据模型意见判定整个任务完成。",
-      summary: "当前操作没有完成，需要修复执行失败。",
-      source: "rules",
-    };
-  } else if (modelDecision.decision === "continue" && !diagnosticStep && !recoveryStepFound) {
-    finalDecision = {
-      decision: "adjust",
-      reason: `${input.failureReason}；剩余计划没有能够处理该失败原因的明确恢复步骤。`,
-      summary: "当前计划无法从本次执行失败中安全恢复。",
       source: "rules",
     };
   }
@@ -190,6 +148,15 @@ export async function reviewExecutionEvidence(
     );
     finalDecision = modelDecision;
 
+    if (modelDecision.source !== "model") {
+      finalDecision = {
+        decision: "adjust",
+        reason: "执行证据需要语义判断，但模型复核不可用；Core 不会代替模型推断继续或完成。",
+        summary: "执行事实已保留，当前进入 blocked/no_action。",
+        source: "rules",
+      };
+    }
+
     if (input.postconditionReview) {
       hardBlocker = postconditionHasHardBlocker(
         input.step,
@@ -198,35 +165,6 @@ export async function reviewExecutionEvidence(
       );
       mutatingStep = isMutatingReviewStep(input.step);
       repairStepFound = remainingPlanCanRepairPostcondition(remainingSteps, input.step);
-      if (modelDecision.source !== "model") {
-        finalDecision = {
-          decision: "adjust",
-          reason: "后置校验未通过且模型复核不可用，程序不会使用兜底规则把该步骤判为成功。",
-          summary: "主命令已执行，但结果尚未得到可靠确认。",
-          source: "rules",
-        };
-      } else if (hardBlocker) {
-        finalDecision = {
-          decision: "adjust",
-          reason: hardBlocker,
-          summary: "模型已完成复核，但程序安全门禁要求先处理确定性阻断。",
-          source: "rules",
-        };
-      } else if (modelDecision.decision === "complete" && mutatingStep) {
-        finalDecision = {
-          decision: "adjust",
-          reason: "变更步骤的后置条件尚未满足，不能仅依据模型意见直接判定整个任务完成。",
-          summary: "变更命令已执行，但目标状态仍需修复或重新验证。",
-          source: "rules",
-        };
-      } else if (modelDecision.decision === "continue" && mutatingStep && !repairStepFound) {
-        finalDecision = {
-          decision: "adjust",
-          reason: "变更步骤的后置条件尚未满足，剩余计划也没有明确的修复步骤。",
-          summary: "需要先调整计划以修复或重新验证目标状态。",
-          source: "rules",
-        };
-      }
     }
   } else {
     finalDecision = {
@@ -240,37 +178,6 @@ export async function reviewExecutionEvidence(
   let blockingSignalResolved: boolean | undefined;
   if (input.step.result?.facts.blockingSignal && !input.postconditionReview) {
     blockingSignalResolved = remainingPlanResolvesBlockingSignal(input.step, remainingSteps);
-    finalDecision = blockingSignalResolved || (remainingSteps.length > 0 && permitsBestEffortRiskReview(input.task, input.step))
-      ? {
-          decision: "continue",
-          reason: "程序识别到阻断，下一步骤已显式关联当前失败与执行上下文。",
-          summary: "仅继续关联恢复阶段，阻断仍需真实复验解除。",
-          source: "rules",
-        }
-      : {
-          decision: "adjust",
-          reason: "程序识别到阻断，下一步骤没有有效的关联恢复关系，禁止继续业务。",
-          summary: "计划必须先诊断、修复并复验阻断条件。",
-          source: "rules",
-        };
-  }
-
-  let continuedForDiagnostics = false;
-  const nextStep = remainingSteps[0];
-  if (
-    finalDecision.decision === "adjust"
-    && !input.postconditionReview
-    && isReadOnlyDiagnosticStep(input.step)
-    && nextStep
-    && isReadOnlyDiagnosticStep(nextStep)
-  ) {
-    continuedForDiagnostics = true;
-    finalDecision = {
-      decision: "continue",
-      reason: "异常模型建议调整，但当前与下一步骤均为只读诊断；继续收集证据后再判断。",
-      summary: "继续完成剩余只读诊断。",
-      source: "rules",
-    };
   }
 
   return {
@@ -283,6 +190,6 @@ export async function reviewExecutionEvidence(
     mutatingStep,
     repairStepFound,
     blockingSignalResolved,
-    continuedForDiagnostics,
+    continuedForDiagnostics: false,
   };
 }

@@ -15,7 +15,7 @@ describe("skill registry", () => {
     const skills = suggestSkillsByRules("使用 SSH 跳转到 192.168.1.237");
     expect(skills.map((skill) => skill.id)).toEqual(["ssh-terminal-jump"]);
     expect(skills[0]).toMatchObject({
-      version: 4,
+      version: 5,
       category: "connectivity",
     });
     expect(buildSkillContext(skills)[0].instructions).toContain("server.resolve_connection");
@@ -42,7 +42,7 @@ describe("skill registry", () => {
     const [skill] = suggestSkillsByRules("构建项目");
     const instructions = buildSkillContext([skill])[0].instructions;
 
-    expect(skill).toMatchObject({ id: "project-build", version: 5 });
+    expect(skill).toMatchObject({ id: "project-build", version: 6 });
     expect(instructions).toContain("不把多个失败边界塞进同一个 Shell 步骤");
     expect(instructions).toContain("安装与构建必须是不同步骤");
     expect(instructions).toContain("不得把全部 stdout/stderr 只重定向到文件");
@@ -56,9 +56,7 @@ describe("skill registry", () => {
 
     expect(skill).toMatchObject({
       id: "project-source-acquisition",
-      version: 12,
-      forbiddenToolIds: ["server.resolve_connection", "server.connect"],
-      allowedToolIds: ["user.request_input"],
+      version: 13,
     });
     expect(instructions).toContain("最短的可执行计划");
     expect(instructions).toContain("GIT_HTTP_CREDENTIAL");
@@ -93,7 +91,7 @@ describe("skill registry", () => {
     const [skill] = suggestSkillsByRules("请进行跨服务器文件传输");
     const context = buildSkillContext([skill]);
 
-    expect(skill).toMatchObject({ id: "file-transfer-integrity", version: 5 });
+    expect(skill).toMatchObject({ id: "file-transfer-integrity", version: 6 });
     expect(context[0].instructions).toContain("files.transfer_between_servers");
     expect(context[0].instructions).toContain("server.resolve_connection");
     expect(context[0].instructions).toContain("BatchMode 认证成功：使用该认证以前台 scp 直接传输");
@@ -105,8 +103,8 @@ describe("skill registry", () => {
     expect(context[0].instructions).toContain("TARGET_SSH_PASSWORD");
     expect(context[0].instructions).toContain("TARGET_SSH_USERNAME");
     expect(context[0].instructions).toContain("server-credential 引用只用于当前可见 PTY");
-    expect(context[0].instructions).toContain("下一轮计划必须且只能调用 user.request_input");
-    expect(context[0].instructions).toContain("文件传输工作流不得调用 server.connect");
+    expect(context[0].instructions).toContain("通过 user.request_input 收集缺失的安全输入");
+    expect(context[0].instructions).toContain("server.connect 会切换连接目标");
     expect(context[0].instructions).not.toContain("${secret.PASSWORD}");
   });
 
@@ -130,7 +128,7 @@ describe("skill registry", () => {
       .find((skill) => skill.id === "application-deployment")!;
 
     expect(deployment).toMatchObject({
-      version: 6,
+      version: 8,
       category: "deployment",
     });
     expect(deployment.description).not.toContain("前后端");
@@ -168,7 +166,7 @@ describe("skill registry", () => {
     registry.push(custom);
 
     const serialized = JSON.parse(JSON.stringify(createSkillConfiguration(registry)));
-    expect(serialized.overrides[0].baseVersion).toBe(4);
+    expect(serialized.overrides[0].baseVersion).toBe(5);
     const restored = resolveSkillRegistry(parseSkillConfiguration(serialized));
     expect(restored.find((skill) => skill.id === "ssh-terminal-jump")).toMatchObject({
       enabled: false,
@@ -212,7 +210,7 @@ describe("skill registry", () => {
     })).filter((skill) => skill.id === "project-source-acquisition");
 
     expect(source.enabled).toBe(false);
-    expect(source.version).toBe(12);
+    expect(source.version).toBe(13);
     expect(source.instructions).not.toContain("旧版自由文本认证流程");
     expect(source.instructions).toContain('"kind":"git-https","role":"username"');
 
@@ -221,7 +219,7 @@ describe("skill registry", () => {
       customSkills: [],
     })).find((skill) => skill.id === "project-source-acquisition")!;
     expect(sourceFromUnversionedConfig.instructions).not.toContain("更早版本的无版本覆盖");
-    expect(sourceFromUnversionedConfig.version).toBe(12);
+    expect(sourceFromUnversionedConfig.version).toBe(13);
   });
 
   it("preserves a source override authored against the v11 contract", () => {
@@ -235,10 +233,8 @@ describe("skill registry", () => {
     })).filter((skill) => skill.id === "project-source-acquisition");
 
     expect(source.instructions).toBe("v11 compatible override");
-    expect(buildSkillContext([source])[0].forbiddenToolIds).toEqual([
-      "server.resolve_connection",
-      "server.connect",
-    ]);
+    expect(buildSkillContext([source])[0]).not.toHaveProperty("forbiddenToolIds");
+    expect(buildSkillContext([source])[0]).not.toHaveProperty("allowedToolIds");
   });
 
   it("replaces a pre-v3 project-build override while preserving its enablement", () => {
@@ -252,7 +248,7 @@ describe("skill registry", () => {
       customSkills: [],
     })).find((skill) => skill.id === "project-build")!;
 
-    expect(build).toMatchObject({ version: 5, enabled: false });
+    expect(build).toMatchObject({ version: 6, enabled: false });
     expect(build.instructions).not.toContain("旧版将依赖安装和构建合并执行");
     expect(build.instructions).toContain("依赖安装：作为独立步骤执行");
   });

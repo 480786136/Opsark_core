@@ -130,6 +130,42 @@ describe("TerminalPanel connection gating", () => {
     expect(fake.clear).not.toHaveBeenCalled();
   });
 
+  it.each(["Backspace", "Delete"])("keeps held %s keys inside the terminal across connection states", async (key) => {
+    await mount();
+    // Connecting, connected, and disconnected must all cancel WebView defaults.
+    for (const state of ["connecting", "connected", "error"] as const) {
+      status({ terminalId, generation: 1, status: state, retryable: false });
+      for (let count = 0; count < 20; count += 1) {
+        const event = new KeyboardEvent("keydown", { key, repeat: count > 0, cancelable: true });
+        const stop = vi.spyOn(event, "stopPropagation");
+        expect(fake.keys?.(event)).toBe(state === "connected");
+        expect(event.defaultPrevented).toBe(true);
+        expect(stop).toHaveBeenCalledOnce();
+      }
+    }
+  });
+
+  it("sends repeated delete and arrow input intact while connected", async () => {
+    await mount();
+    status({ terminalId, generation: 1, status: "connected", retryable: false });
+    const inputs = Array.from({ length: 100 }, () => ["a", "\u007f", "\u001b[D", "\u001b[C"]).flat();
+    inputs.forEach((data) => fake.input?.(data));
+    expect(vi.mocked(backend.writeTerminal).mock.calls).toEqual(inputs.map((data) => [terminalId, data]));
+    expect(ops.reportConnectionFailure).not.toHaveBeenCalled();
+  });
+
+  it("recovers from incoming-flow failure through the coordinator", async () => {
+    await mount();
+    const reason = "终端输入发送失败：Failure while draining incoming flow";
+    status({ terminalId, generation: 1, status: "error", retryable: true, reason });
+    expect(ops.reportConnectionFailure).toHaveBeenCalledWith("server-a", reason);
+    ops.serverConnection("server-a").status = "suspect";
+    fake.input?.("\u007f");
+    expect(backend.writeTerminal).not.toHaveBeenCalled();
+    ops.serverConnection("server-a").status = "connected";
+    await vi.waitFor(() => expect(backend.startTerminal).toHaveBeenCalledTimes(2));
+  });
+
   it("ignores a late terminal start after the pane closes", async () => {
     let resolve!: (generation: number) => void;
     vi.mocked(backend.startTerminal).mockImplementation(() => new Promise((done) => { resolve = done; }));

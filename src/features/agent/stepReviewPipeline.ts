@@ -19,7 +19,6 @@ import {
   applyPreconditionReview,
 } from "@/features/agent/reviewCoordination";
 import type { AuditEventDraft } from "@/features/agent/auditTrail";
-import { permitsBestEffortRiskReview } from "./recoveryContract";
 
 type FailureReviewer = (
   input: ReviewExecutionFailureInput,
@@ -142,7 +141,6 @@ export async function runEvidenceReviewPipeline(
     remainingSteps: review.remainingSteps,
     review: review.finalDecision,
     reviewWasRequired: input.reviewRequired,
-    allowRiskAttemptReview: permitsBestEffortRiskReview(input.task, input.step),
   });
   return { cancelled: false as const, review, audits, coordination };
 }
