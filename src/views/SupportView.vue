@@ -100,7 +100,7 @@ const statusLabels: Record<string, string> = { open: "待处理", in_progress: "
 <template>
   <ConfirmActionDialog :message="confirmationMessage" :title="confirmationTitle" :confirm-label="confirmationLabel" @result="resolveConfirmation" />
   <div class="page management-page support-page">
-    <header class="page-header"><div><span class="eyebrow">SUPPORT / OPSARK</span><h1>联系、反馈与更新</h1><p>把遇到的问题告诉我们，一起让 OpsArk 更好用。</p></div><span class="support-version">v{{ updates.currentVersion }}</span></header>
+    <header class="page-header"><div><span class="eyebrow">SUPPORT / OPSARK</span><h1>联系、反馈与更新</h1><p>把遇到的问题告诉我们，一起让 OpsArk 更好用。</p></div><span class="support-version">v{{ updates.displayVersion }}</span></header>
     <div class="support-layout">
       <div class="feedback-column">
         <section class="support-card feedback-card" aria-labelledby="feedback-heading">
@@ -146,7 +146,7 @@ const statusLabels: Record<string, string> = { open: "待处理", in_progress: "
         </section>
         <section class="support-card system-card" aria-labelledby="system-heading">
           <div class="card-heading"><h2 id="system-heading">版本与系统</h2><span class="system-dot" /></div>
-          <div class="installed-version"><span>OpsArk</span><strong>v{{ updates.currentVersion }}</strong><small>当前安装版本</small></div>
+          <div class="installed-version"><span>OpsArk</span><strong>v{{ updates.displayVersion }}</strong><small>当前安装版本</small></div>
           <dl class="system-facts"><div><dt>官方 Skill</dt><dd>{{ updates.contentVersions.skills ? `v${updates.contentVersions.skills}` : '安装包内置' }}</dd></div><div><dt>工具配置</dt><dd>{{ updates.contentVersions.tools ? `v${updates.contentVersions.tools}` : '安装包内置' }}</dd></div></dl>
           <button class="button secondary check-update" :disabled="updates.busy" @click="updates.check()"><RefreshCw :size="15" :class="{ spinning: updates.busy }" />{{ updates.busy ? '检查中…' : '检查更新' }}</button>
           <p v-if="updates.error" class="support-error" role="alert">{{ updates.error }}</p><p v-if="updates.contentError" class="support-error" role="alert">{{ updates.contentError }}</p><p v-if="updates.contentNotice" role="status">{{ updates.contentNotice }}</p>

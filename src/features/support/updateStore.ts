@@ -1,6 +1,6 @@
 import { defineStore } from "pinia";
 import { cloudRequest } from "@/features/account/cloudClient";
-import { version } from "../../../package.json";
+import { version, releaseChannel } from "../../../package.json";
 import { officialContentLoadError, officialVersions, syncOfficialRelease, type OfficialRelease } from "./officialContent";
 import { useOpsStore } from "@/stores/ops";
 export interface ClientRelease { id: string; version: string; notes: string; download_url: string; platform: string; arch: string }
@@ -22,7 +22,7 @@ function savedContact() {
   catch { return { ...DEFAULT_CONTACT }; }
 }
 export const useUpdateStore = defineStore("updates", {
-  state: () => ({ info: null as ClientInfo | null, busy: false, error: "", currentVersion: version, dismissed: false,
+  state: () => ({ info: null as ClientInfo | null, busy: false, error: "", currentVersion: version, displayVersion: releaseChannel ? `${version}-${releaseChannel}` : version, dismissed: false,
     contact: savedContact(),
     contentVersions: officialVersions(), contentNotice: "", contentError: officialContentLoadError }),
   actions: {

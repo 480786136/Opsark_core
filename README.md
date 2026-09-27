@@ -80,7 +80,7 @@ npm run build:macos -- aarch64-apple-darwin
 
 
 ## 代码提交
-git -c http.proxy=http://127.0.0.1:7897 -c https.proxy=http://127.0.0.1:7897 push
+git -c http.proxy=http://127.0.0.1:7890 -c https.proxy=http://127.0.0.1:7890 push
 ## 演示流程
 
 1. 在“服务器”页面打开预置的 `生产环境 · Web-01`。
