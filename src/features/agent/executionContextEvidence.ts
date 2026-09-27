@@ -3,8 +3,10 @@ import type { PlanStep } from "@/types";
 import { textFingerprint } from "./longRunningReviewOutput";
 
 export function isUserInputStep(step: PlanStep) {
-  return step.result?.facts.toolId === "user.request_input"
-    || /^\s*opsark-tool\s+user\.request_input(?:\s|$)/u.test(step.command);
+  // Read-only historical redaction; this never decodes arguments or enables dispatch.
+  return /^\s*opsark-tool\s+user\.request_input(?:\s|$)/u.test(step.command)
+    || step.result?.facts.toolId === "user.request_input"
+    || (step.action?.type === "tool" && step.action.toolId === "user.request_input");
 }
 
 /** Historical form bodies/facts must not bypass the scoped decision store. */
@@ -24,8 +26,10 @@ export function modelToolOutput(step: PlanStep, value: string | undefined, allow
   if (isUserInputStep(step)) {
     // Raw form output is historical evidence, not a scope-aware user decision.
     // Values enter model requests only through confirmedUserInputs.
-    return { contentRef: "confirmedUserInputs", sourceStepId: step.id,
-      instruction: "仅复用 confirmedUserInputs 中当前目标/服务器有效的完整输入；历史表单输出不扩大适用范围。" };
+    // This standalone projector cannot prove the enclosing request contains
+    // the scoped inputs. Emit provenance, not an unresolved content reference.
+    return { sourceStepId: step.id, contentState: "omitted",
+      instruction: "若当前请求包含 confirmedUserInputs，仅复用其中作用域有效的完整输入；本记录不包含用户选择，不得自行推断。" };
   }
   const archive = allowArchive && value && step.evidence?.find(item => item.rawOutput === value
     && item.archive?.fingerprint === textFingerprint(value))?.archive;

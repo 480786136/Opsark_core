@@ -29,7 +29,7 @@ it("accepts reordered JSON for every shipped schema and prevents changing nested
   const base = defaultToolCatalog.find(t => t.id === "user.request_input")!.inputSchema;
   const changed = sorted(base);
   changed.properties.fields.items.oneOf = [];
-  expect(() => validateCompatibleToolSchema(changed, base)).toThrow("执行协议字段 oneOf");
+  expect(() => validateCompatibleToolSchema(changed, base)).toThrow();
 });
 
 it("validates Unicode lengths, array bounds and enums against configured limits", () => {
@@ -37,4 +37,19 @@ it("validates Unicode lengths, array bounds and enums against configured limits"
   expect(() => validateSchemaValue({ type: "string", minLength: 2 }, "😀", "title", "title")).toThrow("长度不足");
   expect(() => validateSchemaValue({ type: "array", maxItems: 1 }, [1, 2], "rows", "rows")).toThrow("最多 1 项");
   expect(() => validateCompatibleToolSchema({ type: "string", enum: ["unsupported"] }, { type: "string", enum: ["supported"] })).toThrow("枚举值");
+});
+
+
+it("enforces conditional credentials and select-only options before dispatch", () => {
+  const connection = defaultToolCatalog.find(tool => tool.id === "server.connect")!.inputSchema;
+  const input = defaultToolCatalog.find(tool => tool.id === "user.request_input")!.inputSchema;
+  const validate = (schema: Record<string, unknown>, value: unknown) => validateSchemaValue(schema, value, "tool", "");
+  expect(() => validate(connection, { host: "server.example", username: "root" })).toThrow();
+  expect(() => validate(connection, { host: "server.example", username: "root", passwordSecretKey: "SSH_PASSWORD" })).not.toThrow();
+  expect(() => validate(connection, { host: "server.example", credentialRef: "managed-server:target" })).not.toThrow();
+  const field = { key: "target", label: "目标", description: "选择目标服务器", type: "select", required: true };
+  expect(() => validate(input, { title: "选择目标", fields: [field] })).toThrow();
+  expect(() => validate(input, { title: "选择目标", fields: [{ ...field, options: [{ value: "a", label: "A" }] }] })).not.toThrow();
+  expect(() => validate(input, { title: "选择目标", fields: [{ ...field, type: "text", options: [{ value: "a", label: "A" }] }] })).toThrow();
+  expect(() => validate(connection, { host: "server.example", credentialRef: "managed-server:target", extra: true })).toThrow();
 });

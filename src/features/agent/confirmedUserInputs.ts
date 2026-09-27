@@ -62,7 +62,39 @@ function projectedInput(key: string, input: SubmittedTaskInput) {
   };
 }
 
-type InputContextTask = Pick<OpsTask, "id" | "serverId" | "executionTargetServerId" | "rootGoal" | "title" | "submittedInputs" | "plan">;
+type InputContextTask = Pick<OpsTask, "id" | "serverId" | "executionTargetServerId" | "rootGoal" | "title" | "submittedInputs" | "plan" | "phaseHistory" | "planHistory">;
+
+function verifiedEnum(task: InputContextTask, key: string, input: SubmittedTaskInput) {
+  if (input.type !== "select" || typeof input.value !== "string") return false;
+  // New submissions persist the validated candidate set. Old submissions must
+  // be checked against their actual source form, never their label or key name.
+  if (input.allowedValues) return Array.isArray(input.allowedValues)
+    && input.allowedValues.every(value => typeof value === "string") && input.allowedValues.includes(input.value);
+  const steps = [...task.plan, ...(task.phaseHistory ?? []).flatMap(phase => phase.plan),
+    ...(task.planHistory ?? []).flatMap(round => [
+      ...round.plan, ...(round.finalPlan ?? []), ...(round.phases ?? []).flatMap(phase => phase.plan),
+    ])];
+  const source = steps.find(step => step.id === input.scope?.sourceStepId && step.status === "completed");
+  if (source?.action?.type !== "tool" || source.action.toolId !== "user.request_input") return false;
+  try {
+    const form = source.action.arguments;
+    return Array.isArray(form.fields) && form.fields.some((field: { key?: string; type?: string; options?: { value?: string }[] }) =>
+      field.key === key && field.type === "select" && Array.isArray(field.options)
+      && field.options.some(option => option.value === input.value));
+  } catch { return false; }
+}
+
+function eligibleInput(task: InputContextTask, key: string, value: unknown): value is SubmittedTaskInput {
+  if (!isConfirmedNonSensitiveInput(value)) return false;
+  if (value.type === "select" && value.allowedValues && !verifiedEnum(task, key, value)) return false;
+  // Credential/authorization *decisions* are not credential values. Only a
+  // verified enum can override that ambiguous name; actual secret fields stay
+  // excluded even in malformed legacy data claiming to be a select.
+  if (!isSensitiveInputKey(key)) return true;
+  const normalized = key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+  if (/password|passwd|passphrase|token|secret|cookie|apikey|privatekey/.test(normalized)) return false;
+  return verifiedEnum(task, key, value);
+}
 
 export function confirmedInputScope(task: InputContextTask, sourceStepId: string): NonNullable<SubmittedTaskInput["scope"]> {
   return {
@@ -87,8 +119,8 @@ function scopeStatus(task: InputContextTask, input: SubmittedTaskInput) {
 /** Exact, current, non-sensitive decisions for local policy; never use the bounded model projection as authority. */
 export function activeConfirmedInputEntries(task: InputContextTask) {
   return Object.entries(task.submittedInputs ?? {})
-    .filter((entry): entry is [string, SubmittedTaskInput] => !isSensitiveInputKey(entry[0])
-      && isConfirmedNonSensitiveInput(entry[1]) && scopeStatus(task, entry[1]) === "active");
+    .filter((entry): entry is [string, SubmittedTaskInput] => eligibleInput(task, entry[0], entry[1])
+      && scopeStatus(task, entry[1]) === "active");
 }
 
 /**
@@ -98,7 +130,7 @@ export function activeConfirmedInputEntries(task: InputContextTask) {
  */
 export function confirmedUserInputsContext(task: InputContextTask) {
   const eligible = Object.entries(task.submittedInputs ?? {})
-    .filter(([key, input]) => !isSensitiveInputKey(key) && isConfirmedNonSensitiveInput(input))
+    .filter(([key, input]) => eligibleInput(task, key, input))
     .map(([key, input], index) => ({ key, input, index }))
     .sort((left, right) => left.input.submittedAt.localeCompare(right.input.submittedAt)
       || left.index - right.index);

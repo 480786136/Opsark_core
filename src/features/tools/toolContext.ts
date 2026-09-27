@@ -9,7 +9,9 @@ export interface ModelToolDefinition {
   description: string;
   usageInstructions: string;
   inputSchema: Record<string, unknown>;
+  effect?: ToolDefinition["effect"];
   outputDescription: string;
+  outputSchema?: Record<string, unknown>;
   planMode: NonNullable<ToolDefinition["planMode"]>;
   completionMode: NonNullable<ToolDefinition["completionMode"]>;
   version: number;
@@ -31,7 +33,9 @@ export function buildToolContext(tools: ToolDefinition[]): ModelToolDefinition[]
       usageInstructions: tool.usageInstructions,
       // Pinia wraps nested schemas in proxies, which structuredClone cannot clone.
       inputSchema: createJsonSnapshot(tool.inputSchema),
+      effect: tool.effect,
       outputDescription: tool.outputDescription,
+      outputSchema: tool.outputSchema ? createJsonSnapshot(tool.outputSchema) : undefined,
       planMode: tool.planMode ?? "regular",
       completionMode: tool.completionMode ?? "continue",
       version: tool.version,

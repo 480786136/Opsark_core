@@ -74,6 +74,32 @@ describe("bounded protocol repair", () => {
     expect(invoke).toHaveBeenCalledOnce();
   });
 
+  it("hands the full rejected deployment to business replanning without executing its acceptance tail", async () => {
+    const steps: PlanStep[] = [
+      { ...diagnose("ls -ld /srv"), id: "discover", recovery: undefined },
+      { ...diagnose("mkdir -p /srv/lucky-wheel; python3 -m http.server 8091 &"),
+        id: "deploy", kind: "change", validation: "curl -f http://127.0.0.1:8091/", recovery: undefined },
+      { ...diagnose("curl -f http://127.0.0.1:8091/"), id: "verify", recovery: undefined },
+    ];
+    vi.mocked(invoke).mockRejectedValueOnce(JSON.stringify({
+      kind: "plan_protocol_failure", steps, rejectedPlanExecuted: false,
+      validationError: "第 2 个计划步骤将进程脱离执行器跟踪；必须重新规划部署及验收",
+    }));
+    const error = await backend.generatePlan("部署抽奖页面", runtime()).catch(error => error);
+    expect(error).toBeInstanceOf(PlanProtocolError);
+    expect(error.repair.previousModelOutput).toEqual(steps);
+    expect(error.repair.progress.stopCode).toBe("PROTOCOL_REPAIR_SCOPE_UNKNOWN");
+    // Reopening the saved local repair cannot dispatch, accept the suffix, or
+    // consume another model request; the existing business-replan path owns it.
+    const restored = JSON.parse(JSON.stringify(error.repair));
+    await expect(backend.generatePlan("部署抽奖页面", runtime({ planGenerationRepair: restored })))
+      .rejects.toBeInstanceOf(PlanProtocolError);
+    delete restored.businessReplanRequired;
+    await expect(backend.generatePlan("部署抽奖页面", runtime({ planGenerationRepair: restored })))
+      .rejects.toBeInstanceOf(PlanProtocolError);
+    expect(invoke).toHaveBeenCalledOnce();
+  });
+
   it("revalidates a persisted retired acceptance-copy rejection without calling the model", async () => {
     const candidate = { ...diagnose("test -s /opt/report/build/report.zip"),
       expected: "实际构建产物存在且非空", recovery: { ...diagnose().recovery!, purpose: "verify" as const } };
@@ -106,6 +132,15 @@ describe("bounded protocol repair", () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
+  it("keeps the selected protocol and operation budget while reducing repair context", () => {
+    const metadata = { _modelIntegration: { apiProtocol: "responses", outputPolicy: "require_schema", capabilitiesV2: { revision: "route-r2" } },
+      _modelCapabilities: { protocol: "chat_completions", version: "legacy-r1" },
+      _requestParameters: { outputBudget: 1200 }, _modelRecovery: { modelOperationId: "same-operation", remainingTokens: 800 } };
+    const projected = JSON.parse(compactProtocolRepairContext(JSON.stringify({ ...metadata, conversationHistory: ["discard"] }), repairOf()));
+    expect(projected).toMatchObject(metadata);
+    expect(projected).not.toHaveProperty("conversationHistory");
+  });
+
   it("does not resend the preserved next-stage decision with a rejected field", () => {
     const repair = { ...repairOf(), nextStageDecision: {
       reason: "OLD_DECISION".repeat(5_000), steps: [diagnose()],
@@ -121,17 +156,17 @@ describe("bounded protocol repair", () => {
     expect(repair.nextStageDecision.reason).toContain("OLD_DECISION");
   });
   it("cannot delete an invalid array tail while claiming to repair only its value", () => {
-    const step = { ...diagnose(), recovery: undefined, command: 'opsark-tool software.check {"names":["git",3]}' };
+    const step = { ...diagnose(), recovery: undefined, command: "", action: { type: "tool" as const, toolId: "software.check", arguments: {"names":["git",3]} } };
     const repair = repairOf([step]);
-    expect(repair.fieldPath).toBe("steps[0].command.arguments.names[1]");
+    expect(repair.fieldPath).toBe("steps[0].action.arguments.names[1]");
     expect(() => assertPlanRepairScope(repair, [{ ...step,
-      command: 'opsark-tool software.check {"names":["git","node"]}' }])).not.toThrow();
+      command: "", action: { type: "tool" as const, toolId: "software.check", arguments: {"names":["git","node"]} } }])).not.toThrow();
     expect(() => assertPlanRepairScope(repair, [{ ...step,
-      command: 'opsark-tool software.check {"names":["git"]}' }])).toThrow("删除报错数组元素");
+      command: "", action: { type: "tool" as const, toolId: "software.check", arguments: {"names":["git"]} } }])).toThrow("删除报错数组元素");
   });
 
   it("finishes an obsolete saved tool repair locally when the complete preserved plan is now valid", async () => {
-    const step = { ...diagnose(), recovery: undefined, command: 'opsark-tool software.check {"names":["git"]}' };
+    const step = { ...diagnose(), recovery: undefined, command: "", action: { type: "tool" as const, toolId: "software.check", arguments: {"names":["git"]} } };
     const repair = buildPlanNormalizationRepair(new Error("第 1 个计划步骤的工具参数无效：旧版规则"), [step]);
     const result = await backend.generatePlan("继续", runtime({ planGenerationRepair: repair }));
     expect(result).toEqual(normalizePlanPreconditions([step]));
@@ -140,31 +175,31 @@ describe("bounded protocol repair", () => {
 
   it("repairs only the validator-identified tool argument and preserves every sibling", async () => {
     const step = { ...diagnose(), recovery: undefined,
-      command: 'opsark-tool software.check {"names":[],"includeVersions":true}' };
+      command: "", action: { type: "tool" as const, toolId: "software.check", arguments: {"names":[],"includeVersions":true} } };
     const repair = repairOf([step]);
     expect(repair).toMatchObject({ errorCode: "tool_schema_validation_failed",
-      diagnostic: { code: "TOOL_ARGUMENT_INVALID", fieldPath: "steps[0].command.arguments.names",
-        allowedRepairPaths: ["steps[0].command.arguments.names"] } });
-    const valid = { ...step, command: 'opsark-tool software.check {"names":["kubeadm"],"includeVersions":true}' };
+      diagnostic: { code: "TOOL_ARGUMENT_INVALID", fieldPath: "steps[0].action.arguments.names",
+        allowedRepairPaths: ["steps[0].action.arguments.names"] } });
+    const valid = { ...step, command: "", action: { type: "tool" as const, toolId: "software.check", arguments: {"names":["kubeadm"],"includeVersions":true} } };
     expect(() => assertPlanRepairScope(repair, [valid])).not.toThrow();
     expect(() => assertPlanRepairScope(repair, [{ ...valid,
-      command: valid.command.replace('"includeVersions":true', '"includeVersions":false') }]))
+      action: JSON.parse(JSON.stringify(valid.action).replace('"includeVersions":true', '"includeVersions":false')) }]))
       .toThrow("其他工具参数");
     vi.mocked(invoke).mockResolvedValueOnce([valid]);
     const result = await backend.generatePlan("仅修复参数", runtime({ planGenerationRepair: repair }));
-    expect(result[0].command).toContain('"kubeadm"');
+    expect(JSON.stringify(result[0].action)).toContain('"kubeadm"');
     expect(invoke).toHaveBeenCalledOnce();
   });
 
   it("a duplicate option repair cannot reorder siblings, delete the field or change its title", () => {
     const args = { title: "选择安装方式", fields: [{ key: "MODE", label: "安装方式", description: "请选择安装来源", type: "select", required: true,
       options: [{ label: "A", value: "same" }, { label: "B", value: "same" }] }] };
-    const step = { ...diagnose(), recovery: undefined, command: `opsark-tool user.request_input ${JSON.stringify(args)}` };
+    const step = { ...diagnose(), recovery: undefined, command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify(args)) } };
     const repair = repairOf([step]);
-    expect(repair.fieldPath).toBe("steps[0].command.arguments.fields[0].options[1].value");
+    expect(repair.fieldPath).toBe("steps[0].action.arguments.fields[0].options[1].value");
     const good = structuredClone(args);
     good.fields[0].options[1].value = "different";
-    const candidate = (value: unknown) => [{ ...step, command: `opsark-tool user.request_input ${JSON.stringify(value)}` }];
+    const candidate = (value: unknown) => [{ ...step, command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify(value)) } }];
     expect(() => assertPlanRepairScope(repair, candidate(good))).not.toThrow();
     expect(() => assertPlanRepairScope(repair, candidate({ ...good, title: "换目标" }))).toThrow("其他工具参数");
     expect(() => assertPlanRepairScope(repair, candidate({ ...good, fields: [] }))).toThrow("父结构");
@@ -254,7 +289,7 @@ describe("bounded protocol repair", () => {
       { ...valid, expected: "weaker" }, { ...valid, kind: "change" as const },
       { ...valid, recovery: { ...valid.recovery!, purpose: "repair" as const } },
       { ...valid, executionScope: "isolated_exec" as const },
-      { ...valid, command: 'opsark-tool software.check {"names":["node"]}' },
+      { ...valid, command: "", action: { type: "tool" as const, toolId: "software.check", arguments: {"names":["node"]} } },
     ]) expect(() => assertPlanRepairScope(repair, [candidate])).toThrow();
     expect(() => assertPlanRepairScope(repair, [valid, valid])).toThrow("步骤数量");
   });

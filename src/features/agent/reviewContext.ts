@@ -16,6 +16,7 @@ import { modelLogContext } from "./modelLogContext";
 import { authenticationContext } from "./authenticationEvidence";
 import { confirmedUserInputsContext } from "./confirmedUserInputs";
 import { isUserInputStep, modelContextStep } from "./executionContextEvidence";
+import { taskRequirementSnapshot } from "./taskGoal";
 
 const REVIEW_HISTORY_STEP_LIMIT = 6;
 const REVIEW_REMAINING_STEP_LIMIT = 6;
@@ -43,6 +44,9 @@ export interface LongRunningProgressStatus {
   executionDeadlineAt?: string;
   stalledNotice?: string;
   runtimeActive?: boolean;
+  runtimeSampleFresh?: boolean;
+  runtimeCpuAvailable?: boolean;
+  runtimeIoAvailable?: boolean;
   runtimeProcessCount?: number;
   runtimeCpuPercent?: number;
   runtimeIoBytes?: number;
@@ -54,7 +58,7 @@ export interface LongRunningProgressStatus {
 }
 
 function taskSnapshot(task: OpsTask) {
-  return { _log: modelLogContext(task), title: task.title, rootGoal: task.rootGoal ?? task.title,
+  return { _log: modelLogContext(task), title: task.title, ...taskRequirementSnapshot(task),
     permission: task.permission, status: task.status };
 }
 
@@ -199,6 +203,7 @@ export function buildExecutionFailureReviewContext(
   step = modelContextStep(step);
   return {
     trigger: "主命令执行失败，需要判断是否影响用户整体目标和剩余计划",
+    failureDisposition: failureDispositionContext(remainingSteps),
     authentication: authenticationContext(task),
     confirmedUserInputs: confirmedUserInputsContext(task),
     reviewPolicy: {
@@ -244,6 +249,8 @@ export function buildEvidenceReviewContext(
         ? "主命令执行成功，但独立后置校验通道未返回真实结束标记"
         : "主命令执行成功，但独立后置校验未通过"
       : "程序发现证据不可解释或相互冲突",
+    failureDisposition: failureDispositionContext(remainingSteps),
+    acceptanceRequired: step.result?.facts.semanticAcceptanceRequired === true,
     authentication: authenticationContext(task),
     confirmedUserInputs: confirmedUserInputsContext(task),
     reviewPolicy: postconditionReview ? {
@@ -271,5 +278,13 @@ export function buildEvidenceReviewContext(
     completedSteps: collectionWindow(completed, REVIEW_HISTORY_STEP_LIMIT, "end"),
     remainingSteps: collectionWindow(remaining, REVIEW_REMAINING_STEP_LIMIT, "start"),
     planSummary: reviewPlanSummary(task.plan),
+  };
+}
+
+function failureDispositionContext(steps: PlanStep[]) {
+  return {
+    remainingStepIds: steps.map(step => step.id),
+    instruction: "失败或结果未证实时：repair/retry/replan/request_input 均返回 decision=adjust，交给规划落实动作；只有 continue_independent 可返回 continue，必须逐一列出全部剩余 stepId、relation(independent/dependent/unknown)、reason。未展示详情的步骤标 unknown。dependent/unknown 不执行；独立步骤仅按原顺序推进，不跳过阻断。不能将需要先修复的步骤标 independent。",
+    acceptanceInstruction: "acceptanceRequired=true 时必须返回 acceptance={status:proven|not_met|unknown,reason,evidenceIds}。引用当前步骤真实 evidence ID，证明 expected 而不是仅引用退出码；信息不足为 unknown。检查方式错误可以说明并请求修正，不能改写失败事实。",
   };
 }

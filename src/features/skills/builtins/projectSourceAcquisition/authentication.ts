@@ -49,7 +49,7 @@ export const sourceAuthenticationBranches: readonly SkillInstructionBranch[] = [
     id: "request-credential",
     when: "HTTPS 需要认证，但当前服务器没有匹配凭据组",
     actions: [
-      `调用 opsark-tool user.request_input ${credentialRequest}`,
+      `调用结构化 action：${JSON.stringify({ type: "tool", toolId: "user.request_input", arguments: JSON.parse(credentialRequest) })}`,
       "将 REPOSITORY_HOST 替换为仓库 URL 的精确主机，提交后使用工具返回的凭据引用",
     ],
   },

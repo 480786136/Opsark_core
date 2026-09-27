@@ -30,8 +30,8 @@ describe("project-source-acquisition v13", () => {
   });
 
   it("declares one explicit Git HTTPS credential group with complementary roles", () => {
-    const request = projectSourceAcquisitionSkill.instructions.match(/opsark-tool user.request_input (\{[^\n]+\})/)![1];
-    const gitHttpsCredentialFields = JSON.parse(request).fields as Array<{ key: string; type: string; credential: unknown }>;
+    const request = projectSourceAcquisitionSkill.instructions.match(/调用结构化 action：(\{[^\n]+\})/)![1];
+    const gitHttpsCredentialFields = JSON.parse(request).arguments.fields as Array<{ key: string; type: string; credential: unknown }>;
     const GIT_HTTPS_CREDENTIAL_GROUP = "git_https_repository";
     expect(gitHttpsCredentialFields.map((field) => ({
       key: field.key,

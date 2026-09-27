@@ -230,19 +230,19 @@ describe("optional recovery audit references and preserved execution facts", () 
     expect(hasVerifiedRecovery(failed, verify)).toBe(true);
   });
 
-  it("preserves failed evidence while accepting the model's completion branch", () => {
+  it("preserves failed evidence and blocks unqualified continuation and later skipping", () => {
     const { failed, repair, verify } = fixture();
     failed.status = "validating";
     failed.result!.executionStatus = "success";
     failed.result!.facts.validationPassed = false;
     expect(applyExecutionEvidenceReview({ step: failed, remainingSteps: [repair, verify],
       review: { decision: "continue", source: "model", reason: "recover", summary: "recover" },
-      reviewWasRequired: true }).shouldAdvance).toBe(true);
+      reviewWasRequired: true }).shouldAdvance).toBe(false);
     expect(failed.status).toBe("failed");
     repair.status = "validating";
     applyExecutionEvidenceReview({ step: repair, remainingSteps: [verify], reviewWasRequired: true,
       review: { decision: "complete", source: "model", reason: "done", summary: "done" } });
-    expect(verify.status).toBe("skipped");
+    expect(verify.status).toBe("pending");
     expect(failed.status).toBe("failed");
     expect(failed.result?.facts.validationPassed).toBe(false);
   });

@@ -125,11 +125,28 @@ export interface StepReview {
   reason: string;
   summary: string;
   source: "model" | "rules";
+  acceptance?: {
+    status: "proven" | "not_met" | "unknown";
+    reason: string;
+    evidenceIds: string[];
+  };
+  recoveryAction?: {
+    kind: "continue_independent" | "repair" | "retry" | "replan" | "request_input";
+    reason: string;
+    steps: Array<{ stepId: string; relation: "independent" | "dependent" | "unknown"; reason: string }>;
+  };
 }
 
 /** One model decision that either completes the goal or supplies its next bounded stage. */
 export interface NextStageDecision extends StepReview {
   steps: PlanStep[];
+  planUpdate?: { basePlanFingerprint: string; replaceStepIds: string[]; reason: string };
+  reconciliation?: {
+    incidentId: string;
+    status: "safe_to_retry" | "completed" | "still_running" | "unknown";
+    evidenceIds: string[];
+    reason: string;
+  };
 }
 
 export interface ServerInfo {
@@ -164,7 +181,155 @@ export interface Metrics {
   sampledAt: string;
 }
 
+export type StepAction =
+  | { type: "tool"; toolId: string; arguments: Record<string, unknown> }
+  | { type: "shell"; command: string };
+
+/** A controller-owned, secret-free identity resolved before authorization. */
+export interface ExecutionTargetRef {
+  role: "execution" | "source" | "target" | "lookup" | "connection" | "interaction";
+  serverId?: string;
+  host: string;
+  port: number;
+  username?: string;
+  connectionGeneration?: number;
+  agentSession?: { id: string; generation: number; contextRevision: number; cwd?: string; shell?: string };
+  credentialRef?: string;
+  passwordSecretKey?: string;
+  path?: string;
+  overwrite?: boolean;
+}
+
+export interface ExecutionInputBinding {
+  key: string;
+  reference: string;
+  version?: string | number;
+  target?: string;
+}
+
+export interface ExecutionIntentSemantic {
+  taskId: string;
+  stepId: string;
+  action: StepAction;
+  targets: ExecutionTargetRef[];
+  kind: PlanStepKind;
+  effect: "read" | "change" | "interaction";
+  risk: RiskLevel;
+  expected: string;
+  executionScope?: ExecutionScope;
+  validationScope?: ExecutionScope;
+  validation?: string;
+  validator?: StepValidator;
+  runtimeClass?: RuntimeClass;
+  sessionContextChange?: Partial<AgentSessionContext>;
+  dependencies: {
+    precedingStepIds: string[];
+    retryBasis?: PlanStep["retryBasis"];
+    retryAfterStepId?: string;
+    failureDependencies?: PlanStep["failureDependencies"];
+    recovery?: PlanStep["recovery"];
+    recoveryRuleVersion?: number;
+    protocolReplanApproval?: PlanStep["protocolReplanApproval"];
+  };
+  permission: PermissionLevel;
+  constraints?: ExecutionConstraints;
+  policyVersion: string;
+  toolContract?: Record<string, unknown>;
+  inputBindings?: ExecutionInputBinding[];
+}
+
+export interface ExecutionIntentSnapshot {
+  version: "execution-intent@1";
+  algorithm: "sha256";
+  digest: string;
+  semantic: ExecutionIntentSemantic;
+}
+
+export interface ExecutionApprovalGrant {
+  version: "execution-approval@1";
+  source: "user" | "policy";
+  scope: "plan" | "step";
+  taskId: string;
+  planRevision: number;
+  stepRevision?: number;
+  executionDigest: string;
+  permission: PermissionLevel;
+  policyVersion: string;
+  grantedAt: string;
+}
+
+/** An admitted proposal contains no authority to execute. */
+export interface PlanProposal {
+  operation?: "plan.generate" | "plan.repair" | "stage.decide";
+  steps: PlanStep[];
+}
+
+interface PreparedStepBase {
+  readonly id: string;
+  readonly stepRevision: number;
+  readonly intent: ExecutionIntentSnapshot;
+}
+export type PreparedStep =
+  | (PreparedStepBase & { readonly type: "tool"; readonly action: Extract<StepAction, { type: "tool" }> })
+  | (PreparedStepBase & { readonly type: "shell"; readonly action: Extract<StepAction, { type: "shell" }>; readonly validator?: StepValidator });
+
+/** Deep-frozen by the preparation boundary; mutate only the compatibility copy. */
+export interface PreparedPlan {
+  readonly version: "prepared-plan@1";
+  readonly taskId: string;
+  readonly planRevision: number;
+  readonly executionDigest: string;
+  readonly displayDigest: string;
+  readonly steps: PreparedStep[];
+  readonly compatibilitySteps: PlanStep[];
+  readonly changes: Array<{ stepId: string; fields: string[] }>;
+}
+
+/** Non-execution operations never imply an executable or approved plan. */
+export type OperationResult =
+  | { operation: "plan.generate"; proposal: PlanProposal }
+  | { operation: "plan.repair"; proposal: PlanProposal }
+  | { operation: "stage.decide"; decision: NextStageDecision; proposal?: PlanProposal }
+  | { operation: "requirement.classify"; classification: Omit<RequirementProcessingResult, "plan">; proposal?: PlanProposal }
+  | { operation: "result.review"; review: StepReview }
+  | { operation: "skill.draft"; draft: import("@/features/skills/types").GeneratedSkillDraft }
+  | { operation: "model.probe"; result: ModelValidationResult }
+  | { operation: "summary.generate"; text: string }
+  | { operation: "answer"; text: string };
+
+/** Core-owned attempt policy; never accepted from a model proposal. */
+export interface CommandExecutionPolicy {
+  version: 1;
+  executionId: string;
+  kind: "bounded" | "scan" | "progressive" | "persistent_service";
+  startedAt: number;
+  deadlineAt?: number;
+}
+
 export interface PlanStep {
+  /** Fixed at dispatch; persisted so reattaching to the same attempt cannot renew its deadline. */
+  executionPolicy?: CommandExecutionPolicy;
+  /** Durable execution identities are controller-owned and survive UI compaction. */
+  executionLedgerAttempts?: Array<{ operationId: string; attemptId: string; executionId: string; phase: string }>;
+  ledgerAppliedAttemptIds?: string[];
+  ledgerVerifiedAttemptIds?: string[];
+  /** J1 controller-owned preparation/authorization; absent on historical records. */
+  executionIntent?: ExecutionIntentSnapshot;
+  planRevision?: number;
+  stepRevision?: number;
+  approvalGrant?: ExecutionApprovalGrant;
+  /** Structured operation. Missing only in historical records. */
+  action?: StepAction;
+  retryBasis?: { failedStepId: string; kind: "changed_state" | "transient"; evidenceIds: string[]; reason: string; afterStepIndex?: number };
+  /** Controller binds proposal-relative indexes to actual preceding step IDs. */
+  retryAfterStepId?: string;
+  /** Executor-owned blockers, persisted until a replacement plan is reviewed. */
+  failureDependencies?: Array<{
+    failedStepId: string;
+    reason: string;
+    relation?: "independent" | "dependent" | "unknown";
+    stepFingerprint?: string;
+  }>;
   recoveryRuleVersion?: number;
   /** Explicit recovery relationship; never inferred from command names or prose. */
   recovery?: {
@@ -173,6 +338,11 @@ export interface PlanStep {
     purpose: "diagnose" | "repair" | "verify";
   };
   authenticationGate?: { fingerprint: string; reason: string; approved?: boolean };
+  /** Executor-owned channel evidence; model prose cannot repair a failed channel. */
+  authenticationAttempt?: {
+    channel: "foreground-pty-v2" | "noninteractive";
+    credentialRevision: number;
+  };
   /** Executor-owned, scoped review of earlier user decisions for a new business plan. */
   protocolReplanApproval?: { inputFingerprint: string; decisionSummary: string };
   id: string;
@@ -202,11 +372,11 @@ export interface PlanStep {
   progressMessage?: string;
   /** Exact non-secret template shown when per-step approval was requested. */
   safetyApprovalSnapshot?: Pick<PlanStep,
-    "command" | "validation" | "risk" | "executionScope" | "validationScope" | "sessionContextChange" | "runtimeClass" | "protocolReplanApproval"
+    "action" | "command" | "validation" | "risk" | "executionScope" | "validationScope" | "sessionContextChange" | "runtimeClass" | "protocolReplanApproval"
   >;
   /** Exact template explicitly accepted by the user; any later change invalidates it. */
   approvedSafetySnapshot?: Pick<PlanStep,
-    "command" | "validation" | "risk" | "executionScope" | "validationScope" | "sessionContextChange" | "runtimeClass" | "protocolReplanApproval"
+    "action" | "command" | "validation" | "risk" | "executionScope" | "validationScope" | "sessionContextChange" | "runtimeClass" | "protocolReplanApproval"
   >;
 }
 
@@ -383,7 +553,33 @@ export type ManagedStopReason =
   | "high_risk_approval"
   | "cancelled";
 
+export interface TaskRequirementSource {
+  content: string;
+  relation: "new_goal" | "replace_goal" | "supplement";
+  source: "user_message" | "task_root" | "current_instruction";
+  sourceMessageId?: string;
+  sourceRoundId?: string;
+  createdAt?: string;
+}
+
 export interface OpsTask {
+  executionLedgerRecovery?: import("@/features/agent/executionLedgerRecovery").ExecutionLedgerRecovery;
+  executionLedgerError?: { stage: string; message: string; operationId?: string; attemptId?: string; remoteResultKnown: boolean };
+  executionLedgerLoading?: boolean;
+  preparedPlan?: PreparedPlan;
+  planApproval?: ExecutionApprovalGrant;
+  /** Executor-owned uncertainty: reconnecting does not prove remote completion. */
+  executionReconciliation?: {
+    id: string;
+    stepId: string;
+    serverId: string;
+    recordedAt: string;
+    command: string;
+    expected: string;
+    knownStepIds: string[];
+    reason: string;
+    resolution?: NonNullable<NextStageDecision["reconciliation"]>;
+  };
   /** Controller-authored versions used throughout a task; never taken from model output. */
   skillSnapshot?: import("@/features/skills/types").SkillDefinition[];
   /** Ephemeral classification work does not replace the execution/approval state. */
@@ -426,6 +622,8 @@ export interface OpsTask {
   rootGoal?: string;
   /** The latest instruction within rootGoal, such as a supplement or retry request. */
   currentInstruction?: string;
+  /** Original requirement sources survive display/history compaction; not a completion verdict. */
+  persistedRequirements?: { version: 1; sources: TaskRequirementSource[] };
   lastRequirementRelation?: RequirementRelation;
   currentRoundId?: string;
   /** Earlier plans from the active round that were superseded by an adjustment. */
@@ -467,7 +665,7 @@ export interface OpsTask {
   /** Present only when automatic continuation intentionally stopped. */
   managedStopReason?: ManagedStopReason;
   /** Explicit continuation renews only the phase budget, never evidence or stagnation history. */
-  automaticPhaseBudget?: { roundId?: string; serverId: string; stepIds: string[]; renewedAt: string };
+  automaticPhaseBudget?: { roundId?: string; serverId: string; stepIds: string[]; reviewedStepIds?: string[]; renewedAt: string };
   summary?: string;
   pauseReason?: string;
   executionConstraints?: ExecutionConstraints;
@@ -509,6 +707,8 @@ export interface SubmittedTaskInput {
   label: string;
   description: string;
   type: "text" | "number" | "select";
+  /** Enum candidates validated by the input handler, never secret material. */
+  allowedValues?: string[];
   /** Identifies fields submitted together, so a username is never paired with an unrelated password. */
   groupId: string;
   groupTitle: string;
@@ -532,17 +732,76 @@ export interface SubmittedSecretBinding {
 }
 
 export interface ModelRequestParameters {
+  /** Semantic generation budget; the selected protocol maps it to exactly one wire field. */
+  outputBudget?: number;
   temperature?: number;
   top_p?: number;
   max_tokens?: number;
   max_completion_tokens?: number;
   frequency_penalty?: number;
   presence_penalty?: number;
-  reasoning_effort?: "low" | "medium" | "high";
+  reasoning_effort?: string;
   thinking?: "default" | "enabled" | "disabled";
 }
 
-export interface ModelProfile {
+export type ModelApiProtocol = "chat_completions" | "responses";
+export type ModelOutputPolicy = "auto" | "require_schema" | "json_only";
+export type ModelCapabilitySupport = "supported" | "unsupported" | "unknown" | "conditional";
+export interface ModelCapabilitiesV2 {
+  version: "model-capabilities@2";
+  revision: string;
+  supportedProtocols: ModelApiProtocol[];
+  preferredProtocol: ModelApiProtocol;
+  outputModes: { json_object: ModelCapabilitySupport; json_schema: ModelCapabilitySupport };
+  parameterAdapter: ModelCapabilities["parameterAdapter"];
+  tokenField: "max_tokens" | "max_completion_tokens" | "max_output_tokens";
+  defaultOutputTokens: number;
+  maxOutputTokens: number;
+  budgetSemantics?: "total_output" | "visible_output" | "unknown";
+  strictFlag?: "required" | "optional" | "unsupported";
+  store?: "supported" | "unsupported" | "unknown";
+  nativeTools?: { supported: boolean; strictFlag?: "required" | "optional" | "unsupported" };
+  parameterRules?: {
+    reasoningEfforts: string[]; thinkingEnabled: boolean; frequencyPenalty: boolean;
+    temperatureExclusiveMax?: number;
+    temperature?: ModelCapabilitySupport; topP?: ModelCapabilitySupport; presencePenalty?: ModelCapabilitySupport;
+  };
+  evidence: { source: "documented" | "locally_tested" | "upstream_tested" | "unknown" | "user_declared" | "legacy"; configFingerprint?: string };
+}
+export interface ModelIntegration {
+  apiProtocol?: ModelApiProtocol;
+  outputPolicy?: ModelOutputPolicy;
+  capabilitiesV2?: ModelCapabilitiesV2;
+}
+export interface ModelRequestPreview {
+  apiProtocol: ModelApiProtocol; endpoint: string; model: string; request: Record<string, unknown>;
+  effectiveOutputMode: string; capabilityRevision?: string; schemaCompilation?: unknown; diagnostics?: unknown[];
+}
+export interface ModelValidationResult {
+  available: boolean; reason: string;
+  validation?: { modelAccess: "passed" | "failed" | "not_tested";
+    structuredOutput: "passed" | "failed" | "not_tested"; businessContract: "passed" | "failed" | "not_tested" };
+}
+
+export interface ModelCapabilities {
+  parameterRules?: {
+    reasoningEfforts: Array<"low" | "medium" | "high">;
+    thinkingEnabled: boolean;
+    frequencyPenalty: boolean;
+    temperatureExclusiveMax?: number;
+  };
+  protocol: "chat_completions";
+  version: string;
+  structuredOutput: "json_schema" | "json_object" | "unknown";
+  parameterAdapter: "gateway" | "portable" | "deepseek" | "qwen" | "openai";
+  tokenField: "max_tokens" | "max_completion_tokens";
+  defaultOutputTokens: number;
+  maxOutputTokens: number;
+}
+
+export interface ModelProfile extends ModelIntegration {
+  validationSnapshot?: { fingerprint: string; validatedAt: string; result: ModelValidationResult };
+  capabilities?: ModelCapabilities;
   /** Official profiles exist only for the active cloud session; never persist credentials. */
   source?: "official";
   requestParameters?: ModelRequestParameters;
@@ -584,10 +843,52 @@ export interface RequirementProcessingResult {
 }
 
 export interface ModelServiceError {
-  httpStatus: number;
+  /** Actual transport status, absent when Core rejected the request before sending it. */
+  httpStatus?: number;
+  gatewayHttpStatus?: number;
+  providerHttpStatus?: number;
+  statusQueryHttpStatus?: number;
   code: string;
   message: string;
   retryable: boolean;
+  origin?: "core" | "provider" | "upstream" | "gateway";
+  stage?: string;
+  jsonPointer?: string;
+  schemaPath?: string;
+  keyword?: string;
+  line?: number;
+  column?: number;
+  operation?: string;
+  contractVersion?: string;
+  providerCode?: string;
+  rawStatus?: string;
+  incompleteReason?: string;
+  dispatchCertainty?: "not_dispatched" | "may_have_dispatched" | "response_received";
+  requestKey?: string;
+  callId?: string;
+  modelOperationId?: string;
+  generationId?: string;
+  responseAvailable?: boolean;
+  creditState?: string;
+  billingMode?: "direct" | "reserved";
+  reserved?: number;
+  actual?: number;
+  recoveryBudget?: {
+    generations?: number;
+    transportAttempts?: number;
+    elapsedMs?: number;
+    accountedTokens?: number;
+    knownUsageTokens?: number;
+    unknownUsageAttempts?: number;
+    maxGenerations?: number;
+    maxTransportAttempts?: number;
+    maxElapsedMs?: number;
+    maxTotalTokens?: number;
+    usageEstimator?: string;
+    exactTokens?: boolean;
+    recoveryBlocked?: boolean;
+    modelOperationId?: string;
+  };
   details?: {
     available_tokens?: number;
     required_tokens?: number;
@@ -634,15 +935,17 @@ export interface DeveloperLogEntry {
   endpoint?: string;
   durationMs?: number;
   tokenUsage?: {
-    input: number;
-    output: number;
-    total: number;
+    input: number | null;
+    output: number | null;
+    total: number | null;
+    reasoning?: number;
     source: "api" | "estimated";
   };
   createdAt: string;
 }
 
 export type ModelTransportEventName =
+  | "compatibility_attempt"
   | "request_sent"
   | "response_received"
   | "request_failed"
@@ -654,6 +957,13 @@ export type ModelTransportEventName =
  * Request, response, responseText, error, URL and file contents never cross the IPC boundary.
  */
 export interface ModelTransportEvent {
+  capabilityVersion?: string;
+  apiProtocol?: ModelApiProtocol;
+  effectiveOutputMode?: string;
+  effectiveOutputTokens?: number;
+  schemaDowngraded?: boolean;
+  cachedJsonOnly?: boolean;
+  compactRepair?: boolean;
   recordId: string;
   event: ModelTransportEventName;
   timestampMs: number;
@@ -687,9 +997,10 @@ export interface ModelTransportEvent {
     }>;
   };
   tokenUsage?: {
-    input: number;
-    output: number;
-    total: number;
+    input: number | null;
+    output: number | null;
+    total: number | null;
+    reasoning?: number;
     source: "api";
     cacheHit?: number;
     cacheMiss?: number;

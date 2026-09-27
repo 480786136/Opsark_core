@@ -2,6 +2,14 @@ import { describe, expect, it } from "vitest";
 import { compactDeveloperLogs, createDeveloperLog, safeDeveloperEndpoint } from "@/features/agent/developerLog";
 
 describe("developer log safety", () => {
+  it("keeps partial usage unknown and never adds reasoning a second time", () => {
+    const log = (usage: unknown) => createDeveloperLog({ level: "success", operation: "model", title: "ok", summary: "ok", response: { usage } }, "j3", "2026-09-26", {}).tokenUsage;
+    expect(log({ input_tokens: 20 })).toEqual({ input: 20, output: null, total: null, source: "api" });
+    expect(log({ input_tokens: 20, output_tokens: 10, output_tokens_details: { reasoning_tokens: 8 } })).toEqual({ input: 20, output: 10, total: 30, reasoning: 8, source: "api" });
+    expect(log({ input_tokens: null, output_tokens: 10, total_tokens: 30 })).toEqual({ input: null, output: 10, total: 30, source: "api" });
+    expect(log({})).toEqual({ input: null, output: null, total: null, source: "api" });
+  });
+
   it("redacts known secrets and endpoint credentials before persistence", () => {
     const entry = createDeveloperLog({
       level: "error",

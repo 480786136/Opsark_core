@@ -18,7 +18,7 @@ export function argumentPropertyPath(parent: string | undefined, key: string) {
 export class ToolArgumentProtocolError extends RecoveryProtocolError {
   constructor(error: unknown, stepIndex: number, stepId?: string) {
     const path = error instanceof ToolArgumentValidationError ? error.argumentPath : undefined;
-    const fieldPath = `steps[${stepIndex}].command.arguments${path ? `.${path}` : ""}`;
+    const fieldPath = `steps[${stepIndex}].action.arguments${path ? `.${path}` : ""}`;
     super({ code: "TOOL_ARGUMENT_INVALID", stepIndex, stepId, fieldPath,
       expected: `第 ${stepIndex + 1} 个计划步骤的工具参数无效：${error instanceof Error ? error.message : String(error)}`,
       allowedRepairPaths: path ? [fieldPath] : [], ruleVersion: RECOVERY_RULE_VERSION });

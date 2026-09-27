@@ -98,11 +98,9 @@ describe("taskProgression", () => {
   });
 
   it("preserves all generated tool steps for hard protocol checks instead of filtering by business meaning", () => {
-    const software = step({ id: "old-software", kind: "observe", command: 'opsark-tool software.check {"names":["node"]}', validation: "" });
-    const userInput = step({ id: "old-input", kind: "observe", validation: "", command:
-      'opsark-tool user.request_input {"title":"目标","fields":[{"key":"TARGET","label":"目标","description":"选择目标","type":"text","required":true}]}' });
-    const connect = step({ id: "old-connect", kind: "observe", validation: "", command:
-      'opsark-tool server.connect {"host":"10.0.0.2","credentialRef":"managed-server:target"}' });
+    const software = step({ id: "old-software", kind: "observe", command: "", action: { type: "tool" as const, toolId: "software.check", arguments: {"names":["node"]} }, validation: "" });
+    const userInput = step({ id: "old-input", kind: "observe", validation: "", command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: {"title":"目标","fields":[{"key":"TARGET","label":"目标","description":"选择目标","type":"text","required":true}]} } });
+    const connect = step({ id: "old-connect", kind: "observe", validation: "", command: "", action: { type: "tool" as const, toolId: "server.connect", arguments: {"host":"10.0.0.2","credentialRef":"managed-server:target"} } });
     const change = step({ id: "install", kind: "change", command: "dnf install -y nodejs", status: "pending" });
     const candidates = [change, ...[software, userInput, connect].map(item => ({ ...item, id: `new-${item.id}`, status: "pending" as const }))];
     expect(selectBusinessReplanSteps([software, userInput, connect], candidates).map(item => item.id))
@@ -144,9 +142,9 @@ describe("taskProgression", () => {
   });
 
   it("does not use target changes or canonical command identity to discard generated steps", () => {
-    const prior = step({ command: 'opsark-tool files.get_structure {"rootPath":"/opt/app","maxDepth":4}',
-      validation: "true", status: "failed", attemptContext: "target-a:v1" });
-    const next = { ...prior, command: 'opsark-tool files.get_structure {"maxDepth":4,"rootPath":"/opt/app"}', status: "pending" as const };
+    const prior = step({ command: "", action: { type: "tool" as const, toolId: "files.get_structure", arguments: {"rootPath":"/opt/app","maxDepth":4} },
+      validation: "", status: "failed", attemptContext: "target-a:v1" });
+    const next = { ...prior, command: "", action: { type: "tool" as const, toolId: "files.get_structure", arguments: {"maxDepth":4,"rootPath":"/opt/app"} }, status: "pending" as const };
     expect(selectAdjustmentSteps([prior], [next], "target-a:v1")).toEqual([next]);
     expect(selectAdjustmentSteps([prior], [next], "target-a:v2")).toEqual([next]);
   });
@@ -164,7 +162,7 @@ describe("taskProgression", () => {
     const serverSwitch = step({
       id: "connect-target",
       kind: "observe",
-      command: 'opsark-tool server.connect {"host":"10.0.0.2","credentialRef":"managed-server:server-2"}',
+      command: "", action: { type: "tool" as const, toolId: "server.connect", arguments: {"host":"10.0.0.2","credentialRef":"managed-server:server-2"} },
       attemptContext: previousContext,
       output: '{"serverId":"server-2"}',
       result: {
@@ -235,7 +233,7 @@ describe("taskProgression", () => {
   it("sends completed user-input evidence to the joint next-stage decision", () => {
     const current = task([step({
       title: "Need parameters",
-      command: 'opsark-tool user.request_input {"title":"Deploy","fields":[{"key":"PORT","label":"服务端口","description":"项目对外监听端口","type":"number","required":true}]}',
+      command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: {"title":"Deploy","fields":[{"key":"PORT","label":"服务端口","description":"项目对外监听端口","type":"number","required":true}]} },
     })]);
     expect(resolveTaskProgression(current)).toEqual({ kind: "complete" });
     current.refinementCount = 8;
@@ -245,7 +243,7 @@ describe("taskProgression", () => {
   it("does not let terminal-tool metadata force another business stage", () => {
     const current = task([step({
       title: "连接并切换服务器",
-      command: 'opsark-tool server.connect {"host":"192.168.1.237","credentialRef":"managed-server:target"}',
+      command: "", action: { type: "tool" as const, toolId: "server.connect", arguments: {"host":"192.168.1.237","credentialRef":"managed-server:target"} },
     })], {
       activeSkillIds: ["ssh-terminal-jump"],
       executionConstraints: {
@@ -267,7 +265,7 @@ describe("taskProgression", () => {
       usageInstructions: "Custom", inputSchema: {}, outputDescription: "Custom",
       completionMode: "refine", enabled: true, builtIn: false, version: 1, updatedAt: "now",
     }];
-    const current = task([step({ command: 'opsark-tool custom.discovery {"scope":"all"}' })]);
+    const current = task([step({ command: "", action: { type: "tool" as const, toolId: "custom.discovery", arguments: {"scope":"all"} } })]);
     expect(resolveTaskProgression(current, tools)).toEqual({ kind: "complete" });
   });
 
@@ -305,7 +303,7 @@ describe("taskProgression", () => {
         completionMode: "refine", enabled: true, builtIn: false, version: 1, updatedAt: "now",
       }];
       const current = task([
-        step({ id: "done", command: "opsark-tool custom.discovery {}" }), waiting,
+        step({ id: "done", command: "", action: { type: "tool" as const, toolId: "custom.discovery", arguments: {} } }), waiting,
       ]);
 
       expect(resolveTaskProgression(current, tools)).toEqual({ kind: "wait", step: waiting });
@@ -325,7 +323,7 @@ describe("taskProgression", () => {
   it("routes completed user input to the joint next-stage decision", () => {
     const input = step({
       id: "input", status: "awaiting_input",
-      command: 'opsark-tool user.request_input {"title":"目标确认","fields":[{"key":"TARGET","label":"目标","description":"本次操作的目标","type":"text","required":true}]}',
+      command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: {"title":"目标确认","fields":[{"key":"TARGET","label":"目标","description":"本次操作的目标","type":"text","required":true}]} },
     });
     const current = task([input]);
 
@@ -349,8 +347,8 @@ describe("taskProgression", () => {
   it("preserves unchanged and validation-only adjustment proposals for hard checks", () => {
     const failedTool = step({
       id: "failed-tool",
-      command: 'opsark-tool files.get_structure {"rootPath":"/opt/app"}',
-      validation: "true",
+      command: "", action: { type: "tool" as const, toolId: "files.get_structure", arguments: {"rootPath":"/opt/app"} },
+      validation: "",
       status: "failed",
     });
     const failedShellValidation = step({

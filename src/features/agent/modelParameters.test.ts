@@ -14,4 +14,6 @@ it("rejects ambiguous output limits and invalid numbers", () => {
   for (const value of [NaN, Infinity, -1, 3]) expect(() => validateRequestParameters({ temperature: value })).toThrow();
   expect(() => validateRequestParameters({ max_tokens: 2.5 })).toThrow();
   expect(() => validateRequestParameters({ max_tokens: 10, max_completion_tokens: 10 })).toThrow();
+  expect(() => validateRequestParameters({ reasoning_effort: "a".repeat(32) })).not.toThrow();
+  expect(() => validateRequestParameters({ reasoning_effort: "a".repeat(33) })).toThrow();
 });

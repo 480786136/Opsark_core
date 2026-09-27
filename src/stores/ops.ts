@@ -1,4 +1,16 @@
-import { validateRequestParameters } from "@/features/agent/modelParameters";
+import { buildOperationsCommand, parseOperationsOutput } from "@/features/tools/operationsInspection";
+import { modelIntegrationConfig } from "@/features/agent/modelIntegration";
+import { directExecutionLedgerOwner } from "@/services/directExecutionLedger";
+import { ExecutionLedgerError, acknowledgeExecutionAttempt, runRecordedExecution, listExecutionLedger, cancelExecutionLedger, flushPendingReceipts, pendingExecutionReceipts, resolveExecutionOperation } from "@/services/executionLedger";
+import { readTaskProjection, executionReceiptSteps, readExecutionLedger, projectExecutionLedgerRecovery, buildReadOnlyReconciliation } from "@/features/agent/executionLedgerRecovery";
+import { ToolExecutionError } from "@/features/tools/toolFailure";
+import { stableProtocolValue } from "@/services/planProtocolRepair";
+import { executionDigest, preparePlanForApproval } from "@/features/agent/planPreparation";
+import type { ExecutionIntentSnapshot, PreparedPlan } from "@/types";
+import { effectiveToolSemanticContract, prepareFinalToolArguments, resolveUniqueServer, resolveUniqueServerEndpoint } from "@/features/tools/toolPreparation";
+import { createModelRecoveryContext } from "@/services/modelRecovery";
+import { assertToolStepBoundary, hasToolStepBoundaryConflict, stepOperationText, ToolStepBoundaryError } from "@/features/agent/stepAction";
+import { validateModelConfiguration } from "@/features/agent/modelCapabilities";
 import { defineStore } from "pinia";
 import { useAccountStore } from "@/features/account/accountStore";
 import { textFingerprint } from "@/features/agent/longRunningReviewOutput";
@@ -10,12 +22,14 @@ import { archiveToolEvidence } from "@/features/agent/evidenceArchive";
 import { workflowLifetime } from "@/features/agent/workflowLifetime";
 import { restoreUserInputRequests } from "@/features/agent/restoreUserInputRequests";
 import { automaticContinuationStop, renewAutomaticPhaseBudget, workflowProgress } from "@/features/agent/workflowProgress";
+import { failureDependencyBlocker, holdFailureDependents } from "@/features/agent/failureDisposition";
+import { reconciliationBlocker, recordExecutionUncertainty, retryBlocker } from "@/features/agent/operationalRecovery";
 import { assertTaskPlanAuthorization, ExecutionPolicyError, executionPolicyBlocker, recoveryHistory, validateRecoveryReferences } from "@/features/agent/recoveryContract";
-import { backend, isTauri, ModelInvocationError, modelServiceError, modelServiceErrorMessage, PlanProtocolError, normalizePlanPreconditions } from "@/services/backend";
+import { backend, isTauri, ModelInvocationError, modelServiceError, modelServiceErrorMessage, PlanProtocolError } from "@/services/backend";
 import type { RuntimeConnection } from "@/services/backend";
 import {
   classifyStepResult,
-  ensureStepValidator,
+  normalizeStepValidation,
 } from "@/features/agent/evidenceReview";
 import {
   applyCommandFailure,
@@ -41,10 +55,12 @@ import { normalizeToolDefinition, validateToolDefinition } from "@/features/tool
 import {
   executeToolCall as executeRegisteredToolCall,
   parseUserInputArguments,
+  parseToolAction,
 } from "@/features/tools/toolExecutor";
 import { selectPlanningTools } from "@/features/tools/toolContext";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { confirmedInputScope } from "@/features/agent/confirmedUserInputs";
+import { authenticationChannelFailure, gitAuthenticationRetryBlocker, repeatedAuthenticationInputBlocker } from "@/features/agent/authenticationRetry";
 import { activeProtocolRepair } from "@/features/agent/protocolReplan";
 import { refreshProtocolReplanApproval } from "@/features/agent/protocolReplanApproval";
 import { executionContextEvidence, modelContextStep } from "@/features/agent/executionContextEvidence";
@@ -100,6 +116,7 @@ import {
   normalizeRequirementRelation,
   restoreWorkflowState,
   taskGoal,
+  taskRequirementSnapshot,
 } from "@/features/agent/taskGoal";
 import { initializeTaskHistoryCheckpoint } from "@/features/agent/taskHistoryCheckpoint";
 import { isPlanProgressMessage } from "@/features/agent/taskMessages";
@@ -114,13 +131,16 @@ import {
 } from "@/features/agent/stepReviewPipeline";
 import {
   acceptStepApproval,
+  acceptPreparedPlanApproval,
   hasCurrentStepApproval,
+  stepMatchesExecutionIntent,
   requestStepApproval,
 } from "@/features/agent/stepApproval";
 import {
   runCommandLifecycle,
   runValidationLifecycle,
 } from "@/features/agent/executionLifecycle";
+import { freezeCommandExecutionPolicy } from "@/features/agent/executionPolicy";
 import { prepareStepExecution } from "@/features/agent/executionPreparation";
 import { executeStepCommand, executeStepValidation } from "@/features/agent/executionRunner";
 import { authenticationBlocker, authenticationFingerprint, recordAuthentication } from "@/features/agent/authenticationEvidence";
@@ -223,6 +243,8 @@ const resumingTransportTaskIds = new Set<string>();
 // handing off to the next stage; an old finally must not release a newer owner.
 const advancingTasks = new WeakMap<OpsTask, ReturnType<typeof workflowLifetime>>();
 const executingTaskSteps = new WeakMap<OpsTask, ReturnType<typeof workflowLifetime>>();
+const ledgerRefreshQueued = new WeakSet<OpsTask>();
+const ledgerDispatchRevisions = new WeakMap<OpsTask, number>();
 const submittingTaskInputs = new WeakMap<OpsTask, ReturnType<typeof workflowLifetime>>();
 const submittingRequirements = new WeakMap<OpsTask, object>();
 const requirementTasksByOwner = new WeakMap<object, Set<OpsTask>>();
@@ -373,6 +395,7 @@ function clearStepRuntime(step: PlanStep, id: string): PlanStep {
     result: undefined,
     evidence: undefined,
     startedAt: undefined,
+    executionPolicy: undefined,
     elapsedSeconds: undefined,
     progressMessage: undefined,
     safetyApprovalSnapshot: undefined,
@@ -406,19 +429,6 @@ async function inspectPlanSafety(command: string, validation: string, repair: bo
     unavailable.issue = unavailable.issues[0];
     return unavailable;
   }
-}
-
-function applySafetyNormalization(step: PlanStep, command: string, validation: string) {
-  const changed = step.command !== command || step.validation !== validation;
-  const normalized = ensureStepValidator({
-    ...step,
-    command,
-    validation,
-    validator: step.validator ? { ...step.validator, command: validation } : undefined,
-    safetyApprovalSnapshot: changed ? undefined : step.safetyApprovalSnapshot,
-    approvedSafetySnapshot: changed ? undefined : step.approvedSafetySnapshot,
-  });
-  Object.assign(step, normalized);
 }
 
 const emptyServerInfo = {
@@ -511,8 +521,15 @@ function initialSecretMetadata() {
     .filter((secret) => secret.scope !== "server" || Boolean(secret.serverId && serverIds.has(secret.serverId)));
 }
 
-function initialTasks() {
-  const tasks = readSaved<OpsTask[]>("opsark.tasks", []).map((task) => {
+function readTaskCache() {
+  try { return readTaskProjection(JSON.parse(localStorage.getItem("opsark.tasks") ?? "null")); }
+  catch { return { tasks: [] as OpsTask[], compatible: false, issues: ["任务缓存无法解析，原始记录已保留，停止覆盖。"] }; }
+}
+
+function initialTasks(savedTasks: OpsTask[]) {
+  const tasks = savedTasks.map((task) => {
+    task.executionLedgerLoading = false;
+    if (task.executionLedgerRecovery) task.executionLedgerRecovery.busyAttemptId = undefined;
     task.requirementProcessing = false;
     task.permission = normalizePermissionLevel(task.permission);
     task.adjustmentInProgress = false;
@@ -545,6 +562,20 @@ function initialTasks() {
       task.adjustmentIncident.generationFailureCount ??= 0;
       delete task.adjustmentIncident.attemptCount;
     }
+    if (!["completed", "failed", "cancelled"].includes(task.status)
+      && task.plan.some(step => !["completed", "failed", "skipped"].includes(step.status)
+        && /^\s*opsark-tool(?:\s|$)/i.test(step.command))) {
+      task.status = "needs_adjustment";
+      task.plan.forEach(step => {
+        if (["awaiting_input", "awaiting_approval"].includes(step.status)) step.status = "pending";
+        step.safetyApprovalSnapshot = undefined;
+        step.approvedSafetySnapshot = undefined;
+      });
+      task.pauseReason = "该未完成计划使用已停用的工具字符串协议。历史证据已保留，请重新生成剩余计划。";
+      task.managedAdjustmentPhase = "manual_required";
+      task.managedStopReason = "workflow_error";
+      task.autoAdjustmentSeconds = undefined;
+    }
     task.confirmedSecretKeys = [];
     task.submittedInputs = normalizeSubmittedInputs(task.submittedInputs);
     task.submittedSecretBindings = normalizeSubmittedSecretBindings(task.submittedSecretBindings);
@@ -560,24 +591,24 @@ function initialTasks() {
       task.autoAdjustmentSeconds = undefined;
       task.pauseReason = "上次业务重新规划因应用重启中断，原计划和证据已保留；请重新规划并评估风险，不会自动执行旧方案。";
     }
-    task.plan = task.plan.map(ensureStepValidator);
-    task.plan.forEach(step => { step.authenticationGate = undefined; });
-    if (task.latestGoalReview?.nextPlan) {
-      task.latestGoalReview.nextPlan = task.latestGoalReview.nextPlan.map(ensureStepValidator);
-    }
+    // Loading is an audit read, not admission of a new executable proposal.
+    // Runtime identities and grants must be refreshed at the next execution boundary.
+    task.preparedPlan = undefined;
+    task.planApproval = undefined;
+    task.plan.forEach(step => {
+      if (["pending", "awaiting_approval", "awaiting_input"].includes(step.status)) {
+        step.authenticationGate = undefined;
+        step.executionIntent = undefined;
+        step.approvalGrant = undefined;
+        step.safetyApprovalSnapshot = undefined;
+        step.approvedSafetySnapshot = undefined;
+      }
+    });
     // An explicit no-action decision survives restarts as a stopped state;
     // stale countdown/generating flags must not revive automatic planning.
     stopForBlockedNoAction(task);
     task.phaseHistory ??= [];
-    task.phaseHistory.forEach((phase) => {
-      phase.plan = phase.plan.map(ensureStepValidator);
-    });
     task.planHistory?.forEach((round) => {
-      round.plan = round.plan.map(ensureStepValidator);
-      round.finalPlan = round.finalPlan?.map(ensureStepValidator);
-      round.phases?.forEach((phase) => {
-        phase.plan = phase.plan.map(ensureStepValidator);
-      });
       if (round.status === "needs_adjustment" && round.summary) {
         round.pauseReason = round.summary;
         round.summary = undefined;
@@ -587,6 +618,23 @@ function initialTasks() {
     if (task.status === "needs_adjustment" && task.summary) {
       task.pauseReason = task.summary;
       task.summary = undefined;
+    }
+    // Do not guess whether a persisted validator was injected by an old Core
+    // or authored elsewhere. Preserve the record and block unfinished calls.
+    const conflictedTools = task.plan.filter(step =>
+      ["pending", "awaiting_approval", "awaiting_input"].includes(step.status)
+      && hasToolStepBoundaryConflict(step));
+    if (conflictedTools.length && !["completed", "failed", "cancelled"].includes(task.status)) {
+      task.status = "needs_adjustment";
+      for (const step of conflictedTools) {
+        step.status = "pending";
+        step.safetyApprovalSnapshot = undefined;
+        step.approvedSafetySnapshot = undefined;
+      }
+      task.pauseReason = "该未完成工具计划包含 Shell 命令或验收字段，无法继续执行。原计划与历史证据已保留，请重新生成剩余计划。";
+      task.managedAdjustmentPhase = "manual_required";
+      task.managedStopReason = "workflow_error";
+      task.autoAdjustmentSeconds = undefined;
     }
     const latestRequirement = latestTaskRequirement(task);
     task.rootGoal ||= latestRequirement;
@@ -599,6 +647,17 @@ function initialTasks() {
       .find((message) => message.role === "user" && message.kind === "message")?.content
       ?? task.rootGoal;
     task.currentRoundId ||= uid("round");
+    const interrupted = task.plan.find(step => ["running", "validating"].includes(step.status));
+    if (interrupted) {
+      recordExecutionUncertainty(task, interrupted, "应用重启中断执行，需核对远端进程与实际结果。");
+      interrupted.status = "failed";
+      holdFailureDependents(interrupted, task.plan.filter(item => item.status === "pending"));
+      task.status = "needs_adjustment";
+      task.managedAdjustmentPhase = "manual_required";
+      task.autoAdjustmentSeconds = undefined;
+      task.currentExecutionId = undefined;
+      task.pauseReason = "上次执行因应用重启中断。已保存目标和执行证据；先核对远端进程及实际结果，不会自动重放变更。";
+    }
     return task;
   });
   return restoreConversationLinks(tasks, readSaved<AuditEvent[]>("opsark.logs", []));
@@ -642,6 +701,7 @@ function compactPersistedStep(step: PlanStep, aggressive: boolean): PlanStep {
 function compactPersistedTasks(tasks: OpsTask[], aggressive = false): OpsTask[] {
   return tasks.slice(0, aggressive ? 20 : 50).map((task) => ({
     ...task,
+    persistedRequirements: { version: 1, sources: taskRequirementSnapshot(task).requirements },
     messages: task.messages.slice(-(aggressive ? 80 : 240)).map((message) => ({
       ...message,
       content: truncatePersistedText(message.content, aggressive ? 4_000 : 16_000) ?? "",
@@ -676,10 +736,23 @@ const connectionMonitors = new WeakMap<object, () => void>();
 interface PendingServerCredential {
   connection: RuntimeConnection;
   remember: boolean;
+  isCurrent?: () => boolean;
   committing?: Promise<void>;
 }
 const pendingServerCredentials = new WeakMap<object, Map<string, PendingServerCredential>>();
 const serverCredentialWrites = new WeakMap<object, Map<string, Promise<void>>>();
+// Runtime-only equality tracking: the snapshot contains the public revision,
+// never a credential value or a hash derived from one. Restart clears grants.
+const principalBindings = new WeakMap<object, Map<string, { value: string; revision: number }>>();
+function principalVersion(owner: object, reference: string, value: string): number {
+  let bindings = principalBindings.get(owner);
+  if (!bindings) { bindings = new Map(); principalBindings.set(owner, bindings); }
+  const previous = bindings.get(reference);
+  if (previous?.value === value) return previous.revision;
+  const revision = (previous?.revision ?? 0) + 1;
+  bindings.set(reference, { value, revision });
+  return revision;
+}
 
 function sameServerConnection(left: RuntimeConnection | undefined, right: RuntimeConnection) {
   return Boolean(left && left.host === right.host && left.port === right.port
@@ -688,7 +761,8 @@ function sameServerConnection(left: RuntimeConnection | undefined, right: Runtim
 
 export const useOpsStore = defineStore("ops", {
   state: () => {
-    const tasks = initialTasks();
+    const taskCache = readTaskCache();
+    const tasks = initialTasks(taskCache.tasks);
     const tools = initialTools();
     return {
       servers: initialServers(),
@@ -720,7 +794,9 @@ export const useOpsStore = defineStore("ops", {
       credentialsHydrated: false,
       credentialsLoading: false,
       credentialError: "",
-      persistenceWarning: "",
+      persistenceWarning: taskCache.issues.join("\n"),
+      taskCacheReadError: taskCache.issues.join("\n"),
+      executionLedgerReadError: "",
     };
   },
 
@@ -808,6 +884,7 @@ export const useOpsStore = defineStore("ops", {
 
     startConnectionMonitor() {
       if (connectionMonitors.has(this)) return;
+      void this.restoreExecutionLedgerTasks();
       const connections = useConnectionStore();
       const stopWatch = watch(() => Object.values(connections.states)
         .map(connection => `${connection.status}:${connection.generation}`).join("|"),
@@ -850,6 +927,8 @@ export const useOpsStore = defineStore("ops", {
     },
 
     pauseTaskForConnection(task: OpsTask, expectedGeneration?: number) {
+      const next = task.plan.find(step => !["completed", "failed", "skipped"].includes(step.status));
+      if (next?.action?.type === "tool" && ["server.resolve_connection", "server.connect", "user.request_input", "evidence.read", "skills.expand"].includes(next.action.toolId)) return false;
       const id = executionServerId(task);
       if (this.getRuntimeConnection(id) && (expectedGeneration === undefined
         || this.serverConnection(id).generation === expectedGeneration)) return false;
@@ -878,6 +957,10 @@ export const useOpsStore = defineStore("ops", {
     async commitVerifiedServerCredential(serverId: string): Promise<void> {
       const pending = pendingServerCredentials.get(this)?.get(serverId);
       if (!pending || !sameServerConnection(this.getRuntimeConnection(serverId), pending.connection)) return;
+      if (pending.isCurrent && !pending.isCurrent()) {
+        pendingServerCredentials.get(this)?.delete(serverId);
+        return;
+      }
       if (pending.committing) return pending.committing;
       const changed = this.serverPasswords[serverId] !== pending.connection.password;
       this.serverPasswords[serverId] = pending.connection.password;
@@ -887,7 +970,7 @@ export const useOpsStore = defineStore("ops", {
       let writes = serverCredentialWrites.get(this);
       if (!writes) { writes = new Map(); serverCredentialWrites.set(this, writes); }
       const commit = (writes.get(serverId) ?? Promise.resolve()).then(async () => {
-        if (pending.remember && sameServerConnection(this.getRuntimeConnection(serverId), pending.connection)) {
+        if (pending.remember && (!pending.isCurrent || pending.isCurrent()) && sameServerConnection(this.getRuntimeConnection(serverId), pending.connection)) {
           try { await backend.saveCredential("server", serverId, pending.connection.password); }
           catch (error) { this.credentialError = String(error); }
         }
@@ -907,7 +990,7 @@ export const useOpsStore = defineStore("ops", {
       const store = this;
       const write = () => {
         try {
-          localStorage.setItem("opsark.tasks", JSON.stringify(compactPersistedTasks(store.tasks)));
+          if (!store.taskCacheReadError) localStorage.setItem("opsark.tasks", JSON.stringify(compactPersistedTasks(store.tasks)));
           localStorage.setItem("opsark.logs", JSON.stringify(store.logs.slice(0, 300)));
           localStorage.setItem("opsark.developerLogs", JSON.stringify(store.developerLogs.slice(0, MAX_DEVELOPER_LOGS)));
           localStorage.setItem("opsark.servers", JSON.stringify(store.servers));
@@ -916,12 +999,12 @@ export const useOpsStore = defineStore("ops", {
           if (import.meta.env.DEV) localStorage.setItem("opsark.toolOverrides", JSON.stringify(createToolOverrides(store.tools)));
           persistOwnedSkills(store.skills);
           localStorage.setItem("opsark.secretMetadata", JSON.stringify(store.secretMetadata));
-          store.persistenceWarning = "";
+          store.persistenceWarning = store.taskCacheReadError;
         } catch (error) {
           // 本地记录空间不足不能改变远程命令结果；降级保存精简快照并继续任务。
           store.persistenceWarning = `任务记录空间不足，已自动压缩历史：${String(error)}`;
           try {
-            localStorage.setItem("opsark.tasks", JSON.stringify(compactPersistedTasks(store.tasks, true)));
+            if (!store.taskCacheReadError) localStorage.setItem("opsark.tasks", JSON.stringify(compactPersistedTasks(store.tasks, true)));
             localStorage.setItem("opsark.logs", JSON.stringify(store.logs.slice(0, 80)));
             localStorage.setItem("opsark.developerLogs", JSON.stringify(compactDeveloperLogs(store.developerLogs)));
           } catch {
@@ -932,6 +1015,281 @@ export const useOpsStore = defineStore("ops", {
       };
       if (immediate) write();
       else persistTimer = window.setTimeout(write, 200);
+    },
+
+    async recordStepExecution<T>(task: OpsTask, step: PlanStep, phase: string, executionId: string,
+      isCurrent: () => boolean, execute: () => Promise<T>,
+      options: { effect?: "read" | "change" | "interaction"; intent?: ExecutionIntentSnapshot; subkey?: string } = {}): Promise<T> {
+      if (this.taskCacheReadError) throw new ExecutionLedgerError(this.taskCacheReadError, "prepare", false);
+      if (phase === "validation" && !options.intent && step.executionIntent) {
+        const semantic = { ...step.executionIntent.semantic, effect: "read" as const, kind: "observe" as const,
+          action: { type: "shell" as const, command: step.executionIntent.semantic.validator?.command ?? step.executionIntent.semantic.validation ?? step.validation },
+          executionScope: step.executionIntent.semantic.validationScope ?? "isolated_exec" as const };
+        options = { ...options, effect: "read", intent: { version: "execution-intent@1", algorithm: "sha256", semantic,
+          digest: executionDigest({ version: "execution-intent@1", semantic }) } };
+      }
+      const effect = options.effect ?? step.executionIntent?.semantic.effect;
+      if (effect === "change" && ["command", "tool"].includes(phase)) {
+        let parsed;
+        try { parsed = readExecutionLedger(await listExecutionLedger(this, task.id)); }
+        catch (error) { throw new ExecutionLedgerError("无法读取既有执行记录，尚未发送命令", "list", false, undefined, undefined, undefined, error); }
+        if (!parsed.compatible) throw new ExecutionLedgerError(parsed.issues.join("；"), "list", false);
+        const previous = parsed.operations.find(operation => operation.stepId === step.id && operation.phase === phase
+          && operation.attempts.some(attempt => attempt.status !== "not_dispatched"));
+        if (previous) throw new ExecutionLedgerError("该步骤已有派发记录，请核对原结果；连接或轮次变化不能重发原操作", "begin", false, previous.operationId, previous.attempts[previous.attempts.length - 1]?.id);
+      }
+      const secrets = { ...this.secretValues, ...Object.fromEntries(Object.entries(this.serverPasswords).map(([key, value]) => [`server-password:${key}`, value])) };
+      return runRecordedExecution({ owner: this,
+        task: { id: task.id, currentRoundId: task.currentRoundId, workflowEpoch: task.workflowEpoch,
+          planRevision: step.planRevision ?? task.preparedPlan?.planRevision ?? 0 }, step, phase, executionId, ...options, isCurrent,
+        redact: text => redactExecutionOutput(text, secrets),
+        execute: async () => {
+          if (!isCurrent()) throw new ToolExecutionError("原执行所有权已结束，未发送命令", "permission", "not_sent");
+          return execute();
+        },
+        classifyResult: value => {
+          const result = value as { success?: boolean; passed?: boolean; error?: { dispatchState?: string; category?: string } };
+          if (result.error?.dispatchState === "not_sent") return "not_dispatched";
+          if (result.error?.dispatchState === "unknown" || result.error?.category === "protocol") return effect === "read" ? "failed" : "unknown";
+          return result.success === false || result.passed === false ? "failed" : "succeeded";
+        },
+        classifyError: error => isSshConnectionSetupFailure(error)
+          || error instanceof ToolExecutionError && error.dispatchState === "not_sent" ? "not_dispatched"
+          : effect === "read" ? "failed" : "unknown",
+        onAttempt: (operation, attempt) => {
+          ledgerDispatchRevisions.set(task, (ledgerDispatchRevisions.get(task) ?? 0) + 1);
+          (step.executionLedgerAttempts ??= []).push({ operationId: operation.operationId, attemptId: attempt.id, executionId, phase });
+          this.persist(true);
+        },
+        onCommitted: (_operationId, attemptId) => {
+          (step.ledgerAppliedAttemptIds ??= []).push(attemptId);
+        },
+      });
+    },
+
+    async markExecutionVerified(step: PlanStep) {
+      step.ledgerVerifiedAttemptIds = [...new Set([...(step.ledgerVerifiedAttemptIds ?? []), ...(step.ledgerAppliedAttemptIds ?? [])])];
+      const taskId = step.executionIntent?.semantic.taskId;
+      if (taskId) {
+        try { await this.persistExecutionAcknowledgements(taskId); }
+        catch { this.persistenceWarning = "执行结果已保存，但验收确认尚未落账；将重试保存，不会重新执行远端操作。"; }
+      }
+    },
+
+    async persistExecutionAcknowledgements(taskId: string, records?: Awaited<ReturnType<typeof listExecutionLedger>>) {
+      const task = this.tasks.find(t => t.id === taskId);
+      const parsed = records ? undefined : readExecutionLedger(await listExecutionLedger(this, taskId));
+      if (parsed && !parsed.compatible) throw new Error(parsed.issues.join("；"));
+      const operations = records ?? parsed!.operations;
+      if (!task) return operations;
+      const steps = executionReceiptSteps(task);
+      const applied = new Set(steps.flatMap(s => s.ledgerAppliedAttemptIds ?? []));
+      const verified = new Set(steps.flatMap(s => s.ledgerVerifiedAttemptIds ?? []));
+      for (const operation of operations) for (let index = 0; index < operation.attempts.length; index++) {
+        const attempt = operation.attempts[index];
+        if (attempt.late || !attempt.outcome || !["succeeded", "failed", "not_dispatched"].includes(attempt.status)) continue;
+        const reviewed = attempt.status === "succeeded" && verified.has(attempt.id);
+        if (applied.has(attempt.id) && (attempt.projectionAppliedAt === undefined || reviewed && attempt.reviewCompletedAt === undefined)) {
+          operation.attempts[index] = await acknowledgeExecutionAttempt(this, operation.operationId, attempt.id, reviewed);
+        }
+      }
+      return operations;
+    },
+
+    handleExecutionLedgerError(task: OpsTask, step: PlanStep, error: ExecutionLedgerError) {
+      task.currentExecutionId = undefined;
+      task.executionLedgerError = { stage: error.stage, message: error.message, operationId: error.operationId,
+        attemptId: error.attemptId, remoteResultKnown: error.remoteResultKnown };
+      if (!task.cancelRequested) {
+        task.status = "needs_adjustment";
+        task.managedAdjustmentPhase = "manual_required";
+        task.autoAdjustmentSeconds = undefined;
+        task.pauseReason = `${error.message}；先恢复记录或只读核对，不会自动重发原操作。`;
+        if (["running", "validating"].includes(step.status)) step.status = "failed";
+      }
+      if (error.stage === "execution" || error.stage === "result_commit") {
+        recordExecutionUncertainty(task, step, error.message);
+      }
+      this.persist(true);
+      void this.refreshExecutionLedger(task.id);
+    },
+
+    async restoreExecutionLedgerTasks() {
+      try {
+        const parsed = readExecutionLedger(await listExecutionLedger(this));
+        if (!parsed.compatible) { this.executionLedgerReadError = parsed.issues.join("；"); return; }
+        this.executionLedgerReadError = "";
+        const orphanIds = [...new Set(parsed.operations.filter(operation => !this.tasks.some(task => task.id === operation.taskId)
+          && (projectExecutionLedgerRecovery([operation]).items.length > 0
+            || !operation.taskId.startsWith("direct-") && operation.effect === "read"
+              && operation.attempts.some(attempt => ["succeeded", "failed"].includes(attempt.status))))
+          .map(operation => operation.taskId))];
+        for (const id of orphanIds) {
+          const records = parsed.operations.filter(operation => operation.taskId === id);
+          const historicalReadsOnly = records.every(record => record.effect === "read" && record.attempts.every(a => ["succeeded", "failed", "not_dispatched"].includes(a.status)));
+          const first = records[0], target = first.intent.semantic.targets.find(target => target.host);
+          const matches = this.servers.filter(server => target && server.host.toLowerCase() === target.host.toLowerCase()
+            && server.port === target.port && server.username === target.username);
+          const server = matches.length === 1 ? matches[0] : undefined;
+          const steps = new Map<string, PlanStep>();
+          for (const operation of records) {
+            const semantic = operation.intent.semantic;
+            if (steps.has(operation.stepId)) continue;
+            steps.set(operation.stepId, { id: operation.stepId, title: "待恢复的执行记录", description: semantic.expected,
+              action: semantic.action, command: semantic.action.type === "shell" ? semantic.action.command : "",
+              kind: semantic.kind, risk: semantic.risk, expected: semantic.expected, validation: semantic.validation ?? "",
+              validator: semantic.validator, runtimeClass: semantic.runtimeClass, status: "failed", executionIntent: operation.intent,
+              executionLedgerAttempts: records.filter(row => row.stepId === operation.stepId).flatMap(row => row.attempts.map(attempt => ({
+                operationId: row.operationId, attemptId: attempt.id, executionId: attempt.executionId, phase: row.phase }))) });
+          }
+          this.tasks.unshift({ id, serverId: server?.id ?? target?.serverId ?? "recovered-execution", modelId: "",
+            title: "执行记录恢复 · " + (server?.name ?? target?.host ?? id), status: "needs_adjustment", permission: "observe",
+            rootGoal: first.intent.semantic.expected, messages: [], plan: historicalReadsOnly ? [] : [...steps.values()], createdAt: new Date(first.createdAt).toISOString(),
+            updatedAt: now(), currentRoundId: first.roundId, workflowEpoch: first.workflowEpoch,
+            adjustmentCount: 0, adjustmentInProgress: false, managedAdjustmentPhase: "manual_required",
+            pauseReason: "任务展示缓存缺失，已从持久台账恢复执行事实。先只读核对，不能重发原变更。" });
+        }
+        await Promise.all(this.tasks.map(task => this.refreshExecutionLedger(task.id)));
+        if (orphanIds.length) this.persist(true);
+      } catch (error) { this.executionLedgerReadError = `执行台账读取失败，变更派发将阻止：${String(error)}`; }
+    },
+
+    async refreshExecutionLedger(taskId: string) {
+      const task = this.tasks.find(item => item.id === taskId);
+      if (!task || executingTaskSteps.get(task)?.current()) return;
+      if (task.executionLedgerLoading) { ledgerRefreshQueued.add(task); return; }
+      task.executionLedgerLoading = true;
+      const dispatchRevision = ledgerDispatchRevisions.get(task) ?? 0;
+      try {
+        const owner = taskId.startsWith("direct-") ? directExecutionLedgerOwner : this;
+        if (pendingExecutionReceipts(owner, taskId).length) {
+          try { await flushPendingReceipts(owner, taskId); } catch { /* Keep the explicit save-only recovery action. */ }
+        }
+        const parsed = readExecutionLedger(await listExecutionLedger(this, taskId));
+        if (!this.tasks.includes(task) || executingTaskSteps.get(task)?.current()) return;
+        if ((ledgerDispatchRevisions.get(task) ?? 0) !== dispatchRevision) { ledgerRefreshQueued.add(task); return; }
+        const pending = pendingExecutionReceipts(taskId.startsWith("direct-") ? directExecutionLedgerOwner : this, taskId);
+        let acknowledgementFailed = false;
+        if (parsed.compatible) {
+          try { await this.persistExecutionAcknowledgements(taskId, parsed.operations); }
+          catch { acknowledgementFailed = true; }
+        }
+        if (!this.tasks.includes(task) || executingTaskSteps.get(task)?.current()) return;
+        if ((ledgerDispatchRevisions.get(task) ?? 0) !== dispatchRevision) { ledgerRefreshQueued.add(task); return; }
+        const previousRecovery = task.executionLedgerRecovery;
+        task.executionLedgerRecovery = { ...projectExecutionLedgerRecovery(parsed.operations, {
+          servers: this.servers,
+          appliedAttemptIds: executionReceiptSteps(task).flatMap(step => step.ledgerAppliedAttemptIds ?? []),
+          verifiedAttemptIds: executionReceiptSteps(task).flatMap(step => step.ledgerVerifiedAttemptIds ?? []),
+          issues: [...parsed.issues, ...(this.taskCacheReadError ? [this.taskCacheReadError] : [])],
+          storageFailures: [...(acknowledgementFailed ? [{ kind: "storage_failed" as const, operationId: "",
+            summary: "执行结果已保存，但任务确认记录保存失败。", knownFacts: ["重试仅保存本地确认，不执行远端操作。"], action: "retry_storage" as const }] : []),
+            ...pending.map(receipt => ({ kind: "storage_failed" as const, operationId: receipt.operationId,
+            attemptId: receipt.attemptId, summary: "远端结果已收到，但记录提交失败；重试只保存记录。",
+            knownFacts: [receipt.remoteResultKnown ? "结果已知，禁止把保存失败当作远端执行失败。" : "派发结果仍不确定，保留原尝试。"], action: "retry_storage" as const }))],
+        }), busyAttemptId: previousRecovery?.busyAttemptId, error: previousRecovery?.busyAttemptId ? previousRecovery.error : undefined };
+        if (task.title.startsWith("执行记录恢复 · ") && !task.executionLedgerRecovery.items.length
+          && task.executionLedgerRecovery.recordedReads?.length && task.status === "needs_adjustment"
+          && task.pauseReason?.startsWith("任务展示缓存缺失")) {
+          task.status = "awaiting_continuation";
+          task.pauseReason = "已恢复历史检查结果，可查看已有证据；这不代表当前任务目标已完成。";
+        }
+        if (!parsed.compatible) task.executionLedgerError = { stage: "list", message: parsed.issues.join("；"), remoteResultKnown: false };
+        else if (!pending.length && task.executionLedgerError && ["list", "result_commit"].includes(task.executionLedgerError.stage)) {
+          const previousMessage = task.executionLedgerError.message;
+          task.executionLedgerError = undefined;
+          if (task.pauseReason?.startsWith(previousMessage)) task.pauseReason = "执行结果已保存，可基于已有证据继续任务；不会重新发送原操作。";
+        }
+      } catch (error) {
+        if (!this.tasks.includes(task) || executingTaskSteps.get(task)?.current()) return;
+        task.executionLedgerRecovery = projectExecutionLedgerRecovery([], { issues: [String(error)] });
+        task.executionLedgerError = { stage: "list", message: String(error), remoteResultKnown: false };
+      } finally {
+        task.executionLedgerLoading = false;
+        if (ledgerRefreshQueued.delete(task)) void this.refreshExecutionLedger(taskId);
+      }
+    },
+
+    async retryExecutionLedgerStorage(taskId: string, _attemptId?: string) {
+      const task = this.tasks.find(item => item.id === taskId);
+      if (!task) return;
+      try { await flushPendingReceipts(taskId.startsWith("direct-") ? directExecutionLedgerOwner : this, taskId); task.executionLedgerError = undefined; }
+      catch (error) { if (task.executionLedgerRecovery) task.executionLedgerRecovery.error = String(error); }
+      await this.refreshExecutionLedger(taskId);
+      this.persist(true);
+    },
+
+    async reconcileExecutionAttempt(taskId: string, attemptId: string) {
+      const task = this.tasks.find(item => item.id === taskId);
+      if (!task || task.executionLedgerRecovery?.busyAttemptId) return;
+      if (executingTaskSteps.get(task)?.current()) {
+        if (task.executionLedgerRecovery) task.executionLedgerRecovery.error = "当前步骤仍在执行或验收，请等待结果后核对。";
+        return;
+      }
+      const recovery = task.executionLedgerRecovery ??= projectExecutionLedgerRecovery([]);
+      const epoch = task.workflowEpoch, roundId = task.currentRoundId, plan = task.plan, incident = task.executionReconciliation;
+      const contextCurrent = () => this.tasks.includes(task) && task.workflowEpoch === epoch
+        && task.currentRoundId === roundId && task.plan === plan && !executingTaskSteps.get(task)?.current();
+      recovery.busyAttemptId = attemptId;
+      recovery.error = undefined;
+      try {
+        const parsed = readExecutionLedger(await listExecutionLedger(this, taskId));
+        if (!parsed.compatible) throw new Error(parsed.issues.join("；"));
+        const operation = parsed.operations.find(row => row.attempts.some(attempt => attempt.id === attemptId));
+        if (!operation) throw new Error("找不到原始执行尝试，不能自动恢复");
+        if (!contextCurrent()) throw new Error("任务上下文已变化，原记录保留，停止本次核对");
+        const draft = buildReadOnlyReconciliation(operation, task, this.servers);
+        if (draft.attemptId !== attemptId) throw new Error("仅允许核对该操作最新的未决尝试");
+        const readIds: string[] = [];
+        const originalStep = recoveryHistory(task).find(step => step.id === operation.stepId);
+        for (const read of draft.reads) {
+          const stepId = `reconcile-${attemptId}-${read.role}`;
+          const semantic = { ...operation.intent.semantic, taskId, stepId,
+            action: { type: "shell" as const, command: read.command }, targets: [{ ...read.target, role: "execution" as const }],
+            effect: "read" as const, kind: "observe" as const, risk: "low" as const, permission: "observe" as const,
+            dependencies: { precedingStepIds: [] }, executionScope: "isolated_exec" as const,
+            validation: undefined, validator: undefined, toolContract: undefined, runtimeClass: undefined };
+          const intent: ExecutionIntentSnapshot = { version: "execution-intent@1", algorithm: "sha256",
+            semantic, digest: executionDigest({ version: "execution-intent@1", semantic }) };
+          const connection = this.getRuntimeConnection(read.serverId);
+          if (!connection || connection.host.toLowerCase() !== read.target.host.toLowerCase()
+            || connection.port !== read.target.port || connection.username !== read.target.username) throw new Error("原目标连接不可用或身份已变化，请连接原服务器后核对");
+          const generation = this.serverConnection(read.serverId).generation;
+          const executionId = uid("reconcile-read");
+          await runRecordedExecution({ owner: this,
+            task: { id: task.id, currentRoundId: roundId, workflowEpoch: epoch, planRevision: operation.planRevision },
+            step: { id: stepId, executionIntent: intent }, phase: "validation", executionId,
+            isCurrent: () => contextCurrent() && this.serverConnection(read.serverId).generation === generation,
+            redact: text => redactExecutionOutput(text, { ...this.secretValues, password: connection.password }),
+            execute: () => backend.executeCommand(read.command, connection, false, { executionId }),
+            classifyResult: result => result.success ? "succeeded" : "failed", classifyError: () => "failed",
+            onAttempt: operation => { readIds.push(operation.operationId); },
+            onCommitted: (_operationId, id) => { if (originalStep) {
+              (originalStep.ledgerAppliedAttemptIds ??= []).push(id); (originalStep.ledgerVerifiedAttemptIds ??= []).push(id);
+            } },
+          });
+        }
+        const proof = draft.kind === "file_transfer"
+          ? { version: 1 as const, kind: "file_transfer" as const, sourceReadOperationId: readIds[0], targetReadOperationId: readIds[1] }
+          : { version: 1 as const, kind: "service" as const, readOperationId: readIds[0] };
+        if (!contextCurrent()) throw new Error("任务上下文已变化，新的只读证据保留在原核对记录中");
+        const resolved = await resolveExecutionOperation(this, operation.operationId, attemptId, proof);
+        if (!contextCurrent()) return;
+        if (task.executionReconciliation === incident && incident?.stepId === operation.stepId && resolved.reconciliation) {
+          incident.resolution = { incidentId: incident.id, status: "completed",
+            evidenceIds: resolved.reconciliation.evidenceRefs, reason: "持久台账已核对新采集的同目标只读证据，当前状态满足原目标；原尝试保持原事实。" };
+        }
+        task.executionLedgerError = undefined;
+        this.pushMessage(task, { role: "assistant", kind: "event", content: "只读证据已确认当前状态满足原目标，核对结果已落账。原尝试记录保留，不会重发原操作；后续变更仍需按当前计划授权。" });
+      } catch (error) { recovery.error = String(error); }
+      finally {
+        const error = recovery.error;
+        recovery.busyAttemptId = undefined;
+        if (task.executionLedgerRecovery) task.executionLedgerRecovery.busyAttemptId = undefined;
+        await this.refreshExecutionLedger(taskId);
+        if (contextCurrent() && task.executionLedgerRecovery) task.executionLedgerRecovery.error = error;
+        this.persist(true);
+      }
     },
 
     saveTools() {
@@ -1348,7 +1706,7 @@ export const useOpsStore = defineStore("ops", {
       }
     },
 
-    async connectServer(serverId: string, password: string, remember = true): Promise<boolean> {
+    async connectServer(serverId: string, password: string, remember = true, isCurrent?: () => boolean): Promise<boolean> {
       const server = this.servers.find(item => item.id === serverId);
       if (!server || !password) return false;
       const requested = {
@@ -1359,7 +1717,7 @@ export const useOpsStore = defineStore("ops", {
       const existing = pending.get(serverId);
       if (existing && sameServerConnection(existing.connection, requested)) existing.remember ||= remember;
       else {
-        pending.set(serverId, { connection: requested, remember });
+        pending.set(serverId, { connection: requested, remember, isCurrent });
         // Clear the prior identity's cache BEFORE publishing connected. Clearing
         // it afterward would invalidate the directory load triggered by that event.
         if (this.serverPasswords[serverId] !== password) useFileWorkspaceStore().clearServerCache(serverId);
@@ -1369,6 +1727,10 @@ export const useOpsStore = defineStore("ops", {
       const connected = verified && Boolean(current && current.host === requested.host
         && current.port === requested.port && current.username === requested.username
         && current.password === requested.password);
+      if (isCurrent && !isCurrent()) {
+        pending.delete(serverId);
+        return connected;
+      }
       this.syncConnectionStates();
       if (connected && this.isServerConnected(serverId)) {
         await this.commitVerifiedServerCredential(serverId);
@@ -1425,17 +1787,21 @@ export const useOpsStore = defineStore("ops", {
       _legacyPaneId?: string,
       taskId?: string,
       onDispatch?: () => void,
+      options?: { prepared?: boolean; assertCurrent?: () => void; assertPrepared?: () => void },
     ) {
+      const ownerTask = taskId ? this.tasks.find(task => task.id === taskId) : undefined;
+      const owner = ownerTask ? workflowLifetime(ownerTask) : undefined;
       const assertCapabilities = () => {
+        owner?.assertCurrent();
+        options?.assertCurrent?.();
         if (!taskId) return;
         const task = this.tasks.find(item => item.id === taskId);
         if (!task) throw new Error("任务已失效，拒绝派发工具");
-        const blocker = executionCapabilityBlocker(task, { command: `opsark-tool ${call.toolId} ${JSON.stringify(call.arguments)}`, validation: "true" }, this.skills);
+        const blocker = executionCapabilityBlocker(task, { action: { type: "tool", toolId: call.toolId, arguments: call.arguments }, command: "", validation: "" }, this.skills);
         if (blocker) throw new Error(blocker);
       };
       assertCapabilities();
       const connection = this.getRuntimeConnection(serverId);
-      if (!connection) throw new Error("请先连接真实服务器");
       const generation = this.serverConnection(serverId).generation;
       const assertConnection = () => {
         assertCapabilities();
@@ -1455,7 +1821,8 @@ export const useOpsStore = defineStore("ops", {
           request: ServerConnectionLookupRequest,
         ): Promise<ServerConnectionLookupResult> => {
           const port = request.port ?? 22;
-          const target = this.servers.find((server) => server.host === request.host && server.port === port);
+          assertCapabilities();
+          const target = resolveUniqueServerEndpoint(this.servers, request.host, port);
           const scopedSecrets = serverSecretValues(this.secretValues, serverId);
           const reusableGroups = collectServerCredentialGroups(this.secretMetadata, serverId)
             .filter((group) => group.kind === "ssh-password"
@@ -1481,82 +1848,146 @@ export const useOpsStore = defineStore("ops", {
           };
         },
         connectServer: async (request: ServerConnectRequest): Promise<ServerConnectResult> => {
-          const port = request.port ?? 22;
-          let username = request.username;
-          let password: string | undefined;
-          let usernamePlaceholder: string | undefined;
-          if (request.credentialRef?.startsWith("managed-server:")) {
-            const targetId = request.credentialRef.slice("managed-server:".length);
-            const managedTarget = this.servers.find((server) => server.id === targetId);
-            if (!managedTarget || managedTarget.host !== request.host || managedTarget.port !== port) {
-              throw new Error("credentialRef 与目标服务器不匹配，请重新查询连接资料");
+          const partial: Record<string, unknown> = { connectionCheckDispatched: false, connectionChecked: false,
+            directoryUpdated: false, connected: false, taskTargetUpdated: false, agentSessionCreationDispatched: false,
+            agentSessionPrepared: false, credentialStorageDispatched: false, credentialStored: false };
+          const initialSource = this.servers.find(server => server.id === serverId);
+          const identity = (server: ServerProfile | undefined) => server
+            ? stableProtocolValue({ id: server.id, host: server.host, port: server.port, username: server.username }) : undefined;
+          const initialSourceIdentity = identity(initialSource);
+          let sourceGeneration = generation;
+          let expectedTaskTarget = ownerTask ? executionServerId(ownerTask) : undefined;
+          const initialPermission = ownerTask?.permission;
+          const initialConstraints = stableProtocolValue(ownerTask?.executionConstraints);
+          let target: ServerProfile | undefined;
+          let targetIdentity: string | undefined;
+          let targetGeneration: number | undefined;
+          let connecting = false;
+          let username: string | undefined;
+          let principalCurrent: (() => boolean) | undefined;
+          const guard = () => {
+            assertCapabilities();
+            if (ownerTask && (ownerTask.permission !== initialPermission
+              || stableProtocolValue(ownerTask.executionConstraints) !== initialConstraints
+              || executionServerId(ownerTask) !== expectedTaskTarget)) throw new Error("复合工具的任务授权或执行目标已变化");
+            if ((initialSource && this.servers.filter(server => server.id === serverId).length !== 1)
+              || identity(this.servers.find(server => server.id === serverId)) !== initialSourceIdentity
+              || !(connecting && target?.id === serverId) && this.serverConnection(serverId).generation !== sourceGeneration) {
+              throw new Error("复合工具的源服务器身份或连接已变化");
             }
-            username = managedTarget.username;
-            password = this.serverPasswords[managedTarget.id];
-          } else if (request.credentialRef?.startsWith("server-credential:")) {
-            const credentialGroupId = request.credentialRef.slice("server-credential:".length);
-            const credentialGroup = collectServerCredentialGroups(this.secretMetadata, serverId)
-              .find((group) => group.id === credentialGroupId);
-            if (!credentialGroup
-              || credentialGroup.kind !== "ssh-password"
-              || credentialGroup.target?.toLocaleLowerCase() !== request.host.toLocaleLowerCase()) {
-              throw new Error("credentialRef 与目标服务器不匹配，请重新查询连接资料");
+            if (target && (this.servers.filter(server => server.id === target!.id).length !== 1
+              || identity(this.servers.find(server => server.id === target!.id)) !== targetIdentity
+              || !connecting && targetGeneration !== undefined && this.serverConnection(target.id).generation !== targetGeneration)) {
+              throw new Error("复合工具的目标服务器身份或连接已变化");
             }
-            const scopedSecrets = serverSecretValues(this.secretValues, serverId);
-            const groupedUsername = scopedSecrets[credentialGroup.username.key];
-            if (request.username && request.username !== groupedUsername) {
-              throw new Error("用户名与 credentialRef 对应的服务器凭据组不匹配");
-            }
-            username = groupedUsername;
-            password = scopedSecrets[credentialGroup.secret.key];
-            usernamePlaceholder = `\${secret.${credentialGroup.username.key}}`;
-          } else if (request.passwordSecretKey) {
-            password = serverSecretValues(this.secretValues, serverId)[request.passwordSecretKey];
-          }
-          if (!username) throw new Error("缺少目标服务器 SSH 用户名，请先查询连接资料或向用户收集");
-          if (credentialUsernameValidationError("ssh-password", username)) {
-            throw new Error("SSH 凭据组中的用户名格式不安全，请在敏感信息管理中修正");
-          }
-          if (!password) throw new Error("缺少目标服务器 SSH 密码，请先查询连接资料或通过用户输入工具安全收集");
-          onDispatch?.();
-          await backend.checkSshConnection({ host: request.host, port, username, password }, 15_000);
-          let target = this.servers.find((server) => server.host === request.host && server.port === port);
-          if (target) {
-            target.username = username;
-            if (request.name) target.name = request.name;
-            if (request.group) target.group = request.group;
-          } else {
-            target = this.addServer({
-              name: request.name ?? request.host,
-              host: request.host,
-              port,
-              username,
-              group: request.group ?? "智能连接",
-            });
-          }
-          if (!await this.connectServer(target.id, password)) {
-            throw new Error(this.serverConnection(target.id).error || "SSH 连接未成功");
-          }
-          const task = taskId ? this.tasks.find((candidate) => candidate.id === taskId) : undefined;
-          if (task) {
-            task.executionTargetServerId = target.id;
-            await this.ensureTaskAgentSession(task.id);
-          }
-          try {
-            await backend.saveCredential("server", target.id, password);
-          } catch (error) {
-            this.credentialError = String(error);
-          }
-          this.persist(true);
-          return {
-            serverId: target.id,
-            name: target.name,
-            host: target.host,
-            port: target.port,
-            username: usernamePlaceholder ?? target.username,
-            connected: true,
-            info: { agentTarget: true, credentialRef: request.credentialRef },
+            if (principalCurrent && !principalCurrent()) throw new Error("复合工具的凭据主体或引用已变化");
           };
+          try {
+            guard();
+            const port = request.port ?? 22;
+            username = request.username;
+            let password: string | undefined;
+            let usernamePlaceholder: string | undefined;
+            if (request.credentialRef?.startsWith("managed-server:")) {
+              const targetId = request.credentialRef.slice("managed-server:".length);
+              const managedTarget = resolveUniqueServer(this.servers, targetId);
+              if (!managedTarget || managedTarget.id !== targetId || managedTarget.host !== request.host || managedTarget.port !== port) {
+                throw new Error("credentialRef 与目标服务器不匹配，请重新查询连接资料");
+              }
+              target = managedTarget;
+              username = managedTarget.username;
+              password = this.serverPasswords[managedTarget.id];
+              principalCurrent = () => this.servers.find(server => server.id === targetId)?.username === username;
+            } else if (request.credentialRef?.startsWith("server-credential:")) {
+              const credentialGroupId = request.credentialRef.slice("server-credential:".length);
+              const credentialGroup = collectServerCredentialGroups(this.secretMetadata, serverId).find(group => group.id === credentialGroupId);
+              if (!credentialGroup || credentialGroup.kind !== "ssh-password"
+                || credentialGroup.target?.toLocaleLowerCase() !== request.host.toLocaleLowerCase()) {
+                throw new Error("credentialRef 与目标服务器不匹配，请重新查询连接资料");
+              }
+              const scopedSecrets = serverSecretValues(this.secretValues, serverId);
+              const groupedUsername = scopedSecrets[credentialGroup.username.key];
+              if (request.username && request.username !== groupedUsername) throw new Error("用户名与 credentialRef 对应的服务器凭据组不匹配");
+              username = groupedUsername;
+              password = scopedSecrets[credentialGroup.secret.key];
+              usernamePlaceholder = `\${secret.${credentialGroup.username.key}}`;
+              principalCurrent = () => {
+                const current = collectServerCredentialGroups(this.secretMetadata, serverId).find(group => group.id === credentialGroupId);
+                return Boolean(current && current.kind === credentialGroup.kind && current.target === credentialGroup.target
+                  && current.username.key === credentialGroup.username.key && current.secret.key === credentialGroup.secret.key
+                  && serverSecretValues(this.secretValues, serverId)[current.username.key] === username);
+              };
+            } else if (request.passwordSecretKey) password = serverSecretValues(this.secretValues, serverId)[request.passwordSecretKey];
+            if (!username) throw new Error("缺少目标服务器 SSH 用户名，请先查询连接资料或向用户收集");
+            if (credentialUsernameValidationError("ssh-password", username)) throw new Error("SSH 凭据组中的用户名格式不安全，请在敏感信息管理中修正");
+            if (!password) throw new Error("缺少目标服务器 SSH 密码，请先查询连接资料或通过用户输入工具安全收集");
+            target ??= resolveUniqueServerEndpoint(this.servers, request.host, port, username);
+            targetIdentity = identity(target);
+            targetGeneration = target ? this.serverConnection(target.id).generation : undefined;
+            guard();
+            onDispatch?.();
+            partial.connectionCheckDispatched = true;
+            await backend.checkSshConnection({ host: request.host, port, username, password }, 15_000);
+            partial.connectionChecked = true;
+            guard();
+            // No intentional local identity changes have happened yet: recheck the complete prepared snapshot.
+            options?.assertPrepared?.();
+            if (!target && resolveUniqueServerEndpoint(this.servers, request.host, port)) throw new Error("目标服务器目录在连接检查期间已变化，请重新准备");
+            if (target) {
+              if (request.name) target.name = request.name;
+              if (request.group) target.group = request.group;
+            } else {
+              target = this.addServer({ name: request.name ?? request.host, host: request.host, port, username, group: request.group ?? "智能连接" });
+              targetIdentity = identity(target);
+              targetGeneration = this.serverConnection(target.id).generation;
+            }
+            partial.directoryUpdated = true;
+            partial.serverId = target.id;
+            guard();
+            connecting = true;
+            const connected = await this.connectServer(target.id, password, false, () => {
+              try { guard(); return true; } catch { return false; }
+            });
+            // A verified connection remains a fact even if cancellation arrives during the await.
+            partial.connected = connected;
+            connecting = false;
+            targetGeneration = this.serverConnection(target.id).generation;
+            if (target.id === serverId) sourceGeneration = targetGeneration;
+            guard();
+            if (!connected) throw new Error(this.serverConnection(target.id).error || "SSH 连接未成功");
+            const task = taskId ? this.tasks.find(candidate => candidate.id === taskId) : undefined;
+            if (task) {
+              task.executionTargetServerId = target.id;
+              expectedTaskTarget = target.id;
+              partial.taskTargetUpdated = true;
+              guard();
+              partial.agentSessionCreationDispatched = isTauri() && agentSandboxTerminalV1Enabled();
+              const session = await this.ensureTaskAgentSession(task.id, () => {
+                try { guard(); return true; } catch { return false; }
+              });
+              partial.agentSessionPrepared = Boolean(session);
+              guard();
+            }
+            guard();
+            partial.credentialStorageDispatched = true;
+            try {
+              await backend.saveCredential("server", target.id, password);
+              partial.credentialStored = true;
+            } catch (error) {
+              this.credentialError = String(error);
+              throw error;
+            }
+            guard();
+            this.persist(true);
+            return { serverId: target.id, name: target.name, host: target.host, port: target.port,
+              username: usernamePlaceholder ?? target.username, connected: true,
+              info: { agentTarget: true, credentialRef: request.credentialRef } };
+          } catch (error) {
+            throw new ToolExecutionError(error instanceof Error ? error.message : String(error),
+              error instanceof ToolExecutionError ? error.category : "business",
+              partial.connectionChecked ? "sent" : partial.connectionCheckDispatched ? "unknown" : "not_sent",
+              error instanceof ToolExecutionError ? error.retryAfterMs : undefined, { ...partial });
+          }
         },
         expandPlanningContext: async (skillId) => {
           const current = this.tasks.find((candidate) => candidate.id === taskId);
@@ -1569,13 +2000,13 @@ export const useOpsStore = defineStore("ops", {
         getRemoteFileStructure: (request) => {
           assertConnection();
           onDispatch?.();
-          return backend.getRemoteFileStructure(connection, request);
+          return backend.getRemoteFileStructure(connection!, request);
         },
         readRemoteFileContent: async (request: FileContentRequest): Promise<FileContentResult> => {
           assertConnection();
           const maxBytes = request.maxBytes ?? 65_536;
           onDispatch?.();
-          const file = await backend.readSftpFilePrefix(connection, request.path, maxBytes);
+          const file = await backend.readSftpFilePrefix(connection!, request.path, maxBytes);
           const sampled = file.data;
           let content: string;
           try {
@@ -1593,6 +2024,54 @@ export const useOpsStore = defineStore("ops", {
             encoding: "utf-8",
           };
         },
+        inspectOperations: async (toolId, request) => {
+          assertConnection();
+          options?.assertPrepared?.();
+          const command = buildOperationsCommand(toolId, request);
+          onDispatch?.();
+          const result = await backend.executeCommand(command, connection, false, {
+            executionId: call.id, captureStreams: true,
+            onProgress: (event) => {
+              // Never stream service logs, file names or the echoed probe into progress UI.
+              const count = event.data.match(/(?:^|\n)OPSARK_PROGRESS (\d+)/)?.[1];
+              if (count) onProgress?.(`正在检查，已读取 ${count} 个条目…`);
+            },
+          });
+          if (!result.success) throw new ToolExecutionError(`运维检查未正常返回（退出码 ${result.exitCode ?? "未知"}）`, "output", "sent");
+          let data: ReturnType<typeof parseOperationsOutput>;
+          try {
+            if (typeof result.stdout !== "string") throw new Error("执行器未提供独立 stdout，请重启并更新 Core 原生进程");
+            if (result.stdoutTruncated) throw new Error("结构化 stdout 已达到捕获上限，拒绝把截断结果视为有效 JSON");
+            data = parseOperationsOutput(toolId, request, result.stdout);
+          } catch (error) {
+            const secrets = { ...serverSecretValues(this.secretValues, serverId), connectionPassword: connection?.password ?? "" };
+            const diagnostic = {
+              toolId, executionId: call.id, exitCode: result.exitCode,
+              stdoutPresent: typeof result.stdout === "string", stdoutTruncated: result.stdoutTruncated,
+              // Redact before slicing so credentials spanning a boundary cannot leak.
+              stdout: redactExecutionOutput(result.stdout ?? "", secrets).slice(0, 16384),
+              stderr: redactExecutionOutput(result.stderr ?? "", secrets).slice(0, 4096),
+              capturedPartial: true,
+            };
+            let evidenceId: string | undefined;
+            if (taskId && isTauri()) {
+              try { evidenceId = await backend.saveTaskEvidence(taskId, {
+                text: JSON.stringify(diagnostic), collectedAt: now(), capturedPartial: true,
+                serverId, executionId: call.id, kind: "tool_output_diagnostic",
+              }); } catch { /* The original protocol failure must remain the reported failure. */ }
+            }
+            this.addLog({ category: "tool", level: "error", title: "工具输出协议诊断",
+              detail: JSON.stringify({ ...diagnostic, evidenceId }), taskId, serverId });
+            throw new ToolExecutionError(`运维检查输出协议异常：${error instanceof Error ? error.message : String(error)}${evidenceId ? `；诊断证据 evidenceId=${evidenceId}` : ""}`, "output", "sent");
+          }
+          // Redact only observation strings; request identity stays byte-exact for contract validation.
+          const scopedSecrets = { ...serverSecretValues(this.secretValues, serverId), connectionPassword: connection?.password ?? "" };
+          for (const item of data.items) {
+            for (const key of ["text", "subject"]) if (typeof item[key] === "string") item[key] = redactExecutionOutput(item[key] as string, scopedSecrets);
+          }
+          for (const item of data.skipped) item.path = redactExecutionOutput(item.path, scopedSecrets);
+          return data;
+        },
         checkSoftware: async (request) => {
           assertConnection();
           const command = buildSoftwareCheckCommand(request);
@@ -1606,14 +2085,14 @@ export const useOpsStore = defineStore("ops", {
         },
         transferFileBetweenServers: async (request: ServerFileTransferRequest) => {
           assertConnection();
-          const target = this.servers.find((server) => [server.id, server.name, server.host].includes(request.targetServer));
+          const target = resolveUniqueServer(this.servers, request.targetServer);
           if (!target) throw new Error(`目标服务器“${request.targetServer}”尚未加入服务器管理`);
           if (target.id === serverId) throw new Error("源服务器和目标服务器不能相同");
           const targetConnection = this.getRuntimeConnection(target.id);
           if (!targetConnection) throw new Error(`目标服务器“${target.name}”缺少已保存的连接凭据，请先在服务器管理中连接该服务器`);
           onDispatch?.();
           const transfer = await backend.transferSftpBetweenServers(
-            connection, targetConnection, call.id, request.sourcePath, request.targetPath,
+            connection!, targetConnection, call.id, request.sourcePath, request.targetPath,
             request.overwrite === true,
             (event) => {
               const percent = event.totalBytes > 0
@@ -1624,7 +2103,7 @@ export const useOpsStore = defineStore("ops", {
           );
           return { ...transfer, targetServerId: target.id };
         },
-      });
+      }, { prepared: options?.prepared });
       if (!result.success && this.serverConnection(serverId).generation === generation) {
         this.reportConnectionFailure(serverId, result.error?.message || "");
       }
@@ -1639,9 +2118,11 @@ export const useOpsStore = defineStore("ops", {
           result: result.success ? {
             truncated: result.truncated,
           } : result.error,
+          partialData: result.success ? undefined : result.data,
           elapsedMs: Math.round(performance.now() - startedAt),
         }, null, 2),
         serverId,
+        taskId,
       });
       return result;
     },
@@ -1787,6 +2268,7 @@ export const useOpsStore = defineStore("ops", {
 
     selectTask(taskId: string) {
       this.activeTaskId = taskId;
+      void this.refreshExecutionLedger(taskId);
     },
 
     deleteTask(taskId: string) {
@@ -1951,7 +2433,7 @@ export const useOpsStore = defineStore("ops", {
           if (request.taskId === sourceTask.id && source?.status === "awaiting_input"
             && request.workflowEpoch === previousEpoch
             && request.roundId === sourceTask.currentRoundId
-            && request.serverId === executionServerId(sourceTask) && request.command === source.command) {
+            && request.serverId === executionServerId(sourceTask) && request.command === stepOperationText(source)) {
             request.workflowEpoch = sourceTask.workflowEpoch;
           }
         }
@@ -2032,6 +2514,7 @@ export const useOpsStore = defineStore("ops", {
         let context = "";
         let processed;
         let pendingProtocolError: PlanProtocolError | undefined;
+        const modelRecovery = createModelRecoveryContext();
         for (let attempt = 0; attempt < 4; attempt += 1) {
           const includedLines = selectedLines.length
             ? selectedLines
@@ -2044,7 +2527,7 @@ export const useOpsStore = defineStore("ops", {
             currentRoundId: task.currentRoundId,
             status: task.status,
           };
-          context = JSON.stringify(buildAgentContext({
+          context = JSON.stringify({ ...buildAgentContext({
             task: contextualTask,
             server,
             metrics: contextMetrics,
@@ -2074,7 +2557,7 @@ export const useOpsStore = defineStore("ops", {
             skillDirectory: this.enabledSkills,
             secretMetadata: this.secretMetadata,
             serverId,
-          }));
+          }), _modelRecovery: modelRecovery });
           const skillDefinitions = buildSkillContext(planningSkills(contextTask, this.enabledSkills));
           const developerRequest = {
             command: "process_ai_requirement",
@@ -2087,10 +2570,12 @@ export const useOpsStore = defineStore("ops", {
           const startedAt = Date.now();
           try {
             processed = await backend.processRequirement(content, {
+              ...modelIntegrationConfig(model),
               apiKey: apiKey ?? "",
               endpoint: model.endpoint,
               model: model.model,
               requestParameters: model.requestParameters,
+              capabilities: model.capabilities,
               timeoutSeconds: model.timeoutSeconds,
               context,
               generationSettings: this.aiGenerationSettings,
@@ -2399,10 +2884,13 @@ export const useOpsStore = defineStore("ops", {
         // Preserve the model proposal as one atomic business decision. Hard
         // authorization below may reject it, but Core must not silently remove
         // individual steps and turn the remainder into a different plan.
-        const candidatePlan = processed.plan.map(ensureStepValidator);
+        const candidatePlan = processed.plan.map(step => {
+          assertToolStepBoundary(step);
+          return normalizeStepValidation(step);
+        });
         validateRecoveryReferences(recoveryHistory(task), candidatePlan, taskAttemptContext(task));
         assertTaskPlanAuthorization(task, candidatePlan);
-        task.plan = candidatePlan;
+        this.prepareTaskPlan(task, candidatePlan);
         if (!task.plan.length) {
           throw new Error("模型返回了空执行计划；未执行任何命令，也未自动要求继续生成步骤");
         }
@@ -2476,7 +2964,9 @@ export const useOpsStore = defineStore("ops", {
         const serviceError = modelServiceError(error);
         if (serviceError) this.recordModelPlanningBlocker(task, serviceError);
         task.pauseReason = serviceError ? modelServiceErrorMessage(serviceError)
-          : error instanceof ExecutionPolicyError
+          : error instanceof ToolStepBoundaryError
+            ? `执行计划校验失败：${message}。未派发工具，请检查或重新生成执行计划。`
+            : error instanceof ExecutionPolicyError
             ? `${message}当前目标和已有记录已保留，未执行该计划。`
             : actionableConfiguration
               ? `${message}当前目标和已有记录已保留。`
@@ -2522,7 +3012,8 @@ export const useOpsStore = defineStore("ops", {
           tools: this.tools, secretMetadata: this.secretMetadata, skills: resolveTaskSkills(task, this.skills) }),
         instruction: task.currentInstruction ?? latestTaskRequirement(task),
         model: model && { id: model.id, model: model.model, provider: model.provider, endpoint: model.endpoint,
-          source: model.source, requestParameters: model.requestParameters },
+          source: model.source, requestParameters: model.requestParameters, capabilities: model.capabilities,
+          ...modelIntegrationConfig(model) },
         generationSettings: this.aiGenerationSettings,
         evidence: buildAdjustmentBlockerSnapshot(task, failed, this.adjustmentTargetState(task)).evidenceFingerprint,
         accountUserId: account?.user.id,
@@ -2557,7 +3048,7 @@ export const useOpsStore = defineStore("ops", {
       // A balance revision alone, or refreshing a stale optimistic cache down to
       // the refusal's actual balance, is not evidence that this call can now run.
       const changedBalance = balance && JSON.stringify(balance) !== JSON.stringify(prior);
-      const improvedBalance = changedBalance && (
+      const improvedBalance = ["INSUFFICIENT_CREDITS", "CREDITS_RECONCILIATION_REQUIRED"].includes(blocker.error.code) && changedBalance && (
         availableAtRefusal !== undefined && balance.available > availableAtRefusal
         || reservedAtRefusal !== undefined && balance.reserved < reservedAtRefusal
       );
@@ -2577,7 +3068,7 @@ export const useOpsStore = defineStore("ops", {
 
     renewAutomaticBudgetForUser(task: OpsTask) {
       if (!renewAutomaticPhaseBudget(task, now())) return;
-      this.pushMessage(task, { role: "system", kind: "event", content: "已按你的继续请求更新自动阶段预算；原目标、执行证据和无进展检测保持不变。" });
+      this.pushMessage(task, { role: "system", kind: "event", content: "已按你的继续请求续接自动执行；原目标和证据保留，后续仍受重复取证检测及有限阶段预算约束。" });
     },
 
     stopAutomaticLoop(task: OpsTask) {
@@ -2846,6 +3337,7 @@ export const useOpsStore = defineStore("ops", {
         const commandWasNotSent = failed.result?.facts.commandDispatched === false
           && category === "terminal_transport";
         if (!commandWasNotSent) {
+          recordExecutionUncertainty(task, failed, "执行通道已恢复，但原命令结果/副作用尚未确认。");
           task.pauseReason = category === "validation_protocol_exception"
             ? "终端通道已恢复，主命令已执行，但后置校验未取得真实退出码。系统不会重放主命令或让模型猜测结果；请检查当前状态后重新校验。"
             : "终端通道已恢复，但无法确定原命令是否产生副作用。系统不会自动重放或让模型猜测；请检查当前服务器状态后重试。";
@@ -2857,13 +3349,24 @@ export const useOpsStore = defineStore("ops", {
           // repeatedly and flood the task timeline.
           clearTransportAdjustmentState(task, true);
           task.transportRecovery = undefined;
-          task.managedStopReason = "transport_recovery";
+          task.managedStopReason = task.executionReconciliation ? "user_input_required" : "transport_recovery";
+          task.managedAdjustmentPhase = "manual_required";
+          if (task.executionReconciliation && !task.executionReconciliation.resolution) {
+            task.pauseReason = "连接已恢复；下一步先生成只读核对计划，检查原进程与实际产物。核对前不允许重新执行变更。";
+          }
           this.persist();
+          if (task.executionReconciliation && !task.executionReconciliation.resolution
+            && task.permission === "managed") await this.beginAdjustment(taskId, true);
           return;
         }
 
         const retry = clearStepRuntime(failed, uid("transport-retry"));
         const remaining = task.plan.filter((step) => step !== failed && ["pending", "awaiting_approval", "awaiting_input"].includes(step.status));
+        // Only this failed dispatch is proven not to have happened. Other
+        // historical dependency holds must survive channel recovery.
+        for (const next of remaining) {
+          next.failureDependencies = next.failureDependencies?.filter(item => item.failedStepId !== failed.id);
+        }
         archiveActivePhase(task, "adjustment");
         task.plan = [retry, ...remaining];
         task.pauseReason = undefined;
@@ -2921,7 +3424,7 @@ export const useOpsStore = defineStore("ops", {
         if (task.cancelRequested || !["needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)) return;
         if (expectedFingerprint && task.adjustmentIncident?.fingerprint !== expectedFingerprint) return;
         const phaseSummary = task.pauseReason;
-        const failed = task.plan.find((step) => step.status === "failed");
+        const failed = [...task.plan].reverse().find((step) => step.status === "failed");
         const localHardRepair = !protocolReplan
           && failed?.result?.facts.category === "plan_safety_rejection";
         const currentIncidentFingerprint = task.adjustmentIncident?.fingerprint
@@ -3058,6 +3561,9 @@ export const useOpsStore = defineStore("ops", {
           }
           if (!lifetime.current()) return;
           if (!policyCurrent()) throw new Error("规划期间目标、授权或已确认输入发生变化，已丢弃旧上下文生成的方案，请重新生成");
+          if (goalReview?.reconciliationResolution && task.executionReconciliation) {
+            task.executionReconciliation.resolution = goalReview.reconciliationResolution;
+          }
           if (goalReview?.complete) {
             if (replanRecord) {
               replanRecord.status = "accepted";
@@ -3149,7 +3655,7 @@ export const useOpsStore = defineStore("ops", {
             recordAdjustmentPlan(adjustmentIncident, adjustment.plan, now());
           }
           archiveActivePhase(task, "adjustment", now(), phaseSummary);
-          task.plan = adjustment.plan;
+          this.prepareTaskPlan(task, adjustment.plan);
           task.pauseReason = undefined;
           if (replanRecord) {
             replanRecord.status = "accepted";
@@ -3331,6 +3837,15 @@ export const useOpsStore = defineStore("ops", {
       }
       const failed = [...task.plan].reverse().find((step) => step.status === "failed");
       const target = this.adjustmentTargetState(task);
+      const channelReady = Boolean(this.getRuntimeConnection(executionServerId(task)))
+        && (!target.paneId || target.terminalStatus === "ready" && !target.terminalBusy);
+      if (!transportOnly && task.executionReconciliation && !task.executionReconciliation.resolution && channelReady) {
+        if (automatic && this.stopAutomaticLoop(task)) return;
+        clearTransportAdjustmentState(task, true);
+        task.transportRecovery = undefined;
+        await this.beginAdjustment(taskId, automatic);
+        return;
+      }
       let snapshot = buildAdjustmentBlockerSnapshot(task, failed, target);
       if (transportOnly && !failed && snapshot.kind !== "transport"
         && (task.adjustmentIncident?.kind === "transport" || task.managedAdjustmentPhase === "waiting_transport"
@@ -3579,6 +4094,18 @@ export const useOpsStore = defineStore("ops", {
       try { request = parseUserInputArguments(dispatch.call.arguments); }
       catch { return false; } // Normal protocol handling reports malformed forms.
 
+      const inputBlocker = repeatedAuthenticationInputBlocker(task, step, recoveryHistory(task));
+      if (inputBlocker) {
+        transitionTask(task, "needs_adjustment");
+        task.pauseReason = inputBlocker;
+        task.autoAdjustmentSeconds = undefined;
+        task.managedAdjustmentPhase = "manual_required";
+        task.managedStopReason = "workflow_error";
+        this.pushMessage(task, { role: "assistant", kind: "event", content: inputBlocker });
+        this.persist();
+        return true;
+      }
+
       // Entering a user decision boundary invalidates older planning/review work,
       // including its error callbacks. No remote call or auto-adjustment is needed.
       task.workflowEpoch = (task.workflowEpoch ?? 0) + 1;
@@ -3596,7 +4123,7 @@ export const useOpsStore = defineStore("ops", {
       this.pendingUserInputs = this.pendingUserInputs.filter(item => item.taskId !== taskId).concat({
         taskId, stepId: step.id, callId: dispatch.call.id,
         roundId: task.currentRoundId, workflowEpoch: task.workflowEpoch,
-        serverId: executionServerId(task), command: step.command, ...request,
+        serverId: executionServerId(task), command: JSON.stringify(step.action), ...request,
       });
       this.pushMessage(task, { role: "assistant", kind: "event", content: `${request.title}：${task.pauseReason}` });
       this.addLog({
@@ -3611,6 +4138,71 @@ export const useOpsStore = defineStore("ops", {
       return true;
     },
 
+    prepareTaskPlan(task: OpsTask, proposal: PlanStep[] = task.plan, commit = true): PreparedPlan {
+      const serverId = executionServerId(task);
+      const groups = collectServerCredentialGroups(this.secretMetadata, serverId);
+      const operationText = JSON.stringify(proposal.map(step => ({ action: step.action, command: step.command, validation: step.validation })));
+      const principalInputBindings = groups
+        .filter(group => operationText.includes(`server-credential:${group.id}`) || operationText.includes(`secret.${group.username.key}`))
+        .map(group => ({
+          key: group.username.key, reference: `principal:${serverId}:${group.id}:${group.username.key}`, target: group.target,
+          version: principalVersion(this, `${serverId}:${group.id}:${group.username.key}`,
+            this.secretValues[secretValueId(serverId, group.username.key)] ?? ""),
+        }));
+      const credentialBindings = Object.fromEntries(
+        groups
+          .filter(group => group.kind === "ssh-password" && group.target)
+          .map(group => [`server-credential:${group.id}`, {
+            host: group.target!, username: `\${secret.${group.username.key}}`,
+          }]),
+      );
+      const prepared = preparePlanForApproval(proposal, {
+        taskId: task.id, permission: task.permission,
+        requirement: latestTaskRequirement(task), executionConstraints: task.executionConstraints,
+        server: this.servers.find(server => server.id === serverId), servers: this.servers,
+        connectionGeneration: this.serverConnection(serverId).generation,
+        connectionGenerations: Object.fromEntries(this.servers.map(server => [server.id, this.serverConnection(server.id).generation])),
+        agentSession: useAgentTerminalStore().sessionsByTask[task.id], credentialBindings,
+        inputBindings: [...Object.entries(task.submittedSecretBindings ?? {}).map(([key, binding]) => ({
+          key, reference: `secret:${key}`, target: serverId,
+          // Password rotation within the same principal does not change authority.
+          version: binding.groupId,
+        })), ...Object.entries(task.submittedInputs ?? {}).map(([key, input]) => ({
+          key, reference: `input:${task.id}:${input.groupId}:${key}`, target: input.scope?.serverId,
+          version: principalVersion(this, `input:${task.id}:${key}`, JSON.stringify({
+            value: input.value, type: input.type, scope: input.scope, allowedValues: input.allowedValues,
+          })),
+        })), ...principalInputBindings],
+        previous: task.preparedPlan,
+      }, this.tools);
+      if (commit) {
+        const samePlan = proposal === task.plan;
+        const compatible = JSON.parse(JSON.stringify(prepared.compatibilitySteps)) as PlanStep[];
+        if (samePlan) {
+          compatible.forEach((step, index) => {
+            // Retain live object references owned by the execution lifecycle.
+            if (task.plan[index] && ["pending", "awaiting_approval", "awaiting_input"].includes(task.plan[index].status)) {
+              const live = task.plan[index];
+              for (const key of Object.keys(live)) if (!(key in step)) delete (live as unknown as Record<string, unknown>)[key];
+              Object.assign(live, step);
+            }
+          });
+        } else task.plan = compatible;
+        if (task.preparedPlan?.executionDigest !== prepared.executionDigest) task.planApproval = undefined;
+        task.preparedPlan = prepared;
+      }
+      return prepared;
+    },
+
+    assertPreparedStep(task: OpsTask, step: PlanStep) {
+      if (!step.executionIntent) return; // Old records are admitted when the queue resumes.
+      const proposal = task.plan.map(item => item === step ? { ...item, status: "pending" as const } : item);
+      const current = this.prepareTaskPlan(task, proposal, false).steps.find(item => item.id === step.id);
+      if (!current || current.intent.digest !== step.executionIntent.digest) {
+        throw new ToolExecutionError("执行动作、目标、工具契约或授权条件已变化，请重新检查计划后批准", "permission", "not_sent");
+      }
+    },
+
     async approvePlan(
       taskId: string,
       automatic = false,
@@ -3622,24 +4214,22 @@ export const useOpsStore = defineStore("ops", {
       if (hasWaitingStep(task)) return;
       if (this.presentTaskUserInput(taskId)) return;
       if (this.pauseTaskForConnection(task)) return;
-      const beforeNormalization = task.plan.map(({ id, command, validation }) => ({ id, command, validation }));
-      task.plan = normalizePlanPreconditions(task.plan, latestTaskRequirement(task), this.tools);
-      const changedSteps = task.plan.filter((step) => {
-        const before = beforeNormalization.find((candidate) => candidate.id === step.id);
-        return before && (before.command !== step.command || before.validation !== step.validation);
-      });
-      if (changedSteps.length) {
+      const requested = task.preparedPlan;
+      let prepared: PreparedPlan;
+      try { prepared = this.prepareTaskPlan(task); }
+      catch (error) { this.pauseWorkflowFailure(task, error); return; }
+      if ((!requested || requested.executionDigest !== prepared.executionDigest) && !automatic) {
         this.pushMessage(task, {
           role: "system",
           kind: "event",
-          content: `执行前安全规范化更新了 ${changedSteps.length} 个步骤的命令或后置校验，计划已显示最终内容。`,
+          content: "计划已完成参数和执行目标准备，请检查显示的最终内容后确认。",
         });
-        if (!automatic) {
-          task.pauseReason = "计划内容在批准前完成了安全规范化，请检查更新后的最终命令并重新确认。";
-          this.persist();
-          return;
-        }
+        task.pauseReason = "执行内容或目标已更新，请检查准备后的计划并重新确认。";
+        this.persist();
+        return;
       }
+      task.planApproval = acceptPreparedPlanApproval(automatic ? prepared : requested ?? prepared, prepared, automatic ? "policy" : "user");
+      if (!task.planApproval) return;
       transitionTask(task, "running");
       task.pauseReason = undefined;
       this.pushMessage(task, {
@@ -3693,7 +4283,10 @@ export const useOpsStore = defineStore("ops", {
       const pending = task.plan.find((step) => step.status === "awaiting_approval");
       if (pending) cancelStep(pending, "用户取消");
       this.pushMessage(task, { role: "user", kind: "event", content: "用户已停止本次执行。" });
-      task.summary = task.protocolRepair
+      void cancelExecutionLedger(this, taskId).then(() => this.refreshExecutionLedger(taskId)).catch(error => {
+        task.executionLedgerError = { stage: "cancel", message: String(error), remoteResultKnown: false };
+      });
+      task.summary = task.currentExecutionId ? "取消请求已记录；已派发操作的远端结果仍待核对，迟到结果会保留。" : task.protocolRepair
         ? "本次执行已停止，当前目标、已完成结果和执行记录已保留。"
         : task.pauseReason
         ? `本次执行已停止，业务目标保留。停止前的暂停原因：${task.pauseReason}`
@@ -3738,6 +4331,8 @@ export const useOpsStore = defineStore("ops", {
       const server = this.servers.find((item) => item.id === targetServerId);
       const password = this.getRuntimeConnection(targetServerId)?.password;
       const agentSession = useAgentTerminalStore().sessionsByTask[task.id];
+      try { await cancelExecutionLedger(this, taskId); }
+      catch (error) { task.executionLedgerError = { stage: "cancel", message: String(error), remoteResultKnown: false }; }
       let agentExecutionHandled = false;
       if (executionId && server && password && agentSession && agentSession.state === "busy") {
         try {
@@ -3775,7 +4370,9 @@ export const useOpsStore = defineStore("ops", {
         cancelStep(active, "用户终止");
       }
       task.currentExecutionId = undefined;
-      task.summary = "本次执行已停止，业务目标与执行证据保留，可继续完成。";
+      task.summary = executionId ? "取消请求已发送；远端结果仍待核对，迟到结果会保留，原操作不会自动重发。"
+        : "本次执行已停止，业务目标与执行证据保留，可继续完成。";
+      await this.refreshExecutionLedger(taskId);
       task.pauseReason = undefined;
       this.pushMessage(task, { role: "assistant", kind: "summary", content: task.summary });
       this.persist(true);
@@ -3829,6 +4426,9 @@ export const useOpsStore = defineStore("ops", {
             isCancelled: () => !lifetime.current(),
           });
           if (!lifetime.current()) return;
+          if (goalReview.reconciliationResolution && task.executionReconciliation) {
+            task.executionReconciliation.resolution = goalReview.reconciliationResolution;
+          }
           this.addLog({
             category: "model",
             level: goalReview.complete ? "success" : "warning",
@@ -3896,19 +4496,30 @@ export const useOpsStore = defineStore("ops", {
           return;
         }
         const step = progression.step;
+        if (!step.executionIntent) this.prepareTaskPlan(task);
+        else if (stableProtocolValue(step.executionIntent.semantic.dependencies.failureDependencies) !== stableProtocolValue(step.failureDependencies)) {
+          // Failure review can revise the controller-owned dependency decision.
+          // Re-admit the stage, then re-evaluate approval under the current policy.
+          this.prepareTaskPlan(task);
+          this.pushMessage(task, { role: "system", kind: "event", content: "失败复核已更新后续步骤的依赖判断，执行前将按当前授权重新评估。" });
+        }
+        this.assertPreparedStep(task, step);
 
-        if (!/^opsark-tool(?:\s|$)/i.test(step.command.trim())) {
+        const dependencyBlocker = failureDependencyBlocker(step);
+        if (dependencyBlocker) {
+          transitionTask(task, "needs_adjustment");
+          task.pauseReason = dependencyBlocker;
+          this.pushMessage(task, { role: "assistant", kind: "event", content: dependencyBlocker });
+          this.persist();
+          if (task.permission === "managed") void this.queueManagedAdjustment(task.id, 5);
+          return;
+        }
+
+        if (step.action?.type !== "tool") {
           step.progressMessage = "正在进行执行前安全检查…";
-          const safety = await inspectPlanSafety(step.command, step.validation, true);
+          const safety = await inspectPlanSafety(step.command, step.validation, false);
           if (!lifetime.current()) return;
-          if (safety.repairedFields.length) {
-            applySafetyNormalization(step, safety.normalizedCommand, safety.normalizedValidation);
-            this.pushMessage(task, {
-              role: "system",
-              kind: "event",
-              content: `执行前安全检查已修正步骤“${step.title}”的 ${safety.repairedFields.join("、")} 退出状态传播；计划已更新为最终内容。`,
-            });
-          }
+          this.assertPreparedStep(task, step);
           if (safety.issues.length) {
             const failure = failPlanSafetyCheck(step, safety.issues);
             transitionTask(task, "needs_adjustment");
@@ -3922,7 +4533,7 @@ export const useOpsStore = defineStore("ops", {
           }
         }
 
-        const approval = requestStepApproval(task.permission, step);
+        const approval = requestStepApproval(task.permission, step, this.tools);
         if (approval) {
           transitionTask(task, approval.taskStatus);
           this.pushMessage(task, {
@@ -3958,7 +4569,16 @@ export const useOpsStore = defineStore("ops", {
         || task.status !== "awaiting_step_approval"
         || task.plan.find(item => !["completed", "failed", "skipped"].includes(item.status)) !== step
         || advancingTasks.get(task)?.current() || executingTaskSteps.get(task)?.current()) return;
-      const approval = acceptStepApproval(step);
+      try { this.assertPreparedStep(task, step); }
+      catch (error) { this.pauseWorkflowFailure(task, error); return; }
+      if (!step.executionIntent) {
+        try { this.prepareTaskPlan(task); }
+        catch (error) { this.pauseWorkflowFailure(task, error); return; }
+        requestStepApproval("observe", step, this.tools);
+        this.persist();
+        return;
+      }
+      const approval = acceptStepApproval(step, task.preparedPlan);
       if (!approval) return;
       if (step.authenticationGate?.fingerprint === authenticationFingerprint(task, step)) step.authenticationGate.approved = true;
       transitionTask(task, approval.taskStatus);
@@ -3972,6 +4592,23 @@ export const useOpsStore = defineStore("ops", {
       const task = this.tasks.find(item => item.id === taskId);
       const step = task?.plan.find(item => item.id === stepId);
       if (!task || !step || isCancelled()) return false;
+      const recoveryBlocker = reconciliationBlocker(task, step) ?? retryBlocker(task, step);
+      if (recoveryBlocker) {
+        transitionTask(task, "needs_adjustment");
+        task.pauseReason = recoveryBlocker;
+        task.managedAdjustmentPhase = "manual_required";
+        this.pushMessage(task, { role: "assistant", kind: "event", content: recoveryBlocker });
+        this.persist();
+        return false;
+      }
+      const dependencyBlocker = failureDependencyBlocker(step);
+      if (dependencyBlocker) {
+        transitionTask(task, "needs_adjustment");
+        task.pauseReason = dependencyBlocker;
+        this.pushMessage(task, { role: "assistant", kind: "event", content: dependencyBlocker });
+        this.persist();
+        return false;
+      }
       pinTaskSkills(task, this.skills);
       const capabilityError = executionCapabilityBlocker(task, step, this.skills);
       if (capabilityError) {
@@ -4018,6 +4655,34 @@ export const useOpsStore = defineStore("ops", {
         || task.plan.find(item => !["completed", "failed", "skipped"].includes(item.status)) !== step
         || task.plan.some(item => item !== step && ["awaiting_input", "awaiting_approval", "running", "validating"].includes(item.status))
         || advancingTasks.get(task)?.current() || submittingTaskInputs.get(task)?.current()) return;
+      const suppliedCall = call;
+      const currentCall = () => {
+        this.assertPreparedStep(task, step);
+        const dispatch = resolveStepDispatch(step, task.confirmedSecretKeys ?? [], suppliedCall.id, this.tools);
+        if (dispatch.kind !== "tool") throw new Error(dispatch.kind === "invalid" ? dispatch.error : "步骤缺少结构化工具 action");
+        const supplied = parseToolAction({ type: "tool", toolId: suppliedCall.toolId, arguments: suppliedCall.arguments }, suppliedCall.id, this.tools);
+        if (supplied && step.executionIntent) {
+          const definition = this.tools.find(tool => tool.id === supplied.toolId);
+          if (!definition) throw new Error("工具已不可用");
+          supplied.arguments = prepareFinalToolArguments(definition, supplied.arguments);
+        }
+        if (stableProtocolValue(supplied) !== stableProtocolValue(dispatch.call)) throw new Error("工具调用参数与当前步骤不一致，拒绝执行");
+        const normalizedAction = { type: "tool" as const, toolId: dispatch.call.toolId, arguments: dispatch.call.arguments };
+        if (stableProtocolValue(step.action) !== stableProtocolValue(normalizedAction)) {
+          if (step.executionIntent) throw new Error("工具参数已变化，必须重新准备和批准");
+          step.action = normalizedAction;
+        }
+        return dispatch.call;
+      };
+      try { call = currentCall(); }
+      catch (error) {
+        const failure = failToolCommandParsing(step, String(error));
+        transitionTask(task, "needs_adjustment");
+        task.pauseReason = failure.pauseReason;
+        this.pushMessage(task, { role: "assistant", kind: "event", content: failure.eventMessage });
+        this.persist();
+        return;
+      }
       const toolDefinition = this.tools.find((tool) => tool.id === call.toolId);
       if (toolDefinition?.executionMode === "user-input") {
         if (!this.presentTaskUserInput(taskId)) {
@@ -4030,28 +4695,101 @@ export const useOpsStore = defineStore("ops", {
         return;
       }
       if (this.pauseTaskForConnection(task)) return;
+      const targetServerId = executionServerId(task);
+      const connectionGeneration = this.serverConnection(targetServerId).generation;
       const lifetime = claimTaskOperation(executingTaskSteps, task);
       if (!lifetime) return;
       try {
+        if (!step.executionIntent) {
+          try { this.prepareTaskPlan(task); }
+          catch (error) {
+            const failure = failToolCommandParsing(step, String(error));
+            transitionTask(task, "needs_adjustment");
+            task.pauseReason = failure.pauseReason;
+            this.pushMessage(task, { role: "assistant", kind: "event", content: failure.eventMessage });
+            this.persist();
+            return;
+          }
+        }
         if (!await this.validateRecoveryDispatch(taskId, stepId, () => !lifetime.current())) return;
+        // Revalidate after asynchronous policy checks and bind the approved action to dispatch.
+        try { call = currentCall(); }
+        catch (error) {
+          const failure = failToolCommandParsing(step, String(error));
+          transitionTask(task, "needs_adjustment");
+          task.pauseReason = failure.pauseReason;
+          this.pushMessage(task, { role: "assistant", kind: "event", content: failure.eventMessage });
+          this.persist();
+          return;
+        }
+        if (requiresStepApproval(task.permission, step, this.tools) && !hasCurrentStepApproval(step)) {
+          requestStepApproval(task.permission, step, this.tools);
+          transitionTask(task, "awaiting_step_approval");
+          step.approvedSafetySnapshot = undefined;
+          this.pushMessage(task, { role: "assistant", kind: "event", content: `步骤“${step.title}”需要确认当前工具及参数后执行。` });
+          this.persist();
+          return;
+        }
+        step.attemptContext = taskAttemptContext(task);
         task.currentExecutionId = call.id;
+        const frozenIntentDigest = step.executionIntent?.digest;
+        // Comparison only: never persist or include supplied values in a diagnostic.
+        const frozenInputBindings = stableProtocolValue({ inputs: task.submittedInputs, secrets: task.submittedSecretBindings });
         let toolSubmitted = false;
         let toolFailedBeforeSend = false;
+        let toolAttemptNumber = 0;
         const lifecycle = await runToolStepLifecycle({
           step,
           call,
           execute: async () => {
-            const result = await this.executeToolCall(
-              executionServerId(task),
-              call,
+            // Retry delays are asynchronous boundaries too. Never move an old
+            // call onto a replacement connection, target, or edited plan.
+            if (executionServerId(task) !== targetServerId
+              || this.serverConnection(targetServerId).generation !== connectionGeneration) {
+              throw new ToolExecutionError("工具调用的目标连接已变化，请核对目标后重新规划", "unavailable", "not_sent");
+            }
+            lifetime.assertCurrent();
+            this.assertPreparedStep(task, step);
+            const dispatch = resolveStepDispatch(step, task.confirmedSecretKeys ?? [], call.id, this.tools);
+            if (task.plan.find(item => item.id === stepId) !== step
+              || dispatch.kind !== "tool" || stableProtocolValue(dispatch.call) !== stableProtocolValue(call)
+              || requiresStepApproval(task.permission, step, this.tools) && !hasCurrentStepApproval(step)) {
+              throw new ToolExecutionError("工具步骤或审批在等待期间已变化，已停止派发", "permission", "not_sent");
+            }
+            const physicalId = toolAttemptNumber++ === 0 ? call.id : uid("tool-attempt");
+            task.currentExecutionId = physicalId;
+            const result = await this.recordStepExecution(task, step, "tool", physicalId, () => lifetime.current(), async () => {
+              lifetime.assertCurrent();
+              this.assertPreparedStep(task, step);
+              return this.executeToolCall(
+              targetServerId,
+              { ...call, id: physicalId },
               (message) => { step.progressMessage = message; },
               undefined,
               task.id,
               () => { toolSubmitted = true; },
+              { prepared: Boolean(step.executionIntent),
+                assertPrepared: () => this.assertPreparedStep(task, step),
+                assertCurrent: () => {
+                  lifetime.assertCurrent();
+                  const intent = step.executionIntent;
+                  const definition = this.tools.find(tool => tool.id === call.toolId);
+                  if (task.plan.find(item => item.id === stepId) !== step || !intent || intent.digest !== frozenIntentDigest
+                    || !stepMatchesExecutionIntent(step) || task.permission !== intent.semantic.permission
+                    || stableProtocolValue({ inputs: task.submittedInputs, secrets: task.submittedSecretBindings }) !== frozenInputBindings
+                    || stableProtocolValue(task.executionConstraints) !== stableProtocolValue(intent.semantic.constraints)
+                    || !definition || stableProtocolValue(effectiveToolSemanticContract(definition)) !== stableProtocolValue(intent.semantic.toolContract)
+                    || requiresStepApproval(task.permission, step, this.tools) && !hasCurrentStepApproval(step)) {
+                    throw new ToolExecutionError("复合工具执行期间动作或授权已变化", "permission", "not_sent");
+                  }
+                },
+              },
             );
-            toolFailedBeforeSend = !result.success && isSshConnectionSetupFailure(result.error?.message);
-            return result;
+            });
+            toolFailedBeforeSend = !result.success && result.error?.dispatchState === "not_sent";
+            return { ...result, callId: call.id };
           },
+          onRetry: attempt => { step.progressMessage = `只读调用暂时失败，正在进行第 ${attempt} 次重试…`; },
           createEvidenceId: () => uid("evidence-tool"),
           now,
           isCancelled: () => !lifetime.current(),
@@ -4071,6 +4809,14 @@ export const useOpsStore = defineStore("ops", {
         }
         if (!lifetime.current()) return;
         transitionTask(task, lifecycle.taskStatus);
+        if (step.status === "completed") await this.markExecutionVerified(step);
+        if (!lifetime.current()) return;
+        if (step.status === "failed") {
+          holdFailureDependents(step, task.plan.filter(item => item.status === "pending"));
+          if (toolSubmitted && !toolFailedBeforeSend && step.result?.facts.commandDispatched !== false) {
+            recordExecutionUncertainty(task, step, "已提交的变更工具返回失败，需先核对是否产生部分副作用。");
+          }
+        }
         task.pauseReason = lifecycle.pauseReason;
         this.pushMessage(task, {
           role: "assistant",
@@ -4090,8 +4836,16 @@ export const useOpsStore = defineStore("ops", {
         }
         lifetime.release();
         await this.advanceTask(taskId);
+      } catch (error) {
+        if (error instanceof ExecutionLedgerError) {
+          if (lifetime.current()) this.handleExecutionLedgerError(task, step, error);
+          else await this.refreshExecutionLedger(taskId);
+          return;
+        }
+        throw error;
       } finally {
         lifetime.release();
+        void this.refreshExecutionLedger(taskId);
       }
     },
 
@@ -4109,16 +4863,30 @@ export const useOpsStore = defineStore("ops", {
       if (!lifetime) return;
       try {
         if (!await this.validateRecoveryDispatch(taskId, stepId, () => !lifetime.current())) return;
+        if (!step.executionIntent) {
+          try { this.prepareTaskPlan(task); }
+          catch (error) {
+            const failure = failToolCommandParsing(step, String(error));
+            transitionTask(task, "needs_adjustment");
+            task.pauseReason = failure.pauseReason;
+            this.pushMessage(task, { role: "assistant", kind: "event", content: failure.eventMessage });
+            this.persist();
+            return;
+          }
+        }
         step.attemptContext = taskAttemptContext(task);
         const targetServerId = executionServerId(task);
         const connectionGeneration = this.serverConnection(targetServerId).generation;
         const assertConnection = () => {
+          lifetime.assertCurrent();
           const capabilityError = executionCapabilityBlocker(task, step, this.skills);
           if (capabilityError) throw new Error(capabilityError);
           if (!this.getRuntimeConnection(targetServerId)
+            || executionServerId(task) !== targetServerId
             || this.serverConnection(targetServerId).generation !== connectionGeneration) {
             throw new Error("SSH 连接已断开或更换，远程操作已暂停；已发送命令的结果需核对");
           }
+          this.assertPreparedStep(task, step);
         };
         const incompatibleSecret = findSecretKeys(`${step.command}\n${step.validation}`)
           .map((key) => ({ key, metadata: this.secretMetadata.find((item) => item.key === key && item.serverId === targetServerId) }))
@@ -4186,11 +4954,9 @@ export const useOpsStore = defineStore("ops", {
           return;
         }
 
-        if (requiresStepApproval(task.permission, step) && !hasCurrentStepApproval(step)) {
-          if (step.status !== "awaiting_approval") transitionStep(step, "awaiting_approval");
+        if (requiresStepApproval(task.permission, step, this.tools) && !hasCurrentStepApproval(step)) {
+          requestStepApproval(task.permission, step, this.tools);
           transitionTask(task, "awaiting_step_approval");
-          step.safetyApprovalSnapshot = undefined;
-          step.approvedSafetySnapshot = undefined;
           this.pushMessage(task, {
             role: "assistant",
             kind: "event",
@@ -4208,7 +4974,7 @@ export const useOpsStore = defineStore("ops", {
         const authenticationIdentity = authenticationFingerprint(task, step);
         if (authenticationReason && !(step.authenticationGate?.approved && step.authenticationGate.fingerprint === authenticationIdentity)) {
           step.authenticationGate = { fingerprint: authenticationIdentity, reason: authenticationReason };
-          transitionStep(step, "awaiting_approval");
+          requestStepApproval("observe", step, this.tools);
           transitionTask(task, "awaiting_step_approval");
           task.pauseReason = authenticationReason;
           task.autoAdjustmentSeconds = undefined;
@@ -4260,6 +5026,7 @@ export const useOpsStore = defineStore("ops", {
         );
         if (!lifetime.current()) return;
         if (this.pauseTaskForConnection(task, connectionGeneration)) return;
+        this.assertPreparedStep(task, step);
         if (finalSafety.issues.length) {
           const failure = failPlanSafetyCheck(step, finalSafety.issues);
           transitionTask(task, "needs_adjustment");
@@ -4314,6 +5081,26 @@ export const useOpsStore = defineStore("ops", {
         const validationPromptCredential = validationCredentialResolution.status === "resolved"
           ? validationCredentialResolution.credential
           : undefined;
+        const hasFixedPromptChannel = Boolean(interactivePromptCredential)
+          && agentSandboxTerminalV1Enabled() && isTauri() && Boolean(prepared.connection);
+        const authRetryBlocker = gitAuthenticationRetryBlocker(task, step, recoveryHistory(task), hasFixedPromptChannel);
+        if (authRetryBlocker) {
+          transitionTask(task, "needs_adjustment");
+          task.pauseReason = authRetryBlocker;
+          task.autoAdjustmentSeconds = undefined;
+          task.managedAdjustmentPhase = "manual_required";
+          task.managedStopReason = "workflow_error";
+          this.pushMessage(task, { role: "assistant", kind: "event", content: authRetryBlocker });
+          this.persist();
+          return;
+        }
+        step.authenticationAttempt = {
+          channel: hasFixedPromptChannel ? "foreground-pty-v2" : "noninteractive",
+          credentialRevision: task.credentialRevision ?? 0,
+        };
+        if (step.executionIntent && (step.command !== prepared.commandTemplate || step.validation !== prepared.validationTemplate)) {
+          throw new Error("命令模板需要重新准备，原批准已失效");
+        }
         step.command = prepared.commandTemplate;
         step.validation = prepared.validationTemplate;
 
@@ -4330,6 +5117,10 @@ export const useOpsStore = defineStore("ops", {
         appendTerminalBlock(this.terminalLines, entry.terminalHeader);
         const agentTerminals = useAgentTerminalStore();
         const scopedStep = normalizePlanStepExecutionScope(step);
+        if (step.executionIntent && (step.executionScope !== scopedStep.executionScope
+          || step.validationScope !== scopedStep.validationScope || step.runtimeClass !== scopedStep.runtimeClass)) {
+          throw new Error("执行作用域需要重新准备，原批准已失效");
+        }
         step.executionScope = scopedStep.executionScope;
         step.validationScope = scopedStep.validationScope;
         step.runtimeClass = scopedStep.runtimeClass;
@@ -4375,7 +5166,14 @@ export const useOpsStore = defineStore("ops", {
             );
             let frameworkStreamed = false;
             try {
-              const frameworkResult = useAgentSandbox && prepared.connection && agentSession
+              const semantic = { ...step.executionIntent!.semantic, action: { type: "shell" as const,
+                command: redactExecutionOutput(command, scopedSecrets) }, effect: "change" as const };
+              const intent: ExecutionIntentSnapshot = { version: "execution-intent@1", algorithm: "sha256", semantic,
+                digest: executionDigest({ version: "execution-intent@1", semantic }) };
+              const frameworkResult = await this.recordStepExecution(task, step, "framework", frameworkExecutionId,
+                () => lifetime.current(), async () => {
+                assertConnection();
+                return useAgentSandbox && prepared.connection && agentSession
                 ? await backend.executeAgentCommand({
                   connection: prepared.connection,
                   session: agentSession,
@@ -4406,6 +5204,7 @@ export const useOpsStore = defineStore("ops", {
                     appendTerminalStream(this.terminalLines, safeChunk);
                   },
                 });
+              }, { intent, effect: "change", subkey: intent.digest });
               const safeFrameworkOutput = redactExecutionOutput(frameworkResult.output, scopedSecrets);
               if (safeFrameworkOutput && !frameworkStreamed) {
                 agentTerminals.completionOutput(task.id, frameworkExecutionId, `${safeFrameworkOutput}\n`);
@@ -4468,6 +5267,8 @@ export const useOpsStore = defineStore("ops", {
             rollbackShellStartupOnFailure = rollbackShellStartup;
           }
           const requirement = latestTaskRequirement(task);
+          step.executionPolicy = freezeCommandExecutionPolicy(step, executionId, Date.now(), step.executionPolicy);
+          this.persist(true);
           const commandLifecycle = await runCommandLifecycle({
             task,
             step,
@@ -4475,6 +5276,7 @@ export const useOpsStore = defineStore("ops", {
             command: prepared.resolvedCommand,
             validation: prepared.resolvedValidation,
             executionId,
+            executionPolicy: step.executionPolicy,
             connection: prepared.connection,
             runtimeModel: prepared.runtimeModel,
             secretValues: scopedSecrets,
@@ -4531,7 +5333,7 @@ export const useOpsStore = defineStore("ops", {
             sampleRuntimeProgress: useAgentSandbox && prepared.connection && agentSession
               ? async () => { assertConnection(); return backend.sampleAgentExecutionProgress(prepared.connection!, agentSession!, executionId); }
               : undefined,
-          }, async (input) => {
+          }, async (input) => this.recordStepExecution(task, step, "command", input.executionId, () => lifetime.current(), async () => {
             assertConnection();
             commandSubmitted = true;
             // Browser tests and the one-version rollback use the existing
@@ -4570,7 +5372,7 @@ export const useOpsStore = defineStore("ops", {
                 exactSecretKeys: input.exactSecretKeys,
               }),
             };
-          });
+          }));
           const result = commandLifecycle.result;
           if (lifetime.current()) this.recordAdjustmentExecution(task, step.id);
           const streamedOutput = commandLifecycle.streamedOutput;
@@ -4640,6 +5442,7 @@ export const useOpsStore = defineStore("ops", {
               evidenceId: uid("evidence-long-review"),
               collectedAt: now(),
             });
+            holdFailureDependents(step, task.plan.filter(item => item.status === "pending"));
             if (step.result && startupTransaction) {
               step.result.facts.shellStartupSnapshot = startupTransaction.backupPaths.join(",");
               step.result.facts.shellStartupRollback = startupRollbackSucceeded ? "success" : "failed";
@@ -4665,6 +5468,24 @@ export const useOpsStore = defineStore("ops", {
               evidenceId: uid("evidence-main"),
               collectedAt: now(),
             });
+            if (authenticationChannelFailure(safeOutput)
+              && (hasFixedPromptChannel || safeOutput.includes("PTY_AUTH_CHANNEL_UNAVAILABLE"))) {
+              holdFailureDependents(step, task.plan.filter(item => item.status === "pending"));
+              await this.archiveTaskStepEvidence(task, step);
+              if (!lifetime.current()) return;
+              transitionTask(task, "needs_adjustment");
+              task.pauseReason = "AUTH_CHANNEL_UNAVAILABLE：认证终端不可用，执行结果已保留。请先修复并验证认证通道；不会重复执行，也不会再次索取同一份凭据。";
+              task.autoAdjustmentSeconds = undefined;
+              task.managedAdjustmentPhase = "manual_required";
+              task.managedStopReason = "workflow_error";
+              this.pushMessage(task, { role: "assistant", kind: "event", content: task.pauseReason });
+              this.persist();
+              return;
+            }
+            if ([124, 137].includes(result.exitCode ?? -1)) {
+              recordExecutionUncertainty(task, step, "变更超时或被强制终止，需先核对是否仍有子进程及已产生的副作用。");
+            }
+            holdFailureDependents(step, task.plan.filter(item => item.status === "pending"));
             if (step.result && startupTransaction) {
               step.result.facts.shellStartupSnapshot = startupTransaction.backupPaths.join(",");
               step.result.facts.shellStartupRollback = startupRollbackSucceeded ? "success" : "failed";
@@ -4783,8 +5604,8 @@ export const useOpsStore = defineStore("ops", {
                   step.attemptContext = taskAttemptContext(task);
                   this.persist();
                 } : undefined,
-              }, useAgentSandbox && prepared.connection && agentSession
-                ? async (input) => {
+              }, async input => this.recordStepExecution(task, step, "validation", input.executionId, () => lifetime.current(), async () => {
+                if (useAgentSandbox && prepared.connection && agentSession) {
                   assertConnection();
                   let agentValidationStreamed = false;
                   agentTerminals.begin(
@@ -4837,7 +5658,8 @@ export const useOpsStore = defineStore("ops", {
                     emptyResult: result.emptyResult,
                   };
                 }
-                : async (input) => { assertConnection(); return executeStepValidation(input); });
+                assertConnection(); return executeStepValidation(input);
+              }, { effect: "read" }));
             })();
           if (!lifetime.current()) {
             await rollbackShellStartup("任务在验收期间已取消");
@@ -4882,6 +5704,9 @@ export const useOpsStore = defineStore("ops", {
             },
           );
           applyValidatedStepResult(step, classified);
+          if (!classified.accepted || classified.result.facts.semanticAcceptanceRequired === true) {
+            holdFailureDependents(step, task.plan.filter(item => item.status === "pending"));
+          }
           if (step.result && startupTransaction) {
             step.result.facts.shellStartupSnapshot = startupTransaction.backupPaths.join(",");
             if (startupRollbackAttempted) {
@@ -4903,7 +5728,8 @@ export const useOpsStore = defineStore("ops", {
             && classified.result.executionStatus === "success";
           const reviewRequired = postconditionReview || classified.needsModelReview;
           if (monitoringModelError) {
-            if (!reviewRequired) transitionStep(step, "completed");
+            if (!reviewRequired) { transitionStep(step, "completed"); await this.markExecutionVerified(step); }
+            if (!lifetime.current()) return;
             this.pauseStepModelServiceFailure(task, step, monitoringModelError);
             return;
           }
@@ -4936,6 +5762,8 @@ export const useOpsStore = defineStore("ops", {
           reviewPipeline.audits.forEach((event) => this.addLog(event));
           const coordination = reviewPipeline.coordination;
           transitionTask(task, coordination.taskStatus);
+          if (step.status === "completed") await this.markExecutionVerified(step);
+          if (!lifetime.current()) return;
           task.pauseReason = coordination.pauseReason;
           this.pushMessage(task, {
             role: "assistant",
@@ -4949,6 +5777,11 @@ export const useOpsStore = defineStore("ops", {
           lifetime.release();
           await this.advanceTask(taskId);
         } catch (error) {
+          if (error instanceof ExecutionLedgerError) {
+            if (lifetime.current()) this.handleExecutionLedgerError(task, step, error);
+            else await this.refreshExecutionLedger(taskId);
+            return;
+          }
           if (!lifetime.current()) return;
           if (this.pauseStepModelServiceFailure(task, step, error)) return;
           // An exception after submission may mean a command ran remotely.
@@ -4968,8 +5801,10 @@ export const useOpsStore = defineStore("ops", {
           if (!lifetime.current()) return;
           if (executionPhase === "validation") {
             const failure = failValidationProtocol(step, error);
+            holdFailureDependents(step, task.plan.filter(item => item.status === "pending"));
             if (monitoringModelError && this.pauseStepModelServiceFailure(task, step, monitoringModelError)) return;
             if (isTerminalTransportFailure(error)) {
+              recordExecutionUncertainty(task, step, "主命令已执行但验收通道中断，需只读核对实际结果。");
               transitionStep(step, "failed");
               transitionTask(task, "needs_adjustment");
               task.pauseReason = failure.pauseReason;
@@ -5039,6 +5874,9 @@ export const useOpsStore = defineStore("ops", {
             step.result.facts.terminalReleased = false;
             step.progressMessage = "终端执行通道待恢复";
           }
+          if (commandSubmitted && !isSshConnectionSetupFailure(error)) {
+            recordExecutionUncertainty(task, step, "已提交命令返回异常，执行结果未知，需核对实际副作用。");
+          }
           transitionTask(task, failure.taskStatus);
           task.pauseReason = failure.pauseReason;
           this.pushMessage(task, {
@@ -5054,6 +5892,7 @@ export const useOpsStore = defineStore("ops", {
         }
       } finally {
         lifetime.release();
+        void this.refreshExecutionLedger(taskId);
       }
     },
 
@@ -5066,7 +5905,7 @@ export const useOpsStore = defineStore("ops", {
         || expectedCallId !== undefined && request.callId !== expectedCallId
         || request.roundId !== undefined && request.roundId !== task.currentRoundId
         || request.workflowEpoch !== undefined && request.workflowEpoch !== (task.workflowEpoch ?? 0)
-        || request.command !== undefined && request.command !== step.command
+        || request.command !== undefined && request.command !== stepOperationText(step)
         || request.serverId !== undefined && request.serverId !== executionServerId(task)) return false;
       const targetServerId = executionServerId(task);
 
@@ -5096,7 +5935,7 @@ export const useOpsStore = defineStore("ops", {
       const currentRequest = () => lifetime.current() && task.status === "awaiting_input"
         && task.plan.find(item => item.id === step.id) === step && step.status === "awaiting_input"
         && this.pendingUserInputs.includes(request) && executionServerId(task) === targetServerId
-        && (request.command === undefined || request.command === step.command);
+        && (request.command === undefined || request.command === stepOperationText(step));
       const assertCurrentRequest = () => { if (!currentRequest()) throw new Error("用户确认请求已过期"); };
       const credentialWrite = request.fields.some(field => field.type === "password")
         ? reserveInputCredentialWrite(this) : undefined;
@@ -5278,6 +6117,7 @@ export const useOpsStore = defineStore("ops", {
                 label: field.label,
                 description: field.description,
                 type: field.type,
+                allowedValues: field.type === "select" ? field.options?.map(option => option.value) : undefined,
                 groupId: request.callId,
                 groupTitle: request.title,
                 submittedAt,
@@ -5352,7 +6192,7 @@ export const useOpsStore = defineStore("ops", {
         || request.roundId !== undefined && request.roundId !== task.currentRoundId
         || request.workflowEpoch !== undefined && request.workflowEpoch !== (task.workflowEpoch ?? 0)
         || request.serverId !== undefined && request.serverId !== executionServerId(task)
-        || request.command !== undefined && request.command !== step.command) return false;
+        || request.command !== undefined && request.command !== stepOperationText(step)) return false;
       const lifetime = claimTaskOperation(submittingTaskInputs, task);
       if (!lifetime) return false;
       const credentialWrite = reserveInputCredentialWrite(this);
@@ -5362,7 +6202,7 @@ export const useOpsStore = defineStore("ops", {
         const currentRequest = () => lifetime.current() && this.pendingSecret === request
           && task.status === "awaiting_input" && step.status === "awaiting_input"
           && task.plan.includes(step) && executionServerId(task) === targetServerId
-          && (request.command === undefined || request.command === step.command);
+          && (request.command === undefined || request.command === stepOperationText(step));
         if (!currentRequest()) return false;
         const valueId = secretValueId(targetServerId, request.key);
         const previous = this.secretValues[valueId];
@@ -5542,8 +6382,24 @@ export const useOpsStore = defineStore("ops", {
       });
     },
 
+    async saveModelProfile(model: ModelProfile, apiKey: string) {
+      if (model.source === "official" || this.models.some(item => item.id === model.id && item.source === "official")) throw new Error("官方连接由账号服务管理");
+      validateModelConfiguration(model);
+      // Persist the credential first; a failed keychain write must not commit the draft.
+      if (apiKey) await backend.saveCredential("model", model.id, apiKey);
+      else await backend.deleteCredential("model", model.id);
+      const saved = { ...model, hasApiKey: Boolean(apiKey) };
+      const index = this.models.findIndex(item => item.id === model.id);
+      if (index < 0) this.models.push(saved); else this.models[index] = saved;
+      this.modelApiKeys[model.id] = apiKey;
+      this.modelAvailability[model.id] = { status: "unknown", reason: "配置已保存，尚未测试", checkedAt: now() };
+      this.persist(true);
+    },
+
     async saveModels() {
-      for (const model of this.models) validateRequestParameters(model.requestParameters);
+      for (const model of this.models) {
+        validateModelConfiguration(model);
+      }
       this.aiGenerationSettings = normalizeAiGenerationSettings(this.aiGenerationSettings);
       this.models = this.models.filter((model) => model.provider !== "Built-in" && model.id !== "model-local");
       const credentials = this.models.filter(model => model.source !== "official").map(async (model) => {
@@ -5561,7 +6417,7 @@ export const useOpsStore = defineStore("ops", {
       } finally {
         this.persist(true);
       }
-      await this.refreshModelAvailability();
+      // Saving settings never performs a paid generation request.
     },
 
     async refreshModelAvailability() {
@@ -5592,7 +6448,8 @@ export const useOpsStore = defineStore("ops", {
             apiKey,
             endpoint: model.endpoint,
             model: model.model,
-            requestParameters: model.requestParameters,
+            // Background availability only uses the model-list endpoint. Explicit
+            // parameter/JSON generation tests live in the model editor.
             timeoutSeconds: model.timeoutSeconds,
           });
           this.modelAvailability[model.id] = {

@@ -5,6 +5,7 @@ import { useConnectionStore } from "@/features/connection/connectionStore";
 import { useAgentTerminalStore } from "@/features/terminal/agentTerminalStore";
 import type { AgentSessionRef, OpsTask, PermissionLevel, ServerProfile } from "@/types";
 import { useOpsStore } from "./ops";
+import { recordExecutionUncertainty } from "@/features/agent/operationalRecovery";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => undefined) }));
 
@@ -91,16 +92,65 @@ describe("bounded task transport recovery", () => {
     expect(task.managedStopReason).toBeUndefined();
   });
 
-  it("a ready channel with unknown command side effects stops manually without replay", async () => {
+  it("a ready channel with unknown side effects preserves the incident when no model can plan verification", async () => {
     const { ops, task } = fixture("managed");
     const approve = vi.spyOn(ops, "approvePlan").mockResolvedValue(undefined);
     await ops.requestAdjustment(task.id, true);
     expect(task.managedAdjustmentPhase).toBe("manual_required");
-    expect(task.managedStopReason).toBe("transport_recovery");
+    expect(task.managedStopReason).toBe("no_action");
+    expect(task.executionReconciliation?.stepId).toBe("failed");
+    expect(task.executionReconciliation?.resolution).toBeUndefined();
     expect(task.adjustmentIncident).toBeUndefined();
     expect(task.plan[0].status).toBe("failed");
     expect(approve).not.toHaveBeenCalled();
     expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it("hands managed recovery to the bounded planner without replaying the unknown write", async () => {
+    const { ops, task } = fixture("managed");
+    const planning = vi.spyOn(ops, "beginAdjustment").mockResolvedValue(undefined);
+    await ops.requestAdjustment(task.id, true);
+    expect(planning).toHaveBeenCalledExactlyOnceWith(task.id, true);
+    expect(task.executionReconciliation?.resolution).toBeUndefined();
+    expect(task.plan[0].status).toBe("failed");
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it("manual verification entry leaves the consumed transport incident instead of replaying it", async () => {
+    const { ops, task } = fixture();
+    recordExecutionUncertainty(task, task.plan[0], "结果未知");
+    const planning = vi.spyOn(ops, "beginAdjustment").mockResolvedValue(undefined);
+    await ops.requestAdjustment(task.id);
+    expect(planning).toHaveBeenCalledExactlyOnceWith(task.id, false);
+    expect(task.managedStopReason).toBeUndefined();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it("restores an interrupted write into a persisted verification hold, retaining evidence", () => {
+    const { ops, task } = fixture("managed");
+    task.status = "running";
+    task.plan[0].status = "running";
+    task.plan[0].output = "partial remote output";
+    ops.persist(true);
+    setActivePinia(createPinia());
+    const restored = useOpsStore().tasks.find(item => item.id === task.id)!;
+    expect(restored.status).toBe("needs_adjustment");
+    expect(restored.plan[0].output).toBe("partial remote output");
+    expect(restored.executionReconciliation?.stepId).toBe("failed");
+    expect(restored.currentExecutionId).toBeUndefined();
+    expect(restored.autoAdjustmentSeconds).toBeUndefined();
+  });
+
+  it("blocks an unknown-side-effect write at dispatch but permits a separate read", async () => {
+    const { ops, task } = fixture("managed");
+    recordExecutionUncertainty(task, task.plan[0], "超时");
+    task.plan.push({ ...task.plan[0], id: "retry", status: "pending", result: undefined });
+    expect(await ops.validateRecoveryDispatch(task.id, "retry", () => false)).toBe(false);
+    expect(task.pauseReason).toContain("先只读检查");
+    task.plan.push({ id: "read", kind: "observe", title: "核对进程", description: "只读", command: "ps -ef",
+      validation: "", expected: "真实进程", risk: "low", status: "pending" });
+    expect(await ops.validateRecoveryDispatch(task.id, "read", () => false)).toBe(true);
     expect(backend.executeAgentCommand).not.toHaveBeenCalled();
   });
 

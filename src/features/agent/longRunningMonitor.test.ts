@@ -7,6 +7,7 @@ import {
 } from "@/features/agent/longRunningMonitor";
 import type { LongRunningMonitorScheduler, StartLongRunningMonitorInput } from "@/features/agent/longRunningMonitor";
 import type { ModelServiceError, OpsTask, PlanStep, StepReview } from "@/types";
+import { freezeCommandExecutionPolicy } from "./executionPolicy";
 
 const review = (decision: StepReview["decision"], source: StepReview["source"]): StepReview => ({
   decision,
@@ -39,6 +40,76 @@ function progressiveMonitor(overrides: Partial<StartLongRunningMonitorInput> = {
 }
 
 describe("longRunningMonitor", () => {
+  it.each([
+    "du -x -h -d 1 / 2>/dev/null | sort -h",
+    "find / -xdev -type f -size +100M -printf '%s %p\\n' | sort -rn | head -n 50",
+  ])("keeps a quiet read scan alive through 90 seconds but enforces its fixed deadline: %s", async command => {
+    const step = { id: "scan", title: "scan", description: "scan", command, kind: "observe",
+      validation: "true", expected: "sizes", risk: "low", status: "running" } satisfies PlanStep;
+    const executionPolicy = freezeCommandExecutionPolicy(step, "exec", 0);
+    const { input, monitor, advance } = progressiveMonitor({ step, executionPolicy,
+      sampleRuntimeProgress: async () => ({ active: true, processCount: 3, cpuPercent: 0, ioBytes: 0 }) });
+    for (const time of [30_000, 60_000, 90_000, 300_000]) await advance(time);
+    expect(input.cancelExecution).not.toHaveBeenCalled();
+    expect(monitor.getState().workload).toBe("progressive");
+    const context = JSON.parse(vi.mocked(input.reviewStep).mock.calls[0][1]);
+    expect(context.progress.hardLimitSeconds).toBe(600);
+    expect(context.progress.maxConsecutiveContinueRounds).toBeUndefined();
+    await advance(600_000);
+    await advance(630_000);
+    expect(input.cancelExecution).toHaveBeenCalledOnce();
+    expect(monitor.getState().decision).toMatchObject({ decision: "adjust", source: "rules" });
+    monitor.stop();
+  });
+
+  it("retains the persisted attempt's deadline when monitoring attaches later", async () => {
+    const step = { id: "scan", title: "scan", description: "scan", command: "du /", kind: "observe",
+      startedAt: new Date(590_000).toISOString(), validation: "true", expected: "sizes",
+      risk: "low", status: "running" } satisfies PlanStep;
+    const executionPolicy = JSON.parse(JSON.stringify(freezeCommandExecutionPolicy(step, "exec", 0)));
+    const { input, monitor, advance } = progressiveMonitor({ step, executionPolicy });
+    await advance(599_000);
+    expect(input.cancelExecution).not.toHaveBeenCalled();
+    await advance(600_000);
+    expect(input.cancelExecution).toHaveBeenCalledOnce();
+    monitor.stop();
+  });
+
+  it("does not miss the next 30-second sample when a prior sample finishes asynchronously", async () => {
+    let release = (_value: { active: boolean; processCount: number; cpuPercent: number; ioBytes: number }) => {};
+    const sampleRuntimeProgress = vi.fn().mockImplementationOnce(() => new Promise(resolve => { release = resolve; }))
+      .mockResolvedValue({ active: true, processCount: 2, cpuPercent: 0, ioBytes: 0 });
+    const { input, monitor, advance } = progressiveMonitor({ sampleRuntimeProgress });
+    await advance(30_000);
+    await advance(31_000);
+    release({ active: true, processCount: 2, cpuPercent: 0, ioBytes: 0 });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await advance(60_000);
+    expect(sampleRuntimeProgress).toHaveBeenCalledTimes(2);
+    expect(monitor.getState().lastRuntimeSampleAt).toBe(new Date(60_000).toISOString());
+    expect(input.cancelExecution).not.toHaveBeenCalled();
+    monitor.stop();
+  });
+
+  it("does not turn stale or unavailable runtime metrics into confirmed idle rounds", async () => {
+    let release = (_value: { active: boolean; processCount: number; cpuPercent: number; ioBytes: number }) => {};
+    const sampleRuntimeProgress = vi.fn().mockImplementationOnce(() => new Promise(resolve => { release = resolve; }))
+      .mockResolvedValue({ active: true, processCount: 2, cpuPercent: null, ioBytes: null });
+    const { input, monitor, advance } = progressiveMonitor({ sampleRuntimeProgress });
+    await advance(30_000);
+    await advance(60_000);
+    release({ active: true, processCount: 2, cpuPercent: 0, ioBytes: 0 });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(monitor.getState()).toMatchObject({ noProgressReviewRounds: 0, runtimeIdleReviewRounds: 0 });
+    const context = JSON.parse(vi.mocked(input.reviewStep).mock.calls[0][1]);
+    expect(context.progress).toMatchObject({ runtimeSampleFresh: false, runtimeCpuAvailable: false, runtimeIoAvailable: false });
+    expect(context.progress.runtimeCpuPercent).toBeUndefined();
+    await advance(90_000);
+    expect(monitor.getState()).toMatchObject({ noProgressReviewRounds: 0, runtimeIdleReviewRounds: 0 });
+    expect(input.cancelExecution).not.toHaveBeenCalled();
+    monitor.stop();
+  });
+
   it.each(["INSUFFICIENT_CREDITS", "CREDITS_RECONCILIATION_REQUIRED"])(
     "reports %s once and keeps monitoring the running command without further model calls",
     async (code) => {
@@ -279,7 +350,7 @@ describe("longRunningMonitor", () => {
     controller.stop();
   });
 
-  it("reports 60 seconds without progress and stops after bounded continue reaches its limit", async () => {
+  it("does not convert two continue decisions or missing samples into bounded failure", async () => {
     let currentTime = Date.parse("2026-08-14T00:00:00.000Z");
     let nextTimerId = 0;
     const timers = new Map<number, () => void>();
@@ -312,16 +383,18 @@ describe("longRunningMonitor", () => {
     currentTime += 30_000;
     timers.get(1)?.();
     await vi.waitFor(() => expect(reviewStep).toHaveBeenCalledTimes(2));
-    await vi.waitFor(() => expect(cancelExecution).toHaveBeenCalledOnce());
+    expect(cancelExecution).not.toHaveBeenCalled();
 
     const secondContext = JSON.parse(vi.mocked(reviewStep).mock.calls[1][1]);
     expect(secondContext.progress).toMatchObject({
       workload: "bounded",
       noProgressSeconds: 60,
-      noProgressReviewRounds: 2,
+      noProgressReviewRounds: 0,
+      runtimeSampleFresh: false,
     });
-    expect(secondContext.progress.stalledNotice).toContain("已连续 60 秒无进展");
-    expect(controller.getState().decision).toMatchObject({ decision: "adjust", source: "rules" });
+    expect(secondContext.progress.stalledNotice).toContain("均不能单独证明业务失败");
+    expect(secondContext.progress.maxConsecutiveContinueRounds).toBeUndefined();
+    expect(controller.getState().decision).toMatchObject({ decision: "continue", source: "model" });
     controller.stop();
   });
 

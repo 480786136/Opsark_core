@@ -6,6 +6,7 @@ export {
   analyzeCommandFailure,
   classifyStepResult,
   ensureStepValidator,
+  normalizeStepValidation,
   isMutatingStepCommand,
 } from "@/services/validation";
 export { isReadOnlyStep };

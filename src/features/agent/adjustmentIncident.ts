@@ -79,7 +79,7 @@ function evidenceFingerprint(task: OpsTask, failedStep?: PlanStep) {
   const evidence = activeRoundSteps(task)
     .filter((step) => step === failedStep || step.status === "completed" || step.status === "failed")
     .map((step) => ({
-      step: adjustmentFingerprint(`${step.title}\n${normalizedCommand(step.command)}`),
+      step: adjustmentFingerprint(`${step.title}\n${stableJson(step.action ?? normalizedCommand(step.command))}`),
       status: step.status,
       result: canonicalize(step.result),
       evidence: step.evidence?.map((item) => ({

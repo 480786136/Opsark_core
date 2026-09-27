@@ -55,9 +55,17 @@ export function validateOfficialContent(envelope: Envelope): Loaded {
           (policy as unknown as Record<string, unknown>)[key] = item[key];
         }
         const base = tools.get(item.id);
-        if (base && base.version >= item.min_implementation_version) validateCompatibleToolSchema(item.inputSchema, base.inputSchema, item.id);
-        else if (!object(item.inputSchema)) throw new Error("工具参数协议无效。");
-        policy.inputSchema = clone(item.inputSchema);
+        let inputSchema = clone(item.inputSchema);
+        // V1 disk policies still mean the original scan depth and first-level
+        // presentation. Add only a fixed presentation field; never widen their
+        // time, scan, path or enabled constraints when the compiled tool upgrades.
+        if (base?.id === "disk.inspect" && base.version >= 2 && item.min_implementation_version === 1
+          && object(inputSchema) && object(inputSchema.properties) && !("reportDepth" in inputSchema.properties)) {
+          inputSchema.properties.reportDepth = { ...clone((base.inputSchema.properties as Record<string, Record<string, unknown>>).reportDepth), minimum: 1, maximum: 1, default: 1 };
+        }
+        if (base && base.version >= item.min_implementation_version) validateCompatibleToolSchema(inputSchema, base.inputSchema, item.id);
+        else if (!object(inputSchema)) throw new Error("工具参数协议无效。");
+        policy.inputSchema = inputSchema;
       }
       return policy;
     });

@@ -61,6 +61,6 @@ function substitutionsInvokeTool(text: string, depth: number): boolean {
 }
 
 export function assertShellToolBoundary(command: string, validation = "") {
-  if ((!/^\s*opsark-tool(?:\s|$)/i.test(command) && shellInvokesTool(command))
+  if (shellInvokesTool(command)
     || shellInvokesTool(validation)) throw new Error(EMBEDDED_TOOL_ERROR);
 }

@@ -15,6 +15,21 @@ const INTERACTIVE_SSH_COMMAND = /(?:^|[\n;&|]\s*)(?:timeout\s+\S+\s+)?(?:command
 const INTERACTIVE_GIT_COMMAND = /(?:^|[\n;&|]\s*)(?:timeout\s+\S+\s+)?(?:env(?:\s+-\S+)*\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|\S+)\s+)*(?:command\s+)?git\s+(?:(?:-c|-C)\s+(?:'[^']*'|"[^"]*"|\S+)\s+)*(?:clone|fetch|pull|ls-remote|submodule)\b/i;
 const HTTPS_URL = /https?:\/\/[^\s'"`<>]+/i;
 
+/** Stable identity for retry accounting, independent of surrounding log text. */
+export function gitAuthenticationOperation(command: string) {
+  const match = INTERACTIVE_GIT_COMMAND.exec(command);
+  if (!match) return undefined;
+  const operation = match[0].match(/(clone|fetch|pull|ls-remote|submodule)\s*$/i)?.[1]?.toLowerCase();
+  const argumentsText = command.slice(match.index + match[0].length).split(/[\n;&|]/, 1)[0];
+  const rawUrl = argumentsText.match(HTTPS_URL)?.[0];
+  if (!operation || !rawUrl) return undefined;
+  try {
+    const url = new URL(rawUrl);
+    // Never carry userinfo/query credentials into an identity or model context.
+    return { operation, target: `${url.protocol}//${url.host.toLowerCase()}${url.pathname.replace(/\/$/, "")}` };
+  } catch { return undefined; }
+}
+
 export interface InteractivePtyCredential {
   kind: "password" | "git-https";
   secret: string;

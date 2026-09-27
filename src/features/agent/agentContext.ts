@@ -17,9 +17,10 @@ import type {
   ServerProfile,
 } from "@/types";
 import { credentialGroupContext } from "@/features/agent/serverCredentialGroup";
-import { allTaskSteps, taskGoal } from "@/features/agent/taskGoal";
+import { allTaskSteps, taskRequirementSnapshot, TASK_REQUIREMENT_INSTRUCTION } from "@/features/agent/taskGoal";
 import { buildTaskDecisionSnapshot } from "@/features/agent/taskDecisionSnapshot";
 import { compactReviewText, textFingerprint } from "@/features/agent/longRunningReviewOutput";
+import { operationalRecoveryContext } from "./operationalRecovery";
 import type { StepReview } from "@/types";
 import { planningSkills } from "@/features/skills/skillPlanning";
 import { modelLogContext } from "./modelLogContext";
@@ -47,7 +48,7 @@ export function extractKnownExecutionFacts(task: OpsTask, skills = resolveTaskSk
     completedSteps: steps.slice(-12).map((step) => ({
       stepId: step.id,
       title: step.title,
-      command: step.command,
+      action: step.action, command: step.command,
       result: modelContextStep(step).result,
       ...executionContextEvidence(step, trimEvidence),
       targetContext: step.attemptContext,
@@ -168,7 +169,7 @@ export function buildAgentContext(input: AgentContextInput) {
     terminalReference: input.terminalReference || undefined,
     terminalContext: input.terminalContext,
     conversationHistory: input.conversationHistory,
-    taskGoal: input.taskGoal,
+    taskGoal: input.task ? { ...taskRequirementSnapshot(input.task), ...input.taskGoal } : input.taskGoal,
     previousExecution: input.previousExecution,
     knownExecutionFacts: input.knownExecutionFacts,
     confirmedUserInputs: input.task ? confirmedUserInputsContext(input.task) : undefined,
@@ -231,11 +232,7 @@ export function buildAdjustmentContext(
     workflowPhase: "adjust_after_failure",
     knowledgeReferences: planSafetyRejection || protocolRepair ? undefined : taskKnowledgeContext(input.task.id),
     recovery: planSafetyRejection ? undefined : recoveryPlanningContext(input.task),
-    taskGoal: {
-      rootGoal: taskGoal(input.task),
-      currentInstruction: input.task.currentInstruction,
-      relation: input.task.lastRequirementRelation,
-    },
+    taskGoal: taskRequirementSnapshot(input.task),
     permission: input.task.permission,
     executionConstraints: input.task.executionConstraints,
     authentication: protocolRepair ? undefined : authenticationContext(input.task),
@@ -273,6 +270,8 @@ export function buildAdjustmentContext(
         reason: compactReviewText(options.reviewDecision.reason, 600),
         summary: compactReviewText(options.reviewDecision.summary, 600),
         source: options.reviewDecision.source,
+        acceptance: options.reviewDecision.acceptance,
+        recoveryAction: options.reviewDecision.recoveryAction,
       } : undefined,
     },
     metrics: input.metrics,
@@ -293,12 +292,13 @@ export function nextStagePolicyFingerprint(input: WorkflowContextInput) {
   return textFingerprint(JSON.stringify({
     attemptContext: taskAttemptContext(input.task),
     planningProjection: planningSkills(input.task, activeSkills).map(({ instructions, allowedToolIds }) => ({ instructions, allowedToolIds })),
-    rootGoal: taskGoal(input.task),
+    taskRequirements: taskRequirementSnapshot(input.task),
     currentRoundId: input.task.currentRoundId,
     permission: input.task.permission,
     modelId: input.task.modelId,
     executionConstraints: input.task.executionConstraints,
     protocolReplan: protocolReplanContext(input.task),
+    executionIncidentId: input.task.executionReconciliation?.id,
     skills: activeSkills.map((skill) => ({
       id: skill.id,
       version: skill.version,
@@ -325,15 +325,13 @@ export function buildNextStageContext(input: WorkflowContextInput) {
   const policyFingerprint = nextStagePolicyFingerprint(input);
   const protocolReplan = protocolReplanContext(input.task);
   return {
+    operationsRecovery: operationalRecoveryContext(input.task),
+    operationalRepair: undefined as { reason: string; instruction: string } | undefined,
     workflowPhase: protocolReplan ? "decide_after_protocol_failure" : "decide_after_phase",
     protocolReplan,
     knowledgeReferences: taskKnowledgeContext(input.task.id),
     recovery: recoveryPlanningContext(input.task),
-    taskGoal: {
-      rootGoal: taskGoal(input.task),
-      currentInstruction: input.task.currentInstruction,
-      relation: input.task.lastRequirementRelation,
-    },
+    taskGoal: taskRequirementSnapshot(input.task),
     permission: input.task.permission,
     authentication: authenticationContext(input.task),
     confirmedUserInputs: confirmedUserInputsContext(input.task),
@@ -341,7 +339,7 @@ export function buildNextStageContext(input: WorkflowContextInput) {
     skillEvidence: buildSkillEvidenceContext(activeSkills),
     tools: buildPlanningToolContext(input.tools, activeSkills),
     activeSkills: buildSkillContext(activeSkills),
-    instruction: `${protocolReplan ? "protocolReplan 只记录上一个方案在执行前未通过硬协议校验，该方案未执行。请仍先根据整体目标和真实证据决定 complete、continue 或 adjust；当前没有合法动作时返回 adjust 且 steps=[]，不得为消除协议事故而编造步骤。" : ""}先依据 baseSnapshot 的真实输出、result/evidence 判断用户整体目标；activeSkills 的流程和验收方法仅作参考，可按事实调整，不得降低用户要求。证据充分时返回 complete 且 steps 为空；尚未完成时明确未满足条件和缺少的事实，只规划最小下一阶段。recoveredEvidence 是从已有执行记录补读的原文，应先检查，再决定是否需要执行新命令。复用已完成且仍有效的工作，不得用计划描述或阶段摘要冒充成功证据。${GOAL_DIRECTED_RECOVERY_INSTRUCTION}${DECISION_EVIDENCE_INSTRUCTION}`,
+    instruction: `${protocolReplan ? "protocolReplan 只记录上一个方案在执行前未通过硬协议校验，该方案未执行。请仍先根据整体目标和真实证据决定 complete、continue 或 adjust；当前没有合法动作时返回 adjust 且 steps=[]，不得为消除协议事故而编造步骤。" : ""}先依据 baseSnapshot 的真实输出、result/evidence 判断用户整体目标；activeSkills 的流程和验收方法仅作参考，可按事实调整，不得降低用户要求。${TASK_REQUIREMENT_INSTRUCTION}证据充分时返回 complete 且 steps 为空；尚未完成时明确未满足条件和缺少的事实，只规划最小下一阶段。recoveredEvidence 是从已有执行记录补读的原文，应先检查，再决定是否需要执行新命令。复用已完成且仍有效的工作，不得用计划描述或阶段摘要冒充成功证据。${GOAL_DIRECTED_RECOVERY_INSTRUCTION}${DECISION_EVIDENCE_INSTRUCTION}`,
     server: serverSnapshot(input.server),
     executionConstraints: input.task.executionConstraints,
     secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),
@@ -366,11 +364,7 @@ export function buildContinuationContext(input: WorkflowContextInput) {
     tools: buildPlanningToolContext(input.tools, activeSkills),
     activeSkills: buildSkillContext(activeSkills),
     instruction: `依据已确认输入、本轮真实证据和仍有效的历史证据，在整体目标及 executionConstraints 的授权边界内生成最少必要的后续步骤。read_only 目标只能进行只读操作；缺少环境事实时可有限只读取证，缺少必须由用户作出的决定时只生成一个 user.request_input 步骤并等待。复用已回答的问题和已完成且仍有效的步骤，不得猜测路径、工具、端口、服务名或用户选择。用户提交输入仅补充对应决定，不代表目标完成，也不能被外推为未明确给出的授权。${GOAL_DIRECTED_RECOVERY_INSTRUCTION}${EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION}`,
-    taskGoal: {
-      rootGoal: taskGoal(input.task),
-      currentInstruction: input.task.currentInstruction,
-      relation: input.task.lastRequirementRelation,
-    },
+    taskGoal: taskRequirementSnapshot(input.task),
     server: serverSnapshot(input.server),
     permission: input.task.permission,
     executionConstraints: input.task.executionConstraints,
@@ -380,7 +374,7 @@ export function buildContinuationContext(input: WorkflowContextInput) {
       stepId: step.id,
       title: step.title,
       description: step.description,
-      command: step.command,
+      action: step.action, command: step.command,
       expected: step.expected,
       result: modelContextStep(step).result,
       executionScope: step.executionScope,

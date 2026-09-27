@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { confirmedInputScope, confirmedUserInputsContext } from "@/features/agent/confirmedUserInputs";
+import { activeConfirmedInputEntries, confirmedInputScope, confirmedUserInputsContext } from "@/features/agent/confirmedUserInputs";
+import { buildTaskDecisionSnapshot } from "./taskDecisionSnapshot";
 import type { OpsTask, SubmittedTaskInput } from "@/types";
 
 const taskIdentity = { id: "task-1", serverId: "server-1", rootGoal: "部署应用", title: "部署应用", plan: [] };
@@ -18,6 +19,39 @@ function submitted(value: string | number, submittedAt: string): SubmittedTaskIn
 }
 
 describe("confirmed user input context", () => {
+  it("preserves verified credential decisions, not secret values or invalid selections", () => {
+    const source = { ...taskIdentity, submittedInputs: {
+      git_credential_decision: { ...submitted("use_saved", "now"), allowedValues: ["use_saved", "cancel"] },
+      authorization_method: { ...submitted("https", "now"), allowedValues: ["https", "ssh"] },
+      git_credential_text: { ...submitted("PRIVATE", "now"), type: "text" as const },
+      git_credential_invalid: { ...submitted("PRIVATE", "now"), allowedValues: ["use_saved"] },
+      password: { ...submitted("PRIVATE", "now"), allowedValues: ["PRIVATE"] },
+      access_token: { ...submitted("PRIVATE", "now"), allowedValues: ["PRIVATE"] },
+    } };
+    expect(activeConfirmedInputEntries(source).map(([key]) => key)).toEqual(["git_credential_decision", "authorization_method"]);
+    expect(JSON.stringify(confirmedUserInputsContext(source))).not.toContain("PRIVATE");
+    expect(activeConfirmedInputEntries({ ...source, executionTargetServerId: "another" })).toEqual([]);
+    expect(activeConfirmedInputEntries({ ...source, rootGoal: "another" })).toEqual([]);
+  });
+
+  it("recovers legacy enums only from the actual completed source form and emits resolvable references", () => {
+    const input = submitted("use_saved", "now");
+    const step = { id: "input-form-1", title: "选择", description: "", expected: "已确认", validation: "",
+      status: "completed", kind: "observe", risk: "low",
+      command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: {"title":"授权","fields":[{"key":"git_credential_decision","type":"select","options":[{"value":"use_saved"}]}]} },
+      output: "PRIVATE_FORM_OUTPUT", result: { executionStatus: "success", observationStatus: "matched", facts: { toolId: "user.request_input" }, warnings: [], evidenceIds: [] },
+    } as OpsTask["plan"][number];
+    const current = { ...taskIdentity, status: "running", permission: "managed", messages: [], createdAt: "now", updatedAt: "now",
+      plan: [step], submittedInputs: { git_credential_decision: input } } as unknown as OpsTask;
+    expect(activeConfirmedInputEntries(current)).toHaveLength(1);
+    const snapshot = buildTaskDecisionSnapshot(current);
+    expect(snapshot.currentPlan.steps[0].output?.contentRef).toBe("confirmedUserInputs");
+    expect(snapshot.confirmedUserInputs?.items[0].value).toBe("use_saved");
+    expect(JSON.stringify(snapshot)).not.toContain("PRIVATE_FORM_OUTPUT");
+    input.value = "invented";
+    expect(activeConfirmedInputEntries(current)).toEqual([]);
+    expect(buildTaskDecisionSnapshot(current).currentPlan.steps[0].output?.contentRef).toBeUndefined();
+  });
   it("projects only bounded non-sensitive decisions and preserves exact ordinary values", () => {
     const source = {
       ...taskIdentity,

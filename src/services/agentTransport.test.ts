@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { backend } from "./backend";
+import { resetExecutionLedgerForTests } from "./executionLedger";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
@@ -9,6 +10,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 describe("Agent transport event routing", () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    resetExecutionLedgerForTests();
     Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
   });
   afterEach(() => Reflect.deleteProperty(window, "__TAURI_INTERNALS__"));
@@ -32,11 +34,11 @@ describe("Agent transport event routing", () => {
     const onProgress = vi.fn();
     const onSessionInvalidated = vi.fn();
     await expect(backend.executeAgentCommand({
-      connection: { host: "example.invalid", port: 22, username: "tester", password: "test" },
+      connection: { host: "example.invalid", port: 22, username: "tester", password: "credential-not-in-command" },
       session: { id: "agent-1", generation: 1 }, executionId: "validation-1",
       command: "test -d /opt/repo/.git", scope: "isolated_exec", approvedHighRisk: false,
       onProgress, onSessionInvalidated,
-    })).rejects.toBe(error);
+    })).rejects.toMatchObject({ stage: "execution", remoteResultKnown: false, originalError: error });
     expect(onProgress).not.toHaveBeenCalled();
     expect(onSessionInvalidated.mock.calls).toEqual([[2], []]);
     expect(unlisten).toHaveBeenCalledOnce();

@@ -1,3 +1,5 @@
+import { operationsPlanningContext, inspectionDecisionStep } from "./operationsPlanning";
+import { operationsObservation } from "@/features/tools/operationsObservation";
 import { compactReviewText, textFingerprint } from "@/features/agent/longRunningReviewOutput";
 import {
   compactReviewEvidence,
@@ -12,12 +14,13 @@ import {
   taskStepEvidenceKey,
   TASK_DECISION_RECENT_PHASE_LIMIT,
 } from "@/features/agent/taskHistoryCheckpoint";
-import { taskGoal } from "@/features/agent/taskGoal";
+import { taskRequirementSnapshot } from "@/features/agent/taskGoal";
 import { modelLogContext } from "./modelLogContext";
 import { currentEvidenceSteps } from "@/features/agent/attemptState";
 import { decisionOutput, decisionOutputProjector, DECISION_EVIDENCE_INSTRUCTION } from "./decisionEvidence";
 import { workflowProgress } from "./workflowProgress";
 import { bindRecoveryCarryForwards, hasVerifiedRecovery } from "./recoveryContract";
+import { confirmedUserInputsContext } from "./confirmedUserInputs";
 import type { OpsTask, PlanStep, TaskExecutionPhase } from "@/types";
 
 const CURRENT_PLAN_STEP_LIMIT = 20;
@@ -64,6 +67,7 @@ function compactStep(
   project: StepOutputProjector,
   location: string,
 ) {
+  step = inspectionDecisionStep(step);
   const exceptional = isExceptionalTaskStep(step);
   const needsCommand = exceptional
     || ["pending", "awaiting_approval", "awaiting_input", "running"].includes(step.status);
@@ -75,10 +79,11 @@ function compactStep(
     expected: compactReviewText(step.expected, 300),
     risk: step.risk,
     status: step.status,
+    failureDependencies: step.failureDependencies,
     command: needsCommand
       ? compactReviewText(redactCommandSecrets(step.command), detail === "current" ? 900 : 560)
       : undefined,
-    commandFingerprint: textFingerprint(step.command),
+    commandFingerprint: textFingerprint(JSON.stringify(step.action ?? step.command)),
     result: compactReviewResult(userInput && step.result
       ? { ...step.result, facts: { toolId: "user.request_input" } } : step.result, exceptional ? 1_500 : 800),
     output: project(step, detail === "current" ? 2_048 : 1_024, location),
@@ -96,6 +101,7 @@ function compactStep(
 
 function currentIncident(step: PlanStep | undefined, project: StepOutputProjector) {
   if (!step) return undefined;
+  step = inspectionDecisionStep(step);
   return {
     ...compactReviewPlanStep(step, { commandLimit: 1_000, validationLimit: 700 }),
     command: compactReviewText(redactCommandSecrets(step.command), 1_000),
@@ -108,6 +114,8 @@ function currentIncident(step: PlanStep | undefined, project: StepOutputProjecto
       reason: compactReviewText(step.review.reason, 480),
       summary: compactReviewText(step.review.summary, 480),
       source: step.review.source,
+      acceptance: step.review.acceptance,
+      recoveryAction: step.review.recoveryAction,
     } : undefined,
     output: project(step, 3_100, "currentIncident.output"),
     validationEvidence: isUserInputEvidenceStep(step) ? undefined : step.evidence
@@ -171,12 +179,14 @@ function selectRecoverySteps(task: OpsTask) {
 }
 
 export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, allowArchive = false) {
+  const confirmedUserInputs = confirmedUserInputsContext(task);
   const checkpoint = initializeTaskHistoryCheckpoint(task);
   const incidentStep = failedStep ?? [...task.plan].reverse().find(isExceptionalTaskStep);
   const selectedCurrentPlan = selectBoundedSteps(task.plan, CURRENT_PLAN_STEP_LIMIT);
   const selectedCurrentSteps = selectedCurrentPlan
     .filter(step => !incidentStep || taskStepEvidenceKey(step) !== taskStepEvidenceKey(incidentStep));
-  const rootGoal = taskGoal(task);
+  const requirements = taskRequirementSnapshot(task);
+  const rootGoal = requirements.rootGoal;
   const progression = workflowProgress(task);
   const allLedgerSteps = [
     ...(task.planHistory ?? []).flatMap(round => [
@@ -193,18 +203,28 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
         && step.evidence?.some(item => item.archive))) bestOutputSource.set(key, step);
   }
 
+  const inspectionPlanning = operationsPlanningContext([...bestOutputSource.values()]);
   const recoverySteps = progression.rereadEvidence ? selectRecoverySteps(task) : [];
   const recoveryKeys = new Set(recoverySteps.map(taskStepEvidenceKey));
   const project = decisionOutputProjector(allowArchive);
   const canonicalOutputRefs = new Map<string, string>();
   const projectStep: StepOutputProjector = (step, limit, location) => {
     if (isUserInputEvidenceStep(step)) {
+      const hasInput = confirmedUserInputs?.items.some(input => input.sourceStepId === step.id);
       return { content: undefined, contentState: "omitted", totalCharacters: 0, omittedCharacters: 0,
-        fingerprint: textFingerprint(step.output ?? ""), contentRef: "confirmedUserInputs",
-        references: undefined, instruction: "仅使用 confirmedUserInputs 中当前目标/服务器有效的输入；历史表单值不在本区重发。" };
+        fingerprint: textFingerprint(step.output ?? ""), contentRef: hasInput ? "confirmedUserInputs" : undefined,
+        references: undefined, instruction: hasInput
+          ? "仅使用本快照 confirmedUserInputs 中当前目标/服务器有效的输入；历史表单值不在本区重发。"
+          : "本表单无已展开且作用域有效的非敏感输入；敏感值严格隔离，不得推断用户选择。可检查 confirmedUserInputs.index 的省略或失效状态。" };
     }
     const key = taskStepEvidenceKey(step);
     const source = bestOutputSource.get(key) ?? step;
+    if (operationsObservation(source)) {
+      const metadata = decisionOutput(source.output, source.evidence, 0, allowArchive);
+      const contentRef = inspectionPlanning.refs.get(key);
+      return metadata ? { ...metadata, contentRef,
+        instruction: contentRef ? "运维事实摘要见 contentRef；这是压缩摘要，完整条目及缺口见本步骤 references，不能把省略当成未采集。" : metadata.instruction } : undefined;
+    }
     const existing = canonicalOutputRefs.get(key);
     if (existing) {
       const metadata = decisionOutput(source.output, [], 0);
@@ -302,9 +322,16 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
           result: fact.result ? { executionStatus: fact.result.executionStatus,
             observationStatus: fact.result.observationStatus, sourceToolId: "user.request_input" } : undefined,
           evidence: undefined,
-          output: { contentRef: "confirmedUserInputs", sourceStepId: fact.stepId },
+          output: { contentRef: confirmedUserInputs?.items.some(input => input.sourceStepId === fact.stepId)
+            ? "confirmedUserInputs" : undefined, sourceStepId: fact.stepId },
         };
       }
+      if (original && operationsObservation(original)) return {
+        stepId: fact.stepId, sourceToolId: original.result?.facts.toolId,
+        targetContext: original.attemptContext,
+        result: compactReviewResult(inspectionDecisionStep(original).result, 600),
+        output: projectStep(original, 0, `historyCheckpoint.verifiedFacts[${index}].output`),
+      };
       if (original) return { ...fact,
         targetContext: original.attemptContext ?? fact.targetContext,
         output: projectStep(original, 800, `historyCheckpoint.verifiedFacts[${index}].output`),
@@ -350,7 +377,9 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
   } : undefined;
   const body = {
     version: 1,
+    confirmedUserInputs,
     rootGoal,
+    taskRequirements: requirements,
     task: {
       title: compactReviewText(task.title, 180),
       status: task.status,
@@ -363,7 +392,16 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
     },
     executionConstraints: task.executionConstraints,
     workflowProgress: progression,
+    executionReconciliation: task.executionReconciliation ? {
+      id: task.executionReconciliation.id, stepId: task.executionReconciliation.stepId,
+      serverId: task.executionReconciliation.serverId, resolution: task.executionReconciliation.resolution,
+    } : undefined,
     recoveredEvidence,
+    operationsEvidence: inspectionPlanning.context,
+    archivedInspectionReceipts: task.executionLedgerRecovery?.recordedReads?.filter(receipt =>
+      !allLedgerSteps.some(step => step.executionLedgerAttempts?.some(a => a.attemptId === receipt.attemptId)))
+      .slice(-12).map(receipt => ({ ...receipt, readTool: allowArchive ? "evidence.read" : undefined,
+        instruction: "历史只读结果已保存，先按 evidenceRefs 补读已有证据；不得因步骤缓存缺失而认定未检查。迟到结果不能视作当前阶段验收。" })),
     progress: {
       ...progress,
       totalRounds: task.planHistory?.length ?? 0,

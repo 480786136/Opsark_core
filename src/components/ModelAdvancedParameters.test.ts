@@ -4,6 +4,7 @@ import { createApp, nextTick, reactive } from "vue";
 import { createI18n } from "vue-i18n";
 import ModelAdvancedParameters from "./ModelAdvancedParameters.vue";
 import type { ModelProfile } from "@/types";
+import { newModelCapabilities } from "@/features/agent/modelCapabilities";
 
 it("renders Chinese labels and keeps API enum values intact", async () => {
   const model = reactive({ id: "chinese" } as ModelProfile);
@@ -50,4 +51,26 @@ it("edits, previews, validates and resets without changing another model", async
     expect(model.requestParameters).toBeUndefined();
     expect(other.requestParameters.temperature).toBe(1);
   } finally { app.unmount(); }
+});
+
+it("does not offer undeclared V2 parameters based on the provider while preserving conflicting saved values", async () => {
+  const model = reactive({ id: "unconfirmed", capabilitiesV2: { ...newModelCapabilities(), parameterAdapter: "deepseek" },
+    requestParameters: { reasoning_effort: "high", thinking: "enabled", temperature: 0.2, outputBudget: 6000 } } as ModelProfile);
+  const host = document.createElement("div"); document.body.append(host);
+  const app = createApp(ModelAdvancedParameters, { model }).use(createI18n({ legacy: false, locale: "en", messages: { en: {} } }));
+  app.mount(host);
+  try {
+    expect(host.querySelector('[aria-label="frequency_penalty"]')).toBeNull();
+    expect(host.querySelector('[aria-label="temperature"]')).not.toBeNull();
+    expect(host.querySelector('[role="alert"]')).not.toBeNull();
+    host.querySelector<HTMLElement>('summary[aria-label="reasoning_effort"]')!.click(); await nextTick();
+    expect(document.querySelector<HTMLButtonElement>('.parameter-options [data-value="high"]')!.disabled).toBe(true);
+    expect(document.querySelector('.parameter-options [data-value="low"]')).toBeNull();
+    host.querySelector<HTMLElement>('summary[aria-label="thinking"]')!.click(); await nextTick();
+    expect(document.querySelector<HTMLButtonElement>('.parameter-options [data-value="enabled"]')!.disabled).toBe(true);
+    host.querySelector<HTMLButtonElement>('.parameter-footer button')!.click(); await nextTick();
+    expect(model.requestParameters).toEqual({ outputBudget: 6000 });
+    expect(host.querySelector('[aria-label="temperature"]')).toBeNull();
+    expect(host.querySelector('summary[aria-label="reasoning_effort"]')).toBeNull();
+  } finally { app.unmount(); host.remove(); }
 });

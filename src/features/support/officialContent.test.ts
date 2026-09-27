@@ -10,7 +10,8 @@ import { createCustomSkill, resolveTaskSkills } from "@/features/skills/skillReg
 import { ownedSkills, pinTaskSkills } from "@/features/skills/ownedSkills";
 import { executionCapabilityBlocker, readExecutionPermissions, saveExecutionPermissions } from "@/features/tools/executionPermissions";
 import { buildToolContext, selectPlanningTools } from "@/features/tools/toolContext";
-import { executeToolCall, parseToolCommand } from "@/features/tools/toolExecutor";
+import { executeToolCall, parseToolAction } from "@/features/tools/toolExecutor";
+import { preparePlanForApproval } from "@/features/agent/planPreparation";
 import type { OpsTask } from "@/types";
 import { version as coreVersion } from "../../../package.json";
 import { hydrateOfficialContent, officialSkills, officialToolEnabled, officialVersions, syncOfficialRelease, validateOfficialContent, type ContentKind } from "./officialContent";
@@ -46,6 +47,21 @@ function configuredTools(version = 1) {
     outputDescription: t.outputDescription, inputSchema: JSON.parse(JSON.stringify(t.inputSchema)) }));
   return { value, body, file: body.items.find((t: { id: string }) => t.id === "files.read_content") };
 }
+it("preserves a v1 disk policy's disabled state and scan limits while fixing legacy presentation at one level", () => {
+  const { value, body } = configuredTools();
+  const disk = body.items.find((item: { id: string }) => item.id === "disk.inspect");
+  disk.min_implementation_version = 1; disk.enabled = false;
+  delete disk.inputSchema.properties.reportDepth;
+  disk.inputSchema.properties.maxDepth.maximum = 4;
+  disk.inputSchema.properties.maxDepth.default = 4;
+  const loaded = validateOfficialContent({ ...value, content: JSON.stringify(body) });
+  const result = loaded.tools!.find(item => item.id === "disk.inspect")!;
+  expect(result.enabled).toBe(false);
+  const properties = result.inputSchema!.properties as Record<string, any>;
+  expect(properties.maxDepth.maximum).toBe(4);
+  expect(properties.reportDepth).toMatchObject({ minimum: 1, maximum: 1, default: 1 });
+  expect(disk.inputSchema.properties).not.toHaveProperty("reportDepth");
+});
 beforeEach(async () => {
   localStorage.clear(); Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   await hydrateOfficialContent(); native.mockReset();
@@ -69,6 +85,25 @@ it("loads guidance-only publications and ignores legacy permission metadata", ()
   expect(legacy[0]).not.toHaveProperty("forbiddenToolIds");
 });
 afterEach(async () => { Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); await hydrateOfficialContent(); });
+
+it("prepares with current official defaults and rejects a tool disabled after the local catalog was loaded", async () => {
+  const target = { id: "prepared-source", name: "source", host: "source.invalid", port: 22, username: "deploy",
+    group: "test", status: "online" as const, environment: [], createdAt: "",
+    info: { os: "", kernel: "", cpu: "", cores: 1, memoryGb: 1, diskGb: 1, uptime: "" } };
+  const context = { taskId: "official-prepared", permission: "safe" as const, server: target, servers: [target] };
+  const proposal = [{ id: "read", title: "read", description: "read", kind: "observe" as const, risk: "low" as const,
+    action: { type: "tool" as const, toolId: "files.read_content", arguments: { path: "/srv/README" } },
+    command: "", validation: "", expected: "file evidence", status: "pending" as const }];
+  const configured = configuredTools(1);
+  configured.file.inputSchema.properties.maxBytes.default = 32768;
+  configured.value.content = JSON.stringify(configured.body);
+  await activate(configured.value);
+  expect(preparePlanForApproval(proposal, context, defaultToolCatalog).steps[0])
+    .toMatchObject({ action: { arguments: { maxBytes: 32768 } } });
+  await activate(envelope("tools", 2, defaultToolCatalog.map(tool => ({ id: tool.id,
+    enabled: tool.id !== "files.read_content", min_implementation_version: tool.version }))));
+  expect(() => preparePlanForApproval(proposal, context, defaultToolCatalog)).toThrow("禁用");
+});
 
 it("preserves user workflows, local contracts and running-task snapshots across official updates", async () => {
   const user = createCustomSkill("skill-personal");
@@ -100,7 +135,7 @@ it("revokes tools in planning and dispatch without overwriting the user's grants
   expect(readExecutionPermissions()).toEqual(permissions);
   expect(officialToolEnabled(id)).toBe(false);
   expect(selectPlanningTools(defaultToolCatalog, [skill])).toEqual([]);
-  expect(executionCapabilityBlocker(task, { command: `opsark-tool ${id} {"path":"/tmp/a"}`, validation: "true" }, [skill])).toContain("已停用");
+  expect(executionCapabilityBlocker(task, { command: "", action: { type: "tool", toolId: id, arguments: { path: "/tmp/a" } }, validation: "" }, [skill])).toContain("已停用");
   const readRemoteFileContent = vi.fn();
   const result = await executeToolCall({ id: "c", toolId: id, arguments: { path: "/tmp/a" } }, defaultToolCatalog, { readRemoteFileContent, getRemoteFileStructure: vi.fn() });
   expect(result.error?.code).toBe("TOOL_DISABLED"); expect(readRemoteFileContent).not.toHaveBeenCalled();
@@ -116,10 +151,10 @@ it("applies published parameters to model context, parsing and direct dispatch w
   const context = buildToolContext(defaultToolCatalog).find(t => t.id === file.id)!;
   expect(context).toMatchObject({ name: "小文件读取", configurationVersion: 1, version: file.min_implementation_version,
     inputSchema: { properties: { maxBytes: { default: 4096, maximum: 8192 } } } });
-  expect(parseToolCommand('opsark-tool files.read_content {"path":"/tmp/a"}', "parsed")?.arguments)
+  expect(parseToolAction({ type: "tool" as const, toolId: "files.read_content", arguments: {"path":"/tmp/a"} }, "parsed")?.arguments)
     .toEqual({ path: "/tmp/a", maxBytes: 4096 });
-  expect(() => parseToolCommand('opsark-tool files.read_content {"path":"/tmp/a","maxBytes":0}', "invalid")).toThrow("最小值");
-  const readRemoteFileContent = vi.fn().mockResolvedValue({ content: "synthetic", truncated: false });
+  expect(() => parseToolAction({ type: "tool" as const, toolId: "files.read_content", arguments: {"path":"/tmp/a","maxBytes":0} }, "invalid")).toThrow("最小值");
+  const readRemoteFileContent = vi.fn().mockResolvedValue({ path: "/tmp/a", content: "synthetic", truncated: false, encoding: "utf-8", returnedBytes: 9, totalBytes: 9 });
   const call = { id: "direct", toolId: file.id, arguments: { path: "/tmp/a" } };
   const dependencies = { getRemoteFileStructure: vi.fn(), readRemoteFileContent };
   expect((await executeToolCall(call, defaultToolCatalog, dependencies)).success).toBe(true);
@@ -142,12 +177,12 @@ it("fills nested defaults and preserves explicit false while enforcing published
   form.inputSchema.properties.fields.items.properties.required.default = true;
   form.inputSchema.properties.title.maxLength = 10;
   value.content = JSON.stringify(body); await activate(value);
-  expect(parseToolCommand('opsark-tool software.check {"names":["git"],"includeVersions":false}', "explicit")?.arguments.includeVersions).toBe(false);
-  expect(() => parseToolCommand('opsark-tool software.check {"names":["python"]}', "enum")).toThrow("允许范围");
+  expect(parseToolAction({ type: "tool" as const, toolId: "software.check", arguments: {"names":["git"],"includeVersions":false} }, "explicit")?.arguments.includeVersions).toBe(false);
+  expect(() => parseToolAction({ type: "tool" as const, toolId: "software.check", arguments: {"names":["python"]} }, "enum")).toThrow("允许范围");
   const args = { title: "输入目标", fields: [{ key: "target", label: "目标", description: "操作目标", type: "text" }] };
-  expect(parseToolCommand(`opsark-tool user.request_input ${JSON.stringify(args)}`, "nested")?.arguments.fields)
+  expect(parseToolAction({ type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify(args)) }, "nested")?.arguments.fields)
     .toEqual([{ ...args.fields[0], required: true }]);
-  expect(() => parseToolCommand(`opsark-tool user.request_input ${JSON.stringify({ ...args, title: "x".repeat(11) })}`, "length"))
+  expect(() => parseToolAction({ type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify({ ...args, title: "x".repeat(11) })) }, "length"))
     .toThrow("长度超过限制");
 });
 
@@ -177,7 +212,7 @@ it("hydrates parameter defaults from the persisted configuration", async () => {
   Object.assign(window, { __TAURI_INTERNALS__: {} });
   native.mockResolvedValueOnce([value, envelope("tools", 1)]);
   await hydrateOfficialContent();
-  expect(parseToolCommand('opsark-tool files.read_content {"path":"/tmp/a"}', "cached")?.arguments.maxBytes).toBe(2048);
+  expect(parseToolAction({ type: "tool" as const, toolId: "files.read_content", arguments: {"path":"/tmp/a"} }, "cached")?.arguments.maxBytes).toBe(2048);
   expect(officialVersions().tools).toBe(2);
 });
 

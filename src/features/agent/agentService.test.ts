@@ -14,6 +14,7 @@ import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 import { ModelInvocationError, PlanProtocolError } from "@/services/backend";
 import { confirmedInputScope } from "@/features/agent/confirmedUserInputs";
 import { taskAttemptContext } from "@/features/agent/attemptState";
+import { currentPlanFingerprint, recordExecutionUncertainty } from "./operationalRecovery";
 
 const model: ModelProfile = {
   id: "model-1",
@@ -64,6 +65,64 @@ const generationSettings = {
 };
 
 describe("agentService", () => {
+  it("includes the new file investigation in stage acceptance without overriding an adjust decision from prose", async () => {
+    const current = task();
+    current.rootGoal = "磁盘还剩多少空间";
+    current.currentInstruction = "现在有哪些大文件占用";
+    current.lastRequirementRelation = "supplement";
+    current.currentRoundId = "round-files";
+    current.messages = [
+      { ...current.messages[0], content: current.rootGoal, requirementRelation: "new_goal" },
+      { ...current.messages[0], id: "files", content: current.currentInstruction, requirementRelation: "supplement" },
+    ];
+    current.plan = [{ ...step("space", "df -h"), output: "根分区剩余 2.9G" }];
+    const decide = vi.fn().mockResolvedValue({ decision: "adjust", reason: "磁盘剩余空间已回答，已完成", summary: "已完成",
+      source: "model", steps: [] });
+    const result = await decideTaskNextStage({ task: current, model, apiKey: "fixture", tools: [], secretMetadata: [], generationSettings }, decide);
+    expect(decide.mock.calls[0][0]).toContain(current.currentInstruction);
+    const context = JSON.parse(decide.mock.calls[0][1].context);
+    expect(context.taskGoal.requirements.map((item: { content: string }) => item.content))
+      .toEqual([current.rootGoal, current.currentInstruction]);
+    expect(context.baseSnapshot.taskRequirements).toEqual(context.taskGoal);
+    expect(context.baseSnapshot.currentPlan.steps[0].output.content).toContain("根分区剩余 2.9G");
+    expect(result.complete).toBe(false);
+    expect(result.nextPlan).toEqual([]);
+    expect(result.decision.decision).toBe("adjust");
+    expect(decide).toHaveBeenCalledTimes(1);
+  });
+
+  it("repairs a stale local patch once and keeps unaffected pending steps", async () => {
+    const current = task();
+    current.plan = [step("done", "pwd"), step("replace", "ls /opt", "pending"), step("keep", "uname -a", "pending")];
+    const original = structuredClone(current.plan);
+    const proposal = { decision: "adjust", reason: "局部更新", summary: "仅更新读取步骤", source: "model",
+      steps: [{ ...step("new", "ls /opt/report", "pending"), kind: "observe" }],
+      planUpdate: { basePlanFingerprint: currentPlanFingerprint(current), replaceStepIds: ["replace"], reason: "更新检查路径" } };
+    const decide = vi.fn().mockResolvedValueOnce({ ...proposal, planUpdate: { ...proposal.planUpdate, basePlanFingerprint: "stale" } })
+      .mockResolvedValueOnce(proposal);
+    const result = await decideTaskNextStage({ task: current, model, apiKey: "fixture", tools: [], secretMetadata: [], generationSettings, skills: [] }, decide);
+    expect(result.nextPlan.map(item => item.id)).toEqual(["new", "keep"]);
+    expect(current.plan).toEqual(original);
+    expect(decide).toHaveBeenCalledTimes(2);
+    const repair = JSON.parse(decide.mock.calls[1][1].context);
+    expect(repair.operationalRepair.reason).toContain("原计划已变化");
+    expect(repair.protocolRepairBudget.remainingModelCalls).toBe(1);
+  });
+
+  it("stops repeated unsafe recovery proposals with the original task intact", async () => {
+    const current = task();
+    current.plan = [{ ...step("write", "npm run build", "failed"), kind: "change" }];
+    recordExecutionUncertainty(current, current.plan[0], "连接中断");
+    const original = structuredClone(current);
+    const decide = vi.fn().mockResolvedValue({ decision: "adjust", reason: "直接重试", summary: "重试", source: "model",
+      steps: [{ ...step("retry", "npm run build", "pending"), kind: "change" }] });
+    await expect(decideTaskNextStage({ task: current, model, apiKey: "fixture", tools: [], secretMetadata: [], generationSettings, skills: [] }, decide))
+      .rejects.toThrow("原变更的执行结果尚未核对");
+    expect(decide).toHaveBeenCalledTimes(2);
+    expect(current.plan).toEqual(original.plan);
+    expect(current.executionReconciliation).toEqual(original.executionReconciliation);
+  });
+
   it.each(["INSUFFICIENT_CREDITS", "CREDITS_RECONCILIATION_REQUIRED"])(
     "%s in the combined decision stops without another paid goal-review request", async (code) => {
       const currentTask = task();
@@ -288,7 +347,8 @@ describe("agentService", () => {
     expect(requirement).not.toContain("仅规划尚未完成的变更与最终验收");
     const context = JSON.parse(runtimeModel.context);
     expect(context.executionConstraints.changePolicy).toBe("read_only");
-    expect(context.completedDiscovery[0].output).toMatchObject({ contentRef: "confirmedUserInputs" });
+    expect(context.completedDiscovery[0].output).toMatchObject({ contentState: "omitted", sourceStepId: "target-input" });
+    expect(context.completedDiscovery[0].output).not.toHaveProperty("contentRef");
     expect(context.confirmedUserInputs.items).toEqual(expect.arrayContaining([
       expect.objectContaining({ key: "target", value: "/opt/resource" }),
     ]));
@@ -608,6 +668,67 @@ describe("agentService", () => {
     expect(result.summary).toContain("补充说明（不改变以上程序结论）：The deployment command failed.");
     expect(result.usedModel).toBe(true);
   });
+
+  it("reports the wheel acceptance failure instead of the older missing web directory", async () => {
+    const current = task();
+    current.plan = [
+      { ...step("检查 /var/www", "ls /var/www", "failed"),
+        result: { executionStatus: "failed", observationStatus: "unknown", facts: {},
+          warnings: [], evidenceIds: [], failureReason: "no such file" } },
+      { ...step("验证抽奖页面", "curl http://127.0.0.1:8091/; printf URL"), kind: "observe",
+        result: { executionStatus: "success", observationStatus: "unhealthy", exitCode: 0,
+          facts: { blockingSignal: true, category: "network_failure" }, warnings: [], evidenceIds: [] },
+        review: { decision: "adjust", source: "model", reason: "页面未写入，8091 无监听", summary: "需要部署" } },
+    ];
+    const before = structuredClone(current);
+    const result = await summarizeFailedTask({ task: current, reason: "无新执行证据" }, vi.fn().mockResolvedValue(""));
+    expect(result.failureContext.latestBlocker).toMatchObject({
+      stepTitle: "验证抽奖页面", reason: "页面未写入，8091 无监听", executionStatus: "success", exitCode: 0,
+    });
+    expect(result.failureContext.confirmedFacts).toEqual([]);
+    expect(result.failureContext.unconfirmedFacts.map(item => item.stepTitle)).toContain("验证抽奖页面");
+    expect(result.summary).toContain("最新阻断：步骤“验证抽奖页面”：页面未写入，8091 无监听");
+    expect(current).toEqual(before);
+  });
+
+  it("prefers the current entry stop over a historical execution failure", () => {
+    const current = task();
+    current.plan = [step("旧失败", "false", "failed"), {
+      ...step("当前诊断", "ls /srv", "pending"),
+      review: { decision: "adjust", source: "rules", reason: "依赖判断尚未完成", summary: "调整方案" },
+    }];
+    expect(buildFailedTaskSummaryContext(current, "停止重复规划").latestBlocker).toMatchObject({
+      stepTitle: "当前诊断", reason: "依赖判断尚未完成",
+    });
+  });
+
+  it.each(["not_found", "unhealthy", "unknown"] as const)(
+    "does not turn ordinary %s discovery into a failure", observationStatus => {
+      const current = task();
+      current.plan = [{ ...step("候选目录探查", "test -d /var/www"), kind: "observe",
+        result: { executionStatus: "success", observationStatus, exitCode: 0,
+          facts: {}, warnings: [], evidenceIds: [] } }];
+      const context = buildFailedTaskSummaryContext(current, "后续模型请求失败");
+      expect(context.latestBlocker).toMatchObject({ stepTitle: undefined, reason: "后续模型请求失败" });
+      expect(context.confirmedFacts).toHaveLength(1);
+      expect(context.unconfirmedFacts).toEqual([]);
+    },
+  );
+
+  it.each([{ validationPassed: false }, { acceptancePassed: false },
+    { semanticAcceptanceRequired: true, semanticAcceptanceStatus: "not_met" }])(
+    "includes explicit acceptance failure with successful execution: %j", facts => {
+      const current = task();
+      current.plan = [{ ...step("当前验收", "check; echo done"),
+        result: { executionStatus: "success", observationStatus: "unknown", exitCode: 0,
+          facts, warnings: [], evidenceIds: [] } }];
+      const context = buildFailedTaskSummaryContext(current, "未完成");
+      expect(context.latestBlocker.stepTitle).toBe("当前验收");
+      expect(context.latestBlocker.reason).toContain("验收未通过");
+      expect(context.confirmedFacts).toEqual([]);
+      expect(context.unconfirmedFacts).toHaveLength(1);
+    },
+  );
 
   it("passes the deterministic reason, latest blocker and fact split to the failure summary model", async () => {
     const currentTask = task();

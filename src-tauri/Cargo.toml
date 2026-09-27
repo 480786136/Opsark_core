@@ -24,6 +24,9 @@ keyring = { version = "4.1.5", features = ["v1"] }
 sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.3"
+jsonschema = { version = "0.46.6", default-features = false }
+rusqlite = { version = "0.32", features = ["bundled"] }
+ryu-js = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Build OpenSSL for the selected macOS target so Apple Silicon hosts can also

@@ -27,6 +27,8 @@ pub(crate) fn request_metrics(body: &Value) -> Value {
 /// Only application-owned context labels are parsed. User text and result strings stay opaque.
 pub(crate) fn prepare_request(body: &Value) -> (Value, Value) {
     let mut prepared = body.clone();
+    let compilation = prepared.as_object_mut().and_then(|body| body.remove("_opsarkSchemaCompilation"));
+    if let Some(body) = prepared.as_object_mut() { body.remove("_opsarkOperationContract"); }
     let raw_context = prepared
         .as_object_mut()
         .and_then(|object| object.remove("_opsarkContext"))
@@ -37,6 +39,7 @@ pub(crate) fn prepare_request(body: &Value) -> (Value, Value) {
             .iter().find_map(|pointer| context.pointer(pointer).and_then(Value::as_str)
                 .filter(|language| matches!(*language, "zh-CN" | "en")).map(str::to_owned)));
     let mut log = Value::Object(Map::new());
+    if let Some(compilation) = compilation { log["schemaCompilation"] = compilation; }
     let Some(messages) = prepared.get_mut("messages").and_then(Value::as_array_mut) else {
         return (prepared, log);
     };

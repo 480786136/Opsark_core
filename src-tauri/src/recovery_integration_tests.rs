@@ -2,7 +2,7 @@ use super::*;
 
 fn diagnosis(command: &str) -> AiPlanStep {
     serde_json::from_value(json!({"kind":"observe","title":"Inspect failed host","description":"Collect read-only evidence",
-        "command":command,"expected":"Evidence for the original failure","validation":"","risk":"low",
+        "action":{"type":"shell","command":command},"expected":"Evidence for the original failure","validation":"","risk":"low",
         "recovery":{"failedStepId":"failed-init","targetContext":"original-target","purpose":"diagnose"}})).unwrap()
 }
 
@@ -54,7 +54,7 @@ fn recovery_incident_is_rejected_before_conversion_with_exact_shared_issue() {
     let issue = recovery_rules::decode_issue(&rejected).unwrap();
     assert_eq!(issue.code, "RECOVERY_DIAGNOSE_MUTATION");
     assert_eq!(issue.matched_token.as_deref(), Some("mktemp"));
-    assert_eq!(issue.field_path, "steps[0].command");
+    assert_eq!(issue.field_path, "steps[0].action.command");
     assert_eq!(plan_error_step_index(&rejected, 1), Some(1));
 }
 
@@ -97,7 +97,7 @@ fn recovery_patch_rejects_replanning_and_stops_identical_output() {
         "description",
     ] {
         let mut value = serde_json::to_value(&original).unwrap();
-        value["command"] = json!("uname -a");
+        value["action"]["command"] = json!("uname -a");
         value[field] = if field == "recovery" {
             json!({"failedStepId":"forged","targetContext":"other","purpose":"repair"})
         } else {
@@ -155,7 +155,7 @@ fn recovery_stop_envelope_retains_original_plan_and_consumed_budget() {
         &recovery_failure_envelope(&error, &[original.clone()], &budget).unwrap(),
     )
     .unwrap();
-    assert_eq!(output["steps"][0]["command"], original.command);
+    assert_eq!(output["steps"][0]["action"]["command"], original.command);
     assert_eq!(output["repairAttempted"], true);
     assert_eq!(output["modelCalls"], 2);
     assert_eq!(output["focusedRepairCalls"], 1);
@@ -180,6 +180,7 @@ fn model_plan_ids_never_collide_across_same_second_generations() {
 #[test]
 fn next_stage_recovery_failure_retains_original_business_decision_for_local_patch() {
     let decision = AiNextStageDecision {
+        plan_update: None, reconciliation: None,
         decision: "adjust".into(),
         reason: "Inspect the existing failure".into(),
         summary: "Read-only diagnosis".into(),
@@ -192,7 +193,7 @@ fn next_stage_recovery_failure_retains_original_business_decision_for_local_patc
     )
     .unwrap_err();
     let envelope: Value = serde_json::from_str(&error).unwrap();
-    assert_eq!(envelope["steps"][0]["command"], "mktemp -d");
+    assert_eq!(envelope["steps"][0]["action"]["command"], "mktemp -d");
     assert_eq!(envelope["nextStageDecision"]["decision"], "adjust");
     assert_eq!(
         envelope["nextStageDecision"]["reason"],
@@ -206,12 +207,14 @@ fn next_stage_recovery_failure_retains_original_business_decision_for_local_patc
 #[test]
 fn next_stage_hidden_tool_failure_preserves_the_rejected_plan_for_business_replanning() {
     let decision = AiNextStageDecision {
+        plan_update: None, reconciliation: None,
         decision: "continue".into(), reason: "Read project declarations".into(),
         summary: "Deployment is not complete".into(),
         steps: vec![AiPlanStep {
+        action: Some(StepAction::Tool { tool_id: "files.get_structure".into(), arguments: serde_json::from_value(json!({"rootPath": "/opt/report"})).unwrap() }),
             kind: "observe".into(), title: "Read".into(), description: "Read evidence".into(),
-            command: "opsark-tool files.get_structure {\"rootPath\":\"/opt/report\"}".into(),
-            expected: "Project structure".into(), validation: "true".into(), risk: Some("low".into()),
+            command: "".into(),
+            expected: "Project structure".into(), validation: "".into(), risk: Some("low".into()),
             ..AiPlanStep::default()
         }],
     };

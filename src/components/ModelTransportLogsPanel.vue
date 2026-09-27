@@ -27,7 +27,7 @@ const errorMessage = ref("");
 const copiedId = ref("");
 const PAGE_SIZE = 100;
 const QUERY_DEBOUNCE_MS = 250;
-const TRANSPORT_EVENTS = ["request_sent", "response_received", "request_failed", "response_failed", "unknown"] as const;
+const TRANSPORT_EVENTS = ["request_sent", "response_received", "request_failed", "response_failed", "compatibility_attempt", "unknown"] as const;
 let reloadTimer: number | undefined;
 let requestVersion = 0;
 let reloadQueued = false;
@@ -62,6 +62,18 @@ function normalizeTransportEvent(value: unknown): ModelTransportEvent | undefine
     event: record.event as ModelTransportEvent["event"],
     timestampMs: record.timestampMs,
   };
+  if (event.event === "compatibility_attempt") {
+    event.capabilityVersion = optionalString(record, "capabilityVersion");
+    const protocol = optionalString(record, "apiProtocol");
+    if (protocol === "chat_completions" || protocol === "responses") event.apiProtocol = protocol;
+    const mode = optionalString(record, "effectiveOutputMode");
+    if (mode && ["text", "json_object", "json_schema"].includes(mode)) event.effectiveOutputMode = mode;
+    const budget = optionalNumber(record, "effectiveOutputTokens");
+    if (budget !== undefined && Number.isInteger(budget) && budget >= 0 && budget <= 1_000_000) event.effectiveOutputTokens = budget;
+    for (const field of ["schemaDowngraded", "cachedJsonOnly", "compactRepair"] as const) {
+      if (typeof record[field] === "boolean") event[field] = record[field];
+    }
+  }
   for (const field of ["callId", "requestId", "upstreamRequestId", "requestName", "modelName", "taskId", "serverId", "roundId", "stepId", "contentType", "contentEncoding"] as const) {
     const item = optionalString(record, field);
     if (item !== undefined) Object.assign(event, { [field]: item });
@@ -102,8 +114,10 @@ function normalizeTransportEvent(value: unknown): ModelTransportEvent | undefine
     const input = optionalNumber(item, "input");
     const output = optionalNumber(item, "output");
     const usageTotal = optionalNumber(item, "total");
-    if (input !== undefined && output !== undefined && usageTotal !== undefined && item.source === "api") {
-      event.tokenUsage = { input, output, total: usageTotal, source: "api" };
+    if (item.source === "api") {
+      event.tokenUsage = { input: input ?? null, output: output ?? null, total: usageTotal ?? null, source: "api" };
+      const reasoning = optionalNumber(item, "reasoning");
+      if (reasoning !== undefined) event.tokenUsage.reasoning = reasoning;
       const cacheHit = optionalNumber(item, "cacheHit");
       const cacheMiss = optionalNumber(item, "cacheMiss");
       if (cacheHit !== undefined) event.tokenUsage.cacheHit = cacheHit;
@@ -290,6 +304,7 @@ function eventLevel(event: ModelTransportEvent) {
 
 function eventTitle(event: ModelTransportEvent) {
   const requestName = event.requestName || (locale.value.startsWith("zh") ? "模型调用" : "Model call");
+  if (event.event === "compatibility_attempt") return `${requestName} · ${locale.value.startsWith("zh") ? "模型兼容策略" : "Model compatibility strategy"}`;
   if (event.event === "request_sent") return `${requestName} · ${locale.value.startsWith("zh") ? "请求已发送" : "request sent"}`;
   if (event.event === "response_received") return `${requestName} · ${locale.value.startsWith("zh") ? "收到响应" : "response received"}${event.status !== undefined ? ` HTTP ${event.status}` : ""}`;
   if (event.event === "request_failed") return `${requestName} · ${locale.value.startsWith("zh") ? "请求传输失败" : "request transport failed"}`;
@@ -298,6 +313,13 @@ function eventTitle(event: ModelTransportEvent) {
 }
 
 function eventSummary(event: ModelTransportEvent) {
+  if (event.event === "compatibility_attempt") return [event.apiProtocol, event.effectiveOutputMode,
+    event.effectiveOutputTokens !== undefined ? `${event.effectiveOutputTokens} Token` : "",
+    event.schemaDowngraded ? (locale.value.startsWith("zh") ? "上游不支持 Schema，已降级" : "Schema unsupported; downgraded") : "",
+    event.cachedJsonOnly ? (locale.value.startsWith("zh") ? "复用 JSON 兼容记录" : "Cached JSON compatibility") : "",
+    event.compactRepair ? (locale.value.startsWith("zh") ? "一次精简修复" : "Single compact repair") : "",
+    event.capabilityVersion,
+  ].filter(Boolean).join(" · ");
   const parts: string[] = [event.event];
   if (event.attempt !== undefined) parts.push(`attempt ${event.attempt}`);
   if (event.status !== undefined) parts.push(`HTTP ${event.status}`);
@@ -310,7 +332,9 @@ function tokenText(event: ModelTransportEvent) {
   const usage = event.tokenUsage;
   if (!usage) return undefined;
   const cache = [usage.cacheHit !== undefined ? `cache hit ${usage.cacheHit}` : "", usage.cacheMiss !== undefined ? `miss ${usage.cacheMiss}` : ""].filter(Boolean).join(" / ");
-  return `${usage.total.toLocaleString()} tokens (${usage.input.toLocaleString()} → ${usage.output.toLocaleString()})${cache ? ` · ${cache}` : ""}`;
+  const format = (value: number | null) => value?.toLocaleString() ?? (locale.value.startsWith("zh") ? "未知" : "unknown");
+  const reasoning = usage.reasoning !== undefined ? ` · reasoning ${usage.reasoning} (included in output)` : "";
+  return `${format(usage.total)} tokens (${format(usage.input)} → ${format(usage.output)})${cache ? ` · ${cache}` : ""}${reasoning}`;
 }
 
 function formatTime(timestampMs: number) {

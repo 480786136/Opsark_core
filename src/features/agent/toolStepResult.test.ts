@@ -52,11 +52,9 @@ describe("tool step result", () => {
       completedAt: "2026-08-14T01:00:00.000Z",
       evidenceId: "evidence-incomplete",
     });
-    expect(outcome.status).toBe("completed");
-    expect(outcome.output).toBe("{}");
-    expect(outcome.result.facts).toMatchObject({ toolId: call.toolId, truncated: false, evidenceComplete: false });
-    expect(outcome.result.facts.evidenceKind).toBeUndefined();
-    expect(outcome.evidence?.[0].facts).toEqual(outcome.result.facts);
+    expect(outcome.status).toBe("failed");
+    expect(outcome.result.facts).toMatchObject({ toolId: call.toolId, errorCode: "TOOL_OUTPUT_INVALID" });
+    expect(outcome.evidence).toBeUndefined();
   });
 
   it("preserves a nested truncation marker in the execution result", () => {
@@ -75,7 +73,7 @@ describe("tool step result", () => {
   it("marks truncated output as warning evidence", () => {
     const outcome = buildToolStepOutcome({
       call,
-      result: { callId: call.id, toolId: call.toolId, success: true, data: [], truncated: true },
+      result: { callId: call.id, toolId: call.toolId, success: true, data: { rootPath: "/opt/app", tree: "/opt/app/", warnings: [], truncated: true }, truncated: true },
       completedAt: "2026-08-14T01:00:00.000Z",
       evidenceId: "evidence-2",
     });
@@ -94,13 +92,41 @@ describe("tool step result", () => {
     };
     const outcome = buildToolStepOutcome({
       call: connectCall,
-      result: { callId: connectCall.id, toolId: connectCall.toolId, success: true, data: { connected: true } },
+      result: { callId: connectCall.id, toolId: connectCall.toolId, success: true, data: { connected: true, host: "192.168.1.237", port: 22, serverId: "server", name: "server", username: "root", info: {} } },
       completedAt: "2026-08-14T01:00:00.000Z",
       evidenceId: "connect-evidence",
     });
 
     expect(outcome.review?.summary).toBe("工具已返回结构化证据。");
     expect(outcome.eventMessage).toContain("完整结果");
+  });
+
+  it("preserves only bounded non-secret partial connect facts through failure validation", () => {
+    const connectionCall: ToolCall = { id: "partial", toolId: "server.connect", arguments: { host: "example.test" } };
+    const outcome = buildToolStepOutcome({ call: connectionCall, completedAt: "now", evidenceId: "unused", result: {
+      callId: connectionCall.id, toolId: connectionCall.toolId, success: false,
+      error: { code: "TOOL_BUSINESS", message: "连接完成后任务取消", category: "business", dispatchState: "sent" },
+      data: { serverId: "srv-123", connectionChecked: true, directoryUpdated: true, connected: true,
+        taskTargetUpdated: false, agentSessionCreationDispatched: true, agentSessionPrepared: false, credentialStored: false,
+        },
+    } });
+    expect(outcome.result.facts.partialEffects).toEqual({ serverId: "srv-123", connectionChecked: true, directoryUpdated: true,
+      connected: true, taskTargetUpdated: false, agentSessionCreationDispatched: true, agentSessionPrepared: false, credentialStored: false });
+    expect(outcome.result.facts.dispatchState).toBe("sent");
+    expect(JSON.stringify(outcome)).not.toContain("must-not-leak");
+    expect(outcome.result.executionStatus).toBe("failed");
+    expect(outcome.evidence).toBeUndefined();
+  });
+
+  it("does not convert arbitrary failure data or untyped values into partial facts", () => {
+    for (const toolId of ["server.connect", "files.get_structure"]) {
+      const failureCall = { ...call, toolId };
+      const outcome = buildToolStepOutcome({ call: failureCall, completedAt: "now", evidenceId: "unused", result: {
+        callId: failureCall.id, toolId, success: false, error: { code: "TOOL_BUSINESS", message: "失败" },
+        data: { serverId: "server\nsecret", connected: "true", directoryUpdated: 1, password: "must-not-leak" },
+      } });
+      expect(outcome.result.facts).not.toHaveProperty("partialEffects");
+    }
   });
 
   it("builds a deterministic failure without evidence", () => {

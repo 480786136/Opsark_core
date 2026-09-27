@@ -90,6 +90,40 @@ fn advance_terminal_write<W: Write>(
     }
 }
 
+fn format_terminal_io_error(
+    operation: &str,
+    error: &std::io::Error,
+    ssh_error: Option<&ssh2::Error>,
+) -> String {
+    // ssh2's conversion to io::Error keeps only the message and discards the
+    // libssh2 code. "transport read" alone cannot distinguish a socket reset
+    // from a decryption/protocol error. Preserve the code before any other SSH
+    // operation (including reading stderr) overwrites session.last_error.
+    let code = ssh_error
+        .map(|error| error.code().to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    format!(
+        "{operation}：{error} [pty-io-v2; io={:?}; ssh={code}]",
+        error.kind()
+    )
+}
+
+fn terminal_io_error(session: &ssh2::Session, operation: &str, error: std::io::Error) -> String {
+    let ssh_error = ssh2::Error::last_session_error(session)
+        .filter(|last| last.message() == error.to_string());
+    let detail = format_terminal_io_error(operation, &error, ssh_error.as_ref());
+    // Negotiated algorithm names contain no credentials or terminal payload.
+    format!(
+        "{detail} [cipher_rx={}; cipher_tx={}]",
+        session
+            .methods(ssh2::MethodType::CryptSc)
+            .unwrap_or("unknown"),
+        session
+            .methods(ssh2::MethodType::CryptCs)
+            .unwrap_or("unknown"),
+    )
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TerminalEvent {
@@ -308,7 +342,7 @@ fn run_terminal_session(
                         unreachable!("terminal input queue changed while processing its front")
                     }
                 },
-                Err(error) => return Err(format!("终端输入发送失败：{error}")),
+                Err(error) => return Err(terminal_io_error(&session, "终端输入发送失败", error)),
             }
         }
 
@@ -322,7 +356,7 @@ fn run_terminal_session(
             ),
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(format!("终端输出读取失败：{error}")),
+            Err(error) => return Err(terminal_io_error(&session, "终端输出读取失败", error)),
         }
 
         match channel.stderr().read(&mut buffer) {
@@ -335,7 +369,7 @@ fn run_terminal_session(
             ),
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(format!("终端错误输出读取失败：{error}")),
+            Err(error) => return Err(terminal_io_error(&session, "终端错误输出读取失败", error)),
         }
 
         if channel.eof() {
@@ -478,6 +512,33 @@ pub(crate) fn close_ssh_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserves_distinct_ssh_failures_with_the_same_transport_message() {
+        for code in [-43, -13, -4, -15] {
+            let ssh_error = ssh2::Error::new(ssh2::ErrorCode::Session(code), "transport read");
+            let io_error = std::io::Error::from(ssh2::Error::new(
+                ssh2::ErrorCode::Session(code),
+                "transport read",
+            ));
+            assert_eq!(io_error.to_string(), "transport read");
+            let detail = format_terminal_io_error("终端输出读取失败", &io_error, Some(&ssh_error));
+            assert!(detail.contains(&format!("ssh=Session({code})")));
+            assert!(detail.contains("pty-io-v2"));
+            assert!(is_retryable_terminal_error(&detail));
+        }
+    }
+
+    #[test]
+    fn reports_missing_ssh_diagnostics_without_inventing_a_code() {
+        let detail = format_terminal_io_error(
+            "终端输入发送失败",
+            &std::io::Error::from(std::io::ErrorKind::WriteZero),
+            None,
+        );
+        assert!(detail.contains("ssh=unavailable"));
+        assert!(detail.contains("io=WriteZero"));
+    }
 
     enum WriteAttempt {
         Accept(usize),

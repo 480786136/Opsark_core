@@ -98,7 +98,7 @@ describe("review context", () => {
     const inputStep = {
       ...step("registry-choice", "completed"),
       title: "选择镜像源",
-      command: 'opsark-tool user.request_input {"title":"选择镜像源","fields":[]}',
+      command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: {"title":"选择镜像源","fields":[]} },
       output: "RAW_FORM_OUTPUT_MUST_NOT_BE_REQUIRED",
       result: {
         executionStatus: "success" as const,

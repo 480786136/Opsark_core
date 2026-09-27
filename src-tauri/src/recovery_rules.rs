@@ -37,18 +37,19 @@ pub struct RecoveryProtocolIssue {
 
 fn issue(code: &str, step: &Value, index: usize, matched: Option<String>) -> RecoveryProtocolIssue {
     let rule = &rules()["errors"][code];
+    let field_path = |field: &str| format!("steps[{index}].{}", if field == "command" && step["action"]["type"] == "shell" { "action.command" } else { field });
     RecoveryProtocolIssue {
         code: code.into(),
         step_index: index,
         step_id: step["id"].as_str().map(str::to_string),
-        field_path: format!("steps[{index}].{}", rule["field"].as_str().unwrap()),
+        field_path: field_path(rule["field"].as_str().unwrap()),
         matched_token: matched,
         expected: rule["expected"].as_str().unwrap().into(),
         allowed_repair_paths: rule["repairFields"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|field| format!("steps[{index}].{}", field.as_str().unwrap()))
+            .map(|field| field_path(field.as_str().unwrap()))
             .collect(),
         rule_version: version(),
     }
@@ -63,7 +64,7 @@ pub fn metadata_issue(step: &Value, index: usize) -> Option<RecoveryProtocolIssu
         {
             return None;
         }
-        command_mutation(step["command"].as_str().unwrap_or(""))
+        command_mutation(step["action"]["command"].as_str().or_else(|| step["command"].as_str()).unwrap_or(""))
             .map(|matched| issue("OBSERVE_COMMAND_MUTATION", step, index, Some(matched)))
     };
     let relation = &step["recovery"];
@@ -101,7 +102,7 @@ pub fn metadata_issue(step: &Value, index: usize) -> Option<RecoveryProtocolIssu
         return Some(issue("RECOVERY_KIND_MISMATCH", step, index, None));
     }
     if purpose["readonly"].as_bool() == Some(true) {
-        if let Some(mutation) = command_mutation(step["command"].as_str().unwrap_or("")) {
+        if let Some(mutation) = command_mutation(step["action"]["command"].as_str().or_else(|| step["command"].as_str()).unwrap_or("")) {
             return Some(issue(
                 "RECOVERY_DIAGNOSE_MUTATION",
                 step,

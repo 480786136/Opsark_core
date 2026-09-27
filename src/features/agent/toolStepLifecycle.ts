@@ -1,3 +1,6 @@
+import { enforceToolResult } from "@/features/tools/toolResultContract";
+import { toolFailure } from "@/features/tools/toolFailure";
+import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 import {
   applyToolStepOutcome,
   buildToolStepOutcome,
@@ -6,6 +9,7 @@ import {
 import { transitionStep } from "@/features/agent/stepMachine";
 import type { PlanStep } from "@/types";
 import type { ToolCall, ToolResult } from "@/features/tools/types";
+import { ExecutionLedgerError } from "@/services/executionLedger";
 
 type ToolExecutor = () => Promise<ToolResult>;
 
@@ -17,6 +21,8 @@ export interface RunToolStepLifecycleInput {
   now(): string;
   isCancelled(): boolean;
   onStart(eventMessage: string): void;
+  waitBeforeRetry?(delayMs: number): Promise<void>;
+  onRetry?(attempt: number): void;
 }
 
 export interface ToolStepCoordination {
@@ -32,7 +38,7 @@ function executionFailure(call: ToolCall, error: unknown): ToolResult {
     callId: call.id,
     toolId: call.toolId,
     success: false,
-    error: { code: "TOOL_EXECUTION_FAILED", message: String(error) },
+    error: toolFailure(error, true),
   };
 }
 
@@ -44,15 +50,30 @@ export async function runToolStepLifecycle(
   transitionStep(input.step, "running");
   const startedAt = input.now();
   input.step.startedAt = startedAt;
-  input.step.progressMessage = "正在调用只读工具…";
-  input.onStart(`调用工具 ${input.call.toolId} 获取执行前证据。`);
+  input.step.progressMessage = "正在调用工具…";
+  input.onStart(`调用工具 ${input.call.toolId} ，等待结构化执行结果。`);
 
   let result: ToolResult;
-  try {
-    result = await input.execute();
-  } catch (error) {
-    result = executionFailure(input.call, error);
+  const attempts: NonNullable<ToolResult["attempts"]> = [];
+  const readOnly = defaultToolCatalog.find(tool => tool.id === input.call.toolId)?.effect === "read";
+  // One owner and one budget per actual tool step. Changes never receive automatic replay here.
+  for (;;) {
+    try { result = enforceToolResult(input.call, await input.execute()); }
+    catch (error) {
+      // Storage, uncertain dispatch and stale receipts are coordinator states.
+      // Converting them to a tool failure would erase known results or retry I/O.
+      if (error instanceof ExecutionLedgerError) throw error;
+      result = executionFailure(input.call, error);
+    }
+    attempts.push({ number: attempts.length + 1, code: result.error?.code, category: result.error?.category, dispatchState: result.error?.dispatchState });
+    const transient = ["network", "timeout", "rate_limit"].includes(result.error?.category ?? "");
+    if (result.success || !readOnly || !transient || attempts.length >= 3 || input.isCancelled()) break;
+    const delay = Math.min(30_000, Math.max(attempts.length === 1 ? 500 : 1500, result.error?.retryAfterMs ?? 0));
+    input.onRetry?.(attempts.length);
+    await (input.waitBeforeRetry ?? (ms => new Promise(resolve => setTimeout(resolve, ms))))(delay);
+    if (input.isCancelled()) return { cancelled: true };
   }
+  result = { ...result, attempts };
   if (input.isCancelled()) return { cancelled: true };
 
   const completedAt = input.now();

@@ -39,10 +39,12 @@ export function buildValidationResultAudit(
   input: ValidationResultAuditInput,
 ): AuditEventDraft {
   const warning = ["warning", "unhealthy"].includes(input.result.observationStatus);
+  const awaitingAcceptance = input.result.facts.semanticAcceptanceRequired === true
+    && input.result.facts.semanticAcceptanceStatus !== "proven";
   return {
     category: "command",
-    level: input.accepted ? (warning ? "warning" : "success") : "error",
-    title: `${input.stepTitle} · ${input.verificationMode === "command_result" ? "观察证据" : "程序证据校验"}`,
+    level: input.accepted ? (warning ? "warning" : awaitingAcceptance ? "info" : "success") : "error",
+    title: `${input.stepTitle} · ${input.verificationMode === "command_result" ? "观察证据" : awaitingAcceptance ? "命令证据已记录，结果待验收" : "程序证据校验"}`,
     detail: JSON.stringify({
       validator: input.validator,
       result: input.result,

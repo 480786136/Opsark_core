@@ -12,17 +12,18 @@ import {
   semanticLongRunningOutputFingerprint,
   hasCriticalLongRunningEvidence,
 } from "@/features/agent/longRunningReviewOutput";
-import type { ModelServiceError, OpsTask, PlanStep, StepReview } from "@/types";
+import type { CommandExecutionPolicy, ModelServiceError, OpsTask, PlanStep, StepReview } from "@/types";
+import { classifyLongRunningWorkload, freezeCommandExecutionPolicy } from "./executionPolicy";
+import type { LongRunningWorkload } from "./executionPolicy";
+export { classifyLongRunningWorkload, BOUNDED_COMMAND_HARD_LIMIT_SECONDS } from "./executionPolicy";
+export type { LongRunningWorkload } from "./executionPolicy";
 
 export const LONG_RUNNING_REVIEW_INTERVAL_MS = 30_000;
 export const PROGRESSIVE_ADVISORY_INTERVAL_MS = 120_000;
 export const MAX_IDLE_ADVISORY_INTERVAL_MS = 600_000;
 export const MAX_RUNTIME_RETRY_INTERVAL_MS = 120_000;
-export const BOUNDED_COMMAND_HARD_LIMIT_SECONDS = 90;
 export const STALLED_REVIEW_NOTICE_ROUNDS = 2;
-export const BOUNDED_MAX_CONTINUE_ROUNDS = 2;
 
-export type LongRunningWorkload = "bounded" | "progressive" | "persistent_service";
 
 export interface LongRunningMonitorState {
   decision?: StepReview;
@@ -70,6 +71,7 @@ export interface StartLongRunningMonitorInput {
   executionId: string;
   /** Trusted caller-owned absolute deadline, fixed when monitoring starts. Never read from model output. */
   executionDeadlineAt?: number;
+  executionPolicy?: CommandExecutionPolicy;
   connection?: RuntimeConnection;
   runtimeModel?: RuntimeModel;
   secretValues: Record<string, string>;
@@ -95,35 +97,6 @@ const browserScheduler: LongRunningMonitorScheduler = {
   setInterval: (callback, intervalMs) => window.setInterval(callback, intervalMs),
   clearInterval: (timerId) => window.clearInterval(timerId),
 };
-
-const PROGRESSIVE_COMMAND_PATTERNS = [
-  /\b(?:curl|wget)\b/,
-  /\bgit\s+(?:clone|fetch|pull|submodule\s+update)\b/,
-  /\b(?:scp|rsync)\b/,
-  /\b(?:dnf|yum|apt|apt-get|zypper|pacman)\s+(?:install|update|upgrade|download)\b/,
-  /\b(?:npm|pnpm|yarn|composer)\s+(?:ci|install|update)\b/,
-  /\b(?:npm|pnpm|yarn)\s+(?:run\s+)?(?:build|compile|bundle|test)\b/,
-  /\b(?:pip|pip3)\s+(?:install|download|wheel)\b/,
-  /\b(?:mvn|mvnw)\b[^\n;]*(?:package|install|deploy)/,
-  /\b(?:gradle|gradlew)\b[^\n;]*(?:build|assemble|publish)/,
-  /\bcargo\s+(?:build|install|fetch|update)\b/,
-  /\brustup\s+(?:install|update|toolchain\s+install)\b/,
-  /\bgo\s+(?:build|install|get)\b/,
-  /(?:^|[;&|]\s*)make(?:\s|$)/,
-  /\bdocker\s+(?:build|pull|push)\b/,
-  /\bdocker\s+compose\b[^\n;]*(?:build|pull|up)\b/,
-  /\b(?:tar|unzip|7z)\b/,
-];
-
-/** Long downloads/builds are allowed to run while their observable output changes. */
-export function classifyLongRunningWorkload(step: Pick<PlanStep, "title" | "description" | "command" | "runtimeClass">): LongRunningWorkload {
-  if (step.runtimeClass === "persistent_service") return "persistent_service";
-  if (step.runtimeClass === "progressive") return "progressive";
-  const command = step.command.toLocaleLowerCase();
-  return PROGRESSIVE_COMMAND_PATTERNS.some((pattern) => pattern.test(command))
-    ? "progressive"
-    : "bounded";
-}
 
 function ruleAdjustment(reason: string, summary: string): StepReview {
   return { decision: "adjust", source: "rules", reason, summary };
@@ -184,13 +157,12 @@ export function startLongRunningMonitor(
   const parsedStartedAt = input.step.startedAt
     ? new Date(input.step.startedAt).getTime()
     : scheduler.now();
-  const startedAt = Number.isFinite(parsedStartedAt) ? parsedStartedAt : scheduler.now();
-  const callerDeadline = Number.isFinite(input.executionDeadlineAt) ? input.executionDeadlineAt : undefined;
-  // Preserve the existing bounded-command policy; progressive/service commands
-  // only have a hard deadline when the execution owner explicitly supplies one.
-  const executionDeadlineAt = state.workload === "bounded"
-    ? Math.min(callerDeadline ?? Infinity, startedAt + BOUNDED_COMMAND_HARD_LIMIT_SECONDS * 1000)
-    : callerDeadline;
+  const policy = freezeCommandExecutionPolicy(input.step, input.executionId,
+    Number.isFinite(parsedStartedAt) ? parsedStartedAt : scheduler.now(),
+    input.executionPolicy, input.executionDeadlineAt);
+  const startedAt = policy.startedAt;
+  const executionDeadlineAt = policy.deadlineAt;
+  state.workload = policy.kind === "scan" ? "progressive" : policy.kind;
   let lastModelReviewAt = startedAt;
   let lastModelReviewedOutput = "";
 
@@ -198,7 +170,6 @@ export function startLongRunningMonitor(
     0,
     Math.floor((scheduler.now() - startedAt) / 1000),
   );
-  const maxContinueRounds = state.workload === "bounded" ? BOUNDED_MAX_CONTINUE_ROUNDS : undefined;
   const markProgress = () => {
     lastProgressAt = scheduler.now();
     state.lastProgressAt = new Date(lastProgressAt).toISOString();
@@ -273,7 +244,8 @@ export function startLongRunningMonitor(
     lastReviewFingerprint = currentFingerprint;
     reviewInFlight = true;
     const priorRuntimeIoBytes = state.runtimeProgress?.ioBytes;
-    const samplingAttempted = Boolean(input.sampleRuntimeProgress) && scheduler.now() >= nextRuntimeSampleAt;
+    const samplingStartedAt = scheduler.now();
+    const samplingAttempted = Boolean(input.sampleRuntimeProgress) && samplingStartedAt >= nextRuntimeSampleAt;
     const sample = samplingAttempted
       ? Promise.resolve().then(() => input.sampleRuntimeProgress!()).catch((error) => {
           if (stopped || input.isCancelled() || interruptionRequested) return undefined;
@@ -287,31 +259,35 @@ export function startLongRunningMonitor(
       : Promise.resolve(undefined);
     void sample.then(async (runtimeProgress) => {
       if (stopped || input.isCancelled() || interruptionRequested) return;
-      const runtimeIoChanged = runtimeProgress !== undefined
-        && priorRuntimeIoBytes !== undefined
-        && runtimeProgress.ioBytes > priorRuntimeIoBytes;
+      const runtimeSampleFresh = runtimeProgress !== undefined
+        && scheduler.now() - samplingStartedAt < LONG_RUNNING_REVIEW_INTERVAL_MS;
+      const cpuAvailable = runtimeSampleFresh && runtimeProgress?.cpuPercent != null;
+      const ioAvailable = runtimeSampleFresh && runtimeProgress?.ioBytes != null;
+      const runtimeIoChanged = ioAvailable && priorRuntimeIoBytes != null
+        && runtimeProgress!.ioBytes! > priorRuntimeIoBytes;
       if (runtimeProgress) {
         state.runtimeProgress = runtimeProgress;
         state.runtimeSamplingStatus = "healthy";
-        state.lastRuntimeSampleAt = new Date(scheduler.now()).toISOString();
+        state.lastRuntimeSampleAt = new Date(samplingStartedAt).toISOString();
         state.consecutiveRuntimeSampleFailures = 0;
-        nextRuntimeSampleAt = scheduler.now() + LONG_RUNNING_REVIEW_INTERVAL_MS;
+        nextRuntimeSampleAt = samplingStartedAt + LONG_RUNNING_REVIEW_INTERVAL_MS;
         // A live process tree is liveness evidence, not progress evidence. A
         // blocked network client commonly keeps parent/child processes alive
         // while doing no CPU or I/O work, which previously kept this counter at
         // zero forever and caused a model review every 30 seconds.
-        const runtimeActivity = runtimeProgress.active && (
-          runtimeProgress.cpuPercent >= 0.1
+        const runtimeActivity = runtimeSampleFresh && runtimeProgress.active && (
+          (cpuAvailable && runtimeProgress.cpuPercent! >= 0.1)
           || runtimeIoChanged
         );
-        state.runtimeIdleReviewRounds = runtimeActivity ? 0 : state.runtimeIdleReviewRounds + 1;
+        state.runtimeIdleReviewRounds = runtimeActivity || !runtimeSampleFresh || !cpuAvailable || !ioAvailable
+          ? 0 : state.runtimeIdleReviewRounds + 1;
         if (runtimeActivity) {
           state.lastRuntimeProgressAt = new Date(scheduler.now()).toISOString();
           markProgress();
         }
         // A service may hand off to a supervisor outside this process group.
         // Its readiness/ownership validator must decide success after exit.
-        if (state.workload === "progressive" && !runtimeProgress.active) {
+        if (runtimeSampleFresh && state.workload === "progressive" && !runtimeProgress.active) {
           const review = ruleAdjustment(
             "远程 executionId 对应的进程组已不存在，但执行通道尚未返回真实退出码",
             "长任务进程已消失且通道未完成，已中断等待并进入执行通道恢复，不会把文本沉默误判为业务完成。",
@@ -326,11 +302,11 @@ export function startLongRunningMonitor(
       }
       const newOutput = currentOutput.startsWith(lastModelReviewedOutput)
         ? currentOutput.slice(lastModelReviewedOutput.length) : currentOutput;
-      const measuredProgress = runtimeProgress?.active === true
-        && (runtimeProgress.cpuPercent >= 0.1 || runtimeIoChanged);
+      const measuredProgress = runtimeSampleFresh && runtimeProgress?.active === true
+        && ((cpuAvailable && runtimeProgress.cpuPercent! >= 0.1) || runtimeIoChanged);
       state.noProgressReviewRounds = outputChangedSinceLastReview || measuredProgress
         ? 0
-        : (runtimeProgress || state.workload === "bounded" ? state.noProgressReviewRounds + 1 : 0);
+        : (runtimeSampleFresh && cpuAvailable && ioAvailable ? state.noProgressReviewRounds + 1 : 0);
       if (state.modelServiceError) {
         // Account conditions cannot be fixed by another advisory request. Keep
         // heartbeat, runtime sampling and the caller's deadline active while
@@ -380,23 +356,21 @@ export function startLongRunningMonitor(
         noProgressSeconds: state.noProgressSeconds,
         noProgressReviewRounds: state.noProgressReviewRounds,
         consecutiveContinueRounds: state.consecutiveContinueRounds,
-        maxConsecutiveContinueRounds: maxContinueRounds,
         hardLimitSeconds: executionDeadlineAt === undefined ? undefined : Math.max(0, (executionDeadlineAt - startedAt) / 1000),
         executionDeadlineAt: executionDeadlineAt === undefined ? undefined : new Date(executionDeadlineAt).toISOString(),
-        runtimeActive: runtimeProgress?.active,
-        runtimeProcessCount: runtimeProgress?.processCount,
-        runtimeCpuPercent: runtimeProgress?.cpuPercent,
-        runtimeIoBytes: runtimeProgress?.ioBytes,
+        runtimeSampleFresh,
+        runtimeCpuAvailable: cpuAvailable,
+        runtimeIoAvailable: ioAvailable,
+        runtimeActive: runtimeSampleFresh ? runtimeProgress?.active : undefined,
+        runtimeProcessCount: runtimeSampleFresh ? runtimeProgress?.processCount : undefined,
+        runtimeCpuPercent: cpuAvailable ? runtimeProgress?.cpuPercent ?? undefined : undefined,
+        runtimeIoBytes: ioAvailable ? runtimeProgress?.ioBytes ?? undefined : undefined,
         runtimeIoChanged,
         runtimeIdleReviewRounds: state.runtimeIdleReviewRounds,
         runtimeSamplingStatus: state.runtimeSamplingStatus,
         consecutiveRuntimeSampleFailures: state.consecutiveRuntimeSampleFailures,
         advisoryIntervalMs: advisoryInterval,
-        stalledNotice: state.workload !== "bounded"
-          ? "文本沉默、CPU/I/O 空闲或采样失败均不能单独证明业务失败；没有明确错误证据或执行期限时仅建议继续观察，不得据此中断进程。常驻服务空闲可能是正常状态。"
-          : state.noProgressReviewRounds >= STALLED_REVIEW_NOTICE_ROUNDS
-            ? `已连续 ${state.noProgressSeconds} 秒无进展；若没有能够证明任务仍在推进的证据，应返回 adjust。`
-            : undefined,
+        stalledNotice: "文本沉默、单次 CPU/I/O 空闲、采样缺失或过期均不能单独证明业务失败；无输出可能来自管道缓冲。请结合明确的业务错误证据决策，不要因复核轮数或接近期限提前中断；执行期限由 Core 独立执行。常驻服务空闲可能是正常状态。",
       };
       const observation = {
         passed: false,
@@ -445,15 +419,6 @@ export function startLongRunningMonitor(
         state.consecutiveContinueRounds = outputChangedSinceLastReview || measuredProgress
           ? 0
           : state.consecutiveContinueRounds + 1;
-        if (maxContinueRounds !== undefined && state.consecutiveContinueRounds >= maxContinueRounds
-          && state.noProgressReviewRounds > 0) {
-          const review = ruleAdjustment(
-            `模型已连续 ${state.consecutiveContinueRounds} 轮建议等待，但期间没有足够的输出进展`,
-            "模型 continue 已达到连续等待上限，当前命令疑似卡住；已中断并进入调整，不会判定为成功。",
-          );
-          await stopForAdjustment(review, review.summary);
-          return;
-        }
         input.onEvent(
           "assistant",
           `第 ${reviewRound} 次长任务复核建议继续等待：${modelDecision.summary || modelDecision.reason}`,

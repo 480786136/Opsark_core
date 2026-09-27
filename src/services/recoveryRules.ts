@@ -38,13 +38,13 @@ export function readRecoveryProtocolError(error: unknown): RecoveryProtocolIssue
 }
 
 type RuleCode = keyof typeof rules.errors;
-type RecoveryStep = { id?: string; kind?: string; command: string; status?: string; recovery?: unknown; recoveryRuleVersion?: number };
+type RecoveryStep = { action?: { type: string; command?: string }; id?: string; kind?: string; command: string; status?: string; recovery?: unknown; recoveryRuleVersion?: number };
 
 function issueFor(code: RuleCode, step: RecoveryStep, stepIndex: number, matchedToken?: string): RecoveryProtocolIssue {
   const rule = rules.errors[code];
   return { code, stepIndex, ...(step.id ? { stepId: step.id } : {}),
-    fieldPath: `steps[${stepIndex}].${rule.field}`, expected: rule.expected,
-    allowedRepairPaths: rule.repairFields.map(field => `steps[${stepIndex}].${field}`),
+    fieldPath: `steps[${stepIndex}].${rule.field === "command" && step.action?.type === "shell" ? "action.command" : rule.field}`, expected: rule.expected,
+    allowedRepairPaths: rule.repairFields.map(field => `steps[${stepIndex}].${field === "command" && step.action?.type === "shell" ? "action.command" : field}`),
     ruleVersion: rules.version, ...(matchedToken ? { matchedToken } : {}) };
 }
 

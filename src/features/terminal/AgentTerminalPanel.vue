@@ -9,6 +9,7 @@ import "@xterm/xterm/css/xterm.css";
 import { useOpsStore } from "@/stores/ops";
 import { useAgentTerminalStore } from "./agentTerminalStore";
 import { buildAgentTerminalTranscript, toXtermData } from "./agentTerminalTranscript";
+import { agentTerminalEmptyState } from "./agentTerminalEmptyState";
 import { usePreferenceStore } from "@/features/preferences/preferenceStore";
 import {
   readTerminalFontFamily,
@@ -31,6 +32,7 @@ const target = computed(() => ops.servers.find(({ id }) => (
 )));
 const entries = computed(() => terminals.entriesByTask[props.taskId] ?? []);
 const transcript = computed(() => buildAgentTerminalTranscript(entries.value));
+const emptyState = computed(() => agentTerminalEmptyState(task.value));
 const sessionStateLabel = computed(() => session.value ? t(`terminal.agentState.${session.value.state}`) : "");
 
 let terminal: Terminal | undefined;
@@ -144,7 +146,10 @@ onBeforeUnmount(() => {
     </header>
     <div class="agent-terminal-screen">
       <div ref="terminalHost" class="agent-terminal-host" :aria-label="t('terminal.agentTerminalIo')" />
-      <span v-if="!transcript" class="agent-terminal-empty">{{ t("terminal.waitingForAgentCommand") }}</span>
+      <div v-if="!transcript" class="agent-terminal-empty" role="status" aria-live="polite">
+        <span>{{ t(emptyState.messageKey, { tool: emptyState.toolId ?? "" }) }}</span>
+        <p v-if="emptyState.reason">{{ emptyState.reason }}</p>
+      </div>
     </div>
   </section>
 </template>
@@ -164,5 +169,6 @@ onBeforeUnmount(() => {
 .agent-terminal-host { width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; background: var(--terminal-bg); }
 .agent-terminal-host :deep(.xterm) { width: 100%; height: 100%; padding: 10px 8px 6px 12px; background: var(--terminal-bg); }
 .agent-terminal-host :deep(.xterm-viewport) { overflow-y: auto !important; scrollbar-gutter: stable; background: var(--terminal-bg) !important; }
-.agent-terminal-empty { position: absolute; top: 12px; left: 14px; color: var(--dim); font: 9px var(--font-mono); pointer-events: none; }
+.agent-terminal-empty { position: absolute; top: 12px; right: 14px; left: 14px; max-height: calc(100% - 24px); overflow: auto; color: var(--dim); font: 9px var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.agent-terminal-empty p { margin: 8px 0 0; color: var(--terminal-text); }
 </style>

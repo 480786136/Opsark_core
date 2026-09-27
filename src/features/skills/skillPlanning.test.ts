@@ -16,7 +16,7 @@ function read(current: OpsTask, path = "/app/package.json", content = '{"scripts
   const bytes = new TextEncoder().encode(content).length;
   const outcome = buildToolStepOutcome({ call, evidenceId: `e-${path}`, completedAt: "now",
     result: { callId: call.id, toolId: call.toolId, success: true,
-      data: { path, content, encoding: "utf-8", totalBytes: bytes, returnedBytes: bytes, truncated } } });
+      data: { path, content, encoding: "utf-8", totalBytes: bytes + (truncated ? 1 : 0), returnedBytes: bytes, truncated } } });
   return { id: path, title: "read", description: "read", command: "read", kind: "observe",
     validation: "", expected: "read", risk: "low", attemptContext: taskAttemptContext(current), ...outcome };
 }

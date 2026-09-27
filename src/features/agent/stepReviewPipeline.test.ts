@@ -49,6 +49,17 @@ const continueReview: StepReview = {
 };
 
 describe("step review pipeline", () => {
+  it("retains dependency holds when the failure reviewer is unavailable", async () => {
+    const failed = step("failed", "failed");
+    const pending = step("build", "pending");
+    const currentTask = task([failed, pending]);
+    await expect(runCommandFailureReviewPipeline({ task: currentTask, step: failed,
+      failureReason: "link missing", serverId: currentTask.serverId, taskId: currentTask.id,
+      isCancelled: () => false,
+    }, vi.fn().mockRejectedValue(new Error("model unavailable")))).rejects.toThrow("model unavailable");
+    expect(pending.failureDependencies).toEqual([{ failedStepId: "failed", reason: "等待失败复核与逐步依赖判断。" }]);
+  });
+
   it("combines an allowed precondition review, audit and execution coordination", async () => {
     const blocker = step("blocker", "failed");
     const pending = step("pending", "pending");
@@ -156,7 +167,7 @@ describe("step review pipeline", () => {
     expect(failed.review).toEqual(adjust);
   });
 
-  it("continues a model-approved diagnostic after a failed change without recovery metadata", async () => {
+  it("blocks legacy continuation without structured dependency judgments", async () => {
     const failed = step("failed-build", "failed");
     failed.kind = "change";
     failed.result = {
@@ -187,7 +198,7 @@ describe("step review pipeline", () => {
     }));
 
     if (result.cancelled) throw new Error("review unexpectedly cancelled");
-    expect(result.coordination).toMatchObject({ taskStatus: "running", shouldAdvance: true });
+    expect(result.coordination).toMatchObject({ taskStatus: "needs_adjustment", shouldAdvance: false });
     expect(failed.status).toBe("failed");
     expect(failed.review).toEqual(continueReview);
     expect(diagnostic.status).toBe("pending");

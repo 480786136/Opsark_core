@@ -1,6 +1,15 @@
 use super::*;
 
 #[test]
+fn readonly_operations_probe_passes_native_command_guards() {
+    let probe = include_str!("../../src/features/tools/operations_probe.py");
+    let quoted = probe.replace('\'', "'\"'\"'");
+    let command = format!("if command -v python3 >/dev/null 2>&1; then\npython3 -I -B -u -c '{quoted}' '{{\"toolId\":\"disk.inspect\",\"request\":{{\"path\":\"/srv\"}}}}'\nelse\nprintf '%s\\n' 'OPSARK_RESULT {{}}'\nfi");
+    assert!(command_safety_rejection(&command).is_none());
+    assert_ne!(risk_for(&command), "high");
+}
+
+#[test]
 fn validates_and_normalizes_generated_skill_drafts() {
     let mut draft = GeneratedSkillDraft {
         name: "  Java 服务上线  ".into(),
@@ -28,151 +37,121 @@ fn detects_compact_periodic_long_running_review_context() {
 }
 
 #[test]
-fn rejects_incomplete_tool_commands_before_the_model_repair_loop_finishes() {
-    let tool_step = |command: &str| AiPlanStep {
-        kind: "change".into(),
-        title: "读取项目结构".into(),
-        description: "获取项目目录树以识别部署入口".into(),
-        command: command.into(),
-        expected: "获得项目目录树".into(),
-        validation: "true".into(),
-        risk: Some("low".into()),
-        ..AiPlanStep::default()
-    };
+fn rejects_removed_tool_string_wire_and_shell_entry() {
+    for command in ["opsark-tool", "opsark-tool files.get_structure {}", "opsark-tool --files.get_structure --root-path /opt"] {
+        let legacy = json!({"kind":"observe", "command":command});
+        assert!(serde_json::from_value::<AiPlanStep>(legacy).is_err());
+        let step = AiPlanStep { action: Some(StepAction::Shell { command: command.into() }), command: command.into(), kind:"observe".into(), ..Default::default() };
+        assert!(validate_step_action(&step).unwrap_err().contains("TOOL_IN_SHELL"));
+    }
+}
 
-    for command in [
-        "opsark-tool",
-        "opsark-tool files.get_structure",
-        "opsark-tool files.get_structure []",
-        "opsark-tool files.get_structure {bad-json}",
+#[test]
+fn structured_tools_need_no_shell_validation_and_reject_boolean_validation() {
+    let value = json!({"kind":"observe","title":"读取目录","description":"检查目录","action":{"type":"tool","toolId":"files.get_structure","arguments":{"rootPath":"/opt/app"}},"expected":"目录状态","validation":"","risk":"low"});
+    let step: AiPlanStep = serde_json::from_value(value.clone()).unwrap();
+    validate_ai_plan_contract(&[step.clone()], &AiGenerationSettings::default()).unwrap();
+    let result = convert_ai_plan_steps(vec![step]).unwrap();
+    assert_eq!(result[0].command, "");
+    assert_eq!(result[0].validation, "");
+    let mut invalid = value.clone(); invalid["validation"] = json!(true);
+    assert!(serde_json::from_value::<AiPlanStep>(invalid).is_err());
+    let mut invalid = value; invalid["validation"] = json!("true");
+    assert!(validate_ai_plan_contract(&[serde_json::from_value(invalid).unwrap()], &AiGenerationSettings::default()).is_err());
+}
+
+#[test]
+fn shell_projection_is_derived_from_action_and_not_serialized_to_model_wire() {
+    let step: AiPlanStep = serde_json::from_value(json!({"action":{"type":"shell","command":"pwd"}})).unwrap();
+    assert_eq!(step.command, "pwd");
+    assert!(serde_json::to_value(step).unwrap().get("command").is_none());
+}
+
+#[test]
+fn plan_prompts_require_structured_action_and_empty_tool_validation() {
+    assert!(PLAN_STEP_OUTPUT_CONTRACT.contains("toolId"));
+    assert!(PLAN_STEP_OUTPUT_CONTRACT.contains("工具 validation 必须为空字符串"));
+    assert!(GENERAL_PLAN_SYSTEM.contains("不支持 opsark-tool 命令字符串"));
+}
+
+fn prompt_json_examples(prompt: &str) -> Vec<Value> {
+    prompt.lines().map(str::trim).filter(|line| line.starts_with('{'))
+        .map(|line| serde_json::from_str(line).expect("prompt examples must be complete standard JSON"))
+        .collect()
+}
+
+#[test]
+fn plan_prompt_json_examples_pass_the_actual_operation_contracts() {
+    for (prompt, operation) in [
+        (PLAN_STEP_OUTPUT_CONTRACT, "计划生成"),
+        (NEXT_STAGE_OUTPUT_CONTRACT, "阶段联合决策"),
     ] {
-        let step = tool_step(command);
-        let error = validate_ai_plan_contract(
-            std::slice::from_ref(&step),
-            &AiGenerationSettings::default(),
-        )
-        .unwrap_err();
-        assert!(error.contains("opsark-tool 协议不完整"), "{error}");
-        let repair = plan_repair_instruction(&error, Some(&[step]));
-        assert!(repair.contains("opsark-tool <toolId> <JSON参数对象>"));
-        assert!(repair.contains("inputSchema"));
+        let examples = prompt_json_examples(prompt);
+        assert_eq!(examples.len(), 1);
+        let example = &examples[0];
+        let schema = model_compatibility::contract(operation, &json!({})).unwrap();
+        schema_validation::validate(&schema, example).unwrap();
+        let steps: Vec<AiPlanStep> = serde_json::from_value(example["steps"].clone()).unwrap();
+        validate_ai_plan_contract(&steps, &AiGenerationSettings::default()).unwrap();
+        assert!(steps.iter().all(|step| step.kind == "observe" && step.command == "uptime" && step.validation.is_empty()));
+        if operation == "阶段联合决策" {
+            let raw = serde_json::from_value(example.clone()).unwrap();
+            validate_and_convert_ai_next_stage(raw, &AiGenerationSettings::default(), None).unwrap();
+        }
     }
+}
 
-    for command in [
-        r#"opsark-tool files.get_structure {"rootPath":"/opt/shiyi-blo"}"#,
-        "opsark-tool files.get_structure --root-path /opt/shiyi-blo",
-        r#"opsark-tool --files.get_structure {"rootPath":"/opt/shiyi-blo"}"#,
+#[test]
+fn classification_prompt_json_examples_pass_each_business_branch() {
+    let examples = prompt_json_examples(REQUIREMENT_CLASSIFICATION_CONTRACT);
+    assert_eq!(examples.len(), 3);
+    let schema = model_compatibility::contract("需求理解", &json!({})).unwrap();
+    let mut intents = HashSet::new();
+    for example in examples {
+        schema_validation::validate(&schema, &example).unwrap();
+        let decision: AiRequirementDecision = serde_json::from_value(example).unwrap();
+        assert_eq!(classification_contract_error(&decision, None), None);
+        intents.insert(decision.intent);
+    }
+    assert_eq!(intents, HashSet::from(["answer".into(), "execute".into(), "terminal_context".into()]));
+}
+
+#[test]
+fn focused_repair_prompt_json_preserves_real_actions_and_contract_fields() {
+    let contracts: Value = serde_json::from_str(include_str!("../../contracts/tool-contracts.json")).unwrap();
+    let schema = model_compatibility::contract("计划生成", &json!({
+        "_opsarkOperationContract":"plan.repair@1",
+        "_opsarkContext":json!({"tools":contracts["tools"]}).to_string(),
+    })).unwrap();
+    let base = prompt_json_examples(PLAN_STEP_OUTPUT_CONTRACT).remove(0)["steps"][0].clone();
+    let mut shell: AiPlanStep = serde_json::from_value(base.clone()).unwrap();
+    shell.action = Some(StepAction::Shell { command: "rm /tmp/example".into() });
+    shell.command = "rm /tmp/example".into();
+    let issue = recovery_rules::metadata_issue(&serde_json::to_value(&shell).unwrap(), 0).unwrap();
+    let mut tool: AiPlanStep = serde_json::from_value(base).unwrap();
+    tool.action = Some(StepAction::Tool {
+        tool_id: "files.get_structure".into(),
+        arguments: serde_json::from_value(json!({"rootPath":"/opt/app"})).unwrap(),
+    });
+    tool.command.clear();
+    for (step, error) in [
+        (shell.clone(), "第 1 个计划步骤未通过校验".to_string()),
+        (shell, json!({"issue":issue}).to_string()),
+        (tool, "第 1 个计划步骤工具参数无效".to_string()),
     ] {
-        assert!(
-            validate_ai_plan_contract(&[tool_step(command)], &AiGenerationSettings::default(),)
-                .is_ok()
-        );
+        let prompt = focused_plan_repair_instruction(&error, std::slice::from_ref(&step), 1);
+        let examples = prompt_json_examples(&prompt);
+        assert_eq!(examples.len(), 1);
+        schema_validation::validate(&schema, &examples[0]).unwrap();
+        let parsed: AiPlanRepairEnvelope = serde_json::from_value(examples[0].clone()).unwrap();
+        assert_eq!(parsed.repair.step_index, 1);
+        assert_eq!(parsed.repair.replacement_steps.len(), 1);
+        let embedded = &examples[0]["repair"]["replacementSteps"][0];
+        assert_eq!(embedded, &serde_json::to_value(step).unwrap());
+        assert!(embedded.get("command").is_none());
+        assert!(embedded["action"].is_object());
+        assert!(prompt.contains("不代表已通过校验"));
     }
-}
-
-#[test]
-fn normalizes_boolean_true_validation_only_at_the_model_input_boundary() {
-    let response = r#"{"steps":[{"kind":"observe","title":"读取项目结构","description":"获取项目目录树","command":"opsark-tool files.get_structure {\"rootPath\":\"/opt/app\"}","expected":"获得项目目录树","validation":true,"risk":"low"}]}"#;
-    let steps: Vec<AiPlanStep> = parse_model_array_field(response, "steps").unwrap();
-
-    assert_eq!(steps[0].validation, "true");
-    assert!(validate_ai_plan_contract(&steps, &AiGenerationSettings::default()).is_ok());
-    assert_eq!(
-        serde_json::to_value(&steps[0]).unwrap()["validation"],
-        json!("true")
-    );
-
-    let focused_repair = r#"{"repair":{"stepIndex":1,"replacementSteps":[{"kind":"observe","title":"检查软件","description":"检查 node 是否可用","command":"opsark-tool software.check {\"names\":[\"node\"]}","expected":"获得软件状态","validation":true,"risk":"low"}]}}"#;
-    let repair: AiPlanRepairEnvelope = parse_model_json(focused_repair).unwrap();
-    assert_eq!(repair.repair.replacement_steps[0].validation, "true");
-}
-
-#[test]
-fn normalizes_empty_validation_only_for_well_formed_model_tool_steps() {
-    let mut tool_step = AiPlanStep {
-        kind: "observe".into(),
-        title: "读取项目结构".into(),
-        description: "获取项目目录树".into(),
-        command: r#"opsark-tool files.get_structure {"rootPath":"/opt/app"}"#.into(),
-        expected: "获得项目目录树".into(),
-        validation: "  ".into(),
-        risk: Some("low".into()),
-        ..AiPlanStep::default()
-    };
-    let shell_step = AiPlanStep {
-        kind: "observe".into(),
-        title: "检查目录".into(),
-        description: "检查项目目录".into(),
-        command: "test -d /opt/app".into(),
-        expected: "目录存在".into(),
-        validation: "".into(),
-        risk: Some("low".into()),
-        ..AiPlanStep::default()
-    };
-    let malformed_tool_step = AiPlanStep {
-        command: "opsark-tool files.get_structure".into(),
-        ..tool_step.clone()
-    };
-
-    assert_eq!(
-        normalize_model_tool_validations(std::slice::from_mut(&mut tool_step)),
-        1
-    );
-    assert_eq!(tool_step.validation, "true");
-    assert!(validate_ai_plan_contract(&[tool_step], &AiGenerationSettings::default()).is_ok());
-
-    let mut unaffected = vec![shell_step, malformed_tool_step.clone()];
-    assert_eq!(normalize_model_tool_validations(&mut unaffected), 0);
-    assert!(unaffected[0].validation.is_empty());
-    assert!(unaffected[1].validation.trim().is_empty());
-    assert!(
-        validate_ai_plan_contract(&[malformed_tool_step], &AiGenerationSettings::default())
-            .unwrap_err()
-            .contains("opsark-tool 协议不完整")
-    );
-}
-
-#[test]
-fn rejects_other_non_string_validation_values_at_the_model_input_boundary() {
-    for validation in ["false", "null", "0", "{}", "[]"] {
-        let response = format!(
-            r#"{{"steps":[{{"kind":"observe","title":"检查","description":"检查状态","command":"opsark-tool software.check {{\"names\":[\"node\"]}}","expected":"获得状态","validation":{validation},"risk":"low"}}]}}"#
-        );
-        let parsed = parse_model_array_field::<AiPlanStep>(&response, "steps");
-        assert!(parsed.is_err(), "validation={validation} must be rejected");
-    }
-}
-
-#[test]
-fn boolean_true_compatibility_does_not_allow_meaningless_shell_validation() {
-    let response = r#"{"steps":[{"kind":"change","title":"创建文件","description":"创建目标文件","command":"touch /tmp/opsark-result","expected":"目标文件存在","validation":true,"risk":"low"}]}"#;
-    let steps: Vec<AiPlanStep> = parse_model_array_field(response, "steps").unwrap();
-
-    assert_eq!(steps[0].validation, "true");
-    let result = validate_ai_plan_contract(&steps, &AiGenerationSettings::default())
-        .and_then(|_| convert_ai_plan_steps(steps));
-    assert!(
-        result.unwrap_err().contains("无业务意义的 validation"),
-        "ordinary Shell validation must remain strict"
-    );
-}
-
-#[test]
-fn plan_prompts_require_the_true_json_string_for_tool_validation() {
-    for prompt in [PLAN_STEP_OUTPUT_CONTRACT, GENERAL_PLAN_SYSTEM] {
-        assert!(prompt.contains(r#""validation":"true""#), "{prompt}");
-        assert!(
-            prompt.contains("禁止输出 JSON 布尔值 true")
-                || prompt.contains("不得输出 JSON 布尔值 true")
-        );
-    }
-
-    let repair = plan_repair_instruction(
-        "第 1 个模型工具步骤的 validation 必须固定为 JSON 字符串 \"true\"",
-        None,
-    );
-    assert!(repair.contains(r#""validation":"true""#));
-    assert!(repair.contains("禁止输出 JSON 布尔值 true"));
 }
 
 #[test]
@@ -221,17 +200,17 @@ fn select_input_survives_the_model_plan_parser_and_normalizers_unchanged() {
             ]
         }]
     });
-    let command = format!("opsark-tool user.request_input {args}");
+    let action = json!({"type":"tool","toolId":"user.request_input","arguments":args});
     let visible = HashSet::from(["user.request_input".to_string()]);
 
-    for validation in [json!("true"), json!(true), json!("")] {
+    for validation in [json!("")] {
         let response = json!({"steps": [{
             "kind": "observe", "title": "确认操作目标", "description": "收集缺少的目标选择。",
-            "command": command, "expected": "用户明确选择本次操作目标。", "validation": validation,
+            "action": action, "expected": "用户明确选择本次操作目标。", "validation": validation,
             "risk": "low", "executionScope": "user_action"
         }]}).to_string();
         let mut steps: Vec<AiPlanStep> = parse_model_array_field(&response, "steps").unwrap();
-        normalize_model_tool_validations(&mut steps);
+        normalize_model_actions(&mut steps);
         normalize_recoverable_plan_failure_masks(&mut steps);
         validate_ai_plan_contract(&steps, &AiGenerationSettings::default()).unwrap();
         validate_visible_tool_policy(&steps, Some(&visible)).unwrap();
@@ -240,11 +219,10 @@ fn select_input_survives_the_model_plan_parser_and_normalizers_unchanged() {
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].kind, "observe");
         assert_eq!(converted[0].execution_scope, "user_action");
-        assert_eq!(converted[0].validation, "true");
-        assert_eq!(converted[0].command, command);
-        let preserved: Value = serde_json::from_str(
-            converted[0].command.strip_prefix("opsark-tool user.request_input ").unwrap(),
-        ).unwrap();
+        assert_eq!(converted[0].validation, "");
+        assert_eq!(converted[0].command, "");
+        let Some(StepAction::Tool { arguments, .. }) = &converted[0].action else { panic!("expected tool action") };
+        let preserved = Value::Object(arguments.clone());
         assert_eq!(preserved, args);
     }
 }
@@ -275,19 +253,16 @@ fn clarification_keeps_the_existing_execute_classification_contract() {
 
 #[test]
 fn clarification_uses_one_tool_step_in_the_existing_next_stage_contract() {
-    let command = format!(
-        "opsark-tool user.request_input {}",
-        json!({
+    let action = json!({"type":"tool","toolId":"user.request_input","arguments":json!({
             "title": "确认操作范围", "description": "当前有多个可能目标，需要先明确本次范围。",
             "fields": [{"key": "target", "label": "操作目标", "description": "请指定本次操作的目标。",
                 "type": "select", "required": true,
                 "options": [{"value": "target-a", "label": "目标 A"}, {"value": "target-b", "label": "目标 B"}]}]
-        })
-    );
+        })});
     let response = json!({
         "decision": "adjust", "reason": "缺少目标选择，等待用户明确范围。", "summary": "等待目标选择。",
         "steps": [{"kind": "observe", "title": "确认操作目标", "description": "收集当前缺少的用户决定。",
-            "command": command, "expected": "用户明确选择本次操作目标。", "validation": "true", "risk": "low",
+            "action": action, "expected": "用户明确选择本次操作目标。", "validation": "", "risk": "low",
             "executionScope": "user_action"}]
     });
     let raw: AiNextStageDecision = parse_model_json(&response.to_string()).unwrap();
@@ -297,7 +272,7 @@ fn clarification_uses_one_tool_step_in_the_existing_next_stage_contract() {
     ).unwrap();
     assert_eq!(converted.decision, "adjust");
     assert_eq!(converted.steps.len(), 1);
-    assert_eq!(converted.steps[0].command, command);
+    assert_eq!(converted.steps[0].command, "");
     assert_eq!(converted.steps[0].execution_scope, "user_action");
     assert!(NEXT_STAGE_DECISION_SYSTEM.contains("steps 中只能有一个 user.request_input 步骤"));
     assert!(NEXT_STAGE_DECISION_SYSTEM.contains("用户回答只解决对应决定，不证明整体目标完成"));
@@ -307,8 +282,8 @@ fn clarification_uses_one_tool_step_in_the_existing_next_stage_contract() {
 fn review_routes_missing_user_decisions_to_planning_without_adding_steps() {
     assert!(GENERAL_REVIEW_SYSTEM.contains("返回 adjust，reason 明确待决事项及影响"));
     assert!(GENERAL_REVIEW_SYSTEM.contains("交由现有规划生成唯一 user.request_input 步骤并等待"));
-    assert!(GENERAL_REVIEW_SYSTEM.contains("本复核协议没有 steps 字段"));
-    assert!(GENERAL_REVIEW_SYSTEM.contains("不得因无法在此输出提问步骤而谎称 complete"));
+    assert!(GENERAL_REVIEW_SYSTEM.contains("本复核协议不输出顶层 steps"));
+    assert!(GENERAL_REVIEW_SYSTEM.contains("有恢复路径不代表恢复已完成"));
     let review: AiStepReview = serde_json::from_value(json!({
         "decision": "adjust", "reason": "需明确目标范围，由规划询问并等待。", "summary": "等待用户决定。"
     })).unwrap();
@@ -319,9 +294,57 @@ fn review_routes_missing_user_decisions_to_planning_without_adding_steps() {
 }
 
 #[test]
+fn failure_review_requires_action_and_complete_dependency_coverage() {
+    let context = json!({"reviewPolicy":{"commandExecutionFailed":true},
+        "failureDisposition":{"remainingStepIds":["check", "build"]}}).to_string();
+    let mut value = json!({"decision":"continue","reason":"先修复再继续","summary":"继续"});
+    let check = |value: &serde_json::Value| {
+        let review: AiStepReview = serde_json::from_value(value.clone()).unwrap();
+        validate_step_review_protocol(&context, &review)
+    };
+    assert!(check(&value).is_err());
+    value["recoveryAction"] = json!({"kind":"repair","reason":"修复链接","steps":[]});
+    assert!(check(&value).is_err());
+    value["decision"] = json!("adjust");
+    assert!(check(&value).is_ok());
+    value["decision"] = json!("continue");
+    value["recoveryAction"] = json!({"kind":"continue_independent","reason":"逐步判断","steps":[
+        {"stepId":"check","relation":"independent","reason":"只读检查另一服务"},
+        {"stepId":"build","relation":"dependent","reason":"需要地图链接"}
+    ]});
+    assert!(check(&value).is_ok());
+    value["recoveryAction"]["steps"][1]["stepId"] = json!("check");
+    assert!(check(&value).is_err());
+    value["recoveryAction"]["steps"][1]["stepId"] = json!("ghost");
+    assert!(check(&value).is_err());
+}
+
+#[test]
+fn raw_shell_acceptance_requires_real_evidence_references() {
+    let context = json!({"acceptanceRequired":true,"failureDisposition":{"remainingStepIds":[]},
+        "currentStep":{"evidence":{"items":[{"id":"validation-proof"}]}}}).to_string();
+    let mut value = json!({"decision":"continue","reason":"验收","summary":"验收"});
+    let check = |value: &serde_json::Value| {
+        let review: AiStepReview = serde_json::from_value(value.clone()).unwrap();
+        validate_step_review_protocol(&context, &review)
+    };
+    assert!(check(&value).is_err());
+    value["acceptance"] = json!({"status":"proven","reason":"目标文件已读取","evidenceIds":["ghost"]});
+    assert!(check(&value).is_err());
+    value["acceptance"]["evidenceIds"] = json!(["validation-proof"]);
+    assert!(check(&value).is_ok());
+    value["acceptance"]["status"] = json!("unknown");
+    assert!(check(&value).is_err());
+    value["decision"] = json!("adjust");
+    value["recoveryAction"] = json!({"kind":"replan","reason":"需要补充检查","steps":[]});
+    assert!(check(&value).is_ok());
+}
+
+#[test]
 fn next_stage_complete_requires_empty_steps_and_serializes_the_public_contract() {
     let settings = AiGenerationSettings::default();
     let complete = AiNextStageDecision {
+        plan_update: None, reconciliation: None,
         decision: " complete ".into(),
         reason: " 已有作用域匹配的结构化证据 ".into(),
         summary: " 整体目标已经验收 ".into(),
@@ -349,6 +372,7 @@ fn next_stage_complete_requires_empty_steps_and_serializes_the_public_contract()
     );
 
     let invalid = AiNextStageDecision {
+        plan_update: None, reconciliation: None,
         decision: "complete".into(),
         reason: "错误地同时给出计划".into(),
         summary: "契约不一致".into(),
@@ -365,6 +389,7 @@ fn next_stage_complete_requires_empty_steps_and_serializes_the_public_contract()
 fn next_stage_continue_requires_a_plan_but_adjust_can_report_no_action() {
     let settings = AiGenerationSettings::default();
     let empty_continue = AiNextStageDecision {
+        plan_update: None, reconciliation: None,
         decision: "continue".into(),
         reason: "目标尚未完成".into(),
         summary: "需要下一阶段".into(),
@@ -376,6 +401,7 @@ fn next_stage_continue_requires_a_plan_but_adjust_can_report_no_action() {
     assert!(error.contains("steps 至少需要 1 个元素"), "{error}");
 
     let no_action = AiNextStageDecision {
+        plan_update: None, reconciliation: None,
         decision: "adjust".into(),
         reason: "当前没有合法且有意义的可执行动作".into(),
         summary: "保留现有证据并停止生成步骤".into(),
@@ -387,27 +413,27 @@ fn next_stage_continue_requires_a_plan_but_adjust_can_report_no_action() {
     assert_eq!(converted.decision, "adjust");
     assert!(converted.steps.is_empty());
 
-    let response = r#"{"decision":"continue","reason":"还需读取目录","summary":"进入最小发现阶段","steps":[{"kind":"observe","title":"读取项目结构","description":"获取项目目录树","command":"opsark-tool files.get_structure {\"rootPath\":\"/opt/app\"}","expected":"获得项目目录树","validation":true,"risk":"low"}]}"#;
+    let response = r#"{"decision":"continue","reason":"还需读取目录","summary":"进入最小发现阶段","steps":[{"kind":"observe","title":"读取项目结构","description":"获取项目目录树","expected":"获得项目目录树","validation":"","risk":"low","action":{"type":"tool","toolId":"files.get_structure","arguments":{"rootPath":"/opt/app"}}}]}"#;
     let raw: AiNextStageDecision = parse_model_json(response).unwrap();
-    assert_eq!(raw.steps[0].validation, "true");
+    assert_eq!(raw.steps[0].validation, "");
     let converted =
         validate_and_convert_ai_next_stage(raw, &settings, None).unwrap();
     assert_eq!(converted.decision, "continue");
     assert_eq!(converted.steps.len(), 1);
-    assert_eq!(converted.steps[0].validation, "true");
+    assert_eq!(converted.steps[0].validation, "");
 }
 
 #[test]
 fn next_stage_reuses_shell_validation_and_visible_tool_gates() {
     let settings = AiGenerationSettings::default();
-    let tool_response = r#"{"decision":"adjust","reason":"需要改用 Skill 允许的凭据通道","summary":"当前工具被禁用","steps":[{"kind":"observe","title":"解析连接","description":"解析目标服务器连接","command":"opsark-tool server.resolve_connection {\"serverId\":\"server-1\"}","expected":"获得连接信息","validation":"true","risk":"low"}]}"#;
+    let tool_response = r#"{"decision":"adjust","reason":"需要改用 Skill 允许的凭据通道","summary":"当前工具被禁用","steps":[{"kind":"observe","title":"解析连接","description":"解析目标服务器连接","expected":"获得连接信息","validation":"","risk":"low","action":{"type":"tool","toolId":"server.resolve_connection","arguments":{"serverId":"server-1"}}}]}"#;
     let raw: AiNextStageDecision = parse_model_json(tool_response).unwrap();
     let visible = HashSet::from(["user.request_input".to_string()]);
     let error = validate_and_convert_ai_next_stage(raw, &settings, Some(&visible)).unwrap_err();
     let envelope: Value = serde_json::from_str(&error).unwrap_or(json!(null));
     assert!(error.contains("当前规划上下文未开放工具"), "{envelope}: {error}");
 
-    let shell_response = r#"{"decision":"continue","reason":"还需创建结果文件","summary":"执行变更阶段","steps":[{"kind":"change","title":"创建文件","description":"创建结果文件","command":"touch /tmp/opsark-result","expected":"结果文件存在","validation":true,"risk":"low"}]}"#;
+    let shell_response = r#"{"decision":"continue","reason":"还需创建结果文件","summary":"执行变更阶段","steps":[{"kind":"change","title":"创建文件","description":"创建结果文件","expected":"结果文件存在","validation":"true","risk":"low","action":{"type":"shell","command":"touch /tmp/opsark-result"}}]}"#;
     let raw: AiNextStageDecision = parse_model_json(shell_response).unwrap();
     let error =
         validate_and_convert_ai_next_stage(raw, &settings, None).unwrap_err();
@@ -415,7 +441,7 @@ fn next_stage_reuses_shell_validation_and_visible_tool_gates() {
 }
 
 #[test]
-fn next_stage_request_has_an_explicit_evidence_gate_and_opt_in_token_limit() {
+fn next_stage_request_has_an_evidence_gate_and_independent_output_budget() {
     let unlimited = AiGenerationSettings::default();
     let body = build_next_stage_request_body(
         "model-a",
@@ -423,14 +449,14 @@ fn next_stage_request_has_an_explicit_evidence_gate_and_opt_in_token_limit() {
         r#"{"baseSnapshot":{},"activeSkills":[]}"#,
         &unlimited,
     );
-    assert!(body.get("max_tokens").is_none());
+    assert_eq!(body["max_tokens"], 5000);
     let system = body["messages"][0]["content"].as_str().unwrap();
     assert!(system.contains(GENERAL_PLAN_SYSTEM));
     assert!(system.contains("完成证据指引"));
     assert!(system.contains(
         "计划文字、步骤标题、expected、阶段 summary、模型 review、指令和待执行步骤都不是完成证据"
     ));
-    assert!(system.contains(r#""validation":"true""#));
+    assert!(system.contains("validation 为空字符串"));
     assert!(system.contains("decision=complete 时 steps 必须严格为空数组"));
     assert!(system.contains("blocked/no_action"));
 
@@ -471,13 +497,37 @@ fn missing_steps_uses_focused_schema_repair_and_never_accepts_empty_completion()
         assert!(error.contains("非空 steps"));
     }
     let step = json!({"kind":"observe","title":"inspect","description":"read actual state",
-        "command":"pwd","validation":"","risk":"low","expected":"path"});
+        "action":{"type":"shell","command":"pwd"},"validation":"","risk":"low","expected":"path"});
     let payload = json!({"choices":[{"message":{"content":json!({"decision":"continue","reason":"inspect","summary":"unfinished","steps":[step]}).to_string()}}]});
     let decision = parse_next_stage_with_format_guard(&payload, &context).unwrap();
     assert!(validate_next_stage_preserving_recovery(decision, &settings, None).is_ok());
     // A normal, evidence-backed complete decision remains legal outside format repair.
     let payload = json!({"choices":[{"message":{"content":"{\"decision\":\"complete\",\"reason\":\"verified\",\"summary\":\"done\",\"steps\":[]}"}}]});
     assert!(parse_next_stage_with_format_guard(&payload, "{}").is_ok());
+}
+
+#[test]
+fn operational_recovery_metadata_survives_conversion_and_protocol_rejection() {
+    let update = json!({"basePlanFingerprint":"plan-v1","replaceStepIds":["failed"],"reason":"local repair"});
+    let reconciliation = json!({"incidentId":"incident","status":"safe_to_retry","evidenceIds":["proof"],"reason":"process stopped"});
+    let retry = json!({"failedStepId":"failed","kind":"changed_state","evidenceIds":["proof"],"reason":"repaired"});
+    let mut value = json!({"decision":"adjust","reason":"repair","summary":"continue",
+        "planUpdate":update,"reconciliation":reconciliation,
+        "steps":[{"kind":"observe","title":"inspect","description":"inspect","action":{"type":"shell","command":"pwd"},
+            "validation":"","risk":"low","expected":"path","retryBasis":retry}]});
+    let decision: AiNextStageDecision = serde_json::from_value(value.clone()).unwrap();
+    let result = validate_next_stage_preserving_recovery(decision, &AiGenerationSettings::default(), None).unwrap();
+    let converted = serde_json::to_value(result).unwrap();
+    assert_eq!(converted["planUpdate"], update);
+    assert_eq!(converted["reconciliation"], reconciliation);
+    assert_eq!(converted["steps"][0]["retryBasis"], retry);
+    value["steps"][0]["action"]["command"] = json!("opsark-tool");
+    let rejected: AiNextStageDecision = serde_json::from_value(value).unwrap();
+    let error = validate_next_stage_preserving_recovery(rejected, &AiGenerationSettings::default(), None).unwrap_err();
+    let envelope: Value = serde_json::from_str(&error).unwrap();
+    assert_eq!(envelope["nextStageDecision"]["planUpdate"], update);
+    assert_eq!(envelope["nextStageDecision"]["reconciliation"], reconciliation);
+    assert_eq!(envelope["rejectedPlanExecuted"], false);
 }
 
 #[test]
@@ -488,10 +538,11 @@ fn rejects_tools_not_exposed_in_the_current_planning_context() {
     .unwrap()
     .unwrap();
     let tool_step = |tool_id: &str| AiPlanStep {
+        action: Some(StepAction::Tool { tool_id: tool_id.into(), arguments: serde_json::from_value(json!({"names":["node"]})).unwrap() }),
         kind: "observe".into(),
         title: "调用工具".into(),
         description: "调用当前阶段工具".into(),
-        command: format!(r#"opsark-tool {tool_id} {{"names":["node"]}}"#),
+        command: "".into(),
         expected: "获得结构化结果".into(),
         validation: "true".into(),
         risk: Some("low".into()),
@@ -515,7 +566,7 @@ fn rejects_tools_not_exposed_in_the_current_planning_context() {
 
 #[test]
 fn repairs_missing_presentational_plan_fields_but_rejects_missing_execution_fields() {
-    let missing_title = r#"{"steps":[{"kind":"change","description":"检查目标是否正常。","command":"custom-tool inspect","expected":"返回真实状态","validation":"custom-tool inspect >/dev/null","risk":"low"}]}"#;
+    let missing_title = r#"{"steps":[{"kind":"change","description":"检查目标是否正常。","expected":"返回真实状态","validation":"custom-tool inspect >/dev/null","risk":"low","action":{"type":"shell","command":"custom-tool inspect"}}]}"#;
     let repairable = parse_model_array_field(missing_title, "steps").unwrap();
     assert!(
         validate_ai_plan_contract(&repairable, &AiGenerationSettings::default())
@@ -526,7 +577,7 @@ fn repairs_missing_presentational_plan_fields_but_rejects_missing_execution_fiel
     assert_eq!(normalized[0].title, "检查目标是否正常");
     assert_eq!(normalized[0].expected, "返回真实状态");
 
-    let missing_expected = r#"{"steps":[{"kind":"change","title":"检查","description":"检查目标","command":"custom-tool inspect","expected":"","validation":"custom-tool inspect >/dev/null","risk":"low"}]}"#;
+    let missing_expected = r#"{"steps":[{"kind":"change","title":"检查","description":"检查目标","expected":"","validation":"custom-tool inspect >/dev/null","risk":"low","action":{"type":"shell","command":"custom-tool inspect"}}]}"#;
     let error = convert_ai_plan_steps(parse_model_array_field(missing_expected, "steps").unwrap())
         .unwrap_err();
     assert!(error.contains("expected"));
@@ -534,12 +585,13 @@ fn repairs_missing_presentational_plan_fields_but_rejects_missing_execution_fiel
     let missing_command = r#"{"steps":[{"kind":"change","title":"检查","description":"检查目标","expected":"返回状态","validation":"custom-tool inspect >/dev/null","risk":"low"}]}"#;
     let error = convert_ai_plan_steps(parse_model_array_field(missing_command, "steps").unwrap())
         .unwrap_err();
-    assert!(error.contains("kind/command/validation"));
+    assert!(error.contains("action"));
 }
 
 #[test]
 fn accepts_observation_steps_without_duplicate_validation() {
     let observe = AiPlanStep {
+        action: Some(StepAction::Shell { command: "systemctl status app.service --no-pager".into() }),
         kind: "observe".into(),
         title: "检查服务状态".into(),
         description: "只读获取进程与端口现状".into(),
@@ -559,6 +611,7 @@ fn accepts_observation_steps_without_duplicate_validation() {
     assert!(converted[0].validation.is_empty());
 
     let invalid = AiPlanStep {
+        action: Some(StepAction::Shell { command: "systemctl status app.service --no-pager".into() }),
         kind: "observe".into(),
         title: "重复检查".into(),
         description: "错误地为观察步骤配置了后置校验".into(),
@@ -581,7 +634,7 @@ fn preserves_optional_agent_session_execution_contract() {
         "kind": "change",
         "title": "加载 NVM 上下文",
         "description": "本任务后续步骤复用 NVM",
-        "command": ". /root/.nvm/nvm.sh && node -v",
+        "action":{"type":"shell","command": ". /root/.nvm/nvm.sh && node -v"},
         "expected": "Agent 任务上下文可用",
         "validation": "test -s /root/.nvm/nvm.sh",
         "risk": "low",
@@ -614,6 +667,7 @@ fn preserves_optional_agent_session_execution_contract() {
 fn plan_length_limits_are_optional_and_allow_multiline_commands() {
     let long_command = format!("echo start\n{}", "x".repeat(1500));
     let steps = vec![AiPlanStep {
+        action: Some(StepAction::Shell { command: long_command.clone() }),
         kind: "change".into(),
         title: "一个超过旧标题长度限制但依然是合法计划步骤的完整标题".into(),
         description: "读取并处理真实环境信息".into(),
@@ -638,6 +692,7 @@ fn plan_length_limits_are_optional_and_allow_multiline_commands() {
 fn plan_step_count_limit_is_only_applied_when_enabled() {
     let steps = (0..8)
         .map(|index| AiPlanStep {
+        action: Some(StepAction::Shell { command: format!("echo {index}") }),
             kind: "change".into(),
             title: format!("步骤 {}", index + 1),
             description: "执行必要操作".into(),
@@ -666,12 +721,13 @@ fn plan_step_count_limit_is_only_applied_when_enabled() {
 #[test]
 fn validates_tool_protocol_without_embedding_catalog_workflows() {
     let input_step = AiPlanStep {
+        action: Some(StepAction::Tool { tool_id: "user.request_input".into(), arguments: serde_json::from_value(json!({"title": "SSH 连接信息", "fields": [{"key": "username", "label": "SSH 用户名", "description": "用于登录 192.168.1.23", "type": "text", "required": true}, {"key": "password", "label": "SSH 密码", "description": "用于验证 SSH 账号", "type": "password", "required": true}]})).unwrap() }),
         kind: "change".into(),
         title: "输入 SSH 连接信息".into(),
         description: "请用户提供目标服务器的 SSH 用户名和密码".into(),
-        command: r#"opsark-tool user.request_input {"title":"SSH 连接信息","fields":[{"key":"username","label":"SSH 用户名","description":"用于登录 192.168.1.23","type":"text","required":true},{"key":"password","label":"SSH 密码","description":"用于验证 SSH 账号","type":"password","required":true}]}"#.into(),
+        command: "".into(),
         expected: "用户完成 SSH 连接参数输入".into(),
-        validation: "true".into(),
+        validation: "".into(),
         risk: Some("low".into()),
     ..AiPlanStep::default()
     };
@@ -684,6 +740,7 @@ fn validates_tool_protocol_without_embedding_catalog_workflows() {
     assert!(convert_ai_plan_steps(vec![input_step.clone()]).is_ok());
 
     let extra_step = AiPlanStep {
+        action: Some(StepAction::Shell { command: "ssh 192.168.1.23".into() }),
         kind: "change".into(),
         title: "立即连接".into(),
         description: "不应在参数输入前规划".into(),
@@ -704,12 +761,13 @@ fn validates_tool_protocol_without_embedding_catalog_workflows() {
 #[test]
 fn accepts_generic_model_tools_and_rejects_non_protocol_validation() {
     let connect = AiPlanStep {
+        action: Some(StepAction::Tool { tool_id: "server.connect".into(), arguments: serde_json::from_value(json!({"host": "192.168.1.23", "port": 22, "username": "root", "passwordSecretKey": "SSH_PASSWORD"})).unwrap() }),
         kind: "change".into(),
         title: "在当前终端执行 SSH 登录".into(),
         description: "使用已安全收集的凭据在任务绑定终端登录目标服务器".into(),
-        command: r#"opsark-tool server.connect {"host":"192.168.1.23","port":22,"username":"root","passwordSecretKey":"SSH_PASSWORD"}"#.into(),
+        command: "".into(),
         expected: "Opsark 完成真实 SSH 连接并获取服务器信息".into(),
-        validation: "true".into(),
+        validation: "".into(),
         risk: Some("low".into()),
     ..AiPlanStep::default()
     };
@@ -721,6 +779,7 @@ fn accepts_generic_model_tools_and_rejects_non_protocol_validation() {
     assert!(convert_ai_plan_steps(vec![connect.clone()]).is_ok());
 
     let source_server_validation = AiPlanStep {
+        action: Some(StepAction::Shell { command: "hostname && id && uptime".into() }),
         kind: "change".into(),
         title: "验证连接".into(),
         description: "错误地在原服务器执行校验".into(),
@@ -744,19 +803,20 @@ fn accepts_generic_model_tools_and_rejects_non_protocol_validation() {
     assert!(
         validate_ai_plan_contract(&[invalid], &AiGenerationSettings::default())
             .unwrap_err()
-            .contains("validation 必须固定为 JSON 字符串 \"true\"")
+            .contains("不允许 Shell")
     );
 }
 
 #[test]
 fn rejects_server_connect_without_complete_credentials() {
     let incomplete = AiPlanStep {
+        action: Some(StepAction::Tool { tool_id: "server.connect".into(), arguments: json!({"host":"192.168.1.237", "port":22, "passwordSecretKey":"TARGET_SSH_PASSWORD"}).as_object().unwrap().clone() }),
         kind: "change".into(),
         title: "连接目标服务器".into(),
         description: "连接目标服务器".into(),
-        command: "opsark-tool server.connect --host 192.168.1.237 --port 22 --passwordSecretKey TARGET_SSH_PASSWORD".into(),
+        command: "".into(),
         expected: "终端完成 SSH 登录".into(),
-        validation: "true".into(),
+        validation: "".into(),
         risk: Some("low".into()),
     ..AiPlanStep::default()
     };
@@ -771,14 +831,13 @@ fn rejects_server_connect_without_complete_credentials() {
     assert!(repair.contains("不得把当前源服务器地址当作目标地址"));
 
     let credential_ref = AiPlanStep {
+        action: Some(StepAction::Tool { tool_id: "server.connect".into(), arguments: json!({"host":"192.168.1.237", "credentialRef":"managed-server:target"}).as_object().unwrap().clone() }),
         kind: "change".into(),
         title: "连接目标服务器".into(),
         description: "使用受管凭据连接".into(),
-        command:
-            "opsark-tool server.connect --host 192.168.1.237 --credentialRef managed-server:target"
-                .into(),
+        command: "".into(),
         expected: "终端完成 SSH 登录".into(),
-        validation: "true".into(),
+        validation: "".into(),
         risk: Some("low".into()),
         ..AiPlanStep::default()
     };
@@ -788,6 +847,7 @@ fn rejects_server_connect_without_complete_credentials() {
 #[test]
 fn builds_targeted_plan_repair_feedback_for_meaningless_validation() {
     let previous = vec![AiPlanStep {
+        action: Some(StepAction::Shell { command: "nc -zvw5 69.33.213.101 22".into() }),
         kind: "change".into(),
         title: "检查 SSH 端口".into(),
         description: "检查目标端口是否可达".into(),
@@ -802,7 +862,7 @@ fn builds_targeted_plan_repair_feedback_for_meaningless_validation() {
         Some(&previous),
     );
 
-    assert!(instruction.contains("只有 command 以 opsark-tool 开头"));
+    assert!(instruction.contains("工具步骤使用结构化 action"));
     assert!(instruction.contains("change 步骤"));
     assert!(instruction.contains("kind=observe"));
     assert!(instruction.contains("nc -zvw5 69.33.213.101 22"));
@@ -813,6 +873,8 @@ fn builds_targeted_plan_repair_feedback_for_meaningless_validation() {
 #[test]
 fn builds_credential_transport_specific_plan_repair_feedback() {
     let previous = vec![AiPlanStep {
+        action: Some(StepAction::Shell { command: "GIT_ASKPASS=/tmp/askpass git clone https://gitee.com/team/app.git /opt/app"
+            .into() }),
         kind: "change".into(),
         title: "使用凭据克隆仓库".into(),
         description: "使用 ${secret.GIT_HTTP_CREDENTIAL} 访问 Gitee 仓库".into(),
@@ -837,6 +899,7 @@ fn builds_credential_transport_specific_plan_repair_feedback() {
 #[test]
 fn rejects_credential_bound_git_step_that_disables_pty_prompts() {
     let previous = vec![AiPlanStep {
+        action: Some(StepAction::Shell { command: "GIT_TERMINAL_PROMPT=0 git -c credential.helper= ls-remote https://gitee.com/team/app.git HEAD".into() }),
         kind: "change".into(),
         title: "使用已保存凭据认证预检".into(),
         description: "使用 server-credential:credential-gitee 访问 Gitee".into(),
@@ -858,6 +921,7 @@ fn rejects_credential_bound_git_step_that_disables_pty_prompts() {
 #[test]
 fn permits_anonymous_git_probe_without_inventing_credential_binding() {
     let step = AiPlanStep {
+        action: Some(StepAction::Shell { command: "GIT_TERMINAL_PROMPT=0 git ls-remote --heads --tags https://gitee.com/belief-team/report.git; rc=$?; echo \"ls-remote-exit:$rc\"; exit $rc".into() }),
         kind: "observe".into(),
         title: "匿名探测仓库可读性".into(),
         description: "命令不使用凭据、不修改 URL 协议。".into(),
@@ -886,6 +950,7 @@ fn permits_anonymous_git_probe_without_inventing_credential_binding() {
 #[test]
 fn rejects_validation_that_waits_for_terminal_input() {
     let invalid = AiPlanStep {
+        action: Some(StepAction::Shell { command: "stat /tmp/result".into() }),
         kind: "change".into(),
         title: "复核文件证据".into(),
         description: "检查上一条命令输出".into(),
@@ -906,6 +971,7 @@ fn rejects_validation_that_waits_for_terminal_input() {
     );
 
     let with_file = AiPlanStep {
+        action: Some(StepAction::Shell { command: "stat /tmp/result".into() }),
         kind: "change".into(),
         title: "复核证据文件".into(),
         description: "读取证据文件".into(),
@@ -918,6 +984,7 @@ fn rejects_validation_that_waits_for_terminal_input() {
     assert!(validate_ai_plan_contract(&[with_file], &AiGenerationSettings::default()).is_ok());
 
     let with_pipe = AiPlanStep {
+        action: Some(StepAction::Shell { command: "stat /tmp/result".into() }),
         kind: "change".into(),
         title: "复核实时状态".into(),
         description: "重新读取真实状态".into(),
@@ -933,6 +1000,7 @@ fn rejects_validation_that_waits_for_terminal_input() {
 #[test]
 fn reports_the_exact_failure_mask_field_and_repair_action() {
     let masked_command = AiPlanStep {
+        action: Some(StepAction::Shell { command: "ssh -o BatchMode=yes target true || echo AUTH_MISSING".into() }),
         kind: "change".into(),
         title: "探测目标 SSH 认证".into(),
         description: "检查源服务器是否已有目标端认证".into(),
@@ -956,6 +1024,7 @@ fn reports_the_exact_failure_mask_field_and_repair_action() {
     assert!(instruction.contains("set -o pipefail"));
 
     let status_validation = AiPlanStep {
+        action: Some(StepAction::Shell { command: "pgrep -f -- '/opt/app/backend' || echo NOT_RUNNING".into() }),
         kind: "change".into(),
         title: "检查后端运行状态".into(),
         description: "区分运行、未运行和检查错误".into(),
@@ -980,6 +1049,7 @@ fn reports_the_exact_failure_mask_field_and_repair_action() {
     assert!(status_instruction.contains("case \"$rc\""));
     assert!(status_instruction.contains("不得把 pgrep 的退出码规则套给 systemctl"));
     let classified_status = AiPlanStep {
+        action: Some(StepAction::Shell { command: "pgrep -f -- '/opt/app/backend' >/dev/null; rc=$?; case \"$rc\" in 0) echo RUNNING;; 1) echo NOT_RUNNING;; *) exit \"$rc\";; esac".into() }),
         kind: "change".into(),
         command: "pgrep -f -- '/opt/app/backend' >/dev/null; rc=$?; case \"$rc\" in 0) echo RUNNING;; 1) echo NOT_RUNNING;; *) exit \"$rc\";; esac".into(),
         validation: "pgrep -f -- '/opt/app/backend' >/dev/null; rc=$?; case \"$rc\" in 0) echo RUNNING;; 1) echo NOT_RUNNING;; *) exit \"$rc\";; esac".into(),
@@ -990,6 +1060,7 @@ fn reports_the_exact_failure_mask_field_and_repair_action() {
     );
 
     let masked_validation = AiPlanStep {
+        action: Some(StepAction::Shell { command: "scp source target:/tmp/part".into() }),
         kind: "change".into(),
         title: "校验目标文件".into(),
         description: "校验目标文件完整性".into(),
@@ -1009,6 +1080,7 @@ fn reports_the_exact_failure_mask_field_and_repair_action() {
 #[test]
 fn applies_a_focused_plan_step_repair_without_rewriting_other_steps() {
     let valid = AiPlanStep {
+        action: Some(StepAction::Shell { command: "test -d /opt/app".into() }),
         kind: "change".into(),
         title: "保留步骤".into(),
         description: "已经正确".into(),
@@ -1019,6 +1091,7 @@ fn applies_a_focused_plan_step_repair_without_rewriting_other_steps() {
         ..AiPlanStep::default()
     };
     let invalid = AiPlanStep {
+        action: Some(StepAction::Shell { command: "npm run build | tail -20".into() }),
         kind: "change".into(),
         title: "读取 npm 日志".into(),
         description: "展示构建输出".into(),
@@ -1029,6 +1102,7 @@ fn applies_a_focused_plan_step_repair_without_rewriting_other_steps() {
         ..AiPlanStep::default()
     };
     let repaired = AiPlanStep {
+        action: Some(StepAction::Shell { command: "set -o pipefail\nnpm run build | tail -20".into() }),
         kind: "change".into(),
         command: "set -o pipefail\nnpm run build | tail -20".into(),
         ..invalid.clone()
@@ -1052,6 +1126,74 @@ fn applies_a_focused_plan_step_repair_without_rewriting_other_steps() {
 
     assert_eq!(steps[0].command, valid.command);
     assert!(validate_ai_plan_contract(&steps, &AiGenerationSettings::default()).is_ok());
+}
+
+#[test]
+fn deployment_repair_cannot_replace_writes_with_discovery_and_keep_acceptance() {
+    let observe = AiPlanStep {
+        action: Some(StepAction::Shell { command: "ls -ld /srv".into() }),
+        kind: "observe".into(), title: "探查".into(), description: "查看现状".into(),
+        command: "ls -ld /srv".into(), expected: "目录状态".into(),
+        validation: "".into(), risk: Some("low".into()), ..AiPlanStep::default()
+    };
+    let deploy = AiPlanStep {
+        action: Some(StepAction::Shell { command: "mkdir -p /srv/lucky-wheel\nprintf page > /srv/lucky-wheel/index.html\npython3 -m http.server 8091 &".into() }),
+        kind: "change".into(), title: "写入并启动抽奖页面".into(),
+        command: "mkdir -p /srv/lucky-wheel\nprintf page > /srv/lucky-wheel/index.html\npython3 -m http.server 8091 &".into(),
+        validation: "curl -f http://127.0.0.1:8091/".into(),
+        expected: "抽奖页面可访问".into(), ..observe.clone()
+    };
+    let verify = AiPlanStep {
+        action: Some(StepAction::Shell { command: "curl -f http://127.0.0.1:8091/".into() }),
+        title: "验证页面".into(), command: "curl -f http://127.0.0.1:8091/".into(),
+        ..observe.clone()
+    };
+    let mut original = vec![observe.clone(), deploy.clone(), verify.clone()];
+    let snapshot = serde_json::to_value(&original).unwrap();
+    // Even a mislabeled change containing only read operations cannot replace
+    // the deployment. Splitting it into several discoveries is no workaround.
+    for kind in ["observe", "change"] {
+        let error = apply_plan_step_repair(&mut original, AiPlanStepRepair {
+            step_index: 2, replacement_steps: vec![AiPlanStep {
+        action: Some(StepAction::Shell { command: "command -v systemctl".into() }),
+                kind: kind.into(), command: "command -v systemctl".into(), ..observe.clone()
+            }, observe.clone()],
+        }).unwrap_err();
+        assert_eq!(serde_json::to_value(&original).unwrap(), snapshot);
+        assert!(requires_business_replan(&error));
+        let envelope: Value = serde_json::from_str(&error).unwrap();
+        assert_eq!(envelope["rejectedPlanExecuted"], false);
+        assert_eq!(envelope["steps"].as_array().unwrap().len(), 3);
+        assert_eq!(envelope["steps"][1]["action"]["command"], deploy.command);
+        assert_eq!(envelope["steps"][2]["action"]["command"], verify.command);
+    }
+}
+
+#[test]
+fn background_startup_requires_business_replan_but_field_repairs_do_not() {
+    let startup = AiPlanStep {
+        action: Some(StepAction::Shell { command: "python3 -m http.server 8091 &".into() }),
+        kind: "change".into(), title: "启动".into(), description: "启动网站".into(),
+        command: "python3 -m http.server 8091 &".into(),
+        expected: "服务运行".into(), validation: "curl -f http://127.0.0.1:8091/".into(),
+        risk: Some("medium".into()), ..AiPlanStep::default()
+    };
+    let error = validate_ai_plan_contract(&[startup], &AiGenerationSettings::default()).unwrap_err();
+    assert!(requires_business_replan(&error), "{error}");
+    assert!(!requires_business_replan("第 1 个计划步骤缺少非空字段 title"));
+    assert!(!requires_business_replan("第 1 个计划步骤的 command 掩盖了失败退出码"));
+
+    let mut steps = vec![AiPlanStep {
+        action: Some(StepAction::Shell { command: "ls -ld /srv".into() }),
+        kind: "change".into(), command: "ls -ld /srv".into(),
+        validation: "true".into(), ..AiPlanStep::default()
+    }];
+    let corrected = AiPlanStep { kind: "observe".into(), validation: "".into(), ..steps[0].clone() };
+    apply_plan_step_repair(&mut steps, AiPlanStepRepair {
+        step_index: 1, replacement_steps: vec![corrected],
+    }).unwrap();
+    assert_eq!(steps[0].command, "ls -ld /srv");
+    assert_eq!(steps[0].kind, "observe");
 }
 
 #[test]
@@ -1081,10 +1223,11 @@ fn focused_plan_repair_context_omits_history_and_unrelated_tool_schemas() {
     })
     .to_string();
     let invalid = AiPlanStep {
+        action: Some(StepAction::Tool { tool_id: "files.read_content".into(), arguments: serde_json::from_value(json!({"path": "/tmp/a"})).unwrap() }),
         kind: "observe".into(),
         title: "read".into(),
         description: "read".into(),
-        command: r#"opsark-tool files.read_content {"path":"/tmp/a"}"#.into(),
+        command: "".into(),
         expected: "content".into(),
         validation: "false".into(),
         risk: Some("low".into()),
@@ -1162,14 +1305,22 @@ fn plan_generation_retries_use_compact_requests_and_merge_the_original_plan() {
     use std::io::{Read, Write};
     use std::time::Duration;
     let good = json!({"kind":"observe","title":"Inspect OS","description":"Read OS",
-        "command":"uname -a","expected":"OS details","validation":"","risk":"low"});
+        "action":{"type":"shell","command":"uname -a"},"expected":"OS details","validation":"","risk":"low"});
     let invalid = json!({"kind":"change","title":"Build","description":"Build app",
-        "command":"npm run build | tail -20","expected":"Build output",
+        "action":{"type":"shell","command":"npm run build | tail -20"},"expected":"Build output",
         "validation":"test -f dist/index.html","risk":"medium"});
     let mut fixed = invalid.clone();
-    fixed["command"] = json!("set -o pipefail\nnpm run build | tail -20");
-    for external in [false, true] {
-        let responses = if external {
+    fixed["action"]["command"] = json!("set -o pipefail\nnpm run build | tail -20");
+    for scenario in ["field_repair", "external", "background"] {
+        let external = scenario == "external";
+        let background = scenario == "background";
+        let mut deployment = invalid.clone();
+        deployment["action"]["command"] = json!("mkdir -p /srv/lucky-wheel\nprintf page > /srv/lucky-wheel/index.html\npython3 -m http.server 8091 &");
+        let verification = json!({"kind":"observe","title":"Verify site","description":"Read HTTP response",
+            "action":{"type":"shell","command":"curl -f http://127.0.0.1:8091/"},"expected":"HTTP success","validation":"","risk":"low"});
+        let responses = if background {
+            vec![json!({"steps":[good.clone(), deployment.clone(), verification.clone()]})]
+        } else if external {
             vec![json!({"steps":[good.clone()]})]
         } else {
             vec![json!({"steps":[good.clone(), invalid.clone()]}),
@@ -1232,9 +1383,21 @@ fn plan_generation_retries_use_compact_requests_and_merge_the_original_plan() {
         let result = tokio::runtime::Runtime::new().unwrap().block_on(generate_ai_plan_with_trace(
             "test-only".into(), endpoint, "fixture".into(), "Build app".into(),
             context.to_string(), None, 5, &mut trace, None,
-        )).unwrap();
+        ));
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), if external { 1 } else { 2 });
+        assert_eq!(requests.len(), if external || background { 1 } else { 2 });
+        if background {
+            let failure: Value = serde_json::from_str(&result.unwrap_err()).unwrap();
+            assert_eq!(failure["kind"], "plan_protocol_failure");
+            assert_eq!(failure["businessReplanRequired"], true);
+            assert_eq!(failure["rejectedPlanExecuted"], false);
+            assert_eq!(failure["steps"].as_array().unwrap().len(), 3);
+            assert_eq!(failure["steps"][1]["action"]["command"], deployment["action"]["command"]);
+            assert_eq!(failure["steps"][2]["action"]["command"], verification["action"]["command"]);
+            assert_eq!(trace.attempts.len(), 1);
+            continue;
+        }
+        let result = result.unwrap();
         let last = requests.last().unwrap();
         let system = last["messages"][0]["content"].as_str().unwrap();
         assert!(system.contains(PLAN_COMPILATION_REPAIR_SYSTEM));
@@ -1248,14 +1411,15 @@ fn plan_generation_retries_use_compact_requests_and_merge_the_original_plan() {
             assert!(last.to_string().len() * 2 < requests[0].to_string().len());
             assert_eq!(result.len(), 2);
             assert_eq!(result[0].command, "uname -a");
-            assert_eq!(result[1].command, fixed["command"].as_str().unwrap());
+            assert_eq!(result[1].command, fixed["action"]["command"].as_str().unwrap());
         }
     }
 }
 
 #[test]
 fn structured_repair_guidance_does_not_request_both_steps_and_repair() {
-    let invalid = AiPlanStep { kind: "observe".into(), command: "rm /tmp/example".into(),
+    let invalid = AiPlanStep {
+        action: Some(StepAction::Shell { command: "rm /tmp/example".into() }), kind: "observe".into(), command: "rm /tmp/example".into(),
         ..AiPlanStep::default() };
     let issue = recovery_rules::metadata_issue(&serde_json::to_value(&invalid).unwrap(), 0).unwrap();
     let prompt = focused_plan_repair_instruction(&json!({"issue":issue}).to_string(), &[invalid], 1);
@@ -1276,12 +1440,13 @@ fn malformed_tool_repair_keeps_the_visible_catalog_but_not_history() {
     })
     .to_string();
     let invalid = AiPlanStep {
+        action: Some(StepAction::Shell { command: "opsark-tool".into() }),
         command: "opsark-tool".into(),
         ..AiPlanStep::default()
     };
     let compact = focused_plan_repair_context(
         &context,
-        "第 1 个计划步骤的 opsark-tool 协议不完整",
+        &validate_step_action(&invalid).unwrap_err(),
         &invalid,
     )
     .unwrap();
@@ -1416,6 +1581,7 @@ fn repair_budget_enforces_full_generation_and_total_hard_limits() {
 #[test]
 fn permits_repeated_observations_but_rejects_untracked_background_operations() {
     let step = AiPlanStep {
+        action: Some(StepAction::Shell { command: "git -C /root/app status --short".into() }),
         kind: "change".into(),
         title: "复查仓库状态".into(),
         description: "允许在不同阶段重新观察同一个仓库".into(),
@@ -1430,6 +1596,7 @@ fn permits_repeated_observations_but_rejects_untracked_background_operations() {
     );
 
     let detached = AiPlanStep {
+        action: Some(StepAction::Shell { command: "nohup git clone git@gitee.com:team/app.git /root/app >clone.log 2>&1 &".into() }),
         kind: "change".into(),
         title: "后台克隆".into(),
         description: "不应被接受".into(),
@@ -1458,6 +1625,7 @@ fn permits_repeated_observations_but_rejects_untracked_background_operations() {
     assert!(!detaches_untracked_process("custom-tool |& tee output.log"));
 
     let masked_command = AiPlanStep {
+        action: Some(StepAction::Shell { command: "timeout 900 make download-toolchain || { echo failed; exit 0; }".into() }),
         kind: "change".into(),
         title: "下载工具链".into(),
         description: "不应掩盖失败".into(),
@@ -1474,6 +1642,7 @@ fn permits_repeated_observations_but_rejects_untracked_background_operations() {
     );
 
     let masked_validation = AiPlanStep {
+        action: Some(StepAction::Shell { command: "make download-toolchain".into() }),
         kind: "change".into(),
         title: "校验工具链".into(),
         description: "必须检查真实产物".into(),
@@ -1520,6 +1689,7 @@ fn deterministically_preserves_failure_status_in_explicit_zero_exit_branches() {
     assert_eq!(failure_mask_reason(&repaired), None);
 
     let mut steps = vec![AiPlanStep {
+        action: Some(StepAction::Shell { command: original.into() }),
         kind: "change".into(),
         title: "构建项目".into(),
         description: "运行真实构建".into(),
@@ -1533,6 +1703,8 @@ fn deterministically_preserves_failure_status_in_explicit_zero_exit_branches() {
     assert!(validate_ai_plan_contract(&steps, &AiGenerationSettings::default()).is_ok());
 
     let mut repeated = vec![AiPlanStep {
+        action: Some(StepAction::Shell { command: "first || { echo first_failed; exit 0; }; second || { echo second_failed; exit 0; }"
+                .into() }),
         kind: "change".into(),
         title: "多阶段检查".into(),
         description: "两个失败分支都必须保留状态".into(),
@@ -1827,6 +1999,8 @@ fn structured_model_failure_survives_workflow_trace_wrapping() {
 #[test]
 fn omits_absent_optional_plan_fields_from_the_frontend_payload() {
     let step = PlanStep {
+        action: None,
+        retry_basis: None,
         id: "step-1".into(),
         kind: "observe".into(),
         title: "检查目录".into(),
@@ -1855,7 +2029,7 @@ fn omits_absent_optional_plan_fields_from_the_frontend_payload() {
 #[test]
 fn structured_recovery_survives_plan_conversion_and_rejects_invalid_purpose() {
     let payload = json!({"kind":"observe", "title":"Verify original postcondition", "description":"Recheck",
-        "command":"test -d /opt/project-a/dist", "validation":"", "expected":"Artifact exists", "risk":"low",
+        "action":{"type":"shell","command":"test -d /opt/project-a/dist"}, "validation":"", "expected":"Artifact exists", "risk":"low",
         "recovery":{"failedStepId":"failed-build-a", "targetContext":"target-a", "purpose":"verify"}});
     let parsed: AiPlanStep = serde_json::from_value(payload.clone()).unwrap();
     let converted = convert_ai_plan_steps(vec![parsed]).unwrap();
@@ -1937,7 +2111,8 @@ fn legacy_skill_metadata_does_not_change_the_live_capability_directory() {
     let selected = vec![skill.id.clone()];
     let context = r#"{"tools":[{"id":"files.read_content"},{"id":"user.request_input"},{"id":"evidence.read"},{"id":"files.get_structure"}]}"#;
     let question = AiPlanStep {
-        command: r#"opsark-tool user.request_input {"title":"确认目标","fields":[{"key":"target","label":"目标","description":"请指定操作目标。","type":"text","required":true}]}"#.into(),
+        action: Some(StepAction::Tool { tool_id: "user.request_input".into(), arguments: serde_json::from_value(json!({"title": "确认目标", "fields": [{"key": "target", "label": "目标", "description": "请指定操作目标。", "type": "text", "required": true}]})).unwrap() }),
+        command: "".into(),
         ..AiPlanStep::default()
     };
 
@@ -2004,6 +2179,8 @@ fn routes_untracked_background_repair_to_a_proven_service_manager() {
     assert!(instruction.contains("kind=observe"));
     assert!(instruction.contains("executionScope=managed_service"));
     assert!(instruction.contains("只修改 executionScope"));
+    assert!(instruction.contains("不能局部替换启动步骤"));
+    assert!(instruction.contains("尚未执行的文件写入、部署和验收"));
 }
 
 #[test]

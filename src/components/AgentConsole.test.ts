@@ -139,6 +139,31 @@ describe("AgentConsole 服务器工作区隔离", () => {
     } finally { i18n.global.locale.value = previousLocale; app.unmount(); }
   });
 
+  it("未知变更结果显示保留现场和只读核对入口，不暗示立即重试写入", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = ops.createTask("server-a", "managed", "model-deepseek");
+    task.status = "needs_adjustment";
+    task.managedAdjustmentPhase = "manual_required";
+    task.executionReconciliation = { id: "incident", stepId: "write", serverId: task.serverId, command: "npm run build",
+      expected: "产物可用", knownStepIds: ["write"], recordedAt: "now", reason: "连接中断" };
+    task.plan = [{ id: "write", kind: "change", command: "npm run build", title: "构建", description: "构建",
+      expected: "产物可用", validation: "test -f dist/index.html", risk: "medium", status: "failed" }];
+    const request = vi.spyOn(ops, "requestAdjustment").mockResolvedValue(undefined);
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      const bar = host.querySelector<HTMLElement>(".approval-bar")!;
+      expect(bar.textContent).toContain("执行结果待核对，已有结果已保留");
+      expect(bar.textContent).toContain("保留结果并结束");
+      const button = bar.querySelector<HTMLButtonElement>(".button.primary")!;
+      expect(button.textContent).toBe("生成只读核对方案");
+      button.click();
+      await nextTick();
+      expect(request).toHaveBeenCalledExactlyOnceWith(task.id);
+    } finally { app.unmount(); }
+  });
+
   it("完全托管正常续接的倒计时和生成提示表达任务推进", async () => {
     const pinia = createPinia();
     const ops = useOpsStore(pinia);
@@ -163,10 +188,11 @@ describe("AgentConsole 服务器工作区隔离", () => {
   });
 
   it.each([
-    { permission: "safe", reason: "no_action" },
-    { permission: "managed", reason: "no_action" },
-    { permission: "managed", reason: "no_progress" },
-  ] as const)("$permission 模式遇到 $reason 时保留阻断提示，不宣称阶段成功", async ({ permission, reason }) => {
+    { permission: "safe", reason: "no_action", restored: false },
+    { permission: "managed", reason: "no_action", restored: false },
+    { permission: "managed", reason: "no_action", restored: true },
+    { permission: "managed", reason: "no_progress", restored: false },
+  ] as const)("$permission 模式遇到 $reason 时保留阻断提示，不宣称阶段成功", async ({ permission, reason, restored }) => {
     const pinia = createPinia();
     const ops = useOpsStore(pinia);
     const task = ops.createTask("server-a", permission, "model-deepseek");
@@ -176,7 +202,7 @@ describe("AgentConsole 服务器工作区隔离", () => {
       decision: { decision: "adjust", reason: task.pauseReason, summary: task.pauseReason, source: "model" },
       snapshot: {}, nextPlan: [], createdAt: task.createdAt,
     };
-    if (permission === "managed") {
+    if (permission === "managed" && !restored) {
       task.managedStopReason = reason;
       task.managedAdjustmentPhase = "manual_required";
     }
@@ -185,6 +211,7 @@ describe("AgentConsole 服务器工作区隔离", () => {
       await nextTick();
       const bar = host.querySelector<HTMLElement>(".approval-bar.warning")!;
       expect(bar.textContent).toContain("缺少部署授权");
+      if (reason === "no_action") expect(bar.textContent).toContain("自动执行已暂停");
       expect(bar.querySelector(".button.primary")?.textContent).toBe("重新评估下一步");
       expect(host.textContent).not.toContain("当前阶段已完成");
       expect(host.querySelector(".summary-progress")).toBeNull();
@@ -248,6 +275,11 @@ describe("AgentConsole 服务器工作区隔离", () => {
       ops.recordModelPlanningBlocker(task, { httpStatus: 402, code: "CREDITS_RECONCILIATION_REQUIRED", message: "待结算", retryable: false });
       await nextTick();
       expect(alert.querySelector("strong")?.textContent).toBe("模型账户待结算核对，任务已暂停");
+      ops.recordModelPlanningBlocker(task, { httpStatus: 422, code: "MODEL_OUTPUT_TRUNCATED", message: "输出截断", retryable: false });
+      await nextTick();
+      expect(alert.querySelector("strong")?.textContent).not.toContain("额度");
+      expect(alert.textContent).toContain("调整模型与输出预算");
+      expect(alert.textContent).not.toContain("查看账户额度");
     } finally { app.unmount(); }
   });
 

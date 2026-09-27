@@ -14,7 +14,7 @@ function read(current: OpsTask, id: string, path = "/app/package.json", truncate
     expected: "read", risk: "low", attemptContext: taskAttemptContext(current),
     ...buildToolStepOutcome({ call, completedAt: "now", evidenceId: `e-${id}`,
       result: { callId: id, toolId: call.toolId, success: true,
-        data: { path, content, encoding: "utf-8", totalBytes: bytes, returnedBytes: bytes, truncated } } }) };
+        data: { path, content, encoding: "utf-8", totalBytes: bytes + (truncated ? 1 : 0), returnedBytes: bytes, truncated } } }) };
 }
 const manifests = (current: OpsTask) => collectPlanningEvidence(current, ["project_manifest"])
   .filter(item => item.kind === "project_manifest");

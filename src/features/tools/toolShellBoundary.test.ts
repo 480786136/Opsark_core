@@ -22,9 +22,9 @@ describe("tool/Shell execution boundary", () => {
   it.each(["echo 'opsark-tool is a protocol'", "# opsark-tool files.get_structure {}\npwd", "grep 'opsark-tool' README.md", "printf '%s' opsark-tool"])("allows non-executed text: %s", command => {
     expect(() => assertShellToolBoundary(command)).not.toThrow();
   });
-  it("keeps atomic tools valid but prohibits tools in postcondition Shells", () => {
-    expect(normalizePlanPreconditions([step(tool, "true")])).toHaveLength(1);
-    expect(resolveStepDispatch(step(tool, "true"), [], "call").kind).toBe("tool");
+  it("rejects legacy atomic tools and tools in postcondition Shells", () => {
+    expect(() => normalizePlanPreconditions([step(tool, "true")])).toThrow("TOOL_IN_SHELL");
+    expect(resolveStepDispatch(step(tool, "true"), [], "call").kind).toBe("invalid");
     expect(() => normalizePlanPreconditions([{ ...step("touch /tmp/result", tool), kind: "change" }])).toThrow("TOOL_IN_SHELL");
     expect(resolveStepDispatch(step("pwd", tool), [], "call").kind).toBe("invalid");
   });

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { normalizePermissionLevel, requiresStepApproval } from "@/features/agent/approvalPolicy";
 import type { PlanStep } from "@/types";
+import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 
 const step = (risk: PlanStep["risk"], command = "uname -a"): PlanStep => ({
   id: "step",
@@ -36,5 +37,23 @@ describe("approval policy", () => {
   it("migrates the removed automatic mode to safe mode", () => {
     expect(normalizePermissionLevel("autonomous")).toBe("safe");
     expect(normalizePermissionLevel("managed")).toBe("managed");
+  });
+
+  it("uses the current effective tool effect rather than the static catalog", () => {
+    const pending = { ...step("low", ""), kind: "change" as const,
+      action: { type: "tool" as const, toolId: "files.get_structure", arguments: { rootPath: "/tmp" } } };
+    const changed = defaultToolCatalog.map(tool => tool.id === "files.get_structure" ? { ...tool, effect: "change" as const } : tool);
+    expect(requiresStepApproval("safe", pending)).toBe(false);
+    expect(requiresStepApproval("safe", pending, changed)).toBe(true);
+  });
+
+  it("does not automatically authorize disabled, missing, or misdeclared tools", () => {
+    const pending = { ...step("low", ""), kind: "observe" as const,
+      action: { type: "tool" as const, toolId: "files.get_structure", arguments: { rootPath: "/tmp" } } };
+    const disabled = defaultToolCatalog.map(tool => tool.id === "files.get_structure" ? { ...tool, enabled: false } : tool);
+    const changed = defaultToolCatalog.map(tool => tool.id === "files.get_structure" ? { ...tool, effect: "change" as const } : tool);
+    expect(requiresStepApproval("managed", pending, disabled)).toBe(true);
+    expect(requiresStepApproval("managed", pending, [])).toBe(true);
+    expect(requiresStepApproval("managed", pending, changed)).toBe(true);
   });
 });

@@ -151,6 +151,52 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     expect(backend.executeCommand).not.toHaveBeenCalled();
   });
 
+  it("抽奖部署退回发现后不执行旧验收，取得证据再规划部署与验收", async () => {
+    const { store, task, repair } = completedPhaseFixture("safe");
+    task.rootGoal = "部署可配置奖品、不重复抽取的转盘页面并给出访问地址";
+    task.submittedInputs = undefined;
+    const deploy = step({ id: "old-deploy", title: "写入并启动抽奖页面", kind: "change",
+      command: "mkdir -p /srv/lucky-wheel; python3 -m http.server 8091 &",
+      validation: "curl -f http://127.0.0.1:8091/" });
+    const verify = step({ id: "old-verify", command: "curl -f http://127.0.0.1:8091/" });
+    const discover = step({ id: "discover-manager", command: "command -v systemctl", expected: "服务管理器信息" });
+    const rejected = { ...repair, businessReplanRequired: true, diagnostic: undefined,
+      validationError: "第 1 个计划步骤将进程脱离执行器跟踪", previousModelOutput: [deploy, verify] };
+    vi.mocked(backend.decideNextStage)
+      .mockRejectedValueOnce(new PlanProtocolError(rejected, "业务重规划"))
+      .mockResolvedValueOnce(nextStage([discover]));
+    const runStep = vi.spyOn(store, "runStep").mockResolvedValue(undefined);
+
+    await store.advanceTask(task.id);
+
+    expect(task.plan.map(item => item.command)).toEqual([discover.command]);
+    expect(runStep).toHaveBeenCalledTimes(1);
+    expect(task.protocolRepairHistory?.[0].repair.previousModelOutput).toEqual([deploy, verify]);
+    const executed = task.plan[0];
+    executed.status = "completed";
+    executed.result = { executionStatus: "success", observationStatus: "matched", exitCode: 0,
+      facts: {}, warnings: [], evidenceIds: ["manager-proof"] };
+    executed.evidence = [{ id: "manager-proof", type: "command-output", source: "main",
+      rawOutput: "/usr/bin/systemctl", facts: {}, collectedAt: new Date().toISOString() }];
+    const write = step({ id: "write-page", kind: "change", risk: "medium",
+      command: "mkdir -p /srv/lucky-wheel", validation: "test -d /srv/lucky-wheel" });
+    vi.mocked(backend.decideNextStage).mockResolvedValueOnce(nextStage([write, { ...verify, id: "new-verify" }]));
+    runStep.mockClear();
+
+    await store.advanceTask(task.id);
+    expect(task.status).toBe("awaiting_continuation");
+    expect(task.latestGoalReview?.nextPlan?.map(item => item.command)).toEqual([write.command, verify.command]);
+    await store.beginAdjustment(task.id);
+
+    expect(task.plan.map(item => item.command)).toEqual([write.command, verify.command]);
+    expect(task.plan.every(item => item.status !== "completed" && !item.result)).toBe(true);
+    expect(task.phaseHistory?.flatMap(phase => phase.plan).some(item =>
+      item.evidence?.some(evidence => evidence.id === "manager-proof"))).toBe(true);
+    expect(runStep).not.toHaveBeenCalledWith(task.id, "old-verify");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
   it("人工调整创建新的变更与验证步骤，保留原轮次、目标、输入及已完成证据并等待计划审批", async () => {
     const { store, task } = fixture();
     const originalRepair = clone(task.protocolRepair);
@@ -408,8 +454,8 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
       errorCode: "next_stage_response_invalid", validationError: "阶段联合决策结构解析失败：missing field steps",
       previousModelOutput: [], rawModelResponse: JSON.stringify(missingSteps), instruction: "返回完整联合决策",
     }, "响应无法解析");
-    const question = step({ command: 'opsark-tool user.request_input {"title":"部署方式","description":"确认部署方式","fields":[{"key":"deployment","label":"部署方式","description":"请选择部署方式","type":"select","required":true,"options":[{"value":"host","label":"主机服务"},{"value":"container","label":"容器"}]}]}',
-      validation: "true" });
+    const question = step({ command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: {"title":"部署方式","description":"确认部署方式","fields":[{"key":"deployment","label":"部署方式","description":"请选择部署方式","type":"select","required":true,"options":[{"value":"host","label":"主机服务"},{"value":"container","label":"容器"}]}]} },
+      validation: "" });
     vi.mocked(backend.decideNextStage).mockRejectedValueOnce(error).mockResolvedValueOnce(nextStage([question]));
 
     await store.advanceTask(task.id);

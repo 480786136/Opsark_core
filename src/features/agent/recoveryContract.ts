@@ -29,7 +29,7 @@ function parsedRecoveryTarget(context?: string): unknown[] | undefined {
 }
 
 function recoveryContractFingerprint(step: PlanStep) {
-  return JSON.stringify([step.id, step.attemptContext, step.kind, step.command, step.validation,
+  return JSON.stringify([step.id, step.attemptContext, step.kind, step.action, step.command, step.validation,
     step.expected, step.executionScope ?? "isolated_exec", step.validationScope ?? "isolated_exec"]);
 }
 
@@ -207,9 +207,10 @@ export function persistedRecoveryContract(step: PlanStep, roundId: string) {
   if (!isBlockingFailure(step)) return undefined;
   return { roundId, step: {
     id: step.id, kind: step.kind, title: step.title, description: "",
-    command: step.command, validation: step.validation, expected: step.expected, risk: step.risk,
+    action: step.action, command: step.command, validation: step.validation, expected: step.expected, risk: step.risk,
     executionScope: step.executionScope, validationScope: step.validationScope,
     attemptContext: step.attemptContext, status: step.status, recovery: step.recovery,
+    retryBasis: step.retryBasis, retryAfterStepId: step.retryAfterStepId,
     result: step.result ? { executionStatus: step.result.executionStatus,
       observationStatus: step.result.observationStatus, exitCode: step.result.exitCode,
       facts: { blockingSignal: step.result.facts.blockingSignal, validationPassed: step.result.facts.validationPassed,

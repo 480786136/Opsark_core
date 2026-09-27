@@ -12,8 +12,42 @@ import { resolveToolRegistry } from "@/features/tools/toolRegistry";
 import { resolveSkillRegistry } from "@/features/skills/skillRegistry";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { confirmedInputScope } from "@/features/agent/confirmedUserInputs";
+import { taskRequirementSnapshot } from "./taskGoal";
+import { buildTaskDecisionSnapshot } from "./taskDecisionSnapshot";
+import { buildLongRunningReviewContext } from "./reviewContext";
 
 describe("agent context", () => {
+  it("shares the same supplemental acceptance requirements across planning, monitoring and final review", () => {
+    const current = createTask();
+    current.rootGoal = "磁盘还剩多少空间";
+    current.currentInstruction = "现在有哪些大文件占用";
+    current.lastRequirementRelation = "supplement";
+    current.currentRoundId = "round-files";
+    current.messages = [
+      { id: "space", role: "user", kind: "message", content: current.rootGoal, requirementRelation: "new_goal", createdAt: "2026-01-01" },
+      { id: "files", role: "user", kind: "message", content: current.currentInstruction, requirementRelation: "supplement", createdAt: "2026-01-02" },
+    ];
+    const input = { task: current, tools: [], secretMetadata: [] };
+    const snapshot = taskRequirementSnapshot(current);
+    const initial = buildAgentContext({ ...input, permission: current.permission, conversationHistory: [],
+      knownExecutionFacts: {}, serverId: current.serverId });
+    const next = buildNextStageContext(input);
+    const monitor = buildLongRunningReviewContext({ task: current, step: current.plan[0], reviewRound: 1,
+      elapsedSeconds: 30, observation: { passed: false, detail: "等待扫描结果" },
+      progress: { workload: "bounded", outputFingerprint: "none", outputChangedSinceLastReview: false,
+        lastOutputChangeAt: "now", noProgressSeconds: 30, noProgressReviewRounds: 0, consecutiveContinueRounds: 0 },
+      outputWindow: { mode: "initial", newCharacters: 0, omittedCharacters: 0, contentFingerprint: "none", content: "" } });
+    for (const actual of [initial.taskGoal, buildContinuationContext(input).taskGoal,
+      buildAdjustmentContext(input).taskGoal, next.taskGoal, next.baseSnapshot.taskRequirements,
+      buildTaskDecisionSnapshot(current).taskRequirements]) expect(actual).toEqual(snapshot);
+    expect(monitor.task.requirements).toEqual(snapshot.requirements);
+    expect(monitor.task.currentInstruction).toBe(current.currentInstruction);
+    const policyBefore = nextStagePolicyFingerprint(input);
+    current.currentInstruction = "只检查 /var 的大文件";
+    current.messages.push({ ...current.messages[1], id: "scope", content: current.currentInstruction });
+    expect(nextStagePolicyFingerprint(input)).not.toBe(policyBefore);
+  });
+
   it("does not rebuild the general decision snapshot for a persisted protocol repair", () => {
     const task = createTask();
     task.protocolRepair = { roundId: task.currentRoundId, serverId: task.serverId,
@@ -221,9 +255,9 @@ describe("agent context", () => {
         id: "read-readme",
         title: "读取 README",
         description: "确认项目入口",
-        command: 'opsark-tool files.read_content {"path":"/opt/app/README.md"}',
+        command: "", action: { type: "tool" as const, toolId: "files.read_content", arguments: {"path":"/opt/app/README.md"} },
         expected: "返回文档",
-        validation: "true",
+        validation: "",
         risk: "low",
         status: "completed",
         output: "requires PHP 8.2",
@@ -391,7 +425,7 @@ describe("agent context", () => {
     const standalone = {
       ...task.plan[0],
       id: "resolve-worker",
-      command: 'opsark-tool server.resolve_connection {"host":"10.213.81.53","port":22}',
+      command: "", action: { type: "tool" as const, toolId: "server.resolve_connection", arguments: {"host":"10.213.81.53","port":22} },
       attemptContext,
       result: {
         executionStatus: "success" as const,

@@ -23,7 +23,7 @@ import {
   appendTerminalOutputChunk,
   createTerminalOutputAccumulator,
 } from "@/utils/terminal";
-import type { OpsTask, PlanStep } from "@/types";
+import type { CommandExecutionPolicy, OpsTask, PlanStep } from "@/types";
 import { isSshConnectionSetupFailure } from "@/features/agent/adjustmentIncident";
 import { findSecretKeys } from "@/features/agent/secretTool";
 import { classifyAuthenticationFailure } from "./authenticationEvidence";
@@ -41,6 +41,7 @@ export interface RunCommandLifecycleInput {
   executionId: string;
   /** Absolute deadline supplied by the execution owner, independent of model plans. */
   executionDeadlineAt?: number;
+  executionPolicy?: CommandExecutionPolicy;
   connection?: RuntimeConnection;
   runtimeModel?: RuntimeModel;
   secretValues: Record<string, string>;
@@ -83,6 +84,7 @@ export async function runCommandLifecycle(
     validation: input.validation,
     executionId: input.executionId,
     executionDeadlineAt: input.executionDeadlineAt,
+    executionPolicy: input.executionPolicy,
     connection: input.connection,
     runtimeModel: input.runtimeModel,
     secretValues: input.secretValues,

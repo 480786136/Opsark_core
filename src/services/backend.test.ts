@@ -4,15 +4,16 @@ import { assertPlanRepairScope, backend, buildPlanNormalizationRepair, normalize
 import type { PlanStep } from "@/types";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 afterEach(() => { Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); vi.resetAllMocks(); });
+const invokedContext = (index: number) => JSON.parse((vi.mocked(invoke).mock.calls[index][1] as { context: string }).context);
 
 const malformedStep: PlanStep = {
   id: "request-git-credential",
   kind: "observe",
   title: "收集 Git 凭据",
   description: "仅在匿名探测证明需要认证后收集",
-  command: "opsark-tool user.request_input {}",
+  command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: {} },
   expected: "获得凭据引用",
-  validation: "true",
+  validation: "",
   risk: "low",
   status: "pending",
 };
@@ -67,9 +68,9 @@ const standaloneStagePlan: PlanStep[] = [
     kind: "observe",
     title: "查询工作节点连接资料",
     description: "查询目标工作节点的受管连接引用",
-    command: 'opsark-tool server.resolve_connection {"host":"10.213.81.53","port":22}',
+    command: "", action: { type: "tool" as const, toolId: "server.resolve_connection", arguments: {"host":"10.213.81.53","port":22} },
     expected: "返回连接资料查询结果",
-    validation: "true",
+    validation: "",
     risk: "low",
     status: "pending",
   },
@@ -262,22 +263,45 @@ describe("plan normalization repair feedback", () => {
     expect(error).toBeInstanceOf(PlanProtocolError);
     expect((error as PlanProtocolError).processed).toEqual(result);
     expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).toEqual(["process_ai_requirement", "generate_ai_plan"]);
+    const initial = invokedContext(0)._modelRecovery;
+    const localRepair = invokedContext(1);
+    expect(initial).toMatchObject({ operationId: expect.any(String), startedAtMs: expect.any(Number) });
+    expect(localRepair._modelRecovery).toEqual(initial);
+    expect(localRepair.planGenerationRepair).not.toHaveProperty("modelRecovery");
+    expect((error as PlanProtocolError).repair.modelRecovery).toEqual(initial);
+    expect(runtime.context).toBe("{}");
     vi.mocked(invoke).mockClear();
     vi.mocked(invoke).mockResolvedValueOnce({ decision: "continue", reason: "继续", summary: "只读", steps: [malformedStep] })
       .mockResolvedValueOnce([{ ...malformedStep, description: "业务被改写" }]);
     await expect(backend.decideNextStage("查询数据库", runtime)).rejects.toBeInstanceOf(PlanProtocolError);
     expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).toEqual(["decide_ai_next_stage", "generate_ai_plan"]);
+    const stage = invokedContext(0)._modelRecovery;
+    expect(stage.operationId).not.toBe(initial.operationId);
+    expect(invokedContext(1)._modelRecovery).toEqual(stage);
+  });
+
+  it("resumes a saved local repair using its original operation identity and limits", async () => {
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+    const repair = buildPlanNormalizationRepair(new Error("第 1 个计划步骤的工具参数无效：格式错误"), [malformedStep]);
+    repair.modelRecovery = { operationId: "persisted-operation", startedAtMs: 1234567, maxGenerations: 3, maxTotalTokens: 9000 };
+    vi.mocked(invoke).mockResolvedValueOnce([{ ...malformedStep, description: "重写业务" }]);
+    const error = await backend.generatePlan("查询数据库", { apiKey: "fixture", endpoint: "https://test.invalid", model: "test",
+      context: JSON.stringify({ planGenerationRepair: repair }) }).catch(error => error);
+    expect(error).toBeInstanceOf(PlanProtocolError);
+    expect(error.repair.modelRecovery).toEqual(repair.modelRecovery);
+    expect(invokedContext(0)._modelRecovery).toEqual(repair.modelRecovery);
+    expect(invoke).toHaveBeenCalledOnce();
   });
   it("rejects business edits, tool replacement, unrelated commands and unrelated arguments", () => {
-    const original = { ...malformedStep, command: 'opsark-tool user.request_input {"title":"确认","fields":[{"key":"USER","type":"text"}]}' };
+    const original = { ...malformedStep, command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: {"title":"确认","fields":[{"key":"USER","type":"text"}]} } };
     const repair = buildPlanNormalizationRepair(new Error("第 1 个计划步骤的工具参数无效：凭据参数 USER 必须使用 password 类型"), [original]);
-    const repaired = { ...original, command: original.command.replace('"text"', '"password"') };
+    const repaired = { ...original, action: JSON.parse(JSON.stringify(original.action).replace('"text"', '"password"')) };
     expect(() => assertPlanRepairScope(repair, [repaired])).not.toThrow();
     expect(() => assertPlanRepairScope(repair, [{ ...repaired, description: "换账号试试" }])).toThrow("description");
-    expect(() => assertPlanRepairScope(repair, [{ ...repaired, command: "echo ok" }])).toThrow("替换工具");
-    expect(() => assertPlanRepairScope(repair, [{ ...repaired, command: repaired.command.replace("确认", "更换目标") }])).toThrow("其他工具参数");
+    expect(() => assertPlanRepairScope(repair, [{ ...repaired, command: "echo ok" }])).toThrow("Shell 命令");
+    expect(() => assertPlanRepairScope(repair, [{ ...repaired, action: JSON.parse(JSON.stringify(repaired.action).replace("确认", "更换目标")) }])).toThrow("其他工具参数");
     const withShell = { ...repair, previousModelOutput: [original, { ...malformedStep, command: "pwd" }] };
-    expect(() => assertPlanRepairScope(withShell, [repaired, { ...malformedStep, command: "whoami" }])).toThrow("无关命令");
+    expect(() => assertPlanRepairScope(withShell, [repaired, { ...malformedStep, command: "whoami" }])).toThrow();
   });
   it("upgrades a legacy tool repair from the original validator and still rejects business edits", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
@@ -291,7 +315,7 @@ describe("plan normalization repair feedback", () => {
     expect(error).toBeInstanceOf(PlanProtocolError);
     expect((error as PlanProtocolError).repair.previousModelOutput).toEqual(repair.previousModelOutput);
     expect((error as PlanProtocolError).repair.diagnostic).toMatchObject({ code: "TOOL_ARGUMENT_INVALID",
-      fieldPath: "steps[0].command.arguments.title" });
+      fieldPath: "steps[0].action.arguments.title" });
     expect((error as PlanProtocolError).repair.progress?.attemptCount).toBe(1);
     expect((error as Error).message).toContain("description");
     expect((error as PlanProtocolError).userMessage).toContain("该计划尚未执行");
@@ -307,13 +331,13 @@ describe("plan normalization repair feedback", () => {
       { key: "MYSQL_PASSWORD", label: "数据库密码", description: "目标实例密码", type: "password", required: true,
         credential: { group: "db", kind: "database", role: "secret", target: "db.internal:3306" } },
     ];
-    const original = { ...malformedStep, command: `opsark-tool user.request_input ${JSON.stringify({ title: "数据库认证", fields })}` };
+    const original = { ...malformedStep, command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify({ title: "数据库认证", fields })) } };
     const normalized = normalizePlanPreconditions([original], "检查当前mysql有哪些库")[0];
-    const args = JSON.parse(normalized.command.slice("opsark-tool user.request_input ".length));
+    const args = (normalized.action as any).arguments;
     expect(args.fields[0].type).toBe("password");
     expect(normalized.description).toBe(original.description);
     expect(normalized.kind).toBe(original.kind);
-    expect(original.command).toContain('"type":"text"');
+    expect(JSON.stringify(original.action)).toContain('"type":"text"');
   });
   it("returns a field-local credential type error with the prior model output", () => {
     const repair = buildPlanNormalizationRepair(
@@ -323,7 +347,7 @@ describe("plan normalization repair feedback", () => {
 
     expect(repair).toMatchObject({
       errorCode: "tool_schema_validation_failed",
-      fieldPath: "steps[0].command.arguments.fields[key=username].type",
+      fieldPath: "steps[0].action.arguments.fields[key=username].type",
       expected: "password",
       previousModelOutput: [malformedStep],
     });

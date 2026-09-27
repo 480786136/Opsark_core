@@ -12,7 +12,7 @@ const inputArguments = {
 function inputStep(overrides: Partial<PlanStep> = {}): PlanStep {
   return {
     id: "input-step", title: "确认目标", description: "确认本次任务范围",
-    command: `opsark-tool user.request_input ${JSON.stringify(inputArguments)}`,
+    command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify(inputArguments)) },
     expected: "用户确认目标", validation: "", risk: "low", status: "awaiting_input",
     ...overrides,
   };
@@ -32,7 +32,7 @@ describe("restoreUserInputRequests", () => {
   it("恢复选择器候选项但不把旧回答或第一个选项设为默认值", () => {
     const fields = [{ key: "TARGET", label: "选择目标", description: "从已发现目标中选择", type: "select", required: true,
       options: [{ value: "target-a", label: "目标甲" }, { value: "target-b", label: "目标乙" }] }];
-    const current = task({ plan: [inputStep({ command: `opsark-tool user.request_input ${JSON.stringify({ title: "选择目标", fields })}` })],
+    const current = task({ plan: [inputStep({ command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify({ title: "选择目标", fields })) } })],
       submittedInputs: { TARGET: { value: "target-a", type: "select", label: "旧问题", description: "旧目标",
         groupId: "old-request", groupTitle: "旧问题", submittedAt: "2026-09-14T00:00:00Z" } } });
     const [restored] = restoreUserInputRequests([current], defaultToolCatalog, () => "restored-select");
@@ -49,7 +49,7 @@ describe("restoreUserInputRequests", () => {
     const restored = restoreUserInputRequests([current], defaultToolCatalog, createCallId);
     expect(restored).toEqual([{
       ...inputArguments, taskId: current.id, stepId: "input-step", callId: "restored-1",
-      roundId: "round-1", workflowEpoch: 3, serverId: "target-server", command: current.plan[0].command,
+      roundId: "round-1", workflowEpoch: 3, serverId: "target-server", command: JSON.stringify(current.plan[0].action),
     }]);
     expect(restoreUserInputRequests([current], defaultToolCatalog, createCallId)[0].callId).toBe("restored-2");
     expect(current).toEqual(snapshot);
@@ -117,20 +117,20 @@ describe("restoreUserInputRequests", () => {
   it("按用户输入执行模式恢复注册工具，并校验完整字段定义", () => {
     const definition = defaultToolCatalog.find((tool) => tool.id === "user.request_input")!;
     const tools = [{ ...definition, id: "custom.ask" }];
-    const current = task({ plan: [inputStep({ command: `opsark-tool custom.ask ${JSON.stringify(inputArguments)}` })] });
+    const current = task({ plan: [inputStep({ command: "", action: { type: "tool" as const, toolId: "custom.ask", arguments: JSON.parse(JSON.stringify(inputArguments)) } })] });
     expect(restoreUserInputRequests([current], tools, () => "restored")).toHaveLength(1);
-    current.plan[0].command = `opsark-tool custom.ask ${JSON.stringify({
+    current.plan[0].command = ""; current.plan[0].action = { type: "tool" as const, toolId: "custom.ask", arguments: JSON.parse(JSON.stringify({
       ...inputArguments,
       fields: [{ ...inputArguments.fields[0], description: "" }],
-    })}`;
+    })) };
     expect(restoreUserInputRequests([current], tools, () => "restored")).toEqual([]);
   });
 
   it("只恢复敏感字段定义，不读取或带回已填写值及密钥绑定", () => {
-    const current = task({ plan: [inputStep({ command: `opsark-tool user.request_input ${JSON.stringify({
+    const current = task({ plan: [inputStep({ command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify({
       title: "确认访问参数",
       fields: [{ key: "API_TOKEN", label: "令牌", description: "访问用户指定服务", type: "password", required: true }],
-    })}` })] });
+    })) } })] });
     Object.defineProperties(current, {
       submittedInputs: { get() { throw new Error("不得读取用户输入值"); } },
       submittedSecretBindings: { get() { throw new Error("不得读取密钥绑定"); } },

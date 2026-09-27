@@ -12,6 +12,8 @@ import {
 import { useI18n } from "vue-i18n";
 import type { ObservationStatus, PlanStep, TaskExecutionPhase } from "@/types";
 import { localizeCoreText } from "@/features/preferences/coreText";
+import { stepOperationText } from "@/features/agent/stepAction";
+import PreparedExecutionTargets from "./PreparedExecutionTargets.vue";
 
 const props = defineProps<{
   phase: TaskExecutionPhase;
@@ -66,6 +68,9 @@ function riskText(step: PlanStep) {
 }
 
 function executionText(step: PlanStep) {
+  if (step.result?.executionStatus === "cancelled" && step.executionLedgerAttempts?.length && step.result.facts.cancelConfirmed !== true) {
+    return locale.value.startsWith("en") ? "Cancellation requested; result unconfirmed" : "取消已请求，结果待核对";
+  }
   const labels = {
     success: "agent.executionSuccess",
     failed: "agent.executionFailed",
@@ -139,7 +144,11 @@ function observationText(step: PlanStep) {
             <ChevronRight v-else :size="15" />
           </button>
           <div v-if="expandedSteps.includes(step.id)" class="step-detail">
-            <label>{{ t("agent.command") }}</label><code>{{ step.command }}</code>
+            <p v-if="step.status === 'skipped' && step.executionLedgerAttempts?.length && !step.result">
+              {{ locale.startsWith('en') ? 'Cancellation requested; the remote result remains unconfirmed.' : '取消已请求，远端执行结果仍待核对。' }}
+            </p>
+            <PreparedExecutionTargets :targets="step.executionIntent?.semantic.targets" />
+            <label>{{ t("agent.command") }}</label><code>{{ stepOperationText(step) }}</code>
             <label>{{ t("agent.expectedValidation") }}</label>
             <p>{{ step.expected }} · {{ step.kind === "observe" ? t("agent.commandResultEvidence") : step.validation }}</p>
             <template v-if="step.result">

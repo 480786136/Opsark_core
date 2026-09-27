@@ -27,6 +27,7 @@ try {
   assert.ok(ready);
   browser = await chromium.launch({ headless: true, ...(process.env.OPSARK_SMOKE_BROWSER ? { channel: process.env.OPSARK_SMOKE_BROWSER } : {}) });
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  page.setDefaultTimeout(10000);
   const models = [{ id: "official-general", name: "OpsArk 通用模型" }, { id: "official-reasoning", name: "OpsArk 推理模型" }];
   let state = "fresh", calls = 0;
   const errors = [];
@@ -69,6 +70,26 @@ try {
   await dialog.waitFor({ state: "detached" });
   assert.match(await page.locator(".official-model-card").first().textContent(), /240s/);
   await page.screenshot({ path: join(screenshots, "signed-in.png") });
+  await page.locator('.model-card:not(.official-model-card)').first().click();
+  await dialog.waitFor();
+  assert.equal(await dialog.locator("select").count(), 0);
+  await dialog.locator('summary[aria-label="参数适配"]').click();
+  await page.getByRole("option", { name: "千问（非思考模式）", exact: true }).click();
+  await dialog.getByText("高级请求参数", { exact: true }).click();
+  await dialog.locator('summary[aria-label="thinking"]').click();
+  assert.equal(await page.getByRole("option", { name: "开启", exact: true }).getAttribute("aria-disabled"), "true");
+  await page.keyboard.press("Escape");
+  await dialog.getByLabel("max_tokens", { exact: true }).fill("777");
+  assert.equal(await dialog.getByLabel("max_tokens", { exact: true }).getAttribute("max"), "16384");
+  await dialog.locator('.drawer-body').evaluate(node => { node.scrollTop = 0; });
+  await page.screenshot({ path: join(screenshots, "editor-desktop.png") });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.screenshot({ path: join(screenshots, "editor-narrow.png") });
+  assert.ok(await dialog.evaluate(node => node.scrollWidth <= node.clientWidth + 1));
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
+  await dialog.waitFor({ state: "detached" });
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("opsark.models"))[0].requestParameters), undefined);
+  await page.setViewportSize({ width: 1440, height: 1000 });
   state = "offline";
   await page.reload();
   await page.getByText("暂时无法更新，正在显示已缓存的官方模型目录。", { exact: true }).waitFor();
@@ -80,6 +101,29 @@ try {
   await page.goto(base + "/#/models");
   await page.getByText("暂无已开放的官方模型。", { exact: true }).waitFor();
   assert.equal(await page.locator(".official-model-card").count(), 0);
+  // Mount the actual shared workbench dialog with the running application's
+  // context; no server connection or remote terminal is needed for this check.
+  await page.evaluate(async () => {
+    const { createVNode, render } = await import("/node_modules/.vite/deps/vue.js");
+    const { default: Settings } = await import("/src/components/ModelSettingsModal.vue");
+    const host = document.createElement("div"); document.body.append(host);
+    const vnode = createVNode(Settings, { open: true, onClose: () => { render(null, host); host.remove(); } });
+    vnode.appContext = document.querySelector("#app").__vue_app__._context;
+    render(vnode, host);
+  });
+  const settings = page.locator('.shared-model-settings');
+  await settings.waitFor();
+  await settings.locator('button.model-card').click();
+  await page.locator('.drawer-overlay').waitFor();
+  assert.equal(await settings.evaluate(node => node.inert), true);
+  await page.locator('.drawer-overlay').getByRole("button", { name: "取消", exact: true }).click();
+  await page.locator('.drawer-overlay').waitFor({ state: "detached" });
+  assert.equal(await settings.evaluate(node => node.inert), false);
+  assert.equal(await settings.locator('button.model-card').evaluate(node => node === document.activeElement), true);
+  await settings.locator('.budget-settings').scrollIntoViewIfNeeded();
+  await page.screenshot({ path: join(screenshots, "shared-settings.png") });
+  await settings.locator('.modal-title button').click();
+  await settings.waitFor({ state: "detached" });
   assert.deepEqual(errors, []);
   console.log("PASS: public catalogue on entry, credential-free request, official ordering/masks/login link, read-only name, timeout preferences, offline persistent cache, withdrawn-model removal.");
   console.log("Screenshots: " + screenshots);

@@ -32,30 +32,31 @@ function estimatedTokens(value: unknown) {
   return Math.max(0, Math.ceil(cjk + (text.length - cjk) / 4));
 }
 
-function apiTokenUsage(value: unknown) {
-  let input = 0;
-  let output = 0;
-  let found = false;
+function apiTokenUsage(value: unknown): DeveloperLogEntry["tokenUsage"] {
+  const usages: Array<{ input: number | null; output: number | null; total: number | null; reasoning: number | null }> = [];
+  const count = (value: unknown) => typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+  const seen = new WeakSet<object>();
   const visit = (current: unknown) => {
-    if (!current || typeof current !== "object") return;
+    if (!current || typeof current !== "object" || seen.has(current)) return;
+    seen.add(current);
     const record = current as Record<string, unknown>;
     const usage = record.usage;
     if (usage && typeof usage === "object") {
       const item = usage as Record<string, unknown>;
-      const prompt = Number(item.prompt_tokens ?? item.input_tokens ?? item.promptTokenCount);
-      const completion = Number(item.completion_tokens ?? item.output_tokens ?? item.candidatesTokenCount);
-      if (Number.isFinite(prompt) || Number.isFinite(completion)) {
-        input += Number.isFinite(prompt) ? prompt : 0;
-        output += Number.isFinite(completion) ? completion : 0;
-        found = true;
-      }
+      const input = count(item.prompt_tokens ?? item.input_tokens ?? item.promptTokenCount);
+      const output = count(item.completion_tokens ?? item.output_tokens ?? item.candidatesTokenCount);
+      const total = count(item.total_tokens ?? item.totalTokenCount) ?? (input !== null && output !== null ? input + output : null);
+      const details = (item.completion_tokens_details ?? item.output_tokens_details) as Record<string, unknown> | undefined;
+      const reasoning = count(details?.reasoning_tokens);
+      usages.push({ input, output, total, reasoning });
     }
-    Object.entries(record).forEach(([key, child]) => {
-      if (key !== "usage") visit(child);
-    });
+    Object.entries(record).forEach(([key, child]) => { if (key !== "usage") visit(child); });
   };
   visit(value);
-  return found ? { input, output, total: input + output, source: "api" as const } : undefined;
+  if (!usages.length) return undefined;
+  const sum = (key: keyof typeof usages[number]) => usages.some(item => item[key] === null) ? null : usages.reduce((total, item) => total + item[key]!, 0);
+  const reasoning = sum("reasoning");
+  return { input: sum("input"), output: sum("output"), total: sum("total"), source: "api", ...(reasoning !== null ? { reasoning } : {}) };
 }
 
 function redactDeveloperText(value: string, secretValues: Record<string, string>) {
@@ -90,10 +91,9 @@ export function createDeveloperLog(
   const tokenUsage = exactUsage ?? {
     input: estimatedTokens(draft.request),
     output: estimatedTokens(draft.response ?? draft.trace ?? draft.error),
-    total: 0,
+    total: estimatedTokens(draft.request) + estimatedTokens(draft.response ?? draft.trace ?? draft.error),
     source: "estimated" as const,
   };
-  tokenUsage.total = tokenUsage.input + tokenUsage.output;
   return {
     ...draft,
     id,

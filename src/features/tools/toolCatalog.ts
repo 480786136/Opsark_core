@@ -1,3 +1,7 @@
+import { operationsToolCatalog } from "./operationsContracts";
+import { fullSchemaPattern, schemaNonWhitespace, schemaWhitespace } from "./toolSchemaPatterns";
+import { toolOutputSchemas } from "./toolOutputSchemas";
+import { compileToolSchema } from "./toolParameterSchema";
 import type { ToolDefinition } from "@/features/tools/types";
 
 const CATALOG_UPDATED_AT = "2026-08-14T00:00:00.000Z";
@@ -5,6 +9,7 @@ const CATALOG_UPDATED_AT = "2026-08-14T00:00:00.000Z";
 export const defaultToolCatalog: ToolDefinition[] = [
   {
     id: "server.basic_info",
+    effect: "read",
     implementation: "serverBasicInfo",
     name: "服务器基本信息获取工具",
     description: "获取服务器操作系统、内核、CPU、核心数、内存、磁盘、运行时间和已部署软件环境。",
@@ -22,6 +27,7 @@ export const defaultToolCatalog: ToolDefinition[] = [
   },
   {
     id: "server.realtime_metrics",
+    effect: "read",
     implementation: "serverRealtimeMetrics",
     name: "服务器实时数据获取工具",
     description: "获取服务器当前 CPU、内存、磁盘和网络吞吐数据。",
@@ -39,6 +45,7 @@ export const defaultToolCatalog: ToolDefinition[] = [
   },
   {
     id: "server.resolve_connection",
+    effect: "read",
     implementation: "serverResolveConnection",
     name: "服务器连接资料查询工具",
     description: "按目标地址查询服务器管理记录或当前服务器长期保存的 SSH 凭据组。",
@@ -47,7 +54,7 @@ export const defaultToolCatalog: ToolDefinition[] = [
       type: "object",
       additionalProperties: false,
       properties: {
-        host: { type: "string", description: "目标服务器 IP 地址或域名。" },
+        host: { type: "string", minLength: 1, maxLength: 253, pattern: fullSchemaPattern(`[^${schemaWhitespace}/@]+`), description: "目标服务器 IP 地址或域名。" },
         port: { type: "integer", minimum: 1, maximum: 65535, default: 22 },
       },
       required: ["host"],
@@ -64,6 +71,7 @@ export const defaultToolCatalog: ToolDefinition[] = [
   },
   {
     id: "server.connect",
+    effect: "change",
     implementation: "serverConnect",
     name: "SSH 服务器连接工具",
     description: "在当前可见终端的真实 PTY 中执行 SSH 登录，并让后续命令继续运行在目标服务器。",
@@ -72,15 +80,16 @@ export const defaultToolCatalog: ToolDefinition[] = [
       type: "object",
       additionalProperties: false,
       properties: {
-        host: { type: "string", description: "目标服务器 IP 地址或域名。" },
+        host: { type: "string", minLength: 1, maxLength: 253, pattern: fullSchemaPattern(`[^${schemaWhitespace}/@]+`), description: "目标服务器 IP 地址或域名。" },
         port: { type: "integer", minimum: 1, maximum: 65535, default: 22, description: "SSH 服务端口。" },
-        username: { type: "string", description: "SSH 登录用户名。" },
-        passwordSecretKey: { type: "string", description: "已由用户输入工具安全收集的密码参数 key，不是密码值。" },
-        credentialRef: { type: "string", description: "服务器连接资料查询工具返回的不可逆凭据引用。" },
+        username: { type: "string", minLength: 1, pattern: fullSchemaPattern(`[^${schemaWhitespace}@]+`), description: "SSH 登录用户名。" },
+        passwordSecretKey: { type: "string", pattern: fullSchemaPattern("[A-Z][A-Z0-9_]*"), description: "已由用户输入工具安全收集的密码参数 key，不是密码值。" },
+        credentialRef: { type: "string", minLength: 1, pattern: fullSchemaPattern(`(managed-server|server-credential):${schemaNonWhitespace}+`), description: "服务器连接资料查询工具返回的不可逆凭据引用。" },
         name: { type: "string", description: "服务器在 Opsark 中的显示名称。" },
         group: { type: "string", description: "可选的服务器分组。" },
       },
       required: ["host"],
+      anyOf: [{ required: ["credentialRef"] }, { required: ["username", "passwordSecretKey"] }],
     },
     outputDescription: "返回终端内 SSH 跳转状态、目标地址和用户名占位元数据，不返回凭据组的真实值。",
     planMode: "standalone",
@@ -94,6 +103,7 @@ export const defaultToolCatalog: ToolDefinition[] = [
   },
   {
     id: "secret.metadata",
+    effect: "change",
     implementation: "secretMetadata",
     name: "服务器信息数据管理工具",
     description: "管理当前服务器长期保存的数据库账号、Git 用户名/令牌和其他敏感变量及凭据组。模型不能读取真实值。",
@@ -120,6 +130,7 @@ export const defaultToolCatalog: ToolDefinition[] = [
   },
   {
     id: "secret.merge_command",
+    effect: "read",
     implementation: "secretMergeCommand",
     name: "指令合并工具",
     description: "在执行阶段将命令中的敏感变量占位符合并为真实值，并保证展示和日志继续脱敏。",
@@ -142,6 +153,7 @@ export const defaultToolCatalog: ToolDefinition[] = [
   },
   {
     id: "user.request_input",
+    effect: "interaction",
     implementation: "userRequestInput",
     name: "用户输入工具",
     description: "以结构化表单请用户明确目标、选择方案、确认操作范围或补充必需参数；等待期间不执行后续操作。",
@@ -150,7 +162,7 @@ export const defaultToolCatalog: ToolDefinition[] = [
       type: "object",
       additionalProperties: false,
       properties: {
-        title: { type: "string", description: "表单标题，说明需要用户补充什么信息。" },
+        title: { type: "string", pattern: schemaNonWhitespace, maxLength: 200, description: "表单标题，说明需要用户补充什么信息。" },
         description: { type: "string", description: "表单整体说明，告知这些信息将用于什么操作。" },
         fields: {
           type: "array",
@@ -161,9 +173,9 @@ export const defaultToolCatalog: ToolDefinition[] = [
             type: "object",
             additionalProperties: false,
             properties: {
-              key: { type: "string", description: "程序使用的参数名。" },
-              label: { type: "string", description: "展示给用户的参数名称。" },
-              description: { type: "string", description: "说明参数是什么、将用于什么操作。" },
+              key: { type: "string", pattern: fullSchemaPattern("[A-Za-z][A-Za-z0-9_]*"), description: "程序使用的参数名。" },
+              label: { type: "string", pattern: schemaNonWhitespace, description: "展示给用户的参数名称。" },
+              description: { type: "string", pattern: schemaNonWhitespace, description: "说明参数是什么、将用于什么操作。" },
               type: { type: "string", enum: ["text", "password", "number", "select"], description: "已知有限候选用 select，开放回答用 text。存在 credential 时，username 和 secret 两种角色都必须使用 password，表示保密输入和存储。" },
               placeholder: { type: "string", description: "不包含真实敏感值的输入示例。" },
               options: {
@@ -175,8 +187,8 @@ export const defaultToolCatalog: ToolDefinition[] = [
                   type: "object",
                   additionalProperties: false,
                   properties: {
-                    value: { type: "string", pattern: "\\S", description: "非空且精确唯一的真实候选值，不含敏感信息。" },
-                    label: { type: "string", pattern: "\\S", description: "向用户显示的非空候选名称。" },
+                    value: { type: "string", pattern: schemaNonWhitespace, description: "非空且精确唯一的真实候选值，不含敏感信息。" },
+                    label: { type: "string", pattern: schemaNonWhitespace, description: "向用户显示的非空候选名称。" },
                   },
                   required: ["value", "label"],
                 },
@@ -187,7 +199,7 @@ export const defaultToolCatalog: ToolDefinition[] = [
                 additionalProperties: false,
                 description: "一次表单至多一个完整凭据组，恰好 username 与 secret 各一项；两项 type=password、required=true，共用 group/kind/target。目标未知时先用普通表单确认目标，再收集凭据。",
                 properties: {
-                  group: { type: "string", description: "同一表单内两个凭据字段共用的组标识。" },
+                  group: { type: "string", pattern: fullSchemaPattern("[A-Za-z][A-Za-z0-9_-]{0,63}"), description: "同一表单内两个凭据字段共用的组标识。" },
                   kind: { type: "string", enum: ["git-https", "ssh-password", "database", "service"] },
                   role: { type: "string", enum: ["username", "secret"] },
                   target: { type: "string", description: "已确认的真实认证目标，不含凭据。数据库使用主机:端口或明确的 socket 绝对路径（保留大小写，不含变量、通配符或路径跳转）；SSH/Git 使用精确主机。不得使用占位标识或尚未填写的字段名。" },
@@ -197,8 +209,8 @@ export const defaultToolCatalog: ToolDefinition[] = [
             },
             required: ["key", "label", "description", "type", "required"],
             oneOf: [
-              { properties: { type: { enum: ["select"] } }, required: ["options"], not: { required: ["credential"] } },
-              { properties: { type: { enum: ["text", "password", "number"] } }, not: { required: ["options"] } },
+              { properties: { type: { type: "string", enum: ["select"] } }, required: ["options"], not: { required: ["credential"] } },
+              { properties: { type: { type: "string", enum: ["text", "password", "number"] } }, not: { required: ["options"] } },
             ],
           },
         },
@@ -217,13 +229,14 @@ export const defaultToolCatalog: ToolDefinition[] = [
   },
   {
     id: "context.expand",
+    effect: "interaction",
     implementation: "expandPlanningContext",
     name: "展开 Skill 上下文",
     description: "当前阶段信息不足时请求该活动 Skill 的完整流程参考，不改变工具范围或权限。",
     usageInstructions: "提供活动 skillId 和具体原因；不执行远端命令，不改变权限。下一轮加载完整 Skill。",
     inputSchema: {
       type: "object", additionalProperties: false,
-      properties: { skillId: { type: "string", pattern: "\\S" }, reason: { type: "string", pattern: "\\S" } },
+      properties: { skillId: { type: "string", pattern: schemaNonWhitespace }, reason: { type: "string", pattern: schemaNonWhitespace } },
       required: ["skillId", "reason"],
     },
     outputDescription: "展开请求的 skillId；不是业务完成证据。",
@@ -231,12 +244,13 @@ export const defaultToolCatalog: ToolDefinition[] = [
     enabled: true, builtIn: true, version: 1, updatedAt: CATALOG_UPDATED_AT,
   },
   {
-    id: "evidence.read", implementation: "readEvidence", name: "读取历史证据",
+    id: "evidence.read",
+    effect: "read", implementation: "readEvidence", name: "读取历史证据",
     description: "按当前任务的证据引用分页取回已保存原文。",
     usageInstructions: "传入上下文中的 evidenceId。offset 按 Unicode 字符计数，后续页使用 nextOffset；按需读取相关页。仅能读取当前任务，返回历史采集内容，不证明远端当前状态；保留 capturedPartial。",
     inputSchema: { type: "object", additionalProperties: false, required: ["evidenceId"], properties: {
-      evidenceId: { type: "string", pattern: "^[a-f0-9]{64}$" },
-      offset: { type: "integer", minimum: 0, default: 0 },
+      evidenceId: { type: "string", pattern: fullSchemaPattern("[a-f0-9]{64}") },
+      offset: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER, default: 0 },
       limit: { type: "integer", minimum: 1, maximum: 12000, default: 6000 },
     } },
     outputDescription: "text、metadata、totalCharacters、nextOffset；nextOffset 为空表示已保存内容读完。",
@@ -245,15 +259,16 @@ export const defaultToolCatalog: ToolDefinition[] = [
   },
   {
     id: "files.get_structure",
+    effect: "read",
     implementation: "getRemoteFileStructure",
     name: "文件数据结构获取工具",
     description: "只读获取远端指定目录的紧凑文本目录树。",
-    usageInstructions: "固定格式为 opsark-tool files.get_structure {...}，工具 ID 前不得添加 --。rootPath 使用远端绝对路径；excludeDirectories 可使用目录名、根目录下的相对路径，或位于 rootPath 下的远程绝对路径。默认排除版本库、依赖缓存和构建产物，默认最多 4 层、600 个节点。探查 / 时先用 maxDepth:1 获取顶层，排除 /proc、/sys、/dev、/run 等虚拟文件系统，再缩小 rootPath 分段下钻；不要对 / 一次遍历多层。结果截断时应缩小 rootPath 再获取，不要盲目提高上限。",
+    usageInstructions: "使用结构化 action={type:tool,toolId:files.get_structure,arguments:{...}}。rootPath 使用远端绝对路径；excludeDirectories 可使用目录名、根目录下的相对路径，或位于 rootPath 下的远程绝对路径。默认排除版本库、依赖缓存和构建产物，默认最多 4 层、600 个节点。探查 / 时先用 maxDepth:1 获取顶层，排除 /proc、/sys、/dev、/run 等虚拟文件系统，再缩小 rootPath 分段下钻；不要对 / 一次遍历多层。结果截断时应缩小 rootPath 再获取，不要盲目提高上限。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
-        rootPath: { type: "string", description: "远端绝对目录路径" },
+        rootPath: { type: "string", minLength: 1, maxLength: 4096, pattern: fullSchemaPattern("/[^\\u0000]*"), description: "远端绝对目录路径" },
         excludeDirectories: { type: "array", description: "要跳过的目录名、rootPath 相对路径，或 rootPath 下的远程绝对路径。", items: { type: "string" } },
         maxDepth: { type: "integer", minimum: 1, maximum: 20, default: 4 },
         maxNodes: { type: "integer", minimum: 1, maximum: 10000, default: 600 },
@@ -273,6 +288,7 @@ export const defaultToolCatalog: ToolDefinition[] = [
   },
   {
     id: "files.read_content",
+    effect: "read",
     implementation: "readRemoteFileContent",
     name: "文件内容读取工具",
     description: "有界、只读地读取远端 UTF-8 文本文件，为项目文档、声明文件和配置分析提供真实证据。",
@@ -281,7 +297,7 @@ export const defaultToolCatalog: ToolDefinition[] = [
       type: "object",
       additionalProperties: false,
       properties: {
-        path: { type: "string", description: "需要读取的远端文件绝对路径。" },
+        path: { type: "string", minLength: 1, maxLength: 4096, pattern: fullSchemaPattern("/[^\\u0000]*"), description: "需要读取的远端文件绝对路径。" },
         maxBytes: { type: "integer", minimum: 1, maximum: 262144, default: 65536 },
       },
       required: ["path"],
@@ -298,6 +314,7 @@ export const defaultToolCatalog: ToolDefinition[] = [
   },
   {
     id: "software.check",
+    effect: "read",
     implementation: "checkSoftware",
     name: "软件可用性检查工具",
     description: "在当前任务绑定终端中检查指定软件是否存在，并获取真实可执行路径和版本首行。",
@@ -306,7 +323,7 @@ export const defaultToolCatalog: ToolDefinition[] = [
       type: "object",
       additionalProperties: false,
       properties: {
-        names: { type: "array", minItems: 1, maxItems: 20, items: { type: "string" }, description: "要检查的精确命令名。" },
+        names: { type: "array", minItems: 1, maxItems: 20, items: { type: "string", minLength: 1, maxLength: 255, pattern: fullSchemaPattern("[A-Za-z0-9+._-]+") }, description: "要检查的精确命令名。" },
         includeVersions: { type: "boolean", default: true },
       },
       required: ["names"],
@@ -323,6 +340,7 @@ export const defaultToolCatalog: ToolDefinition[] = [
   },
   {
     id: "files.transfer_between_servers",
+    effect: "change",
     implementation: "transferFileBetweenServers",
     name: "服务器间文件传输工具",
     description: "使用 Opsark 已保存的两台服务器凭据，在桌面后端中流式中转文件并进行 SHA-256 校验。",
@@ -331,9 +349,9 @@ export const defaultToolCatalog: ToolDefinition[] = [
       type: "object",
       additionalProperties: false,
       properties: {
-        sourcePath: { type: "string", description: "当前服务器上的源文件绝对路径" },
-        targetServer: { type: "string", description: "目标服务器 ID、名称或地址" },
-        targetPath: { type: "string", description: "目标文件绝对路径，必须包含文件名" },
+        sourcePath: { type: "string", minLength: 1, maxLength: 4096, pattern: fullSchemaPattern("/[^\\u0000]*"), description: "当前服务器上的源文件绝对路径" },
+        targetServer: { type: "string", minLength: 1, pattern: schemaNonWhitespace, description: "目标服务器 ID、名称或地址" },
+        targetPath: { type: "string", minLength: 1, maxLength: 4096, pattern: fullSchemaPattern("/[^\\u0000]*"), description: "目标文件绝对路径，必须包含文件名" },
         overwrite: { type: "boolean", default: false },
       },
       required: ["sourcePath", "targetServer", "targetPath"],
@@ -347,4 +365,14 @@ export const defaultToolCatalog: ToolDefinition[] = [
     version: 1,
     updatedAt: CATALOG_UPDATED_AT,
   },
+  ...operationsToolCatalog,
 ];
+
+// Invalid or unsupported contracts fail at startup, before any model plan runs.
+for (const tool of defaultToolCatalog) {
+  tool.inputSchema = { $schema: "http://json-schema.org/draft-07/schema#", ...tool.inputSchema };
+  if (toolOutputSchemas[tool.id]) tool.outputSchema = toolOutputSchemas[tool.id];
+  compileToolSchema(tool.inputSchema);
+  if (tool.outputSchema) compileToolSchema(tool.outputSchema);
+  else if ((tool.modelExposure ?? "planner") === "planner") throw new Error(`可调用工具缺少输出契约：${tool.id}`);
+}

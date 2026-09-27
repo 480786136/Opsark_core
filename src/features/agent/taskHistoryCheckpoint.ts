@@ -60,7 +60,7 @@ export function taskStepEvidenceKey(step: PlanStep) {
 
 export function isUserInputEvidenceStep(step: PlanStep) {
   return step.result?.facts.toolId === "user.request_input"
-    || /^\s*opsark-tool\s+user\.request_input(?:\s|$)/u.test(step.command);
+    || (step.action?.type === "tool" && step.action.toolId === "user.request_input");
 }
 
 function unresolvedIssueKey(

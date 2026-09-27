@@ -1,0 +1,1766 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "context.expand inputSchema valid",
+      "value": {
+        "skillId": "deploy",
+        "reason": "need detail"
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "context.expand"
+    },
+    {
+      "name": "context.expand inputSchema unknown field",
+      "value": {
+        "skillId": "deploy",
+        "reason": "need detail",
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "context.expand"
+    },
+    {
+      "name": "context.expand inputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "context.expand"
+    },
+    {
+      "name": "context.expand inputSchema missing skillId",
+      "value": {
+        "reason": "need detail"
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "context.expand"
+    },
+    {
+      "name": "evidence.read inputSchema valid",
+      "value": {
+        "evidenceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "evidence.read"
+    },
+    {
+      "name": "evidence.read inputSchema unknown field",
+      "value": {
+        "evidenceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "evidence.read"
+    },
+    {
+      "name": "evidence.read inputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "evidence.read"
+    },
+    {
+      "name": "evidence.read inputSchema missing evidenceId",
+      "value": {},
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "evidence.read"
+    },
+    {
+      "name": "server.resolve_connection inputSchema valid",
+      "value": {
+        "host": "host.example"
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "server.resolve_connection inputSchema unknown field",
+      "value": {
+        "host": "host.example",
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "server.resolve_connection inputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "server.resolve_connection inputSchema missing host",
+      "value": {},
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "server.connect inputSchema valid",
+      "value": {
+        "host": "host.example",
+        "credentialRef": "managed-server:1"
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "server.connect"
+    },
+    {
+      "name": "server.connect inputSchema unknown field",
+      "value": {
+        "host": "host.example",
+        "credentialRef": "managed-server:1",
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.connect"
+    },
+    {
+      "name": "server.connect inputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.connect"
+    },
+    {
+      "name": "server.connect inputSchema missing host",
+      "value": {
+        "credentialRef": "managed-server:1"
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.connect"
+    },
+    {
+      "name": "user.request_input inputSchema valid",
+      "value": {
+        "title": "端口",
+        "fields": [
+          {
+            "key": "PORT",
+            "label": "端口",
+            "description": "监听端口",
+            "type": "number",
+            "required": true
+          }
+        ]
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "user.request_input"
+    },
+    {
+      "name": "user.request_input inputSchema unknown field",
+      "value": {
+        "title": "端口",
+        "fields": [
+          {
+            "key": "PORT",
+            "label": "端口",
+            "description": "监听端口",
+            "type": "number",
+            "required": true
+          }
+        ],
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "user.request_input"
+    },
+    {
+      "name": "user.request_input inputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "user.request_input"
+    },
+    {
+      "name": "user.request_input inputSchema missing title",
+      "value": {
+        "fields": [
+          {
+            "key": "PORT",
+            "label": "端口",
+            "description": "监听端口",
+            "type": "number",
+            "required": true
+          }
+        ]
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "user.request_input"
+    },
+    {
+      "name": "files.get_structure inputSchema valid",
+      "value": {
+        "rootPath": "/app"
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "files.get_structure"
+    },
+    {
+      "name": "files.get_structure inputSchema unknown field",
+      "value": {
+        "rootPath": "/app",
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "files.get_structure"
+    },
+    {
+      "name": "files.get_structure inputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "files.get_structure"
+    },
+    {
+      "name": "files.get_structure inputSchema missing rootPath",
+      "value": {},
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "files.get_structure"
+    },
+    {
+      "name": "files.read_content inputSchema valid",
+      "value": {
+        "path": "/app/a"
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "files.read_content"
+    },
+    {
+      "name": "files.read_content inputSchema unknown field",
+      "value": {
+        "path": "/app/a",
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "files.read_content"
+    },
+    {
+      "name": "files.read_content inputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "files.read_content"
+    },
+    {
+      "name": "files.read_content inputSchema missing path",
+      "value": {},
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "files.read_content"
+    },
+    {
+      "name": "software.check inputSchema valid",
+      "value": {
+        "names": [
+          "node"
+        ]
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "software.check"
+    },
+    {
+      "name": "software.check inputSchema unknown field",
+      "value": {
+        "names": [
+          "node"
+        ],
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "software.check"
+    },
+    {
+      "name": "software.check inputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "software.check"
+    },
+    {
+      "name": "software.check inputSchema missing names",
+      "value": {},
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "software.check"
+    },
+    {
+      "name": "files.transfer_between_servers inputSchema valid",
+      "value": {
+        "sourcePath": "/a",
+        "targetServer": "s2",
+        "targetPath": "/b"
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "files.transfer_between_servers"
+    },
+    {
+      "name": "files.transfer_between_servers inputSchema unknown field",
+      "value": {
+        "sourcePath": "/a",
+        "targetServer": "s2",
+        "targetPath": "/b",
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "files.transfer_between_servers"
+    },
+    {
+      "name": "files.transfer_between_servers inputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "files.transfer_between_servers"
+    },
+    {
+      "name": "files.transfer_between_servers inputSchema missing sourcePath",
+      "value": {
+        "targetServer": "s2",
+        "targetPath": "/b"
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "files.transfer_between_servers"
+    },
+    {
+      "name": "context.expand outputSchema valid",
+      "value": {
+        "skillId": "deploy"
+      },
+      "valid": true,
+      "contract": "outputSchema",
+      "toolId": "context.expand"
+    },
+    {
+      "name": "context.expand outputSchema unknown field",
+      "value": {
+        "skillId": "deploy",
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "context.expand"
+    },
+    {
+      "name": "context.expand outputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "context.expand"
+    },
+    {
+      "name": "context.expand outputSchema missing skillId",
+      "value": {},
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "context.expand"
+    },
+    {
+      "name": "evidence.read outputSchema valid",
+      "value": {
+        "evidenceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "historical": true,
+        "metadata": {
+          "custom": {
+            "version": 1
+          }
+        },
+        "text": "中文😀",
+        "offset": 0,
+        "totalCharacters": 3,
+        "nextOffset": null,
+        "instruction": "历史记录"
+      },
+      "valid": true,
+      "contract": "outputSchema",
+      "toolId": "evidence.read"
+    },
+    {
+      "name": "evidence.read outputSchema unknown field",
+      "value": {
+        "evidenceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "historical": true,
+        "metadata": {
+          "custom": {
+            "version": 1
+          }
+        },
+        "text": "中文😀",
+        "offset": 0,
+        "totalCharacters": 3,
+        "nextOffset": null,
+        "instruction": "历史记录",
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "evidence.read"
+    },
+    {
+      "name": "evidence.read outputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "evidence.read"
+    },
+    {
+      "name": "evidence.read outputSchema missing evidenceId",
+      "value": {
+        "historical": true,
+        "metadata": {
+          "custom": {
+            "version": 1
+          }
+        },
+        "text": "中文😀",
+        "offset": 0,
+        "totalCharacters": 3,
+        "nextOffset": null,
+        "instruction": "历史记录"
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "evidence.read"
+    },
+    {
+      "name": "server.resolve_connection outputSchema valid",
+      "value": {
+        "host": "host.example",
+        "port": 22,
+        "found": false,
+        "credentialAvailable": false
+      },
+      "valid": true,
+      "contract": "outputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "server.resolve_connection outputSchema unknown field",
+      "value": {
+        "host": "host.example",
+        "port": 22,
+        "found": false,
+        "credentialAvailable": false,
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "server.resolve_connection outputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "server.resolve_connection outputSchema missing found",
+      "value": {
+        "host": "host.example",
+        "port": 22,
+        "credentialAvailable": false
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "server.connect outputSchema valid",
+      "value": {
+        "host": "host.example",
+        "port": 22,
+        "serverId": "s1",
+        "name": "server",
+        "username": "root",
+        "connected": true,
+        "info": {
+          "os": "Linux"
+        }
+      },
+      "valid": true,
+      "contract": "outputSchema",
+      "toolId": "server.connect"
+    },
+    {
+      "name": "server.connect outputSchema unknown field",
+      "value": {
+        "host": "host.example",
+        "port": 22,
+        "serverId": "s1",
+        "name": "server",
+        "username": "root",
+        "connected": true,
+        "info": {
+          "os": "Linux"
+        },
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "server.connect"
+    },
+    {
+      "name": "server.connect outputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "server.connect"
+    },
+    {
+      "name": "server.connect outputSchema missing serverId",
+      "value": {
+        "host": "host.example",
+        "port": 22,
+        "name": "server",
+        "username": "root",
+        "connected": true,
+        "info": {
+          "os": "Linux"
+        }
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "server.connect"
+    },
+    {
+      "name": "user.request_input outputSchema valid",
+      "value": {
+        "title": "端口",
+        "values": {
+          "PORT": 80
+        }
+      },
+      "valid": true,
+      "contract": "outputSchema",
+      "toolId": "user.request_input"
+    },
+    {
+      "name": "user.request_input outputSchema unknown field",
+      "value": {
+        "title": "端口",
+        "values": {
+          "PORT": 80
+        },
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "user.request_input"
+    },
+    {
+      "name": "user.request_input outputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "user.request_input"
+    },
+    {
+      "name": "user.request_input outputSchema missing title",
+      "value": {
+        "values": {
+          "PORT": 80
+        }
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "user.request_input"
+    },
+    {
+      "name": "files.get_structure outputSchema valid",
+      "value": {
+        "rootPath": "/app",
+        "tree": "/app/",
+        "truncated": false,
+        "warnings": []
+      },
+      "valid": true,
+      "contract": "outputSchema",
+      "toolId": "files.get_structure"
+    },
+    {
+      "name": "files.get_structure outputSchema unknown field",
+      "value": {
+        "rootPath": "/app",
+        "tree": "/app/",
+        "truncated": false,
+        "warnings": [],
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "files.get_structure"
+    },
+    {
+      "name": "files.get_structure outputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "files.get_structure"
+    },
+    {
+      "name": "files.get_structure outputSchema missing rootPath",
+      "value": {
+        "tree": "/app/",
+        "truncated": false,
+        "warnings": []
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "files.get_structure"
+    },
+    {
+      "name": "files.read_content outputSchema valid",
+      "value": {
+        "path": "/app/a",
+        "content": "abc",
+        "returnedBytes": 3,
+        "totalBytes": 3,
+        "truncated": false,
+        "encoding": "utf-8"
+      },
+      "valid": true,
+      "contract": "outputSchema",
+      "toolId": "files.read_content"
+    },
+    {
+      "name": "files.read_content outputSchema unknown field",
+      "value": {
+        "path": "/app/a",
+        "content": "abc",
+        "returnedBytes": 3,
+        "totalBytes": 3,
+        "truncated": false,
+        "encoding": "utf-8",
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "files.read_content"
+    },
+    {
+      "name": "files.read_content outputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "files.read_content"
+    },
+    {
+      "name": "files.read_content outputSchema missing path",
+      "value": {
+        "content": "abc",
+        "returnedBytes": 3,
+        "totalBytes": 3,
+        "truncated": false,
+        "encoding": "utf-8"
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "files.read_content"
+    },
+    {
+      "name": "software.check outputSchema valid",
+      "value": {
+        "items": [
+          {
+            "name": "node",
+            "installed": true,
+            "path": "/usr/bin/node",
+            "version": "v22"
+          }
+        ]
+      },
+      "valid": true,
+      "contract": "outputSchema",
+      "toolId": "software.check"
+    },
+    {
+      "name": "software.check outputSchema unknown field",
+      "value": {
+        "items": [
+          {
+            "name": "node",
+            "installed": true,
+            "path": "/usr/bin/node",
+            "version": "v22"
+          }
+        ],
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "software.check"
+    },
+    {
+      "name": "software.check outputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "software.check"
+    },
+    {
+      "name": "software.check outputSchema missing items",
+      "value": {},
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "software.check"
+    },
+    {
+      "name": "files.transfer_between_servers outputSchema valid",
+      "value": {
+        "sourcePath": "/a",
+        "targetPath": "/b",
+        "targetServerId": "s2",
+        "transferredBytes": 3,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "valid": true,
+      "contract": "outputSchema",
+      "toolId": "files.transfer_between_servers"
+    },
+    {
+      "name": "files.transfer_between_servers outputSchema unknown field",
+      "value": {
+        "sourcePath": "/a",
+        "targetPath": "/b",
+        "targetServerId": "s2",
+        "transferredBytes": 3,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "unexpected": true
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "files.transfer_between_servers"
+    },
+    {
+      "name": "files.transfer_between_servers outputSchema null",
+      "value": null,
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "files.transfer_between_servers"
+    },
+    {
+      "name": "files.transfer_between_servers outputSchema missing sourcePath",
+      "value": {
+        "targetPath": "/b",
+        "targetServerId": "s2",
+        "transferredBytes": 3,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "files.transfer_between_servers"
+    },
+    {
+      "name": "host pattern 'bad host'",
+      "value": {
+        "host": "bad host"
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "host pattern 'a/b'",
+      "value": {
+        "host": "a/b"
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "host pattern 'host.example'",
+      "value": {
+        "host": "host.example"
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "host pattern ''",
+      "value": {
+        "host": ""
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "port 0",
+      "value": {
+        "host": "host",
+        "port": 0
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "port 1",
+      "value": {
+        "host": "host",
+        "port": 1
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "port 65535",
+      "value": {
+        "host": "host",
+        "port": 65535
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "port 65536",
+      "value": {
+        "host": "host",
+        "port": 65536
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "port 22.0",
+      "value": {
+        "host": "host",
+        "port": 22.0
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "port 22.5",
+      "value": {
+        "host": "host",
+        "port": 22.5
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "port True",
+      "value": {
+        "host": "host",
+        "port": true
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "port '22'",
+      "value": {
+        "host": "host",
+        "port": "22"
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "port None",
+      "value": {
+        "host": "host",
+        "port": null
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "read maximum 0",
+      "value": {
+        "path": "/a",
+        "maxBytes": 0
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "files.read_content"
+    },
+    {
+      "name": "read maximum 1",
+      "value": {
+        "path": "/a",
+        "maxBytes": 1
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "files.read_content"
+    },
+    {
+      "name": "read maximum 262144",
+      "value": {
+        "path": "/a",
+        "maxBytes": 262144
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "files.read_content"
+    },
+    {
+      "name": "read maximum 262145",
+      "value": {
+        "path": "/a",
+        "maxBytes": 262145
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "files.read_content"
+    },
+    {
+      "name": "software input []",
+      "value": {
+        "names": []
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "software.check"
+    },
+    {
+      "name": "software input ['node', 'node', 'node', 'node', 'node', 'node', 'node', 'node', 'node', 'node', 'node', 'node', 'node', 'node', 'node', 'node', 'node', 'node', 'node', 'node', 'node']",
+      "value": {
+        "names": [
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node",
+          "node"
+        ]
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "software.check"
+    },
+    {
+      "name": "software input ['node;id']",
+      "value": {
+        "names": [
+          "node;id"
+        ]
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "software.check"
+    },
+    {
+      "name": "software input ['node', 'npm']",
+      "value": {
+        "names": [
+          "node",
+          "npm"
+        ]
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "software.check"
+    },
+    {
+      "name": "connect credential alternative",
+      "value": {
+        "host": "host",
+        "username": "root",
+        "passwordSecretKey": "SSH_PASSWORD"
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "server.connect"
+    },
+    {
+      "name": "connect missing authentication",
+      "value": {
+        "host": "host"
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.connect"
+    },
+    {
+      "name": "connect missing password reference",
+      "value": {
+        "host": "host",
+        "username": "root"
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "server.connect"
+    },
+    {
+      "name": "select missing options",
+      "value": {
+        "title": "端口",
+        "fields": [
+          {
+            "key": "PORT",
+            "label": "端口",
+            "description": "监听端口",
+            "type": "select",
+            "required": true
+          }
+        ]
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "user.request_input"
+    },
+    {
+      "name": "select valid",
+      "value": {
+        "title": "端口",
+        "fields": [
+          {
+            "key": "PORT",
+            "label": "端口",
+            "description": "监听端口",
+            "type": "select",
+            "required": true,
+            "options": [
+              {
+                "label": "80",
+                "value": "80"
+              }
+            ]
+          }
+        ]
+      },
+      "valid": true,
+      "contract": "inputSchema",
+      "toolId": "user.request_input"
+    },
+    {
+      "name": "number forbidden options",
+      "value": {
+        "title": "端口",
+        "fields": [
+          {
+            "key": "PORT",
+            "label": "端口",
+            "description": "监听端口",
+            "type": "number",
+            "required": true,
+            "options": [
+              {
+                "label": "80",
+                "value": "80"
+              }
+            ]
+          }
+        ]
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "user.request_input"
+    },
+    {
+      "name": "unknown enum",
+      "value": {
+        "title": "端口",
+        "fields": [
+          {
+            "key": "PORT",
+            "label": "端口",
+            "description": "监听端口",
+            "type": "checkbox",
+            "required": true
+          }
+        ]
+      },
+      "valid": false,
+      "contract": "inputSchema",
+      "toolId": "user.request_input"
+    },
+    {
+      "name": "credential available missing reference",
+      "value": {
+        "host": "host.example",
+        "port": 22,
+        "found": false,
+        "credentialAvailable": true
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "credential unavailable with reference",
+      "value": {
+        "host": "host.example",
+        "port": 22,
+        "found": false,
+        "credentialAvailable": false,
+        "credentialRef": "managed-server:1"
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "credential found reference",
+      "value": {
+        "host": "host.example",
+        "port": 22,
+        "found": true,
+        "credentialAvailable": true,
+        "credentialRef": "managed-server:1"
+      },
+      "valid": true,
+      "contract": "outputSchema",
+      "toolId": "server.resolve_connection"
+    },
+    {
+      "name": "installed missing path",
+      "value": {
+        "items": [
+          {
+            "name": "node",
+            "installed": true
+          }
+        ]
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "software.check"
+    },
+    {
+      "name": "absent with path",
+      "value": {
+        "items": [
+          {
+            "name": "node",
+            "installed": false,
+            "path": "/bin/node"
+          }
+        ]
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "software.check"
+    },
+    {
+      "name": "absent valid",
+      "value": {
+        "items": [
+          {
+            "name": "node",
+            "installed": false
+          }
+        ]
+      },
+      "valid": true,
+      "contract": "outputSchema",
+      "toolId": "software.check"
+    },
+    {
+      "name": "missing directory valid",
+      "value": {
+        "rootPath": "/app",
+        "tree": "",
+        "truncated": false,
+        "warnings": [],
+        "pathStatus": "missing"
+      },
+      "valid": true,
+      "contract": "outputSchema",
+      "toolId": "files.get_structure"
+    },
+    {
+      "name": "missing directory with tree",
+      "value": {
+        "rootPath": "/app",
+        "tree": "/app/",
+        "truncated": false,
+        "warnings": [],
+        "pathStatus": "missing"
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "files.get_structure"
+    },
+    {
+      "name": "unknown path status",
+      "value": {
+        "rootPath": "/app",
+        "tree": "/app/",
+        "truncated": false,
+        "warnings": [],
+        "pathStatus": "denied"
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "files.get_structure"
+    },
+    {
+      "name": "directory empty",
+      "value": {
+        "rootPath": "/app",
+        "tree": "",
+        "truncated": false,
+        "warnings": []
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "files.get_structure"
+    },
+    {
+      "name": "invalid checksum",
+      "value": {
+        "sourcePath": "/a",
+        "targetPath": "/b",
+        "targetServerId": "s2",
+        "transferredBytes": 3,
+        "sha256": "abc"
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "files.transfer_between_servers"
+    },
+    {
+      "name": "negative size",
+      "value": {
+        "sourcePath": "/a",
+        "targetPath": "/b",
+        "targetServerId": "s2",
+        "transferredBytes": -1,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "files.transfer_between_servers"
+    },
+    {
+      "name": "unsafe integer",
+      "value": {
+        "sourcePath": "/a",
+        "targetPath": "/b",
+        "targetServerId": "s2",
+        "transferredBytes": 9007199254740992,
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "valid": false,
+      "contract": "outputSchema",
+      "toolId": "files.transfer_between_servers"
+    },
+    {
+      "name": "success envelope",
+      "value": {
+        "callId": "call",
+        "toolId": "context.expand",
+        "success": true,
+        "data": {
+          "skillId": "deploy"
+        }
+      },
+      "valid": true,
+      "contract": "resultSchema"
+    },
+    {
+      "name": "success with error",
+      "value": {
+        "callId": "call",
+        "toolId": "context.expand",
+        "success": true,
+        "data": {
+          "skillId": "deploy"
+        },
+        "error": {
+          "code": "x",
+          "message": "x"
+        }
+      },
+      "valid": false,
+      "contract": "resultSchema"
+    },
+    {
+      "name": "failure envelope",
+      "value": {
+        "callId": "call",
+        "toolId": "context.expand",
+        "success": false,
+        "error": {
+          "code": "TOOL_OUTPUT_INVALID",
+          "message": "invalid",
+          "category": "output",
+          "dispatchState": "unknown"
+        }
+      },
+      "valid": true,
+      "contract": "resultSchema"
+    },
+    {
+      "name": "failure without error",
+      "value": {
+        "callId": "call",
+        "toolId": "context.expand",
+        "success": false
+      },
+      "valid": false,
+      "contract": "resultSchema"
+    },
+    {
+      "name": "unicode length '😀'",
+      "value": "😀",
+      "valid": true,
+      "schema": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1
+      }
+    },
+    {
+      "name": "unicode length '中文'",
+      "value": "中文",
+      "valid": false,
+      "schema": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1
+      }
+    },
+    {
+      "name": "unicode length ''",
+      "value": "",
+      "valid": false,
+      "schema": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1
+      }
+    },
+    {
+      "name": "format is annotation",
+      "value": "not-an-email",
+      "valid": true,
+      "schema": {
+        "type": "string",
+        "format": "email"
+      }
+    },
+    {
+      "name": "default never inserted",
+      "value": {},
+      "valid": false,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "integer",
+            "default": 1
+          }
+        },
+        "required": [
+          "x"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "nullable field",
+      "value": {
+        "x": null
+      },
+      "valid": true,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "x"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "oneOf exactly one",
+      "value": 1,
+      "valid": false,
+      "schema": {
+        "oneOf": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "integer"
+          }
+        ]
+      }
+    },
+    {
+      "name": "allOf range",
+      "value": 0,
+      "valid": false,
+      "schema": {
+        "type": "integer",
+        "allOf": [
+          {
+            "minimum": 1
+          },
+          {
+            "maximum": 3
+          }
+        ]
+      }
+    },
+    {
+      "name": "portable whitespace BOM",
+      "toolId": "context.expand",
+      "contract": "inputSchema",
+      "value": {
+        "skillId": "﻿",
+        "reason": "test"
+      },
+      "valid": false
+    },
+    {
+      "name": "portable whitespace NEL",
+      "toolId": "context.expand",
+      "contract": "inputSchema",
+      "value": {
+        "skillId": "",
+        "reason": "test"
+      },
+      "valid": true
+    },
+    {
+      "name": "portable whitespace FS",
+      "toolId": "context.expand",
+      "contract": "inputSchema",
+      "value": {
+        "skillId": "\u001c",
+        "reason": "test"
+      },
+      "valid": true
+    },
+    {
+      "name": "portable whitespace NBSP",
+      "toolId": "context.expand",
+      "contract": "inputSchema",
+      "value": {
+        "skillId": " ",
+        "reason": "test"
+      },
+      "valid": false
+    },
+    {
+      "name": "portable whitespace line separator",
+      "toolId": "context.expand",
+      "contract": "inputSchema",
+      "value": {
+        "skillId": " ",
+        "reason": "test"
+      },
+      "valid": false
+    },
+    {
+      "name": "strict boundary server.resolve_connection{'host': 'host\\n'}",
+      "toolId": "server.resolve_connection",
+      "contract": "inputSchema",
+      "value": {
+        "host": "host\n"
+      },
+      "valid": false
+    },
+    {
+      "name": "strict boundary software.check{'names': ['node\\n']}",
+      "toolId": "software.check",
+      "contract": "inputSchema",
+      "value": {
+        "names": [
+          "node\n"
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "strict boundary evidence.read{'evidenceId': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'}",
+      "toolId": "evidence.read",
+      "contract": "inputSchema",
+      "value": {
+        "evidenceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+      },
+      "valid": false
+    },
+    {
+      "name": "strict boundary evidence.read{'evidenceId': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'offset': 9007199254740992}",
+      "toolId": "evidence.read",
+      "contract": "inputSchema",
+      "value": {
+        "evidenceId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "offset": 9007199254740992
+      },
+      "valid": false
+    },
+    {
+      "name": "server.connect partial failure retains known side effects",
+      "contract": "resultSchema",
+      "value": {
+        "callId": "partial",
+        "toolId": "server.connect",
+        "success": false,
+        "error": {
+          "code": "TOOL_BUSINESS",
+          "message": "Stopped after partial effects",
+          "dispatchState": "sent"
+        },
+        "data": {
+          "connectionCheckDispatched": true,
+          "directoryUpdated": true,
+          "connected": false,
+          "serverId": "srv-123"
+        }
+      },
+      "valid": true
+    },
+    {
+      "name": "server.connect partial failure rejects secret payloads",
+      "contract": "resultSchema",
+      "value": {
+        "callId": "partial",
+        "toolId": "server.connect",
+        "success": false,
+        "error": {
+          "code": "TOOL_BUSINESS",
+          "message": "Stopped after partial effects",
+          "dispatchState": "sent"
+        },
+        "data": {
+          "connected": true,
+          "password": "fixture-must-not-be-recorded"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "server.connect partial failure rejects untyped effects",
+      "contract": "resultSchema",
+      "value": {
+        "callId": "partial",
+        "toolId": "server.connect",
+        "success": false,
+        "error": {
+          "code": "TOOL_BUSINESS",
+          "message": "Stopped after partial effects",
+          "dispatchState": "sent"
+        },
+        "data": {
+          "connected": "true"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "other tool failure cannot smuggle partial effects",
+      "contract": "resultSchema",
+      "value": {
+        "callId": "partial",
+        "toolId": "files.read_content",
+        "success": false,
+        "error": {
+          "code": "TOOL_BUSINESS",
+          "message": "Stopped after partial effects",
+          "dispatchState": "sent"
+        },
+        "data": {
+          "connected": true
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "J4 disk capacity",
+      "toolId": "disk.inspect",
+      "contract": "inputSchema",
+      "value": {
+        "path": "/"
+      },
+      "valid": true
+    },
+    {
+      "name": "J4 disk check enum",
+      "toolId": "disk.inspect",
+      "contract": "inputSchema",
+      "value": {
+        "path": "/",
+        "check": "cleanup"
+      },
+      "valid": false
+    },
+    {
+      "name": "J4 disk no arbitrary command",
+      "toolId": "disk.inspect",
+      "contract": "inputSchema",
+      "value": {
+        "path": "/",
+        "command": "rm"
+      },
+      "valid": false
+    },
+    {
+      "name": "J4 large bounded",
+      "toolId": "files.find_large",
+      "contract": "inputSchema",
+      "value": {
+        "path": "/srv",
+        "minBytes": 0,
+        "timeoutSeconds": 600,
+        "sameFilesystem": true
+      },
+      "valid": true
+    },
+    {
+      "name": "J4 large time bound",
+      "toolId": "files.find_large",
+      "contract": "inputSchema",
+      "value": {
+        "path": "/srv",
+        "timeoutSeconds": 601
+      },
+      "valid": false
+    },
+    {
+      "name": "J4 large numeric types",
+      "toolId": "files.find_large",
+      "contract": "inputSchema",
+      "value": {
+        "path": "/srv",
+        "minBytes": "100"
+      },
+      "valid": false
+    },
+    {
+      "name": "J4 large null path",
+      "toolId": "files.find_large",
+      "contract": "inputSchema",
+      "value": {
+        "path": null
+      },
+      "valid": false
+    },
+    {
+      "name": "J4 service status",
+      "toolId": "services.inspect",
+      "contract": "inputSchema",
+      "value": {
+        "check": "status",
+        "service": "nginx.service"
+      },
+      "valid": true
+    },
+    {
+      "name": "J4 service missing selector",
+      "toolId": "services.inspect",
+      "contract": "inputSchema",
+      "value": {
+        "check": "status"
+      },
+      "valid": false
+    },
+    {
+      "name": "J4 service invalid selector",
+      "toolId": "services.inspect",
+      "contract": "inputSchema",
+      "value": {
+        "check": "status",
+        "service": "nginx;reboot"
+      },
+      "valid": false
+    },
+    {
+      "name": "J4 service no unused selector",
+      "toolId": "services.inspect",
+      "contract": "inputSchema",
+      "value": {
+        "check": "ports",
+        "service": "nginx"
+      },
+      "valid": false
+    },
+    {
+      "name": "J4 service health",
+      "toolId": "services.inspect",
+      "contract": "inputSchema",
+      "value": {
+        "check": "health",
+        "url": "https://example.invalid/health"
+      },
+      "valid": true
+    },
+    {
+      "name": "J4 service missing url",
+      "toolId": "services.inspect",
+      "contract": "inputSchema",
+      "value": {
+        "check": "health"
+      },
+      "valid": false
+    },
+    {
+      "name": "J4 service log cap",
+      "toolId": "services.inspect",
+      "contract": "inputSchema",
+      "value": {
+        "check": "logs",
+        "service": "app",
+        "logLines": 201
+      },
+      "valid": false
+    }
+  ]
+}

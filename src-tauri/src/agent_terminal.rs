@@ -105,8 +105,8 @@ pub(crate) struct AgentCommandResult {
 pub(crate) struct AgentRuntimeProgress {
     active: bool,
     process_count: u64,
-    cpu_percent: f64,
-    io_bytes: u64,
+    cpu_percent: Option<f64>,
+    io_bytes: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -321,24 +321,45 @@ impl AgentTerminalManager {
     }
 }
 
-fn parse_runtime_progress(output: &str) -> AgentRuntimeProgress {
+fn parse_runtime_progress(output: &str) -> Result<AgentRuntimeProgress, String> {
     let value = |key: &str| {
         output
             .lines()
             .find_map(|line| line.strip_prefix(&format!("{key}=")))
     };
-    AgentRuntimeProgress {
-        active: value("active") == Some("1"),
-        process_count: value("processCount")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0),
-        cpu_percent: value("cpuPercent")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0.0),
-        io_bytes: value("ioBytes")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0),
+    let active = match value("active") {
+        Some("1") => true,
+        Some("0") => false,
+        _ => return Err("Agent 运行态采样缺少有效的进程存活状态".into()),
+    };
+    let process_count = match value("processCount") {
+        Some(raw) => raw.parse::<u64>().map_err(|_| "Agent 运行态进程数无效")?,
+        None if !active => 0,
+        None => return Err("Agent 运行态采样缺少进程数".into()),
+    };
+    if active && process_count == 0 {
+        return Err("Agent 运行态存活状态与进程数不一致".into());
     }
+    let cpu_percent = match value("cpuPercent") {
+        None | Some("unknown") => None,
+        Some(raw) => {
+            let cpu = raw.parse::<f64>().map_err(|_| "Agent 运行态 CPU 采样无效")?;
+            if !cpu.is_finite() || cpu < 0.0 {
+                return Err("Agent 运行态 CPU 采样无效".into());
+            }
+            Some(cpu)
+        }
+    };
+    let io_bytes = match value("ioBytes") {
+        None | Some("unknown") => None,
+        Some(raw) => Some(raw.parse::<u64>().map_err(|_| "Agent 运行态 I/O 采样无效")?),
+    };
+    Ok(AgentRuntimeProgress {
+        active,
+        process_count,
+        cpu_percent,
+        io_bytes,
+    })
 }
 
 #[tauri::command]
@@ -607,7 +628,7 @@ pub(crate) async fn interrupt_agent_terminal_command(
     generation: u64,
     execution_id: String,
 ) -> Result<bool, String> {
-    let pid_file = execution_pid_file(&execution_id)?;
+    let command = crate::ssh::cancellation_command(&execution_id)?;
     let acknowledged = {
         let sessions = manager
             .sessions
@@ -634,11 +655,11 @@ pub(crate) async fn interrupt_agent_terminal_command(
     }
     tauri::async_runtime::spawn_blocking(move || {
         let session = connect_ssh(&host, port, &username, &password)?;
-        let command = format!(
-            "if test -s {0}; then pid=$(cat {0}); kill -TERM -- -\"$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null || true; sleep 1; kill -KILL -- -\"$pid\" 2>/dev/null || kill -KILL \"$pid\" 2>/dev/null || true; rm -f {0}; fi",
-            shell_quote(&pid_file),
-        );
-        ssh_exec(&session, &command).map(|_| true)
+        let (_, status) = ssh_exec(&session, &command)?;
+        if status != 0 {
+            return Err(format!("Agent 远程取消未确认完成（退出码 {status}）"));
+        }
+        Ok(true)
     })
     .await
     .map_err(|error| format!("中断 Agent 执行线程异常：{error}"))?
@@ -660,16 +681,25 @@ pub(crate) async fn sample_agent_terminal_progress(
     tauri::async_runtime::spawn_blocking(move || {
         let session = connect_ssh(&host, port, &username, &password)?;
         let command = format!(
-            r#"pid_file={};
-if ! test -s "$pid_file"; then printf 'active=0\nprocessCount=0\ncpuPercent=0\nioBytes=0\n'; exit 0; fi
+            r#"LC_ALL=C; export LC_ALL
+pid_file={};
+if ! test -s "$pid_file"; then printf 'active=0\nprocessCount=0\ncpuPercent=unknown\nioBytes=unknown\n'; exit 0; fi
 leader=$(cat "$pid_file" 2>/dev/null)
-if ! test -n "$leader" || ! kill -0 "$leader" 2>/dev/null; then printf 'active=0\nprocessCount=0\ncpuPercent=0\nioBytes=0\n'; exit 0; fi
-pgid=$(ps -o pgid= -p "$leader" 2>/dev/null | tr -d ' ')
-stats=$(ps -eo pgid=,%cpu= 2>/dev/null | awk -v g="$pgid" '$1 == g {{ count += 1; cpu += $2 }} END {{ printf "%d %.2f", count, cpu }}')
-set -- $stats; count=${{1:-1}}; cpu=${{2:-0}}; io=0
-for pid in $(ps -eo pid=,pgid= 2>/dev/null | awk -v g="$pgid" '$2 == g {{ print $1 }}'); do
-  if test -r "/proc/$pid/io"; then bytes=$(awk '/^(rchar|wchar):/ {{ sum += $2 }} END {{ print sum + 0 }}' "/proc/$pid/io" 2>/dev/null); io=$((io + bytes)); fi
+if ! test -n "$leader" || ! kill -0 "$leader" 2>/dev/null; then printf 'active=0\nprocessCount=0\ncpuPercent=unknown\nioBytes=unknown\n'; exit 0; fi
+pgid=$(ps -o pgid= -p "$leader" 2>/dev/null) || exit 24
+pgid=$(printf '%s' "$pgid" | tr -d ' ')
+test -n "$pgid" || exit 24
+processes=$(ps -eo pid=,pgid=,%cpu= 2>/dev/null) || exit 24
+stats=$(printf '%s\n' "$processes" | awk -v g="$pgid" '$2 == g {{ count += 1; if ($3 !~ /^[0-9]+([.][0-9]+)?$/) unknown = 1; else cpu += $3 }} END {{ printf "%d ", count; if (unknown) printf "unknown"; else printf "%.2f", cpu }}') || exit 24
+set -- $stats; count=${{1:-0}}; cpu=${{2:-unknown}}; io=0; io_available=1
+test "$count" -gt 0 || exit 24
+for pid in $(printf '%s\n' "$processes" | awk -v g="$pgid" '$2 == g {{ print $1 }}'); do
+  if test -r "/proc/$pid/io"; then
+    bytes=$(awk '/^(rchar|wchar):/ {{ sum += $2; fields += 1 }} END {{ if (fields == 2) printf "%.0f", sum; else exit 1 }}' "/proc/$pid/io" 2>/dev/null) || io_available=0
+    case "$bytes" in ''|*[!0-9]*) io_available=0 ;; *) io=$((io + bytes)) ;; esac
+  else io_available=0; fi
 done
+if test "$io_available" != 1; then io=unknown; fi
 printf 'active=1\nprocessCount=%s\ncpuPercent=%s\nioBytes=%s\n' "$count" "$cpu" "$io""#,
             shell_quote(&pid_file),
         );
@@ -677,7 +707,7 @@ printf 'active=1\nprocessCount=%s\ncpuPercent=%s\nioBytes=%s\n' "$count" "$cpu" 
         if status != 0 {
             return Err(format!("Agent 运行态采样失败，退出码 {status}"));
         }
-        Ok(parse_runtime_progress(&output))
+        parse_runtime_progress(&output)
     })
     .await
     .map_err(|error| format!("Agent 运行态采样线程异常：{error}"))?
@@ -818,9 +848,18 @@ mod tests {
     fn parses_bounded_runtime_progress() {
         assert_eq!(
             parse_runtime_progress("active=1\nprocessCount=3\ncpuPercent=21.50\nioBytes=4096")
-                .process_count,
+                .unwrap().process_count,
             3
         );
-        assert!(!parse_runtime_progress("active=0").active);
+        assert!(!parse_runtime_progress("active=0").unwrap().active);
+        let unavailable = parse_runtime_progress("active=1\nprocessCount=2\ncpuPercent=unknown\nioBytes=unknown").unwrap();
+        assert_eq!(unavailable.cpu_percent, None);
+        assert_eq!(unavailable.io_bytes, None);
+        assert!(parse_runtime_progress("").is_err());
+        assert!(parse_runtime_progress("active=1\ncpuPercent=0\nioBytes=0").is_err());
+        for cpu in ["NaN", "inf", "-1", "bad"] {
+            assert!(parse_runtime_progress(&format!("active=1\nprocessCount=1\ncpuPercent={cpu}")).is_err());
+        }
+        assert!(parse_runtime_progress("active=1\nprocessCount=1\nioBytes=bad").is_err());
     }
 }

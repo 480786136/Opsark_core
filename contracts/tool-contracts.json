@@ -1,0 +1,2219 @@
+{
+  "schemaVersion": 1,
+  "dialect": "http://json-schema.org/draft-07/schema#",
+  "resultSchema": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "callId": {
+        "type": "string",
+        "minLength": 1
+      },
+      "toolId": {
+        "type": "string",
+        "minLength": 1
+      },
+      "success": {
+        "type": "boolean"
+      },
+      "data": {
+        "type": "object"
+      },
+      "error": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "type": "string",
+            "minLength": 1
+          },
+          "message": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "arguments",
+              "unavailable",
+              "authentication",
+              "permission",
+              "network",
+              "timeout",
+              "rate_limit",
+              "business",
+              "output"
+            ]
+          },
+          "dispatchState": {
+            "type": "string",
+            "enum": [
+              "not_sent",
+              "sent",
+              "unknown"
+            ]
+          },
+          "argumentPath": {
+            "type": "string"
+          },
+          "retryAfterMs": {
+            "type": "number",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ]
+      },
+      "truncated": {
+        "type": "boolean"
+      },
+      "attempts": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "number": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "code": {
+              "type": "string"
+            },
+            "category": {
+              "type": "string"
+            },
+            "dispatchState": {
+              "type": "string",
+              "enum": [
+                "not_sent",
+                "sent",
+                "unknown"
+              ]
+            }
+          },
+          "required": [
+            "number"
+          ]
+        }
+      }
+    },
+    "required": [
+      "callId",
+      "toolId",
+      "success"
+    ],
+    "oneOf": [
+      {
+        "properties": {
+          "success": {
+            "const": true
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "not": {
+          "required": [
+            "error"
+          ]
+        }
+      },
+      {
+        "properties": {
+          "success": {
+            "const": false
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "anyOf": [
+          {
+            "not": {
+              "required": [
+                "data"
+              ]
+            }
+          },
+          {
+            "properties": {
+              "toolId": {
+                "const": "server.connect"
+              },
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "connectionCheckDispatched": {
+                    "type": "boolean"
+                  },
+                  "connectionChecked": {
+                    "type": "boolean"
+                  },
+                  "directoryUpdated": {
+                    "type": "boolean"
+                  },
+                  "connected": {
+                    "type": "boolean"
+                  },
+                  "taskTargetUpdated": {
+                    "type": "boolean"
+                  },
+                  "agentSessionPrepared": {
+                    "type": "boolean"
+                  },
+                  "agentSessionCreationDispatched": {
+                    "type": "boolean"
+                  },
+                  "credentialStorageDispatched": {
+                    "type": "boolean"
+                  },
+                  "credentialStored": {
+                    "type": "boolean"
+                  },
+                  "serverId": {
+                    "type": "string",
+                    "pattern": "^(?:[A-Za-z0-9_-]{1,128})$(?![\\s\\S])"
+                  }
+                },
+                "required": []
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "tools": [
+    {
+      "id": "server.basic_info",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "id": "server.realtime_metrics",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "id": "server.resolve_connection",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253,
+            "pattern": "^(?:[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff/@]+)$(?![\\s\\S])",
+            "description": "目标服务器 IP 地址或域名。"
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535,
+            "default": 22
+          }
+        },
+        "required": [
+          "host"
+        ]
+      },
+      "outputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "found": {
+            "type": "boolean"
+          },
+          "serverId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "host": {
+            "type": "string",
+            "minLength": 1
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "username": {
+            "type": "string",
+            "minLength": 1
+          },
+          "credentialAvailable": {
+            "type": "boolean"
+          },
+          "credentialRef": {
+            "type": "string",
+            "pattern": "^(?:(managed-server|server-credential):[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]+)$(?![\\s\\S])"
+          }
+        },
+        "required": [
+          "found",
+          "host",
+          "port",
+          "credentialAvailable"
+        ],
+        "if": {
+          "properties": {
+            "credentialAvailable": {
+              "const": true
+            }
+          },
+          "required": [
+            "credentialAvailable"
+          ]
+        },
+        "then": {
+          "required": [
+            "credentialRef"
+          ],
+          "properties": {
+            "found": {
+              "const": true
+            }
+          }
+        },
+        "else": {
+          "not": {
+            "required": [
+              "credentialRef"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "server.connect",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "host": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253,
+            "pattern": "^(?:[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff/@]+)$(?![\\s\\S])",
+            "description": "目标服务器 IP 地址或域名。"
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535,
+            "default": 22,
+            "description": "SSH 服务端口。"
+          },
+          "username": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?:[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff@]+)$(?![\\s\\S])",
+            "description": "SSH 登录用户名。"
+          },
+          "passwordSecretKey": {
+            "type": "string",
+            "pattern": "^(?:[A-Z][A-Z0-9_]*)$(?![\\s\\S])",
+            "description": "已由用户输入工具安全收集的密码参数 key，不是密码值。"
+          },
+          "credentialRef": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?:(managed-server|server-credential):[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]+)$(?![\\s\\S])",
+            "description": "服务器连接资料查询工具返回的不可逆凭据引用。"
+          },
+          "name": {
+            "type": "string",
+            "description": "服务器在 Opsark 中的显示名称。"
+          },
+          "group": {
+            "type": "string",
+            "description": "可选的服务器分组。"
+          }
+        },
+        "required": [
+          "host"
+        ],
+        "anyOf": [
+          {
+            "required": [
+              "credentialRef"
+            ]
+          },
+          {
+            "required": [
+              "username",
+              "passwordSecretKey"
+            ]
+          }
+        ]
+      },
+      "outputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "serverId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "host": {
+            "type": "string",
+            "minLength": 1
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "username": {
+            "type": "string",
+            "minLength": 1
+          },
+          "connected": {
+            "const": true
+          },
+          "info": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "serverId",
+          "name",
+          "host",
+          "port",
+          "username",
+          "connected",
+          "info"
+        ]
+      }
+    },
+    {
+      "id": "secret.metadata",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "global",
+              "server"
+            ]
+          }
+        },
+        "required": [
+          "key",
+          "description",
+          "scope"
+        ]
+      }
+    },
+    {
+      "id": "secret.merge_command",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ]
+      }
+    },
+    {
+      "id": "user.request_input",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": "string",
+            "pattern": "[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]",
+            "maxLength": 200,
+            "description": "表单标题，说明需要用户补充什么信息。"
+          },
+          "description": {
+            "type": "string",
+            "description": "表单整体说明，告知这些信息将用于什么操作。"
+          },
+          "fields": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "description": "用户需要填写的参数列表。",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "key": {
+                  "type": "string",
+                  "pattern": "^(?:[A-Za-z][A-Za-z0-9_]*)$(?![\\s\\S])",
+                  "description": "程序使用的参数名。"
+                },
+                "label": {
+                  "type": "string",
+                  "pattern": "[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]",
+                  "description": "展示给用户的参数名称。"
+                },
+                "description": {
+                  "type": "string",
+                  "pattern": "[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]",
+                  "description": "说明参数是什么、将用于什么操作。"
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "text",
+                    "password",
+                    "number",
+                    "select"
+                  ],
+                  "description": "已知有限候选用 select，开放回答用 text。存在 credential 时，username 和 secret 两种角色都必须使用 password，表示保密输入和存储。"
+                },
+                "placeholder": {
+                  "type": "string",
+                  "description": "不包含真实敏感值的输入示例。"
+                },
+                "options": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 100,
+                  "description": "仅 select 必须提供。候选来自已知证据或用户给定选项，不得捏造，不得含敏感值或默认选择；value 精确唯一并按原始字符串返回。",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "value": {
+                        "type": "string",
+                        "pattern": "[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]",
+                        "description": "非空且精确唯一的真实候选值，不含敏感信息。"
+                      },
+                      "label": {
+                        "type": "string",
+                        "pattern": "[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]",
+                        "description": "向用户显示的非空候选名称。"
+                      }
+                    },
+                    "required": [
+                      "value",
+                      "label"
+                    ]
+                  }
+                },
+                "required": {
+                  "type": "boolean",
+                  "description": "该参数是否必填。"
+                },
+                "credential": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "description": "一次表单至多一个完整凭据组，恰好 username 与 secret 各一项；两项 type=password、required=true，共用 group/kind/target。目标未知时先用普通表单确认目标，再收集凭据。",
+                  "properties": {
+                    "group": {
+                      "type": "string",
+                      "pattern": "^(?:[A-Za-z][A-Za-z0-9_-]{0,63})$(?![\\s\\S])",
+                      "description": "同一表单内两个凭据字段共用的组标识。"
+                    },
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "git-https",
+                        "ssh-password",
+                        "database",
+                        "service"
+                      ]
+                    },
+                    "role": {
+                      "type": "string",
+                      "enum": [
+                        "username",
+                        "secret"
+                      ]
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "已确认的真实认证目标，不含凭据。数据库使用主机:端口或明确的 socket 绝对路径（保留大小写，不含变量、通配符或路径跳转）；SSH/Git 使用精确主机。不得使用占位标识或尚未填写的字段名。"
+                    }
+                  },
+                  "required": [
+                    "group",
+                    "kind",
+                    "role",
+                    "target"
+                  ]
+                }
+              },
+              "required": [
+                "key",
+                "label",
+                "description",
+                "type",
+                "required"
+              ],
+              "oneOf": [
+                {
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "select"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "options"
+                  ],
+                  "not": {
+                    "required": [
+                      "credential"
+                    ]
+                  }
+                },
+                {
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "text",
+                        "password",
+                        "number"
+                      ]
+                    }
+                  },
+                  "not": {
+                    "required": [
+                      "options"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "title",
+          "fields"
+        ]
+      },
+      "outputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "values": {
+            "type": "object",
+            "propertyNames": {
+              "pattern": "^(?:[A-Za-z][A-Za-z0-9_]*)$(?![\\s\\S])"
+            },
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "number"
+                }
+              ]
+            }
+          }
+        },
+        "required": [
+          "title",
+          "values"
+        ]
+      }
+    },
+    {
+      "id": "context.expand",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "skillId": {
+            "type": "string",
+            "pattern": "[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]"
+          },
+          "reason": {
+            "type": "string",
+            "pattern": "[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]"
+          }
+        },
+        "required": [
+          "skillId",
+          "reason"
+        ]
+      },
+      "outputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "skillId": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "skillId"
+        ]
+      }
+    },
+    {
+      "id": "evidence.read",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "evidenceId"
+        ],
+        "properties": {
+          "evidenceId": {
+            "type": "string",
+            "pattern": "^(?:[a-f0-9]{64})$(?![\\s\\S])"
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "default": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 12000,
+            "default": 6000
+          }
+        }
+      },
+      "outputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "evidenceId": {
+            "type": "string",
+            "pattern": "^(?:[a-f0-9]{64})$(?![\\s\\S])"
+          },
+          "historical": {
+            "const": true
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "text": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "totalCharacters": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "nextOffset": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "instruction": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "evidenceId",
+          "historical",
+          "metadata",
+          "text",
+          "offset",
+          "totalCharacters",
+          "nextOffset",
+          "instruction"
+        ]
+      }
+    },
+    {
+      "id": "files.get_structure",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "rootPath": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])",
+            "description": "远端绝对目录路径"
+          },
+          "excludeDirectories": {
+            "type": "array",
+            "description": "要跳过的目录名、rootPath 相对路径，或 rootPath 下的远程绝对路径。",
+            "items": {
+              "type": "string"
+            }
+          },
+          "maxDepth": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "default": 4
+          },
+          "maxNodes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 10000,
+            "default": 600
+          },
+          "includeHidden": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "rootPath"
+        ]
+      },
+      "outputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "rootPath": {
+            "type": "string",
+            "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])",
+            "maxLength": 4096
+          },
+          "pathStatus": {
+            "type": "string",
+            "enum": [
+              "directory",
+              "missing"
+            ]
+          },
+          "tree": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "rootPath",
+          "tree",
+          "truncated",
+          "warnings"
+        ],
+        "if": {
+          "properties": {
+            "pathStatus": {
+              "const": "missing"
+            }
+          },
+          "required": [
+            "pathStatus"
+          ]
+        },
+        "then": {
+          "properties": {
+            "tree": {
+              "const": ""
+            },
+            "truncated": {
+              "const": false
+            },
+            "warnings": {
+              "type": "array",
+              "maxItems": 0
+            }
+          }
+        },
+        "else": {
+          "properties": {
+            "tree": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "files.read_content",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])",
+            "description": "需要读取的远端文件绝对路径。"
+          },
+          "maxBytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 262144,
+            "default": 65536
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "outputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])",
+            "maxLength": 4096
+          },
+          "content": {
+            "type": "string"
+          },
+          "totalBytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "returnedBytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "encoding": {
+            "const": "utf-8"
+          }
+        },
+        "required": [
+          "path",
+          "content",
+          "totalBytes",
+          "returnedBytes",
+          "truncated",
+          "encoding"
+        ]
+      }
+    },
+    {
+      "id": "software.check",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "names": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "pattern": "^(?:[A-Za-z0-9+._-]+)$(?![\\s\\S])"
+            },
+            "description": "要检查的精确命令名。"
+          },
+          "includeVersions": {
+            "type": "boolean",
+            "default": true
+          }
+        },
+        "required": [
+          "names"
+        ]
+      },
+      "outputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "pattern": "^(?:[A-Za-z0-9+._-]+)$(?![\\s\\S])"
+                },
+                "installed": {
+                  "type": "boolean"
+                },
+                "path": {
+                  "type": "string",
+                  "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])",
+                  "maxLength": 4096
+                },
+                "version": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "installed"
+              ],
+              "if": {
+                "properties": {
+                  "installed": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "installed"
+                ]
+              },
+              "then": {
+                "required": [
+                  "path"
+                ]
+              },
+              "else": {
+                "not": {
+                  "required": [
+                    "path"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "required": [
+          "items"
+        ]
+      }
+    },
+    {
+      "id": "files.transfer_between_servers",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sourcePath": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])",
+            "description": "当前服务器上的源文件绝对路径"
+          },
+          "targetServer": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "[^\\u0009-\\u000d\\u0020\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]",
+            "description": "目标服务器 ID、名称或地址"
+          },
+          "targetPath": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])",
+            "description": "目标文件绝对路径，必须包含文件名"
+          },
+          "overwrite": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "sourcePath",
+          "targetServer",
+          "targetPath"
+        ]
+      },
+      "outputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sourcePath": {
+            "type": "string",
+            "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])",
+            "maxLength": 4096
+          },
+          "targetPath": {
+            "type": "string",
+            "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])",
+            "maxLength": 4096
+          },
+          "transferredBytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^(?:[a-f0-9]{64})$(?![\\s\\S])"
+          },
+          "targetServerId": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "sourcePath",
+          "targetPath",
+          "transferredBytes",
+          "sha256",
+          "targetServerId"
+        ]
+      }
+    },
+    {
+      "id": "disk.inspect",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])"
+          },
+          "timeoutSeconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 600,
+            "default": 60
+          },
+          "maxEntries": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000000,
+            "default": 100000
+          },
+          "maxResults": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200,
+            "default": 50
+          },
+          "maxDepth": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 64,
+            "default": 16,
+            "description": "实际递归扫描深度上限，不是结果展示层级。达到此深度的子目录不继续扫描，结果仅覆盖已扫描范围。"
+          },
+          "sameFilesystem": {
+            "type": "boolean",
+            "default": true
+          },
+          "excludePaths": {
+            "type": "array",
+            "maxItems": 100,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096,
+              "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])"
+            },
+            "default": [
+              "/proc",
+              "/sys",
+              "/dev",
+              "/run"
+            ]
+          },
+          "reportDepth": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8,
+            "default": 1,
+            "description": "目录结果汇总展示层级，默认仅展示根与一级子项；统计仍递归至 maxDepth/时间/条目限制。多个展示层级的父子汇总不可相加。"
+          },
+          "check": {
+            "type": "string",
+            "enum": [
+              "capacity",
+              "directory",
+              "deleted",
+              "docker"
+            ],
+            "default": "capacity"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "outputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "request": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
+                "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])"
+              },
+              "timeoutSeconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 600,
+                "default": 60
+              },
+              "maxEntries": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000,
+                "default": 100000
+              },
+              "maxResults": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50
+              },
+              "maxDepth": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 64,
+                "default": 16,
+                "description": "实际递归扫描深度上限，不是结果展示层级。达到此深度的子目录不继续扫描，结果仅覆盖已扫描范围。"
+              },
+              "sameFilesystem": {
+                "type": "boolean",
+                "default": true
+              },
+              "excludePaths": {
+                "type": "array",
+                "maxItems": 100,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4096,
+                  "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])"
+                },
+                "default": [
+                  "/proc",
+                  "/sys",
+                  "/dev",
+                  "/run"
+                ]
+              },
+              "reportDepth": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 8,
+                "default": 1,
+                "description": "目录结果汇总展示层级，默认仅展示根与一级子项；统计仍递归至 maxDepth/时间/条目限制。多个展示层级的父子汇总不可相加。"
+              },
+              "check": {
+                "type": "string",
+                "enum": [
+                  "capacity",
+                  "directory",
+                  "deleted",
+                  "docker"
+                ],
+                "default": "capacity"
+              }
+            },
+            "required": [
+              "path"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "no_match",
+              "partial",
+              "timeout",
+              "cancelled",
+              "permission_denied",
+              "unsupported",
+              "error"
+            ]
+          },
+          "items": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "const": "filesystem"
+                    },
+                    "subject": {
+                      "type": "string",
+                      "maxLength": 32768
+                    },
+                    "totalBytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "freeBytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "availableBytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "usedBytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "inodeTotal": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "inodeFree": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "subject",
+                    "totalBytes",
+                    "freeBytes",
+                    "availableBytes",
+                    "usedBytes",
+                    "inodeTotal",
+                    "inodeFree"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "const": "directory"
+                    },
+                    "subject": {
+                      "type": "string",
+                      "maxLength": 32768
+                    },
+                    "allocatedBytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "subject",
+                    "allocatedBytes"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "const": "deleted_file"
+                    },
+                    "subject": {
+                      "type": "string",
+                      "maxLength": 32768
+                    },
+                    "sizeBytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "allocatedBytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "subject",
+                    "sizeBytes",
+                    "allocatedBytes"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "const": "docker"
+                    },
+                    "subject": {
+                      "type": "string",
+                      "maxLength": 32768
+                    },
+                    "text": {
+                      "type": "string",
+                      "maxLength": 32768
+                    },
+                    "exitCode": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "subject",
+                    "text",
+                    "exitCode"
+                  ]
+                }
+              ]
+            }
+          },
+          "scannedEntries": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "matchedEntries": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "skippedCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "skipped": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "maxLength": 32768
+                },
+                "reason": {
+                  "type": "string",
+                  "enum": [
+                    "excluded",
+                    "filesystem",
+                    "symlink",
+                    "depth",
+                    "entry_limit",
+                    "permission_denied",
+                    "timeout",
+                    "cancelled",
+                    "unsupported",
+                    "error",
+                    "output_limit"
+                  ]
+                }
+              },
+              "required": [
+                "path",
+                "reason"
+              ]
+            }
+          },
+          "coverageComplete": {
+            "type": "boolean"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "elapsedMs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "finishedAt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40
+          }
+        },
+        "required": [
+          "request",
+          "status",
+          "items",
+          "scannedEntries",
+          "matchedEntries",
+          "skippedCount",
+          "skipped",
+          "coverageComplete",
+          "truncated",
+          "elapsedMs",
+          "finishedAt"
+        ]
+      }
+    },
+    {
+      "id": "files.find_large",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])"
+          },
+          "timeoutSeconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 600,
+            "default": 60
+          },
+          "maxEntries": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000000,
+            "default": 100000
+          },
+          "maxResults": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200,
+            "default": 50
+          },
+          "maxDepth": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 64,
+            "default": 16,
+            "description": "实际递归扫描深度上限，不是结果展示层级。达到此深度的子目录不继续扫描，结果仅覆盖已扫描范围。"
+          },
+          "sameFilesystem": {
+            "type": "boolean",
+            "default": true
+          },
+          "excludePaths": {
+            "type": "array",
+            "maxItems": 100,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096,
+              "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])"
+            },
+            "default": [
+              "/proc",
+              "/sys",
+              "/dev",
+              "/run"
+            ]
+          },
+          "minBytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "default": 104857600
+          }
+        },
+        "required": [
+          "path"
+        ]
+      },
+      "outputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "request": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
+                "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])"
+              },
+              "timeoutSeconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 600,
+                "default": 60
+              },
+              "maxEntries": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000,
+                "default": 100000
+              },
+              "maxResults": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50
+              },
+              "maxDepth": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 64,
+                "default": 16,
+                "description": "实际递归扫描深度上限，不是结果展示层级。达到此深度的子目录不继续扫描，结果仅覆盖已扫描范围。"
+              },
+              "sameFilesystem": {
+                "type": "boolean",
+                "default": true
+              },
+              "excludePaths": {
+                "type": "array",
+                "maxItems": 100,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4096,
+                  "pattern": "^(?:/[^\\u0000]*)$(?![\\s\\S])"
+                },
+                "default": [
+                  "/proc",
+                  "/sys",
+                  "/dev",
+                  "/run"
+                ]
+              },
+              "minBytes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "default": 104857600
+              }
+            },
+            "required": [
+              "path"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "no_match",
+              "partial",
+              "timeout",
+              "cancelled",
+              "permission_denied",
+              "unsupported",
+              "error"
+            ]
+          },
+          "items": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "const": "file"
+                    },
+                    "subject": {
+                      "type": "string",
+                      "maxLength": 32768
+                    },
+                    "sizeBytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "allocatedBytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "modifiedAt": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "subject",
+                    "sizeBytes",
+                    "allocatedBytes",
+                    "modifiedAt"
+                  ]
+                }
+              ]
+            }
+          },
+          "scannedEntries": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "matchedEntries": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "skippedCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "skipped": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "maxLength": 32768
+                },
+                "reason": {
+                  "type": "string",
+                  "enum": [
+                    "excluded",
+                    "filesystem",
+                    "symlink",
+                    "depth",
+                    "entry_limit",
+                    "permission_denied",
+                    "timeout",
+                    "cancelled",
+                    "unsupported",
+                    "error",
+                    "output_limit"
+                  ]
+                }
+              },
+              "required": [
+                "path",
+                "reason"
+              ]
+            }
+          },
+          "coverageComplete": {
+            "type": "boolean"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "elapsedMs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "finishedAt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40
+          }
+        },
+        "required": [
+          "request",
+          "status",
+          "items",
+          "scannedEntries",
+          "matchedEntries",
+          "skippedCount",
+          "skipped",
+          "coverageComplete",
+          "truncated",
+          "elapsedMs",
+          "finishedAt"
+        ]
+      }
+    },
+    {
+      "id": "services.inspect",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "check": {
+            "type": "string",
+            "enum": [
+              "status",
+              "ports",
+              "logs",
+              "health"
+            ]
+          },
+          "service": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "pattern": "^(?:[A-Za-z0-9_][A-Za-z0-9_.@:-]*)$(?![\\s\\S])"
+          },
+          "url": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048,
+            "pattern": "^https?://"
+          },
+          "timeoutSeconds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 60,
+            "default": 15
+          },
+          "logLines": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200,
+            "default": 50
+          },
+          "sinceMinutes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1440,
+            "default": 30
+          }
+        },
+        "required": [
+          "check"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "check": {
+                  "enum": [
+                    "status",
+                    "logs"
+                  ]
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "service"
+              ]
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "service"
+                ]
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "check": {
+                  "const": "health"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "url"
+              ]
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "url"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "outputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "request": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "check": {
+                "type": "string",
+                "enum": [
+                  "status",
+                  "ports",
+                  "logs",
+                  "health"
+                ]
+              },
+              "service": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 255,
+                "pattern": "^(?:[A-Za-z0-9_][A-Za-z0-9_.@:-]*)$(?![\\s\\S])"
+              },
+              "url": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2048,
+                "pattern": "^https?://"
+              },
+              "timeoutSeconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 60,
+                "default": 15
+              },
+              "logLines": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 50
+              },
+              "sinceMinutes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1440,
+                "default": 30
+              }
+            },
+            "required": [
+              "check"
+            ],
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "check": {
+                      "enum": [
+                        "status",
+                        "logs"
+                      ]
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "service"
+                  ]
+                },
+                "else": {
+                  "not": {
+                    "required": [
+                      "service"
+                    ]
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "check": {
+                      "const": "health"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "url"
+                  ]
+                },
+                "else": {
+                  "not": {
+                    "required": [
+                      "url"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "no_match",
+              "partial",
+              "timeout",
+              "cancelled",
+              "permission_denied",
+              "unsupported",
+              "error"
+            ]
+          },
+          "items": {
+            "type": "array",
+            "maxItems": 200,
+            "items": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "const": "service"
+                    },
+                    "subject": {
+                      "type": "string",
+                      "maxLength": 32768
+                    },
+                    "text": {
+                      "type": "string",
+                      "maxLength": 32768
+                    },
+                    "exitCode": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "subject",
+                    "text",
+                    "exitCode"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "const": "ports"
+                    },
+                    "subject": {
+                      "type": "string",
+                      "maxLength": 32768
+                    },
+                    "text": {
+                      "type": "string",
+                      "maxLength": 32768
+                    },
+                    "exitCode": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "subject",
+                    "text",
+                    "exitCode"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "const": "logs"
+                    },
+                    "subject": {
+                      "type": "string",
+                      "maxLength": 32768
+                    },
+                    "text": {
+                      "type": "string",
+                      "maxLength": 32768
+                    },
+                    "exitCode": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "subject",
+                    "text",
+                    "exitCode"
+                  ]
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "const": "health"
+                    },
+                    "subject": {
+                      "type": "string",
+                      "maxLength": 32768
+                    },
+                    "httpStatus": {
+                      "type": "integer",
+                      "minimum": 100,
+                      "maximum": 599
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "subject",
+                    "httpStatus"
+                  ]
+                }
+              ]
+            }
+          },
+          "scannedEntries": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "matchedEntries": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "skippedCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "skipped": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "maxLength": 32768
+                },
+                "reason": {
+                  "type": "string",
+                  "enum": [
+                    "excluded",
+                    "filesystem",
+                    "symlink",
+                    "depth",
+                    "entry_limit",
+                    "permission_denied",
+                    "timeout",
+                    "cancelled",
+                    "unsupported",
+                    "error",
+                    "output_limit"
+                  ]
+                }
+              },
+              "required": [
+                "path",
+                "reason"
+              ]
+            }
+          },
+          "coverageComplete": {
+            "type": "boolean"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "elapsedMs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "finishedAt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40
+          }
+        },
+        "required": [
+          "request",
+          "status",
+          "items",
+          "scannedEntries",
+          "matchedEntries",
+          "skippedCount",
+          "skipped",
+          "coverageComplete",
+          "truncated",
+          "elapsedMs",
+          "finishedAt"
+        ]
+      }
+    }
+  ]
+}

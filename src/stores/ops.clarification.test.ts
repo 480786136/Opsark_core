@@ -24,21 +24,21 @@ function inputStep(overrides: Partial<PlanStep> = {}): PlanStep {
   return step({
     id: "clarification-step", title: "确认本次目标",
     description: "需要用户明确本次操作对象，不做任何环境变更",
-    command: `opsark-tool user.request_input ${JSON.stringify({
+    command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify({
       title: "确认目标", description: "目标信息不足，请先明确本次操作对象。",
       fields: [{ key: "TARGET", label: "目标", description: "本次操作的具体目标", type: "text", required: true }],
-    })}`,
-    expected: "用户明确目标", ...overrides,
+    })) },
+    expected: "用户明确目标", validation: "", ...overrides,
   });
 }
 
 function selectionStep(options = [{ value: "target-a", label: "目标甲" }, { value: "target-b", label: "目标乙" }], required = true) {
-  return inputStep({ command: `opsark-tool user.request_input ${JSON.stringify({
+  return inputStep({ command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify({
     title: "选择目标并确认范围", fields: [
       { key: "TARGET", label: "目标", description: "选择已发现的目标", type: "select", required, options },
       { key: "CONFIRMATION", label: "操作确认", description: "明确本次允许的操作范围", type: "text", required: true },
     ],
-  })}` });
+  })) } });
 }
 
 function deferred<T>() {
@@ -121,6 +121,7 @@ describe("通用澄清与审批的单次恢复", () => {
     store.secretMetadata = [{ key: "DB_PASSWORD", serverId: server.id, scope: "server", description: "已存数据库凭据",
       credentialKind: "database", credentialRole: "secret", credentialTarget: "db.internal:3306" }];
     task.plan = [step({ command: 'mysql --socket=/run/mysql.sock -u root -e "SHOW DATABASES;"', validation: "" })];
+    store.prepareTaskPlan(task);
     await store.runStep(task.id, "next-step");
     expect(task.status).toBe("awaiting_step_approval");
     expect(task.pauseReason).toContain("免密");
@@ -223,8 +224,10 @@ describe("通用澄清与审批的单次恢复", () => {
 
   it("合法步骤批准并发点击只派发一次实际命令", async () => {
     const { store, task } = createTask();
-    task.status = "awaiting_step_approval";
-    task.plan = [step({ id: "approval-step", risk: "high", status: "awaiting_approval" })];
+    task.plan = [step({ id: "approval-step", risk: "high" })];
+    store.prepareTaskPlan(task);
+    await store.advanceTask(task.id);
+    expect(task.status).toBe("awaiting_step_approval");
     const execution = deferred<Awaited<ReturnType<typeof backend.executeCommand>>>();
     vi.mocked(backend.executeCommand).mockReturnValueOnce(execution.promise);
 
@@ -289,12 +292,12 @@ describe("通用澄清与审批的单次恢复", () => {
 
   it("敏感输入保存尚未结束时重复提交，也只能消费一次确认请求", async () => {
     const { store, task } = createTask();
-    task.plan = [inputStep({ command: `opsark-tool user.request_input ${JSON.stringify({
+    task.plan = [inputStep({ command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify({
       title: "补充访问参数", fields: [
         { key: "TARGET", label: "目标", description: "本次访问的目标", type: "text", required: true },
         { key: "ACCESS_TOKEN", label: "访问令牌", description: "本次目标访问所需的令牌", type: "password", required: true },
       ],
-    })}` })];
+    })) } })];
     await store.runStep(task.id, "clarification-step");
     const request = store.pendingUserInputs.find(item => item.taskId === task.id)!;
     const saving = deferred<void>();
@@ -420,12 +423,12 @@ describe("通用澄清与审批的单次恢复", () => {
 
   it("保存输入期间取消任务，不应用迟到的回答或恢复执行", async () => {
     const { store, task } = createTask();
-    task.plan = [inputStep({ command: `opsark-tool user.request_input ${JSON.stringify({
+    task.plan = [inputStep({ command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify({
       title: "补充访问参数", fields: [
         { key: "TARGET", label: "目标", description: "本次目标", type: "text", required: true },
         { key: "ACCESS_TOKEN", label: "令牌", description: "用于访问目标", type: "password", required: true },
       ],
-    })}` })];
+    })) } })];
     store.presentTaskUserInput(task.id);
     const request = store.pendingUserInputs[0];
     const saving = deferred<void>();
@@ -464,12 +467,12 @@ describe("通用澄清与审批的单次恢复", () => {
 
   it("旧轮次凭据保存及回滚完成后才写新回答，不会删除新轮次凭据", async () => {
     const { store, task } = createTask();
-    const protectedStep = (id: string) => inputStep({ id, command: `opsark-tool user.request_input ${JSON.stringify({
+    const protectedStep = (id: string) => inputStep({ id, command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify({
       title: "补充访问参数", fields: [
         { key: "TARGET", label: "目标", description: "本次目标", type: "text", required: true },
         { key: "ACCESS_TOKEN", label: "令牌", description: "用于访问目标", type: "password", required: true },
       ],
-    })}` });
+    })) } });
     task.plan = [protectedStep("old-input")];
     store.presentTaskUserInput(task.id);
     const oldRequest = store.pendingUserInputs[0];
@@ -504,9 +507,9 @@ describe("通用澄清与审批的单次恢复", () => {
   it("回答后仍有新的必要问题，直接展示新表单且不执行或循环规划", async () => {
     const { store, task, request } = await awaitingInputTask();
     vi.mocked(backend.decideNextStage).mockResolvedValueOnce(continuation([inputStep({
-      id: "second-question", command: `opsark-tool user.request_input ${JSON.stringify({
+      id: "second-question", command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify({
         title: "确认影响范围", fields: [{ key: "SCOPE", label: "范围", description: "允许影响哪些对象", type: "text", required: true }],
-      })}`,
+      })) },
     })]));
     expect(await store.provideUserInput(task.id, { TARGET: "target-a" }, request.callId)).toBe(true);
     expect(task.status).toBe("awaiting_input");
@@ -610,9 +613,9 @@ describe("通用澄清与审批的单次恢复", () => {
 
   it.each(["text", "number"] as const)("可选 %s 清空会撤销同 key 旧决定", async type => {
     const { store, task } = createTask();
-    task.plan = [inputStep({ command: `opsark-tool user.request_input ${JSON.stringify({
+    task.plan = [inputStep({ command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify({
       title: "更新参数", fields: [{ key: "OPTIONAL", label: "可选参数", description: "留空表示不指定", type, required: false }],
-    })}` })];
+    })) } })];
     task.submittedInputs = { OPTIONAL: { type, value: type === "number" ? 65432 : "OLD_OPTIONAL_VALUE",
       label: "可选参数", description: "原值", groupId: "old", groupTitle: "旧表单", submittedAt: "now",
       scope: confirmedInputScope(task, "old-input"),

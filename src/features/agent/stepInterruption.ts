@@ -12,6 +12,14 @@ export interface StepFailureOutcome {
 export function cancelStep(step: PlanStep, reason: string): void {
   transitionStep(step, "skipped");
   step.progressMessage = reason;
+  if (step.executionLedgerAttempts?.length) {
+    // Stopping local progression does not acknowledge a remote stop. Keep any
+    // command result already collected; the ledger owns late/unknown outcomes.
+    step.progressMessage = `${reason}；取消请求已记录，远端结果待核对。`;
+    if (step.result) step.result = { ...step.result,
+      facts: { ...step.result.facts, cancelRequested: true, cancelConfirmed: false } };
+    return;
+  }
   step.result = {
     executionStatus: "cancelled",
     observationStatus: "unknown",

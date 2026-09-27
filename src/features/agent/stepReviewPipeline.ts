@@ -19,6 +19,7 @@ import {
   applyPreconditionReview,
 } from "@/features/agent/reviewCoordination";
 import type { AuditEventDraft } from "@/features/agent/auditTrail";
+import { holdFailureDependents } from "./failureDisposition";
 
 type FailureReviewer = (
   input: ReviewExecutionFailureInput,
@@ -78,10 +79,12 @@ export async function runCommandFailureReviewPipeline(
   input: RunCommandFailureReviewInput,
   reviewFailure: FailureReviewer = reviewExecutionFailure,
 ) {
+  if (!input.isCancelled()) holdFailureDependents(input.step, input.task.plan.filter(step => step.status === "pending"));
   const review = await reviewFailure(input);
   if (input.isCancelled()) {
     return { cancelled: true as const, review, audits: [] as AuditEventDraft[] };
   }
+  const coordination = applyCommandFailureReview(input.step, review.remainingSteps, review.finalDecision);
   const audit = buildCommandFailureReviewAudit({
     stepTitle: input.step.title,
     context: review.context,
@@ -92,12 +95,8 @@ export async function runCommandFailureReviewPipeline(
     recoveryStepFound: review.recoveryStepFound,
     serverId: input.serverId,
     taskId: input.taskId,
+    executionDisposition: coordination,
   });
-  const coordination = applyCommandFailureReview(
-    input.step,
-    review.remainingSteps,
-    review.finalDecision,
-  );
   return {
     cancelled: false as const,
     review,
@@ -115,10 +114,19 @@ export async function runEvidenceReviewPipeline(
   input: RunEvidenceReviewInput,
   reviewEvidence: EvidenceReviewer = reviewExecutionEvidence,
 ) {
+  if (!input.isCancelled() && (input.postconditionReview || input.step.result?.facts.semanticAcceptanceRequired === true)) {
+    holdFailureDependents(input.step, input.task.plan.filter(step => step.status === "pending"));
+  }
   const review = await reviewEvidence(input);
   if (input.isCancelled()) {
     return { cancelled: true as const, review, audits: [] as AuditEventDraft[] };
   }
+  const coordination = applyExecutionEvidenceReview({
+    step: input.step,
+    remainingSteps: review.remainingSteps,
+    review: review.finalDecision,
+    reviewWasRequired: input.reviewRequired,
+  });
   const audits = buildEvidenceReviewAudits({
     stepTitle: input.step.title,
     reviewRequired: input.reviewRequired,
@@ -135,12 +143,7 @@ export async function runEvidenceReviewPipeline(
     blockingFacts: input.blockingFacts,
     serverId: input.serverId,
     taskId: input.taskId,
-  });
-  const coordination = applyExecutionEvidenceReview({
-    step: input.step,
-    remainingSteps: review.remainingSteps,
-    review: review.finalDecision,
-    reviewWasRequired: input.reviewRequired,
+    executionDisposition: coordination,
   });
   return { cancelled: false as const, review, audits, coordination };
 }

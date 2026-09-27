@@ -9,7 +9,8 @@ describe("execution evidence in model context", () => {
       evidence: [{ id: "form-evidence", rawOutput: '{"values":{"TARGET":"old-server-value"}}', facts: { TARGET: "legacy-fact-value" } }],
     } as unknown as PlanStep;
     const projected = executionContextEvidence(step, value => value);
-    expect(projected.output).toMatchObject({ contentRef: "confirmedUserInputs", sourceStepId: "form-1" });
+    expect(projected.output).toMatchObject({ contentState: "omitted", sourceStepId: "form-1" });
+    expect(projected.output).not.toHaveProperty("contentRef");
     expect(JSON.stringify(projected)).not.toContain("old-server-value");
     expect(JSON.stringify(projected)).not.toContain("legacy-fact-value");
     expect(JSON.stringify(modelContextStep(step))).not.toContain("legacy-fact-value");

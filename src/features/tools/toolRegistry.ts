@@ -46,7 +46,9 @@ export function resolveToolRegistry(
       // Security-sensitive fields always come from the trusted catalog.
       id: definition.id,
       implementation: definition.implementation,
+      effect: definition.effect,
       inputSchema: structuredClone(definition.inputSchema),
+      outputSchema: definition.outputSchema ? structuredClone(definition.outputSchema) : undefined,
       planMode: definition.planMode,
       completionMode: definition.completionMode,
       refinementScope: definition.refinementScope,

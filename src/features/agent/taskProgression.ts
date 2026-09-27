@@ -1,7 +1,7 @@
 import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 import type { ToolDefinition } from "@/features/tools/types";
 import type { OpsTask, PlanStep } from "@/types";
-import { taskGoal } from "@/features/agent/taskGoal";
+import { taskAcceptanceRequirement } from "@/features/agent/taskGoal";
 import { unresolvedRecoveryBlockers } from "./recoveryContract";
 
 export type TaskProgression =
@@ -9,9 +9,9 @@ export type TaskProgression =
   | { kind: "execute-step"; step: PlanStep }
   | { kind: "complete" };
 
-/** Returns the stable overall goal; follow-up instructions must not silently replace it. */
+/** Preserves the overall goal together with classified supplements that still need acceptance. */
 export function latestTaskRequirement(task: OpsTask) {
-  return taskGoal(task);
+  return taskAcceptanceRequirement(task);
 }
 
 /**

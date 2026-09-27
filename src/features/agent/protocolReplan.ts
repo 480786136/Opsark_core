@@ -43,10 +43,11 @@ export function freshProtocolReplanSteps(steps: PlanStep[]): PlanStep[] {
   return steps.map(step => ({
     id: `replan-step-${crypto.randomUUID()}`,
     kind: step.kind, title: step.title, description: step.description,
-    command: step.command, expected: step.expected, validation: step.validation, risk: step.risk,
+    action: step.action, command: step.command, expected: step.expected, validation: step.validation, risk: step.risk,
     executionScope: step.executionScope, validationScope: step.validationScope,
     runtimeClass: step.runtimeClass, sessionContextChange: step.sessionContextChange,
     recovery: step.recovery, recoveryRuleVersion: step.recoveryRuleVersion,
+    retryBasis: step.retryBasis,
     status: "pending",
   }));
 }

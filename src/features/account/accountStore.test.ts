@@ -5,6 +5,7 @@ import { useAccountStore, type AccountSnapshot } from "./accountStore";
 import { useOpsStore } from "@/stores/ops";
 import { backend } from "@/services/backend";
 import { saveOfficialPreferences } from "./officialModelSettings";
+import { directCapabilities, newModelCapabilities } from "@/features/agent/modelCapabilities";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const snapshot: AccountSnapshot = {
   user: { id: "user-one", email: "user@example.test" },
@@ -102,6 +103,28 @@ it("uses the Admin display name and only restores account-scoped editable prefer
   expect(useOpsStore().models.find(m => m.source === "official")).toMatchObject({ name: "Renamed by Admin", timeoutSeconds: 123, endpoint: snapshot.endpoint, model: "trial-model" });
   account.apply({ ...snapshot, user: { id: "user-two", email: "second@example.test" } });
   expect(useOpsStore().models.find(m => m.source === "official")?.name).toBe("trial-model");
+});
+
+it("preserves legacy catalog availability but blocks explicitly unknown V2 structured capabilities", () => {
+  const account = useAccountStore(), ops = useOpsStore();
+  account.apply({ ...snapshot, models: [{ id: "trial-model", capabilities: { ...directCapabilities("portable"), structuredOutput: "unknown" } }] });
+  expect(ops.models.find(model => model.source === "official")?.capabilitiesV2).toBeUndefined();
+  expect(ops.modelAvailability["official:user-one:trial-model"].status).toBe("available");
+  account.apply({ ...snapshot, models: [{ id: "trial-model", capabilitiesV2: newModelCapabilities() }] });
+  expect(ops.modelAvailability["official:user-one:trial-model"]).toMatchObject({ status: "unavailable" });
+  expect(ops.modelAvailability["official:user-one:trial-model"].reason).toContain("结构输出能力");
+  expect(ops.models.find(model => model.source === "official")?.validationSnapshot).toBeUndefined();
+});
+
+it("blocks a saved Responses preference when the refreshed catalog no longer declares V2 protocol support", () => {
+  const account = useAccountStore(), ops = useOpsStore();
+  account.apply(snapshot);
+  const model = ops.models.find(item => item.source === "official")!;
+  saveOfficialPreferences({ ...model, timeoutSeconds: 90, apiProtocol: "responses" });
+  account.apply(snapshot);
+  expect(ops.models.find(item => item.source === "official")?.apiProtocol).toBe("responses");
+  expect(ops.modelAvailability[model.id].status).toBe("unavailable");
+  expect(ops.modelAvailability[model.id].reason).toContain("重新选择协议");
 });
 
 it("waits for GitHub authorization without passing codes or tokens through frontend state", async () => {

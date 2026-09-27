@@ -39,10 +39,46 @@ describe("step approval", () => {
   });
 
   it("accepts only a step currently waiting for approval", () => {
-    const waiting = step("high", "awaiting_approval");
+    const waiting = step("high");
+    requestStepApproval("managed", waiting);
 
     expect(acceptStepApproval(waiting)).toEqual({ taskStatus: "running", shouldExecute: true });
     expect(waiting.status).toBe("awaiting_approval");
+    expect(hasCurrentStepApproval(waiting)).toBe(true);
+  });
+
+  it("does not turn a restored waiting status or old snapshot into new approval", () => {
+    const waiting = step("high", "awaiting_approval");
+    expect(acceptStepApproval(waiting)).toBeUndefined();
+    waiting.safetyApprovalSnapshot = {
+      command: waiting.command, validation: waiting.validation, risk: waiting.risk,
+    };
+    expect(acceptStepApproval(waiting)).toBeUndefined();
+    expect(hasCurrentStepApproval(waiting)).toBe(false);
+  });
+
+  it.each(["command", "validation", "expected", "kind", "validator", "failureDependencies", "recovery"] as const)(
+    "rejects %s edits made while the approval dialog was waiting",
+    field => {
+      const waiting = step("high");
+      requestStepApproval("managed", waiting);
+      if (field === "kind") waiting.kind = "observe";
+      else if (field === "validator") waiting.validator = { type: "command", command: "true", validStates: ["unknown"] };
+      else if (field === "failureDependencies") waiting.failureDependencies = [{ failedStepId: "old", reason: "must recover" }];
+      else if (field === "recovery") waiting.recovery = { failedStepId: "old", targetContext: "target", purpose: "repair" };
+      else waiting[field] += " changed";
+      expect(acceptStepApproval(waiting)).toBeUndefined();
+      expect(hasCurrentStepApproval(waiting)).toBe(false);
+    },
+  );
+
+  it("allows display-only edits and object-key reordering without changing semantics", () => {
+    const waiting: PlanStep = { ...step("high"), sessionContextChange: { cwd: "/opt/app", shell: "bash" } };
+    requestStepApproval("managed", waiting);
+    waiting.title = "新的展示名称";
+    waiting.description = "新的展示文案";
+    waiting.sessionContextChange = { shell: "bash", cwd: "/opt/app" };
+    expect(acceptStepApproval(waiting)?.shouldExecute).toBe(true);
     expect(hasCurrentStepApproval(waiting)).toBe(true);
   });
 
@@ -111,4 +147,23 @@ describe("step approval", () => {
     pending.protocolReplanApproval = undefined;
     expect(hasCurrentStepApproval(pending)).toBe(false);
   });
+});
+
+
+it("invalidates approval when structured arguments or the tool identity change", () => {
+  const pending = step("medium");
+  pending.command = "";
+  pending.validation = "";
+  pending.action = { type: "tool", toolId: "files.transfer_between_servers", arguments: {
+    sourcePath: "/app/archive", targetPath: "/backup/archive", targetServer: "backup", overwrite: false,
+  } };
+  requestStepApproval("safe", pending);
+  acceptStepApproval(pending);
+  expect(hasCurrentStepApproval(pending)).toBe(true);
+  pending.action.arguments.overwrite = true;
+  expect(hasCurrentStepApproval(pending)).toBe(false);
+  expect(pending.approvedSafetySnapshot?.action).toMatchObject({ arguments: { overwrite: false } });
+  pending.action.arguments.overwrite = false;
+  pending.action.toolId = "server.connect";
+  expect(hasCurrentStepApproval(pending)).toBe(false);
 });

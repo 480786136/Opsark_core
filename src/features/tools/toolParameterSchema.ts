@@ -1,53 +1,53 @@
+import Ajv, { type ErrorObject, type ValidateFunction } from "ajv";
 import { argumentPropertyPath, ToolArgumentValidationError } from "./toolArgumentProtocol";
 
 export const isSchemaObject = (value: unknown): value is Record<string, unknown> => !!value && typeof value === "object" && !Array.isArray(value);
 const isRecord = isSchemaObject;
 
+// Draft-07; never coerce, remove fields, or mutate defaults during validation.
+const ajv = new Ajv({ strict: true, strictRequired: false, validateFormats: false, allErrors: true, ownProperties: true });
+const compiled = new Map<string, ValidateFunction>();
+export function compileToolSchema(schema: Record<string, unknown>) {
+  const key = JSON.stringify(schema);
+  let validate = compiled.get(key);
+  if (!validate) {
+    validate = ajv.compile(schema);
+    if (compiled.size >= 256) { compiled.clear(); ajv.removeSchema(); }
+    compiled.set(key, validate);
+  }
+  return validate;
+}
+function errorPath(error: ErrorObject, base: string | undefined) {
+  let path = base;
+  for (const token of error.instancePath.split("/").slice(1).map(item => item.replace(/~1/g, "/").replace(/~0/g, "~"))) {
+    path = /^\d+$/.test(token) ? path === undefined ? undefined : `${path}[${token}]` : argumentPropertyPath(path, token);
+  }
+  if (error.keyword === "required") path = argumentPropertyPath(path, String(error.params.missingProperty));
+  if (error.keyword === "additionalProperties") path = argumentPropertyPath(path, String(error.params.additionalProperty));
+  return path;
+}
+function schemaErrorMessage(error: ErrorObject) {
+  const p = error.params;
+  const messages: Record<string, string> = {
+    required: `缺少必填字段：${p.missingProperty}`, additionalProperties: `不支持字段：${p.additionalProperty}`,
+    type: `类型必须为 ${p.type}`, enum: "不在允许范围内", pattern: "格式无效",
+    minimum: `小于最小值 ${p.limit}`, maximum: `超过最大值 ${p.limit}`,
+    minItems: `数量不足，至少 ${p.limit} 项`, maxItems: `数量过多，最多 ${p.limit} 项`,
+    minLength: "长度不足", maxLength: "长度超过限制",
+  };
+  return messages[error.keyword] ?? error.message;
+}
 export function validateSchemaValue(schema: Record<string, unknown>, value: unknown, path: string, argumentPath: string | undefined) {
-  const properties = isRecord(schema.properties) ? schema.properties : {};
-  const required = Array.isArray(schema.required) ? schema.required.filter((key): key is string => typeof key === "string") : [];
-  const type = schema.type;
-  const validType = type === "string" ? typeof value === "string"
-    : type === "boolean" ? typeof value === "boolean"
-      : type === "number" ? typeof value === "number" && Number.isFinite(value)
-        : type === "integer" ? typeof value === "number" && Number.isInteger(value)
-          : type === "array" ? Array.isArray(value)
-            : type === "object" ? isRecord(value)
-              : true;
-  if (!validType) throw new ToolArgumentValidationError(`${path} 类型必须为 ${String(type)}`, argumentPath);
-  if (isRecord(value) && schema.additionalProperties === false) {
-    const unknown = Object.keys(value).find((key) => !(key in properties));
-    if (unknown) throw new ToolArgumentValidationError(`${path} 不支持字段：${unknown}`, argumentPropertyPath(argumentPath, unknown));
-  }
-  if (isRecord(value)) {
-    const missing = required.find((key) => value[key] === undefined);
-    if (missing) throw new ToolArgumentValidationError(`${path} 缺少必填字段：${missing}`, argumentPropertyPath(argumentPath, missing));
-    for (const [key, rawRule] of Object.entries(properties)) {
-      if (value[key] !== undefined && isRecord(rawRule)) validateSchemaValue(rawRule, value[key], `${path}.${key}`, argumentPropertyPath(argumentPath, key));
-    }
-  }
-  if (typeof value === "number") {
-    if (typeof schema.minimum === "number" && value < schema.minimum) throw new ToolArgumentValidationError(`${path} 小于最小值 ${schema.minimum}`, argumentPath);
-    if (typeof schema.maximum === "number" && value > schema.maximum) throw new ToolArgumentValidationError(`${path} 超过最大值 ${schema.maximum}`, argumentPath);
-  }
-  if (typeof value === "string" && typeof schema.pattern === "string" && !new RegExp(schema.pattern).test(value)) {
-    throw new ToolArgumentValidationError(`${path} 格式无效，应匹配 ${schema.pattern}`, argumentPath);
-  }
-  if (typeof value === "string") {
-    const length = [...value].length;
-    if (typeof schema.minLength === "number" && length < schema.minLength) throw new ToolArgumentValidationError(`${path} 长度不足`, argumentPath);
-    if (typeof schema.maxLength === "number" && length > schema.maxLength) throw new ToolArgumentValidationError(`${path} 长度超过限制`, argumentPath);
-  }
-  if (Array.isArray(value)) {
-    if (typeof schema.minItems === "number" && value.length < schema.minItems) throw new ToolArgumentValidationError(`${path} 数量不足，至少 ${schema.minItems} 项`, argumentPath);
-    if (typeof schema.maxItems === "number" && value.length > schema.maxItems) throw new ToolArgumentValidationError(`${path} 数量过多，最多 ${schema.maxItems} 项`, argumentPath);
-    const itemRule = isRecord(schema.items) ? schema.items : undefined;
-    if (itemRule) value.forEach((item, index) => validateSchemaValue(itemRule, item, `${path}[${index}]`,
-      argumentPath === undefined ? undefined : `${argumentPath}[${index}]`));
-  }
-  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
-    throw new ToolArgumentValidationError(`${path} 不在允许范围内：${schema.enum.join("、")}`, argumentPath);
-  }
+  const validate = compileToolSchema(schema);
+  if (validate(value)) return;
+  const errors = validate.errors ?? [];
+  // Alternative branches do not establish which field the caller intended.
+  const combined = errors.find(error => ["oneOf", "anyOf", "not"].includes(error.keyword));
+  const error = combined ?? errors[0];
+  const location = error ? errorPath(error, argumentPath) : undefined;
+  const details = errors.filter(item => !["oneOf", "anyOf"].includes(item.keyword)).slice(0, 4)
+    .map(item => `${item.instancePath || "/"} ${schemaErrorMessage(item)}`).join("；");
+  throw new ToolArgumentValidationError(`${path} 参数校验失败：${details}`, combined ? undefined : location);
 }
 
 const editable = new Set(["description", "default", "minimum", "maximum", "minItems", "maxItems", "minLength", "maxLength", "enum", "required"]);
@@ -62,6 +62,7 @@ function same(a: unknown, b: unknown): boolean {
 export function validateCompatibleToolSchema(candidate: unknown, base: Record<string, unknown>, path = "参数协议", depth = 0): asserts candidate is Record<string, unknown> {
   const fail = (reason: string): never => { throw new Error(`${path}：${reason}`); };
   if (depth > 12 || !isRecord(candidate)) return fail("必须为受支持的参数对象");
+  if (depth === 0) compileToolSchema(candidate);
   for (const key of new Set([...Object.keys(candidate), ...Object.keys(base)])) {
     if (!editable.has(key) && key !== "properties" && key !== "items" && (!own(candidate, key) || !own(base, key) || !same(candidate[key], base[key]))) fail(`不能修改执行协议字段 ${key}`);
   }

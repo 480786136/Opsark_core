@@ -204,7 +204,17 @@ fn public_snapshot(base: &str, me: &Value, models: &Value) -> Result<Value, Stri
         .filter_map(|m| {
             m["id"]
                 .as_str()
-                .map(|id| json!({"id": id, "name": m["name"].as_str().unwrap_or(id)}))
+                .map(|id| {
+                    let mut entry = json!({"id": id, "name": m["name"].as_str().unwrap_or(id)});
+                    if let Some(caps) = crate::model_compatibility::public_capabilities(&m["capabilities"]) {
+                        entry["capabilities"] = caps;
+                    }
+                    if let Some(caps) = crate::model_protocol::public_capabilities(&m["capabilitiesV2"]) {
+                        entry["apiProtocol"] = caps["preferredProtocol"].clone();
+                        entry["capabilitiesV2"] = caps;
+                    }
+                    entry
+                })
         })
         .collect::<Vec<_>>();
     Ok(json!({"user": {"id": id, "email": email},
@@ -392,7 +402,7 @@ pub(crate) async fn authorization(url: &str, key: &str) -> Result<String, String
         return Ok(key.to_owned());
     };
     let base = origin()?;
-    if url != format!("{base}/v1/chat/completions") && url != format!("{base}/v1/models") {
+    if url != format!("{base}/v1/chat/completions") && url != format!("{base}/v1/responses") && url != format!("{base}/v1/models") {
         return Err("官方账号凭据不能用于自定义模型接口".into());
     }
     let mut state = session().lock().await;

@@ -18,7 +18,10 @@ import { buildStepScopeEvidence } from "@/features/agent/executionScope";
 import { recordedSupplementalAcceptance, validationHasAcceptanceCheck } from "@/features/agent/planSafety";
 import { commandMutation } from "@/services/recoveryRules";
 
-export type NormalizedPlanStep = PlanStep & { validator: StepValidator };
+export type NormalizedShellStep = PlanStep & {
+  action?: { type: "shell"; command: string };
+  validator: StepValidator;
+};
 
 export interface CommandSnapshot {
   output: string;
@@ -79,19 +82,18 @@ function defaultValidStates(type: ValidatorType): ObservationStatus[] {
   return validStatesForSkillValidator(type);
 }
 
-export function ensureStepValidator(step: PlanStep): NormalizedPlanStep {
-  if (step.validator && /^opsark-tool\s/.test(step.command.trim())) {
-    return {
-      ...step,
-      validator: {
-        ...step.validator,
-        command: step.validation,
-      },
-    };
-  }
+/** Plan loading/preparation must not add or silently strip tool fields. */
+export function normalizeStepValidation(step: PlanStep): PlanStep {
+  return step.action?.type === "tool" ? step : ensureStepValidator(step);
+}
+
+/** Shell-only boundary. Tool results use their own output contract. */
+export function ensureStepValidator(step: PlanStep): NormalizedShellStep {
+  if (step.action?.type === "tool") throw new Error("工具步骤不能进入 Shell 验收流程");
   const type = inferValidatorType(step);
   return {
     ...step,
+    action: step.action,
     validator: {
       type,
       command: step.validation,
@@ -264,11 +266,12 @@ export function classifyStepResult(
     scope: scopeTarget ? buildStepScopeEvidence(step, "validation", scopeTarget) : undefined,
   };
   const evidence = commandResultOnly ? [mainEvidence] : [mainEvidence, validationEvidence];
+  const semanticAcceptanceRequired = !commandResultOnly && validator.type === "command";
   return {
     accepted,
     // Uninterpreted raw output is not an execution failure. Overall-goal review
     // still receives the raw evidence; do not loop on a missing domain parser.
-    needsModelReview: accepted && ((parsed.status === "unknown" && validator.type !== "command") || evidenceConflict || outputSignals.blocking),
+    needsModelReview: accepted && (semanticAcceptanceRequired || (parsed.status === "unknown" && validator.type !== "command") || evidenceConflict || outputSignals.blocking),
     evidence,
     result: {
       executionStatus: execution.success ? "success" : "failed",
@@ -279,6 +282,8 @@ export function classifyStepResult(
         ...acceptanceFacts,
         interpretation: validator.type === "command" ? "raw" : "structured",
         proves: "command_execution_only",
+        semanticAcceptanceRequired,
+        semanticAcceptanceStatus: semanticAcceptanceRequired ? "unknown" : undefined,
         mainObservationStatus: mainParsed.status,
         verificationMode: commandResultOnly ? "command_result" : "postcondition",
         validationObservationStatus: validationParsed?.status,

@@ -1,5 +1,6 @@
 import type { AuditEventDraft } from "@/features/agent/auditTrail";
 import type { StepResult, StepReview } from "@/types";
+import type { ReviewCoordinationResult } from "./reviewCoordination";
 
 interface AuditScope {
   stepTitle: string;
@@ -56,6 +57,7 @@ export function buildPeriodicReviewAudit(input: PeriodicReviewAuditInput): Audit
 }
 
 export interface CommandFailureReviewAuditInput extends AuditScope {
+  executionDisposition?: ReviewCoordinationResult;
   context: Record<string, unknown>;
   modelDecision?: StepReview;
   finalDecision: StepReview;
@@ -81,6 +83,7 @@ export function buildCommandFailureReviewAudit(
       mutatingStep: input.mutatingStep,
       recoveryStepFound: input.recoveryStepFound,
       finalDecision: input.finalDecision,
+      executionDisposition: input.executionDisposition,
     }),
     serverId: input.serverId,
     taskId: input.taskId,
@@ -88,6 +91,7 @@ export function buildCommandFailureReviewAudit(
 }
 
 export interface EvidenceReviewAuditInput extends AuditScope {
+  executionDisposition?: ReviewCoordinationResult;
   reviewRequired: boolean;
   postconditionReview: boolean;
   context?: Record<string, unknown>;
@@ -120,6 +124,8 @@ export function buildEvidenceReviewAudits(
           : "程序发现证据不可解释或相互冲突",
         input: input.context,
         result: input.modelDecision,
+        acceptanceResult: input.result?.facts.semanticAcceptanceStatus,
+        executionDisposition: input.executionDisposition,
       }),
       serverId: input.serverId,
       taskId: input.taskId,
@@ -169,4 +175,3 @@ export function buildEvidenceReviewAudits(
   }
   return events;
 }
-

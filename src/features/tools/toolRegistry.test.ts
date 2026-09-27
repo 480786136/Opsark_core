@@ -17,6 +17,7 @@ describe("tool registry", () => {
       name: "项目结构读取",
       implementation: "unsafeExecutor",
       inputSchema: { type: "string" },
+      outputSchema: {},
       enabled: false,
     }]));
     const tool = tools.find((item) => item.id === "files.get_structure")!;
@@ -24,6 +25,7 @@ describe("tool registry", () => {
     expect(tool.name).toBe("项目结构读取");
     expect(tool.enabled).toBe(false);
     expect(tool.implementation).toBe("getRemoteFileStructure");
+    expect(tool.outputSchema).toEqual(defaultToolCatalog.find(item => item.id === tool.id)?.outputSchema);
     expect(tool.inputSchema).toEqual(defaultToolCatalog.find((item) => item.id === "files.get_structure")?.inputSchema);
   });
 
@@ -53,6 +55,7 @@ describe("tool registry", () => {
     expect(context.some((tool) => tool.id === "server.basic_info")).toBe(false);
     expect(context.some((tool) => tool.id === "server.realtime_metrics")).toBe(false);
     expect(context.some((tool) => tool.id === "files.get_structure")).toBe(true);
+    expect(context.every(tool => tool.outputSchema?.additionalProperties === false)).toBe(true);
     expect(context[0]).not.toHaveProperty("implementation");
     expect(context[0]).not.toHaveProperty("builtIn");
   });
@@ -137,4 +140,10 @@ describe("tool registry", () => {
       { field: "description", message: "不能超过 1000 个字符" },
     ]));
   });
+});
+
+
+it("keeps side-effect classification owned by the trusted catalog", () => {
+  const forged = { id: "files.transfer_between_servers", effect: "read" as const };
+  expect(resolveToolRegistry([forged]).find(tool => tool.id === forged.id)?.effect).toBe("change");
 });

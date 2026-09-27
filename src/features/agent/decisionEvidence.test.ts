@@ -169,6 +169,7 @@ describe("decision evidence projection", () => {
     old.status = "failed";
     old.result!.executionStatus = "failed";
     const current = task([step("other", longOutput("other")), failed]);
+    current.rootGoal = `检查磁盘并保留完整用户要求：${"逐项核对扫描范围。".repeat(1500)}`;
     current.phaseHistory = [{ id: "first-phase", roundId: "round", reason: "adjustment", requirement: "query",
       plan: [step("first", longOutput("first"))], createdAt: "now", completedAt: "now" },
     { id: "old-phase", roundId: "round", reason: "adjustment", requirement: "query",
@@ -178,13 +179,21 @@ describe("decision evidence projection", () => {
     const textBodies: string[] = [];
     const collect = (value: unknown) => {
       if (!value || typeof value !== "object") return;
+      const projection = value as Record<string, unknown>;
+      // The limit governs captured execution output, not user-authored requirements.
+      // Both now have a content field; only evidence projections have capture metadata.
+      if (typeof projection.content === "string" && typeof projection.totalCharacters === "number"
+        && ["complete", "excerpt", "omitted"].includes(String(projection.contentState))) {
+        textBodies.push(projection.content);
+      }
       for (const [key, child] of Object.entries(value)) {
-        if (key === "content" && typeof child === "string") textBodies.push(child);
-        else collect(child);
+        if (key !== "content") collect(child);
       }
     };
     collect(snapshot);
     expect(textBodies.reduce((total, text) => total + text.length, 0)).toBeLessThanOrEqual(DECISION_OUTPUT_BUDGET);
+    expect(current.rootGoal.length).toBeGreaterThan(DECISION_OUTPUT_BUDGET);
+    expect(snapshot.taskRequirements.requirements[0].content).toBe(current.rootGoal);
     expect(snapshot.currentIncident?.output?.content).toContain("important middle failed");
     expect(snapshot.currentIncident?.validationEvidence?.[0].output?.content).toContain("acceptance failed");
     expect(snapshot.recentPhases[1].steps[1].output?.contentRef).toBe("currentIncident.output");
@@ -201,8 +210,8 @@ describe("decision evidence projection", () => {
     }));
     const snapshot = buildTaskDecisionSnapshot(current, undefined, true);
     expect(JSON.stringify(snapshot)).not.toContain("OLD_TARGET_ONLY_VALUE");
-    expect(snapshot.currentPlan.steps[0].output?.contentRef).toBe("confirmedUserInputs");
-    expect(snapshot.historyCheckpoint?.verifiedFacts[0].output).toMatchObject({ contentRef: "confirmedUserInputs" });
+    expect(snapshot.currentPlan.steps[0].output?.contentRef).toBeUndefined();
+    expect(snapshot.historyCheckpoint?.verifiedFacts[0].output?.contentRef).toBeUndefined();
     expect(current.plan[0].output).toContain("OLD_TARGET_ONLY_VALUE");
   });
 });

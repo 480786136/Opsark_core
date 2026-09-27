@@ -1,6 +1,6 @@
 import { ensureStepValidator } from "@/services/validation";
 import { defaultToolCatalog } from "@/features/tools/toolCatalog";
-import { parseToolCommand } from "@/features/tools/toolExecutor";
+import { parseToolAction } from "@/features/tools/toolExecutor";
 import { ToolArgumentProtocolError } from "@/features/tools/toolArgumentProtocol";
 import { assertShellToolBoundary } from "@/features/tools/toolShellBoundary";
 import type { ToolDefinition } from "@/features/tools/types";
@@ -13,6 +13,7 @@ import {
 import { validateShellStartupTransaction } from "@/features/agent/shellStartupConfig";
 import { semanticRiskForCommand, validateAuthorizedChangeOperations } from "@/features/agent/changeOperation";
 import { validateRecoveryMetadata } from "./recoveryContract";
+import { assertToolStepBoundary } from "./stepAction";
 
 export function normalizeSecretPlaceholders(value: string) {
   return value.replace(/\\+\$\{secret\.([A-Z0-9_]+)\}/g, "\${secret.$1}");
@@ -42,29 +43,26 @@ export function normalizeLongRunningCommandOutput(command: string) {
     .join("\n");
 }
 
-/** Canonicalizes the only recoverable tool-id typo without weakening argument validation. */
-export function normalizeToolCommandSyntax(command: string) {
-  return command.replace(
-    /^(\s*opsark-tool\s+)--(?=[a-z0-9][a-z0-9_.-]*\s)/i,
-    "$1",
-  );
-}
-
 export function normalizePlanPreconditions(
   steps: PlanStep[],
   requirement = "",
   tools: ToolDefinition[] = defaultToolCatalog,
 ): PlanStep[] {
   steps.filter(step => ["pending", "awaiting_approval"].includes(step.status))
-    .forEach(step => assertShellToolBoundary(step.command, step.validation));
+    .forEach(step => {
+      if (step.action?.type === "tool") {
+        assertToolStepBoundary(step);
+      } else {
+        if (step.action && (step.action.type !== "shell" || step.action.command !== step.command)) throw new Error("Shell action 与执行命令不一致");
+        assertShellToolBoundary(step.command, step.validation);
+      }
+    });
   let normalized = steps.map((step) => normalizePlanStepExecutionScope(normalizePlanStepSafety({
     ...step,
     // Preserve the previous execution contract for persisted plans. New model
     // plans always provide kind explicitly.
     kind: step.kind ?? "change",
-    command: normalizeToolCommandSyntax(
-      normalizeLongRunningCommandOutput(normalizeSecretPlaceholders(step.command)),
-    ),
+    command: step.action?.type === "tool" ? "" : normalizeLongRunningCommandOutput(normalizeSecretPlaceholders(step.command)),
     validation: normalizeSecretPlaceholders(step.validation),
     // Rust versions that predate the omitted-Option wire format emitted null.
     // Keep persisted/backend plans canonical before approval snapshots are made.
@@ -74,12 +72,10 @@ export function normalizePlanPreconditions(
   const pendingToolCalls: Array<{ index: number; toolId: string }> = [];
   normalized.forEach((step, index) => {
     validateRecoveryMetadata(step, index);
-    if (step.status === "pending" && /^opsark-tool(?:\s|$)/i.test(step.command.trim())) {
+    if (["pending", "awaiting_approval"].includes(step.status) && step.action?.type === "tool") {
       try {
-        const call = parseToolCommand(step.command, `normalize-strict-${index}`, tools);
-        if (call?.toolId === "user.request_input") {
-          step.command = `opsark-tool ${call.toolId} ${JSON.stringify(call.arguments)}`;
-        }
+        const call = parseToolAction(step.action, `normalize-strict-${index}`, tools);
+        if (call) step.action = { type: "tool", toolId: call.toolId, arguments: call.arguments };
         if (call) pendingToolCalls.push({ index, toolId: call.toolId });
       } catch (error) {
         throw new ToolArgumentProtocolError(error, index, step.id);
@@ -87,7 +83,10 @@ export function normalizePlanPreconditions(
     }
   });
   for (const { index, toolId } of pendingToolCalls) {
-    if (toolById.get(toolId)?.planMode === "read_batch" && normalized[index].kind !== "observe") {
+    const definition = toolById.get(toolId);
+    if (definition?.effect === "change" && normalized[index].kind !== "change") throw new Error(`工具 ${toolId} 会变更状态，kind 必须为 change`);
+    if (definition?.effect === "change" && normalized[index].risk === "low") normalized[index].risk = "medium";
+    if ((definition?.effect === "read" || definition?.planMode === "read_batch") && normalized[index].kind !== "observe") {
       throw new Error(`第 ${index + 1} 个计划步骤调用 read_batch 工具 ${toolId}；只读批次工具的 kind 必须为 observe`);
     }
   }
@@ -103,6 +102,7 @@ export function normalizePlanPreconditions(
     );
   }
   const scoped = normalized.map((step) => {
+    if (step.action?.type === "tool") return step;
     const scoped = validatePlanStepExecutionScope(step);
     validateShellStartupTransaction(scoped);
     const semanticRisk = semanticRiskForCommand(scoped.command);
@@ -111,7 +111,7 @@ export function normalizePlanPreconditions(
       : semanticRisk === "medium" || scoped.risk === "medium"
         ? "medium"
         : "low";
-    const riskNormalized = { ...scoped, risk };
+    const riskNormalized = { ...scoped, risk, action: { type: "shell" as const, command: scoped.command } };
     return riskNormalized.kind === "observe" ? riskNormalized : ensureStepValidator(riskNormalized);
   });
   validateAuthorizedChangeOperations(scoped, requirement);

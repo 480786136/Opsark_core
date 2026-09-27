@@ -1,5 +1,6 @@
 import type { RuntimeModel } from "@/services/backend";
 import type { AiGenerationSettings, ModelProfile } from "@/types";
+import { modelIntegrationConfig } from "./modelIntegration";
 
 /** Creates backend model parameters only when both profile and credential are available. */
 export function createRuntimeModel(
@@ -11,6 +12,8 @@ export function createRuntimeModel(
 ): RuntimeModel | undefined {
   if (!model || !apiKey) return undefined;
   return {
+    ...modelIntegrationConfig(model),
+    capabilities: model.capabilities,
     requestParameters: model.requestParameters,
     timeoutSeconds: model.timeoutSeconds,
     apiKey,

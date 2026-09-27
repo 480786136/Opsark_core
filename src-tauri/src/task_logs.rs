@@ -1042,11 +1042,28 @@ fn project_model_call_metadata(
         .filter(|event| {
             matches!(
                 *event,
-                "request_sent" | "response_received" | "request_failed" | "response_failed"
+                "request_sent" | "response_received" | "request_failed" | "response_failed" | "compatibility_attempt"
             )
         })
         .unwrap_or("unknown");
     projected.insert("event".into(), json!(event));
+    if event == "compatibility_attempt" {
+        if let Some(protocol) = value["apiProtocol"].as_str().filter(|p| matches!(*p, "chat_completions" | "responses")) {
+            projected.insert("apiProtocol".into(), json!(protocol));
+        }
+        if let Some(version) = bounded_string_field(value, "capabilityVersion", 80) {
+            projected.insert("capabilityVersion".into(), json!(version));
+        }
+        if let Some(mode) = value["effectiveOutputMode"].as_str().filter(|mode| matches!(*mode, "text" | "json_object" | "json_schema")) {
+            projected.insert("effectiveOutputMode".into(), json!(mode));
+        }
+        if let Some(tokens) = value["effectiveOutputTokens"].as_u64().filter(|tokens| *tokens <= 1_000_000) {
+            projected.insert("effectiveOutputTokens".into(), json!(tokens));
+        }
+        for key in ["schemaDowngraded", "cachedJsonOnly", "compactRepair"] {
+            if let Some(flag) = value[key].as_bool() { projected.insert(key.into(), json!(flag)); }
+        }
+    }
 
     for (field, maximum_chars) in [
         ("callId", 512usize),
@@ -1150,7 +1167,7 @@ fn project_token_usage(value: Option<&Value>) -> Option<Value> {
     )
     .or_else(|| {
         usage
-            .get("prompt_tokens_details")
+            .get("prompt_tokens_details").or_else(|| usage.get("input_tokens_details"))
             .and_then(Value::as_object)
             .and_then(|details| first_u64(details, &["cached_tokens"]))
     });
@@ -1160,28 +1177,20 @@ fn project_token_usage(value: Option<&Value>) -> Option<Value> {
     )
     .or_else(|| {
         usage
-            .get("prompt_tokens_details")
+            .get("prompt_tokens_details").or_else(|| usage.get("input_tokens_details"))
             .and_then(Value::as_object)
             .and_then(|details| first_u64(details, &["cache_creation_input_tokens"]))
     });
-    if input.is_none()
-        && output.is_none()
-        && reported_total.is_none()
-        && cache_hit.is_none()
-        && cache_miss.is_none()
-    {
-        return None;
-    }
-
-    let input = input.unwrap_or(0);
-    let output = output.unwrap_or(0);
-    let total = reported_total.unwrap_or_else(|| input.saturating_add(output));
+    let reasoning = usage.get("completion_tokens_details").or_else(|| usage.get("output_tokens_details"))
+        .and_then(Value::as_object).and_then(|details| first_u64(details, &["reasoning_tokens"]));
+    if input.is_none() && output.is_none() && reported_total.is_none()
+        && cache_hit.is_none() && cache_miss.is_none() && reasoning.is_none() { return None; }
+    let total = reported_total.or_else(|| input.zip(output).map(|(a,b)| a.saturating_add(b)));
     let mut projected = serde_json::Map::from_iter([
-        ("input".into(), json!(input)),
-        ("output".into(), json!(output)),
-        ("total".into(), json!(total)),
-        ("source".into(), json!("api")),
+        ("input".into(), json!(input)), ("output".into(), json!(output)),
+        ("total".into(), json!(total)), ("source".into(), json!("api")),
     ]);
+    if let Some(reasoning) = reasoning { projected.insert("reasoning".into(), json!(reasoning)); }
     if let Some(cache_hit) = cache_hit {
         projected.insert("cacheHit".into(), json!(cache_hit));
     }
@@ -1420,6 +1429,25 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn responses_usage_keeps_unknown_counts_and_reasoning_subset() {
+        let usage = super::project_token_usage(Some(&serde_json::json!({
+            "input_tokens": 10, "output_tokens": 20,
+            "input_tokens_details": {"cached_tokens":4},
+            "output_tokens_details": {"reasoning_tokens":12}
+        }))).unwrap();
+        assert_eq!(usage["input"], 10);
+        assert_eq!(usage["output"], 20);
+        assert_eq!(usage["total"], 30);
+        assert_eq!(usage["cacheHit"], 4);
+        assert_eq!(usage["reasoning"], 12);
+        let partial = super::project_token_usage(Some(&serde_json::json!({"output_tokens":20}))).unwrap();
+        assert!(partial["input"].is_null());
+        assert!(partial["total"].is_null());
+        assert_eq!(partial["output"], 20);
+        assert!(super::project_token_usage(Some(&serde_json::json!({}))).is_none());
+    }
     use super::*;
 
     fn event_query(task_id: Option<&str>, limit: usize) -> TaskLogQuery {
@@ -1797,6 +1825,20 @@ mod tests {
         wrong_operation.operation = Some("SSH.EXEC".into());
         assert_eq!(query(&root, wrong_operation).unwrap().total, 0);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn compatibility_projection_exposes_strategy_without_request_or_credentials() {
+        let raw = json!({"event":"compatibility_attempt", "capabilityVersion":"revision",
+            "effectiveOutputMode":"json_object", "effectiveOutputTokens":5000,
+            "schemaDowngraded":true, "cachedJsonOnly":false, "compactRepair":true,
+            "apiKey":"secret-sentinel", "request":{"messages":[{"content":"private-sentinel"}]}});
+        let projected = project_model_call_metadata(&raw, "test.jsonl", 1, 1);
+        assert_eq!(projected["event"], "compatibility_attempt");
+        assert_eq!(projected["effectiveOutputTokens"], 5000);
+        assert_eq!(projected["schemaDowngraded"], true);
+        assert!(!projected.to_string().contains("sentinel"));
+        assert!(projected.get("request").is_none());
     }
 
     #[test]

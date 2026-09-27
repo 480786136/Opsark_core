@@ -52,7 +52,7 @@ export function protocolFieldValue(step: PlanStep, field: keyof PlanStep) {
 export function planSemanticFingerprint(steps: PlanStep[]) {
   const ids = new Map(steps.map((step, index) => [step.id, index]));
   return textFingerprint(stableProtocolValue(steps.map(step => ({
-    kind: step.kind, command: canonicalToolCommand(step.command), validation: step.validation,
+    kind: step.kind, action: step.action, command: step.command, validation: step.validation,
     expected: step.expected, risk: step.risk, executionScope: step.executionScope ?? "agent_session",
     validationScope: step.validationScope ?? "isolated_exec", runtimeClass: step.runtimeClass ?? "bounded",
     sessionContextChange: step.sessionContextChange ?? null,
@@ -61,14 +61,6 @@ export function planSemanticFingerprint(steps: PlanStep[]) {
         ? { planStepIndex: ids.get(step.recovery.failedStepId) } : step.recovery.failedStepId,
     } : null,
   }))));
-}
-
-function canonicalToolCommand(command: string) {
-  const tool = command.match(/^opsark-tool\s+(\S+)\s+([\s\S]+)$/);
-  if (tool) {
-    try { return { toolId: tool[1], arguments: JSON.parse(tool[2]) }; } catch { /* Preserve invalid source. */ }
-  }
-  return command;
 }
 
 /** Unparsed responses must not all collapse to the fingerprint of an empty plan. */
@@ -95,6 +87,9 @@ export function protocolRepairAuthority(context: string) {
   return {
     _log: source._log ?? task._log,
     _requestParameters: source._requestParameters,
+    _modelCapabilities: source._modelCapabilities,
+    _modelIntegration: source._modelIntegration,
+    _modelRecovery: source._modelRecovery,
     taskGoal: source.taskGoal ?? snapshot.taskGoal ?? { rootGoal: snapshot.rootGoal ?? task.rootGoal },
     permission: source.permission ?? task.permission,
     executionConstraints: source.executionConstraints ?? snapshot.executionConstraints,
@@ -129,7 +124,7 @@ export function repairStepIndices(fieldPath: string | undefined, steps: PlanStep
 /** Only the invalid step is sent. The full original plan is merged and checked locally. */
 export function compactProtocolRepairContext<T extends {
   fieldPath?: string; diagnostic?: PlanRepairDiagnostic; previousModelOutput: PlanStep[]; progress?: ProtocolRepairProgress;
-  nextStageDecision?: unknown;
+  nextStageDecision?: unknown; modelRecovery?: unknown;
 }>(
   context: string,
   repair: T,
@@ -138,13 +133,13 @@ export function compactProtocolRepairContext<T extends {
   const authority = protocolRepairAuthority(context);
   const indices = repairStepIndices(repair.fieldPath, repair.previousModelOutput);
   const steps = indices.map(index => repair.previousModelOutput[index]);
-  const referencedTools = new Set(steps.flatMap(step => step.command.match(/^opsark-tool\s+(\S+)/)?.[1] ?? []));
+  const referencedTools = new Set(steps.flatMap(step => step.action?.type === "tool" ? [step.action.toolId] : []));
   const failedIds = new Set(steps.flatMap(step => step.recovery?.failedStepId ?? []));
   const recovery = record(authority.recovery);
   const failedAttempts = Array.isArray(recovery.failedAttempts)
     ? recovery.failedAttempts
     : Array.isArray(recovery.blockers) ? recovery.blockers : [];
-  const { previousModelOutput: _fullPlan, progress: _progress, nextStageDecision: _decision, ...feedback } = repair;
+  const { previousModelOutput: _fullPlan, progress: _progress, nextStageDecision: _decision, modelRecovery: _modelRecovery, ...feedback } = repair;
   return JSON.stringify({
     ...authority,
     workflowPhase: "protocol_repair",
@@ -160,7 +155,7 @@ export function compactProtocolRepairContext<T extends {
       ...feedback,
       previousModelOutput: steps.map(step => ({
         kind: step.kind, title: step.title, description: step.description,
-        command: step.command, expected: step.expected, validation: step.validation, risk: step.risk,
+        action: step.action, command: step.command, expected: step.expected, validation: step.validation, risk: step.risk,
         executionScope: step.executionScope, validationScope: step.validationScope,
         runtimeClass: step.runtimeClass, sessionContextChange: step.sessionContextChange, recovery: step.recovery,
       })),

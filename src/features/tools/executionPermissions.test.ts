@@ -5,7 +5,7 @@ import { executionCapabilityBlocker, permissionStorageKey, permissionTools, read
 import { selectPlanningTools } from "./toolContext";
 import type { OpsTask } from "@/types";
 
-const command = { command: 'opsark-tool files.read_content {"path":"/tmp/example"}', validation: "true" };
+const command = { command: "", action: { type: "tool" as const, toolId: "files.read_content", arguments: {"path":"/tmp/example"} }, validation: "" };
 const shell = { command: "pwd", validation: "true" };
 beforeEach(() => localStorage.clear());
 it("preserves local capability defaults but fails closed on corrupt saved policies", () => {

@@ -25,6 +25,7 @@ import { automaticContinuationBlocker } from "@/features/agent/workflowProgress"
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { recoveryHistory, unresolvedRecoveryBlockers, validateRecoveryReferences } from "@/features/agent/recoveryContract";
 import { useAccountStore } from "@/features/account/accountStore";
+import { requestStepApproval } from "@/features/agent/stepApproval";
 
 const plan: PlanStep[] = [
   {
@@ -59,8 +60,36 @@ const plan: PlanStep[] = [
   },
 ];
 
+function provenStepReview(_requirement: string, rawContext: string) {
+  const context = JSON.parse(rawContext);
+  return {
+    decision: "continue", reason: "测试证据与预期一致", summary: "当前步骤已达到预期。", source: "model",
+    ...(context.acceptanceRequired ? { acceptance: {
+      status: "proven", reason: "测试模型根据当前步骤结果确认预期条件",
+      evidenceIds: context.currentStep.evidence.items.map(item => item.id),
+    } } : {}),
+  };
+}
+
+function connectionLookupPlanStep(id = "lookup-tool-lifecycle"): PlanStep {
+  return {
+    id,
+    title: "查询目标服务器连接资料",
+    description: "读取本地已保存的连接信息",
+    kind: "observe",
+    action: { type: "tool", toolId: "server.resolve_connection", arguments: { host: "example.invalid", port: 22 } },
+    command: "",
+    validation: "",
+    risk: "low",
+    expected: "返回匹配的服务器及凭据可用状态",
+    status: "pending",
+  };
+}
+
 describe("智能任务状态机", () => {
   afterEach(() => {
+    // Invalidate asynchronous managed countdowns before the next test replaces its mocks.
+    for (const task of useOpsStore().tasks) task.cancelRequested = true;
     vi.useRealTimers();
     Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
   });
@@ -125,12 +154,7 @@ describe("智能任务状态机", () => {
       passed: true,
       detail: "校验通过",
     });
-    vi.spyOn(backend, "reviewStep").mockResolvedValue({
-      decision: "continue",
-      reason: "输出与预期一致",
-      summary: "当前步骤已达到预期。",
-      source: "model",
-    });
+    vi.spyOn(backend, "reviewStep").mockImplementation(provenStepReview);
     vi.spyOn(backend, "reviewGoal").mockResolvedValue({
       decision: "complete",
       reason: "整体目标已有完整验收证据",
@@ -165,6 +189,59 @@ describe("智能任务状态机", () => {
         host: server.host, port: server.port, username: server.username, password: "fixture-ssh-password",
       });
     }
+  });
+
+  it.each(["connection", "arguments", "target"])("工具重试期间 %s 改变时停止派发", async change => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
+    task.status = "running";
+    task.plan = [{ ...structuredClone(plan[0]), id: "retry-context", kind: "observe", command: "", validation: "",
+      action: { type: "tool", toolId: "files.get_structure", arguments: { rootPath: "/app" } } }];
+    vi.spyOn(store, "advanceTask").mockResolvedValue();
+    vi.spyOn(store, "routeAutomaticAdjustment").mockResolvedValue();
+    vi.mocked(backend.getRemoteFileStructure).mockImplementationOnce(async () => {
+      if (change === "connection") store.serverConnection(task.serverId).generation += 1;
+      else if (change === "target") task.executionTargetServerId = "srv-tencent-test";
+      else task.plan[0].action.arguments.rootPath = "/changed";
+      throw new Error("SSH 网络连接失败：temporary reset");
+    });
+    await store.runToolStep(task.id, "retry-context", { id: "retry-call", toolId: "files.get_structure", arguments: { rootPath: "/app" } });
+    expect(backend.getRemoteFileStructure).toHaveBeenCalledTimes(1);
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.plan[0].status).toBe("failed");
+    expect(store.advanceTask).not.toHaveBeenCalled();
+    expect(task.plan[0].result.facts.dispatchState).toBe("not_sent");
+  });
+
+  it("结构化工具拒绝与计划不同的参数", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
+    task.status = "running";
+    task.plan = [{ ...structuredClone(plan[0]), id: "bound-tool", kind: "observe", command: "", validation: "",
+      action: { type: "tool", toolId: "files.read_content", arguments: { path: "/app/config" } } }];
+    const execute = vi.spyOn(store, "executeToolCall");
+    await store.runToolStep(task.id, "bound-tool", { id: "call", toolId: "files.read_content", arguments: { path: "/etc/shadow" } });
+    expect(execute).not.toHaveBeenCalled();
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.pauseReason).toContain("参数与当前步骤不一致");
+  });
+
+  it("审批后的工具参数改变会重新等待确认", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    task.status = "running";
+    const action = { type: "tool", toolId: "files.transfer_between_servers", arguments: {
+      sourcePath: "/app/archive", targetServer: "srv-tencent-test", targetPath: "/backup/archive", overwrite: false,
+    } };
+    task.plan = [{ ...structuredClone(plan[0]), id: "approved-tool", kind: "change", risk: "medium", command: "", validation: "", action }];
+    const step = task.plan[0];
+    step.approvedSafetySnapshot = { action: structuredClone(action), command: "", validation: "", risk: "medium" };
+    step.action.arguments.overwrite = true;
+    const execute = vi.spyOn(store, "executeToolCall");
+    await store.runToolStep(task.id, step.id, { id: "call", toolId: action.toolId, arguments: action.arguments });
+    expect(execute).not.toHaveBeenCalled();
+    expect(task.status).toBe("awaiting_step_approval");
+    expect(step.approvedSafetySnapshot).toBeUndefined();
   });
 
   it("将审计事件归档到任务所属服务器并保留名称快照", () => {
@@ -253,6 +330,22 @@ describe("智能任务状态机", () => {
     expect(backend.decideNextStage).not.toHaveBeenCalled();
   });
 
+  it("结构输出失败后相同条件不能反复规划，余额增加不解除，调整预算才解除", () => {
+    const { store, task } = completedObservationTask();
+    store.models.find(model => model.id === task.modelId)!.source = "official";
+    const account = useAccountStore();
+    account.current = { user: { id: "compat-user", email: "fixture@example.invalid" },
+      billingMode: "direct", balance: { available: 12000, reserved: 0, revision: 1, unit: "tokens" },
+      models: [], endpoint: "https://account.invalid" };
+    store.recordModelPlanningBlocker(task, { httpStatus: 422, code: "MODEL_OUTPUT_TRUNCATED",
+      message: "compact recovery exhausted", retryable: false });
+    expect(store.stopBlockedModelPlanning(task)).toBe(true);
+    account.current.balance.available = 24000;
+    expect(store.stopBlockedModelPlanning(task)).toBe(true);
+    store.models.find(model => model.id === task.modelId)!.requestParameters = { max_tokens: 8000 };
+    expect(store.stopBlockedModelPlanning(task)).toBe(false);
+  });
+
   it("服务切换直接扣费后刷新账号可解除历史预留不足阻断，余额不必改变", () => {
     const { store, task } = completedObservationTask();
     store.models.find(model => model.id === task.modelId)!.source = "official";
@@ -267,6 +360,39 @@ describe("智能任务状态机", () => {
     store.recordModelPlanningBlocker(task, { httpStatus: 402, code: "INSUFFICIENT_CREDITS",
       message: "余额已用完", retryable: false, details: { billing_mode: "direct", available_tokens: 0 } });
     expect(store.stopBlockedModelPlanning(task)).toBe(true);
+  });
+
+  it("只读扫描在实际派发前保存固定期限，沉默超过90秒仍等待且保留用户取消", async () => {
+    vi.useFakeTimers();
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
+    store.serverPasswords[task.serverId] = "test-password";
+    task.status = "running";
+    const command = "du -x -h -d 1 / 2>/dev/null | sort -h";
+    task.plan = [{ ...structuredClone(plan[0]), kind: "observe", command,
+      action: { type: "shell", command }, validation: "", expected: "列出各目录磁盘占用" }];
+    let finishExecution!: (result: { output: string; success: boolean; simulated: boolean; exitCode: number }) => void;
+    vi.mocked(backend.executeCommand).mockImplementationOnce(() => {
+      const cached = JSON.parse(localStorage.getItem("opsark.tasks")!).find((item: OpsTask) => item.id === task.id);
+      expect(cached.plan[0].executionPolicy).toMatchObject({ kind: "scan", executionId: expect.any(String) });
+      return new Promise(resolve => { finishExecution = resolve; });
+    });
+    vi.mocked(backend.reviewStep).mockResolvedValue({ decision: "continue", reason: "仍在执行期限内，沉默不能证明失败", summary: "继续等待", source: "model" });
+    const cancel = vi.spyOn(backend, "cancelCommand").mockResolvedValue(undefined);
+    const running = store.runStep(task.id, task.plan[0].id);
+    await vi.advanceTimersByTimeAsync(91_000);
+    const policy = task.plan[0].executionPolicy!;
+    expect(policy.deadlineAt! - policy.startedAt).toBe(600_000);
+    expect(task.status).toBe("running");
+    expect(cancel).not.toHaveBeenCalled();
+    await store.terminateTask(task.id);
+    finishExecution({ output: "cancelled", success: false, simulated: false, exitCode: 130 });
+    await vi.runAllTimersAsync();
+    await running;
+    expect(cancel).toHaveBeenCalled();
+    expect(task.status).toBe("cancelled");
+    expect(task.plan[0].executionPolicy).toEqual(policy);
+    expect(backend.executeCommand).toHaveBeenCalledOnce();
   });
 
   it.each([true, false])("长任务复核额度不足等待真实退出后暂停后续步骤，主命令成功=%s", async (success) => {
@@ -295,7 +421,7 @@ describe("智能任务状态机", () => {
     expect(task.status).toBe("needs_adjustment");
     expect(task.pauseReason).toContain("额度不足");
     expect(task.modelPlanningBlocker?.error.code).toBe("INSUFFICIENT_CREDITS");
-    expect(task.plan[0].status).toBe(success ? "completed" : "failed");
+    expect(task.plan[0].status).toBe("failed"); // Shell result is retained, acceptance awaits the unavailable model.
     expect(task.plan[0].result?.executionStatus).toBe(success ? "success" : "failed");
     expect(task.plan[0].output).toContain("original long command result");
     expect(task.plan[1].status).toBe("pending");
@@ -334,7 +460,7 @@ describe("智能任务状态机", () => {
   it("证据工具结束后的联合决策额度不足时不会重复请求", async () => {
     vi.useFakeTimers();
     const { store, task } = completedObservationTask();
-    task.plan[0].command = `opsark-tool evidence.read ${JSON.stringify({ evidenceId: "a".repeat(64) })}`;
+    task.plan[0].command = ""; task.plan[0].action = { type: "tool" as const, toolId: "evidence.read", arguments: JSON.parse(JSON.stringify({ evidenceId: "a".repeat(64) })) };
     const original = JSON.parse(JSON.stringify(task.plan));
     vi.mocked(backend.decideNextStage).mockRejectedValueOnce(quotaError());
     await store.advanceTask(task.id);
@@ -455,6 +581,55 @@ describe("智能任务状态机", () => {
     expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(backend.executeCommand).not.toHaveBeenCalled();
     expect(task.activeSkillIds).toEqual(selectedSkillIds);
+  });
+
+  it("同一次需求扩展终端上下文沿用恢复预算，下一次独立需求使用新预算", async () => {
+    const store = useOpsStore();
+    store.terminalLines = Array.from({ length: 200 }, (_, index) => `terminal line ${index}`);
+    vi.mocked(backend.processRequirement)
+      .mockResolvedValueOnce({ intent: "terminal_context", terminalContextLines: 40, plan: [] })
+      .mockResolvedValueOnce({ intent: "terminal_context", terminalContextLines: 80, plan: [] })
+      .mockResolvedValueOnce({ intent: "answer", answer: "终端记录显示服务可用", plan: [] })
+      .mockResolvedValueOnce({ intent: "answer", answer: "新问题的独立回答", plan: [] });
+    await store.submitRequirement("srv-production-01", "分析终端记录", "safe", "model-deepseek");
+    const firstCalls = vi.mocked(backend.processRequirement).mock.calls;
+    expect(firstCalls).toHaveLength(3);
+    const contexts = firstCalls.map(call => JSON.parse(call[1].context));
+    expect(contexts[0]._modelRecovery).toMatchObject({ operationId: expect.any(String), startedAtMs: expect.any(Number) });
+    expect(contexts[1]._modelRecovery).toEqual(contexts[0]._modelRecovery);
+    expect(contexts[2]._modelRecovery).toEqual(contexts[0]._modelRecovery);
+    expect(contexts[1].terminalContext.includedLines).toBeGreaterThan(contexts[0].terminalContext.includedLines);
+    expect(contexts[2].terminalContext.includedLines).toBeGreaterThan(contexts[1].terminalContext.includedLines);
+    await store.submitRequirement("srv-production-01", "新的独立问题", "safe", "model-deepseek");
+    const next = JSON.parse(vi.mocked(backend.processRequirement).mock.calls[3][1].context);
+    expect(next._modelRecovery.operationId).not.toBe(contexts[0]._modelRecovery.operationId);
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("分类成功后恢复预算耗尽仍保留目标、约束和Skill，并阻断相同条件重试", async () => {
+    const store = useOpsStore();
+    const selectedSkillIds = [store.skills[0].id];
+    const constraints = { changePolicy: "observe_only", userDirectives: ["只读检查"], prohibitedActions: ["不得重启服务"], requiredConditions: [] };
+    const modelError = { code: "MODEL_RECOVERY_BUDGET_EXHAUSTED", origin: "core", stage: "recovery_budget",
+      message: "generation budget exhausted", retryable: false, modelOperationId: "same-operation",
+      recoveryBudget: { maxGenerations: 6, generations: 6, maxTotalTokens: 1000000, accountedTokens: 20000 } };
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({ intent: "execute", relation: "new_goal",
+      selectedSkillIds, constraints, plan: [],
+      planError: `需求已判定为执行类，但计划生成失败：OPSARK_MODEL_TRACE_V1:${JSON.stringify({ message: "stopped", modelError })}` });
+    const requirement = "检查当前运行状态，不得重启服务";
+    await store.submitRequirement("srv-production-01", requirement, "managed", "model-deepseek");
+    const task = store.activeTask!;
+    expect(task.rootGoal).toBe(requirement);
+    expect(task.activeSkillIds).toEqual(selectedSkillIds);
+    expect(task.executionConstraints).toMatchObject(constraints);
+    expect(task.status).toBe("planning_failed");
+    expect(task.modelPlanningBlocker?.error).toEqual(modelError);
+    expect(task.pauseReason).toContain("恢复预算");
+    expect(task.autoAdjustmentSeconds).toBeUndefined();
+    await store.submitRequirement("srv-production-01", requirement, "managed", "model-deepseek", "", task.id);
+    expect(backend.processRequirement).toHaveBeenCalledOnce();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
   });
 
   it("余额revision增长或陈旧高余额刷新到实际拒绝余额不会解锁额度阻断", async () => {
@@ -733,7 +908,7 @@ describe("智能任务状态机", () => {
     return { store, task, terminals: useAgentTerminalStore() };
   }
 
-  it("Agent 克隆完成后 SSH 握手失败只重试校验，成功后正常推进且不调用模型", async () => {
+  it("Agent 克隆后握手失败只重试校验，再复核结果而不重做克隆", async () => {
     const { store, task, terminals } = setupAgentClone();
     let validationAttempts = 0;
     const execute = vi.spyOn(backend, "executeAgentCommand").mockImplementation(async (input) => {
@@ -757,7 +932,7 @@ describe("智能任务状态机", () => {
     expect(task.plan[0].status).toBe("completed");
     expect(task.plan[0].output).toContain("Cloning into");
     expect(terminals.sessionsByTask[task.id]).toMatchObject({ state: "ready", generation: 2 });
-    expect(backend.reviewStep).not.toHaveBeenCalled();
+    expect(backend.reviewStep).toHaveBeenCalledOnce();
     expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(store.advanceTask).toHaveBeenCalledOnce();
   });
@@ -986,6 +1161,82 @@ describe("智能任务状态机", () => {
     expect(terminalSessions.activeSessionByServer["srv-production-01"]).toBe(initiatingTerminal.id);
     expect(terminalSessions.sessionsByServer["srv-production-01"]
       .find(({ id }) => id === firstTerminalId)?.panes[0]).not.toHaveProperty("agentTaskId");
+  });
+
+  it.each(["managed", "safe"] as const)("工具计划在 %s 模式从需求到审批派发不注入 Shell 验收器", async permission => {
+    const store = useOpsStore();
+    store.servers = store.servers.filter(server => server.id === "srv-production-01");
+    store.serverPasswords["srv-production-01"] = "lookup-private-password";
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({
+      intent: "execute",
+      relation: "new_goal",
+      plan: [connectionLookupPlanStep()],
+    });
+
+    await store.submitRequirement(
+      "srv-production-01", "查询 example.invalid 的连接资料和凭据是否可用", permission, "model-deepseek",
+    );
+    const task = store.activeTask!;
+    expect(task.plan).toHaveLength(1);
+    expect(task.plan[0].validator).toBeUndefined();
+
+    if (permission === "safe") {
+      expect(task.status).toBe("awaiting_plan_approval");
+      expect(task.plan[0].status).toBe("pending");
+      expect(task.plan[0].result).toBeUndefined();
+      expect(task.plan[0].evidence).toBeUndefined();
+      await store.approvePlan(task.id);
+    }
+
+    expect(task.status).toBe("completed");
+    expect(task.plan[0]).toMatchObject({
+      status: "completed",
+      command: "",
+      validation: "",
+      action: { type: "tool", toolId: "server.resolve_connection", arguments: { host: "example.invalid", port: 22 } },
+      result: { executionStatus: "success", facts: { toolId: "server.resolve_connection" } },
+    });
+    expect(task.plan[0].validator).toBeUndefined();
+    expect(JSON.parse(task.plan[0].output!)).toMatchObject({
+      found: true,
+      serverId: "srv-production-01",
+      host: "example.invalid",
+      port: 22,
+      credentialAvailable: true,
+      credentialRef: "managed-server:srv-production-01",
+    });
+    expect(task.plan[0].evidence).toHaveLength(1);
+    expect(JSON.stringify(task.plan[0].evidence)).not.toContain("lookup-private-password");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.validateStep).not.toHaveBeenCalled();
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["command", "uname -a"],
+    ["validation", "test -d /tmp"],
+    ["validator", { type: "command", command: "", validStates: ["matched"] }],
+    ["sessionContextChange", { cwd: "/tmp" }],
+  ])("工具计划原始提案夹带 %s 时拒绝整份提案且不自动删除字段后执行", async (field, value) => {
+    const store = useOpsStore();
+    const proposal = { ...connectionLookupPlanStep(), [field]: value };
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({
+      intent: "execute", relation: "new_goal", plan: [proposal],
+    });
+
+    await store.submitRequirement("srv-production-01", "查询 example.invalid 的连接资料", "managed", "model-deepseek");
+
+    const task = store.activeTask!;
+    expect(task.status).toBe("planning_failed");
+    expect(task.plan).toHaveLength(0);
+    expect(task.pauseReason).toContain("工具步骤不能夹带 Shell");
+    expect(task.pauseReason).toContain("未派发工具");
+    expect(proposal[field]).toEqual(value);
+    expect(backend.processRequirement).toHaveBeenCalledOnce();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.validateStep).not.toHaveBeenCalled();
+    expect(backend.decideNextStage).not.toHaveBeenCalled();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
   });
 
   it.skip("继续提交既有任务时保持最初发起终端绑定", async () => {
@@ -1335,10 +1586,10 @@ describe("智能任务状态机", () => {
     task.status = "running";
     task.plan = [{
       ...structuredClone(plan[0]),
-      id: "tool-step",
+      id: "tool-step", kind: "observe",
       title: "获取项目文件结构",
-      command: 'opsark-tool files.get_structure {"rootPath":"/opt/app","excludeDirectories":["uploads"]}',
-      validation: "true",
+      kind: "observe", command: "", action: { type: "tool" as const, toolId: "files.get_structure", arguments: {"rootPath":"/opt/app","excludeDirectories":["uploads"]} },
+      validation: "",
     }];
 
     await store.runStep(task.id, "tool-step");
@@ -1372,12 +1623,12 @@ describe("智能任务状态机", () => {
     task.status = "running";
     task.activeSkillIds = ["application-deployment"];
     const reads = ["README.md", "package.json"].map((name, index) => ({
-      ...structuredClone(plan[0]), id: `read-${index}`, kind: "observe", validation: "true",
-      command: `opsark-tool files.read_content ${JSON.stringify({ path: `/opt/app/${name}` })}`,
+      ...structuredClone(plan[0]), id: `read-${index}`, kind: "observe", validation: "",
+      command: "", action: { type: "tool" as const, toolId: "files.read_content", arguments: JSON.parse(JSON.stringify({ path: `/opt/app/${name}` })) },
     }));
     task.plan = normalizePlanPreconditions(reads, "部署项目", store.tools);
     const execute = vi.spyOn(store, "executeToolCall").mockImplementation(async (_serverId, call) => ({
-      callId: call.id, toolId: call.toolId, success: true, data: { content: "project evidence" },
+      callId: call.id, toolId: call.toolId, success: true, data: { path: call.arguments.path, content: "project evidence", encoding: "utf-8", returnedBytes: 16, totalBytes: 16, truncated: false },
     }));
     vi.mocked(backend.decideNextStage).mockImplementationOnce(async () => {
       expect(execute).toHaveBeenCalledTimes(2);
@@ -1414,7 +1665,7 @@ describe("智能任务状态机", () => {
       { ...structuredClone(plan[0]), id: "clone", kind: "change", risk: scenario === "high_risk" ? "high" : "medium",
         command: "git clone -- https://example.invalid/team/app.git /opt/app", validation: "git -C /opt/app rev-parse --verify HEAD" },
       { ...structuredClone(plan[0]), id: "read-clone", kind: "observe",
-        command: 'opsark-tool files.get_structure {"rootPath":"/opt/app"}', validation: "" },
+        command: "", action: { type: "tool" as const, toolId: "files.get_structure", arguments: {"rootPath":"/opt/app"} }, validation: "" },
     ], task.rootGoal, store.tools);
     vi.spyOn(store, "queueManagedAdjustment").mockResolvedValue(undefined);
     const order: string[] = [];
@@ -1448,6 +1699,48 @@ describe("智能任务状态机", () => {
     }
   });
 
+  it("授权枚举保存候选值和作用域，拒绝非法选择，后续同一表单不重复弹出", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
+    task.status = "running";
+    const command = 'opsark-tool user.request_input {"title":"授权选择","fields":[{"key":"git_credential_decision","label":"认证方式","description":"使用已保存凭据或取消","type":"select","required":true,"options":[{"label":"已保存","value":"use_saved"},{"label":"取消","value":"cancel"}]}]}';
+    task.plan = [{ ...structuredClone(plan[0]), id: "authorization-form", command: "", action: { type: "tool", toolId: "user.request_input", arguments: { title: "授权选择", fields: [{ key: "git_credential_decision", label: "认证方式", description: "使用已保存凭据或取消", type: "select", required: true, options: [{label:"已保存",value:"use_saved"},{label:"取消",value:"cancel"}] }] } }, validation: "" }];
+    expect(store.presentTaskUserInput(task.id)).toBe(true);
+    expect(await store.provideUserInput(task.id, { git_credential_decision: "invented" })).toBe(false);
+    expect(task.submittedInputs?.git_credential_decision).toBeUndefined();
+    vi.spyOn(store, "advanceTask").mockResolvedValue();
+    await store.provideUserInput(task.id, { git_credential_decision: "use_saved" });
+    expect(task.submittedInputs?.git_credential_decision).toMatchObject({
+      type: "select", value: "use_saved", allowedValues: ["use_saved", "cancel"],
+      scope: { taskId: task.id, serverId: task.serverId, sourceStepId: "authorization-form" },
+    });
+    task.status = "running";
+    task.plan.push({ ...structuredClone(plan[0]), id: "duplicate-form", command: "", action: JSON.parse(JSON.stringify(task.plan[0].action)), validation: "" });
+    expect(store.presentTaskUserInput(task.id)).toBe(true);
+    expect(store.pendingUserInputs.filter(request => request.taskId === task.id)).toEqual([]);
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.pauseReason).toContain("USER_DECISION_ALREADY_CONFIRMED");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("认证通道失败直接保留证据暂停，不继续模型重试或索取密码", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "managed", "model-deepseek");
+    task.status = "running";
+    task.plan = [{ ...structuredClone(plan[0]), id: "clone", kind: "change",
+      command: "git clone https://gitee.com/team/app.git /opt/app", validation: "test -d /opt/app/.git" }];
+    vi.mocked(backend.executeCommand).mockResolvedValue({ success: false, simulated: false, exitCode: 128,
+      output: "PTY_AUTH_CHANNEL_UNAVAILABLE: controlling terminal unavailable" });
+    await store.runStep(task.id, "clone");
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.plan[0].result?.exitCode).toBe(128);
+    expect(task.plan[0].evidence?.length).toBeGreaterThan(0);
+    expect(task.pauseReason).toContain("AUTH_CHANNEL_UNAVAILABLE");
+    expect(task.autoAdjustmentSeconds).toBeUndefined();
+    expect(backend.reviewStep).not.toHaveBeenCalled();
+    expect(backend.decideNextStage).not.toHaveBeenCalled();
+  });
+
   it("用户输入工具展示参数用途，并在提交后以脱敏证据继续规划", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "safe", "model-deepseek");
@@ -1465,8 +1758,8 @@ describe("智能任务状态机", () => {
       ...structuredClone(plan[0]),
       id: "user-input-step",
       title: "获取部署参数",
-      command: 'opsark-tool user.request_input {"title":"补充部署信息","description":"用于生成安全的部署计划","fields":[{"key":"port","label":"服务端口","description":"应用对外监听的 TCP 端口","type":"number","required":true},{"key":"deploy_token","label":"部署令牌","description":"访问私有制品库的鉴权令牌","type":"password","required":true}]}',
-      validation: "true",
+      command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: {"title":"补充部署信息","description":"用于生成安全的部署计划","fields":[{"key":"port","label":"服务端口","description":"应用对外监听的 TCP 端口","type":"number","required":true},{"key":"deploy_token","label":"部署令牌","description":"访问私有制品库的鉴权令牌","type":"password","required":true}]} },
+      validation: "",
     }];
 
     await store.runStep(task.id, "user-input-step");
@@ -1529,8 +1822,8 @@ describe("智能任务状态机", () => {
       ...structuredClone(plan[0]),
       id: "target-secret-input",
       title: "获取目标服务器凭据",
-      command: 'opsark-tool user.request_input {"title":"目标服务器令牌","fields":[{"key":"DEPLOY_TOKEN","label":"部署令牌","description":"仅供目标服务器使用","type":"password","required":true}]}',
-      validation: "true",
+      command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: {"title":"目标服务器令牌","fields":[{"key":"DEPLOY_TOKEN","label":"部署令牌","description":"仅供目标服务器使用","type":"password","required":true}]} },
+      validation: "",
     }];
 
     await store.runStep(task.id, "target-secret-input");
@@ -1557,8 +1850,8 @@ describe("智能任务状态机", () => {
       ...structuredClone(plan[0]),
       id: "save-gitee-credential",
       title: "保存 Gitee 凭据",
-      command: 'opsark-tool user.request_input {"title":"提供Gitee HTTPS认证凭据","fields":[{"key":"GIT_USERNAME","label":"Gitee用户名","description":"https://gitee.com 平台账号的登录用户名，用于本次克隆认证。","type":"password","required":true,"credential":{"group":"gitee_read","kind":"git-https","role":"username","target":"gitee.com"}},{"key":"GIT_HTTP_CREDENTIAL","label":"Gitee密码或个人访问令牌","description":"https://gitee.com 平台账号的密码，或具有该仓库读取权限的个人访问令牌。","type":"password","required":true,"credential":{"group":"gitee_read","kind":"git-https","role":"secret","target":"gitee.com"}}]}',
-      validation: "true",
+      command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: {"title":"提供Gitee HTTPS认证凭据","fields":[{"key":"GIT_USERNAME","label":"Gitee用户名","description":"https://gitee.com 平台账号的登录用户名，用于本次克隆认证。","type":"password","required":true,"credential":{"group":"gitee_read","kind":"git-https","role":"username","target":"gitee.com"}},{"key":"GIT_HTTP_CREDENTIAL","label":"Gitee密码或个人访问令牌","description":"https://gitee.com 平台账号的密码，或具有该仓库读取权限的个人访问令牌。","type":"password","required":true,"credential":{"group":"gitee_read","kind":"git-https","role":"secret","target":"gitee.com"}}]} },
+      validation: "",
     }];
     await store.runStep(inputTask.id, "save-gitee-credential");
     await store.provideUserInput(inputTask.id, {
@@ -1745,8 +2038,8 @@ describe("智能任务状态机", () => {
       task.plan = [{
         ...structuredClone(plan[0]),
         id: `save-gitee-${index}`,
-        command: 'opsark-tool user.request_input {"title":"Gitee HTTPS 凭据","fields":[{"key":"GIT_USERNAME","label":"Gitee 用户名","description":"用于 gitee.com Git 认证的用户名","type":"password","required":true},{"key":"GIT_HTTP_CREDENTIAL","label":"Gitee 令牌","description":"用于 gitee.com Git 认证的访问令牌","type":"password","required":true}]}',
-        validation: "true",
+        command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: {"title":"Gitee HTTPS 凭据","fields":[{"key":"GIT_USERNAME","label":"Gitee 用户名","description":"用于 gitee.com Git 认证的用户名","type":"password","required":true},{"key":"GIT_HTTP_CREDENTIAL","label":"Gitee 令牌","description":"用于 gitee.com Git 认证的访问令牌","type":"password","required":true}]} },
+        validation: "",
       }];
       await store.runStep(task.id, `save-gitee-${index}`);
       await store.provideUserInput(task.id, { GIT_USERNAME: username, GIT_HTTP_CREDENTIAL: token });
@@ -1792,6 +2085,81 @@ describe("智能任务状态机", () => {
 
     expect(legacy?.submittedInputs).toEqual({});
     expect(legacy?.submittedSecretBindings).toEqual({});
+  });
+
+  it("工具计划恢复时不向当前、缓存或嵌套历史步骤注入 Shell 验收器", () => {
+    const task = JSON.parse(JSON.stringify(useOpsStore().createTask("srv-production-01", "safe", "model-deepseek")));
+    const createdAt = "2026-09-26T05:59:00.000Z";
+    const archivedStep = { ...connectionLookupPlanStep("archived-tool"), status: "completed", output: "historical result" };
+    const phase = {
+      id: "archived-phase", roundId: "archived-round", requirement: "查询连接资料",
+      reason: "replan", plan: [archivedStep], createdAt, completedAt: createdAt,
+    };
+    task.status = "awaiting_plan_approval";
+    task.plan = [connectionLookupPlanStep()];
+    task.latestGoalReview = {
+      decision: { decision: "adjust", reason: "下一阶段查询", summary: "查询连接资料", source: "model" },
+      snapshot: {}, nextPlan: [connectionLookupPlanStep("cached-next-tool")], createdAt,
+    };
+    task.phaseHistory = [phase];
+    task.planHistory = [{
+      id: "archived-history", roundId: "archived-round", requirement: "查询连接资料", status: "completed",
+      plan: [archivedStep], finalPlan: [archivedStep], phases: [phase], createdAt, completedAt: createdAt,
+    }];
+    localStorage.setItem("opsark.tasks", JSON.stringify([task]));
+    setActivePinia(createPinia());
+
+    const restored = useOpsStore().tasks.find(candidate => candidate.id === task.id)!;
+    const restoredPlans = [
+      restored.plan, restored.latestGoalReview!.nextPlan!, restored.phaseHistory![0].plan,
+      restored.planHistory![0].plan, restored.planHistory![0].finalPlan!, restored.planHistory![0].phases![0].plan,
+    ];
+    expect(restored.status).toBe("awaiting_plan_approval");
+    for (const steps of restoredPlans) {
+      expect(steps).toHaveLength(1);
+      expect(steps[0].validator).toBeUndefined();
+      expect(steps[0].action).toEqual(connectionLookupPlanStep().action);
+      expect(steps[0].command).toBe("");
+      expect(steps[0].validation).toBe("");
+    }
+    expect(restored.planHistory![0].plan[0].output).toBe("historical result");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.validateStep).not.toHaveBeenCalled();
+  });
+
+  it("工具计划恢复遇到已有 Shell 验收污染时保留原记录并撤销审批等待重新生成", () => {
+    const task = JSON.parse(JSON.stringify(useOpsStore().createTask("srv-production-01", "managed", "model-deepseek")));
+    const validator = { type: "command", command: "", validStates: ["matched"] };
+    const pollutedStep = {
+      ...connectionLookupPlanStep(), status: "awaiting_approval", validator,
+      safetyApprovalSnapshot: { command: "", validation: "", risk: "low" },
+      approvedSafetySnapshot: { command: "", validation: "", risk: "low" },
+    };
+    task.status = "awaiting_step_approval";
+    task.plan = [pollutedStep];
+    task.summary = "旧计划摘要";
+    task.autoAdjustmentSeconds = 5;
+    task.planHistory = [{
+      id: "polluted-history", requirement: "查询连接资料", status: "completed",
+      plan: [{ ...pollutedStep, status: "completed", output: "preserved historical result" }],
+      createdAt: task.createdAt, completedAt: task.updatedAt,
+    }];
+    localStorage.setItem("opsark.tasks", JSON.stringify([task]));
+    setActivePinia(createPinia());
+
+    const restored = useOpsStore().tasks.find(candidate => candidate.id === task.id)!;
+    expect(restored.status).toBe("needs_adjustment");
+    expect(restored.managedAdjustmentPhase).toBe("manual_required");
+    expect(restored.autoAdjustmentSeconds).toBeUndefined();
+    expect(restored.pauseReason).toMatch(/工具计划.*Shell.*重新生成/);
+    expect(restored.plan[0].validator).toEqual(validator);
+    expect(restored.plan[0].safetyApprovalSnapshot).toBeUndefined();
+    expect(restored.plan[0].approvedSafetySnapshot).toBeUndefined();
+    expect(restored.plan[0].result).toBeUndefined();
+    expect(restored.planHistory![0].plan[0]).toMatchObject({ validator, output: "preserved historical result" });
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.validateStep).not.toHaveBeenCalled();
+    expect(backend.processRequirement).not.toHaveBeenCalled();
   });
 
   it("启动时旁问不会清空已持久化执行计划与整体目标状态", () => {
@@ -1985,8 +2353,8 @@ describe("智能任务状态机", () => {
       ...structuredClone(plan[0]),
       id: "credential-input-step",
       title: "获取 Git 凭据",
-      command: 'opsark-tool user.request_input {"title":"Gitee HTTPS 凭据","fields":[{"key":"gitUsername","label":"Gitee 登录名","description":"用于 gitee.com 的 HTTPS Git 认证","type":"text","required":true},{"key":"GIT_HTTP_CREDENTIAL","label":"Gitee 令牌","description":"用于 gitee.com 私有仓库的密码或访问令牌","type":"password","required":true}]}',
-      validation: "true",
+      command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: {"title":"Gitee HTTPS 凭据","fields":[{"key":"gitUsername","label":"Gitee 登录名","description":"用于 gitee.com 的 HTTPS Git 认证","type":"text","required":true},{"key":"GIT_HTTP_CREDENTIAL","label":"Gitee 令牌","description":"用于 gitee.com 私有仓库的密码或访问令牌","type":"password","required":true}]} },
+      validation: "",
     }];
     await store.runStep(task.id, "credential-input-step");
     vi.mocked(backend.saveCredential)
@@ -2154,8 +2522,8 @@ describe("智能任务状态机", () => {
       ...structuredClone(plan[0]),
       id: "discovery-tool-step",
       title: "获取项目文件结构",
-      command: 'opsark-tool files.get_structure {"rootPath":"/opt/app"}',
-      validation: "true",
+      kind: "observe", command: "", action: { type: "tool" as const, toolId: "files.get_structure", arguments: {"rootPath":"/opt/app"} },
+      validation: "",
     }];
     const nextStep = { ...structuredClone(plan[1]), id: "deploy-after-structure" };
     vi.mocked(backend.decideNextStage).mockResolvedValueOnce({
@@ -2248,7 +2616,7 @@ describe("智能任务状态机", () => {
       await running;
 
       expect(backend.validateStep).toHaveBeenCalledTimes(1);
-      expect(backend.reviewStep).toHaveBeenCalledTimes(1);
+      expect(backend.reviewStep).toHaveBeenCalledTimes(2);
       expect(cancelCommand).not.toHaveBeenCalled();
       expect(task.plan[0].status).toBe("completed");
       expect(task.status).toBe("completed");
@@ -2337,6 +2705,8 @@ describe("智能任务状态机", () => {
           command: "java -version; npm --version",
           validation: "true",
         }];
+        vi.mocked(backend.reviewStep).mockResolvedValueOnce({ decision: "adjust", source: "model",
+          reason: "已确认当前命令需要调整", summary: "暂停当前命令并保留结果" });
         let finishExecution!: (value: {
           output: string;
           success: boolean;
@@ -2357,7 +2727,8 @@ describe("智能任务状态机", () => {
 
         if (permission === "observe") {
           task.status = "awaiting_step_approval";
-          task.plan[0].status = "awaiting_approval";
+          store.prepareTaskPlan(task);
+          requestStepApproval("observe", task.plan[0], store.tools);
         }
         const running = permission === "observe"
           ? store.approveStep(task.id, `stalled-${permission}`)
@@ -2370,7 +2741,7 @@ describe("智能任务状态机", () => {
         expect(task.plan[0].status).toBe("failed");
         expect(task.plan[0].result?.facts.stoppedByPeriodicReview).toBe(true);
         expect(backend.generatePlan).not.toHaveBeenCalled();
-        expect(task.messages.some(({ content }) => content.includes("不会自动调用模型"))).toBe(true);
+        expect(task.permission).toBe(permission);
       } finally {
         vi.useRealTimers();
       }
@@ -2393,7 +2764,8 @@ describe("智能任务状态机", () => {
       facts: { cancelled: true },
       failureReason: "用户终止",
     });
-    expect(task.summary).toContain("执行已停止");
+    expect(task.summary).toContain("取消请求已发送");
+    expect(task.summary).toContain("远端结果仍待核对");
     expect(task.goalCancellation).toBeUndefined();
   });
 
@@ -2452,7 +2824,7 @@ describe("智能任务状态机", () => {
     terminalSessions.releaseAgentPtyCommandAfterRecovery(paneId, "exec-terminate-pty");
   });
 
-  it("远程执行抛出异常时会清理执行 ID 并写入失败结果", async () => {
+  it("远程执行抛出异常时持久保留未知结果并停止自动重发", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
@@ -2464,9 +2836,12 @@ describe("智能任务状态机", () => {
     expect(task.currentExecutionId).toBeUndefined();
     expect(task.status).toBe("needs_adjustment");
     expect(task.plan[0].status).toBe("failed");
-    expect(task.plan[0].result?.facts.category).toBe("terminal_transport");
+    expect(task.plan[0].result?.executionStatus).not.toBe("failed");
+    expect(task.executionLedgerError?.stage).toBe("execution");
+    expect(task.executionLedgerError?.remoteResultKnown).toBe(false);
+    expect(task.plan[0].executionLedgerAttempts).toHaveLength(1);
     expect(task.adjustmentCount).toBe(0);
-    expect(task.adjustmentIncident?.kind).toBe("transport");
+    expect(backend.executeCommand).toHaveBeenCalledTimes(1);
     expect(backend.generatePlan).not.toHaveBeenCalled();
   });
 
@@ -2830,7 +3205,7 @@ describe("智能任务状态机", () => {
     { name: "本地参数拒绝", invalidArguments: true, disabled: false, error: undefined, expectedCount: 0, backendCalls: 0 },
     { name: "工具停用前置拒绝", invalidArguments: false, disabled: true, error: undefined, expectedCount: 0, backendCalls: 0 },
     { name: "正常执行", invalidArguments: false, disabled: false, error: undefined, expectedCount: 1, backendCalls: 1 },
-    { name: "明确 SSH 建连失败", invalidArguments: false, disabled: false, error: "SSH 网络连接失败：connection reset", expectedCount: 0, backendCalls: 1 },
+    { name: "明确 SSH 建连失败", invalidArguments: false, disabled: false, error: "SSH 网络连接失败：connection reset", expectedCount: 0, backendCalls: 3 },
     { name: "提交后结果未知", invalidArguments: false, disabled: false, error: "channel closed after dispatch", expectedCount: 1, backendCalls: 1 },
   ])("恢复工具执行计数：$name", async ({ invalidArguments, disabled, error, expectedCount, backendCalls }) => {
     const store = useOpsStore();
@@ -2838,7 +3213,7 @@ describe("智能任务状态机", () => {
     task.status = "needs_adjustment";
     task.plan = [{ ...structuredClone(plan[0]), id: "original-tool-failure", status: "failed" }];
     const toolStep = { ...structuredClone(plan[0]), id: "inspect-build-files", kind: "observe",
-      command: 'opsark-tool files.get_structure {"rootPath":"/opt/app"}', validation: "true", status: "pending" };
+      command: "", action: { type: "tool" as const, toolId: "files.get_structure", arguments: {"rootPath":"/opt/app"} }, validation: "", status: "pending" };
     vi.mocked(backend.decideNextStage).mockResolvedValueOnce({
       decision: "adjust",
       reason: "需要使用工具检查构建文件",
@@ -2851,7 +3226,7 @@ describe("智能任务状态机", () => {
     vi.spyOn(store, "advanceTask").mockResolvedValue();
     vi.spyOn(store, "routeAutomaticAdjustment").mockResolvedValue();
     if (disabled) store.tools.find(tool => tool.id === "files.get_structure")!.enabled = false;
-    if (error) vi.mocked(backend.getRemoteFileStructure).mockRejectedValueOnce(new Error(error));
+    if (error) for (let attempt = 0; attempt < backendCalls; attempt++) vi.mocked(backend.getRemoteFileStructure).mockRejectedValueOnce(new Error(error));
     task.status = "running";
     const call = { id: "tool-counting-call", toolId: "files.get_structure",
       arguments: invalidArguments ? [] : { rootPath: "/opt/app" } };
@@ -3103,6 +3478,7 @@ describe("智能任务状态机", () => {
       sessionContextChange: null as unknown as PlanStep["sessionContextChange"],
     }];
 
+    store.prepareTaskPlan(task);
     await store.approvePlan(task.id);
     expect(task.status).toBe("awaiting_step_approval");
     expect(backend.executeCommand).not.toHaveBeenCalled();
@@ -3182,7 +3558,7 @@ describe("智能任务状态机", () => {
 
     expect(task.status).toBe("awaiting_step_approval");
     expect(task.plan[0].status).toBe("awaiting_approval");
-    expect(task.plan[0].safetyApprovalSnapshot).toBeUndefined();
+    expect(task.plan[0].safetyApprovalSnapshot).toMatchObject({ command: "release-tool publish production --changed" });
     expect(task.plan[0].approvedSafetySnapshot).toBeUndefined();
     expect(task.messages.some(({ content }) => content.includes("原批准已失效"))).toBe(true);
     expect(backend.executeCommand).not.toHaveBeenCalled();
@@ -3200,6 +3576,7 @@ describe("智能任务状态机", () => {
       command: "deploy --token ${secret.DEPLOY_TOKEN}",
     }];
 
+    store.prepareTaskPlan(task);
     await store.approvePlan(task.id);
     await store.approveStep(task.id, "approved-secret-step");
 
@@ -3832,7 +4209,7 @@ describe("智能任务状态机", () => {
     task.status = "completed";
     task.rootGoal = "检查目标";
     task.plan = [{ ...structuredClone(plan[0]), id: "old-input", kind: "observe", status: "completed",
-      command: 'opsark-tool user.request_input {"title":"确认目标","fields":[]}',
+      command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: {"title":"确认目标","fields":[]} },
       output: '{"values":{"TARGET":"OLD_FORM_TARGET"}}',
       result: { executionStatus: "success", observationStatus: "matched", warnings: [], evidenceIds: ["input-evidence"],
         facts: { toolId: "user.request_input", values: { TARGET: "OLD_FACT_TARGET" } } },
@@ -3845,7 +4222,8 @@ describe("智能任务状态机", () => {
     await store.submitRequirement("srv-production-01", "继续检查目标", "safe", "model-deepseek");
     const context = JSON.parse(vi.mocked(backend.processRequirement).mock.calls[0][1].context);
     const serialized = JSON.stringify(context);
-    expect(context.previousExecution.steps[0].output.contentRef).toBe("confirmedUserInputs");
+    expect(context.previousExecution.steps[0].output.contentRef).toBeUndefined();
+    expect(context.previousExecution.steps[0].output.contentState).toBe("omitted");
     expect(context.confirmedUserInputs.index[0].status).toBe("unverified_legacy");
     expect(serialized).not.toContain("OLD_FORM_TARGET");
     expect(serialized).not.toContain("OLD_FACT_TARGET");
@@ -3970,7 +4348,7 @@ describe("智能任务状态机", () => {
     task.currentRoundId = "input-round";
     task.status = "awaiting_input";
     task.plan = [{ ...structuredClone(plan[0]), id: "choose-network", status: "awaiting_input", kind: "observe",
-      command: 'opsark-tool user.request_input {"title":"确认网段","fields":[]}', validation: "" }];
+      command: "", action: { type: "tool" as const, toolId: "user.request_input", arguments: {"title":"确认网段","fields":[]} }, validation: "" }];
     store.pendingUserInputs = [{ taskId: task.id, stepId: "choose-network", callId: "input-call", title: "确认网段",
       fields: [{ key: "CIDR", label: "Pod 网段", type: "text", required: true, description: "选择不冲突的网段" }] }];
     const pending = JSON.parse(JSON.stringify(store.pendingUserInputs));
@@ -4752,15 +5130,9 @@ describe("智能任务状态机", () => {
     expect(normalized[0].validation).not.toContain("\\${secret.DB_PASSWORD}");
   });
 
-  it("会把误写成命令行选项的工具 ID 规范化为注册 ID", () => {
-    const normalized = normalizePlanPreconditions([{
-      ...structuredClone(plan[0]),
-      kind: "observe",
-      command: 'opsark-tool --files.get_structure {"rootPath":"/opt/app"}',
-      validation: "true",
-    }]);
-
-    expect(normalized[0].command).toBe('opsark-tool files.get_structure {"rootPath":"/opt/app"}');
+  it("拒绝旧工具字符串与 CLI 兼容入口", () => {
+    expect(() => normalizePlanPreconditions([{ ...structuredClone(plan[0]), kind: "observe",
+      command: 'opsark-tool --files.get_structure {"rootPath":"/opt/app"}', validation: "" }])).toThrow("TOOL_IN_SHELL");
   });
 
   it("通用核心不自动注入任何技术栈的预检或替换原命令", () => {
@@ -4778,10 +5150,10 @@ describe("智能任务状态机", () => {
   it("有序计划允许只读工具与 Shell 混合，但只读工具本身不能声明为变更", () => {
     const read = {
       ...structuredClone(plan[0]), id: "read", kind: "observe" as const,
-      command: 'opsark-tool files.get_structure {"rootPath":"/opt/app"}', validation: "true",
+      command: "", action: { type: "tool" as const, toolId: "files.get_structure", arguments: {"rootPath":"/opt/app"} }, validation: "",
     };
     const shell = {
-      ...read, id: "shell", command: "pwd", validation: "",
+      ...read, action: undefined, id: "shell", command: "pwd", validation: "",
     };
     expect(normalizePlanPreconditions([read, shell]).map(step => step.command)).toEqual([read.command, shell.command]);
     expect(() => normalizePlanPreconditions([read, { ...read, id: "change", kind: "change" }]))
@@ -4792,8 +5164,8 @@ describe("智能任务状态机", () => {
     const connect = {
       ...structuredClone(plan[0]),
       id: "connect-target",
-      command: 'opsark-tool server.connect {"host":"192.168.1.237","port":22,"username":"root","passwordSecretKey":"PASSWORD"}',
-      validation: "true",
+      command: "", action: { type: "tool" as const, toolId: "server.connect", arguments: {"host":"192.168.1.237","port":22,"username":"root","passwordSecretKey":"PASSWORD"} },
+      validation: "",
     };
     const sourceValidation = {
       ...structuredClone(plan[1]),
@@ -4811,15 +5183,15 @@ describe("智能任务状态机", () => {
       ...structuredClone(plan[0]),
       id: "lookup-completed",
       status: "completed" as const,
-      command: 'opsark-tool server.resolve_connection {"host":"192.168.1.237"}',
-      validation: "true",
+      command: "", action: { type: "tool" as const, toolId: "server.resolve_connection", arguments: {"host":"192.168.1.237"} },
+      validation: "",
     };
     const connect = {
       ...structuredClone(plan[1]),
       id: "connect-pending",
       status: "pending" as const,
-      command: 'opsark-tool server.connect {"host":"192.168.1.237","credentialRef":"managed-server:target"}',
-      validation: "true",
+      command: "", action: { type: "tool" as const, toolId: "server.connect", arguments: {"host":"192.168.1.237","credentialRef":"managed-server:target"} },
+      validation: "",
     };
     const prematureValidation = { ...structuredClone(plan[2]), id: "validation-pending" };
 
@@ -4926,11 +5298,11 @@ describe("智能任务状态机", () => {
     expect(task.plan.map((step) => step.id)).toEqual(["evidence-based-change"]);
   });
 
-  it("正常程序证据一致时跳过逐步骤模型复核", async () => {
+  it("正常只读观察跳过逐步骤模型复核", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
-    task.plan = [structuredClone(plan[0])];
+    task.plan = [{ ...structuredClone(plan[0]), kind: "observe" }];
 
     await store.runStep(task.id, task.plan[0].id);
 
@@ -4951,12 +5323,14 @@ describe("智能任务状态机", () => {
       {
         ...structuredClone(plan[0]),
         id: "check-port-owner",
+        kind: "observe",
         title: "检查 O2OA 端口归属",
         command: "ss -lntp",
       },
       {
         ...structuredClone(plan[2]),
         id: "check-o2oa-logs",
+        kind: "observe",
         title: "查找 O2OA 日志",
         command: "find /opt/O2OA -type f -name '*.log' -print",
       },
@@ -5017,7 +5391,7 @@ describe("智能任务状态机", () => {
     expect(backend.executeCommand).not.toHaveBeenCalled();
   });
 
-  it("模型 complete 决定后续流转，但不改写未通过的真实后置校验", async () => {
+  it("模型 complete 不能绕过未通过的真实后置校验", async () => {
     vi.mocked(backend.validateStep).mockResolvedValueOnce({ passed: false, exitCode: 2, detail: "独立校验与主输出冲突，需要复核" });
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
@@ -5043,12 +5417,12 @@ describe("智能任务状态机", () => {
 
     expect(task.plan[0].status).toBe("failed");
     expect(task.plan[0].result?.facts.validationPassed).toBe(false);
-    expect(task.plan[1].status).toBe("skipped");
-    expect(task.status).toBe("completed");
+    expect(task.plan[1].status).toBe("pending");
+    expect(task.status).toBe("needs_adjustment");
     expect(backend.executeCommand).toHaveBeenCalledTimes(1);
   });
 
-  it("原始 Shell 输出未作领域解释不单独触发失败调整", async () => {
+  it("旧 Shell 变更需结果验收，证据不足时调整而非自动完成", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
@@ -5071,10 +5445,10 @@ describe("智能任务状态机", () => {
 
     await store.runStep(task.id, "unknown-http");
 
-    expect(task.status).toBe("completed");
-    expect(task.plan[0].status).toBe("completed");
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.plan[0].status).toBe("failed");
     expect(task.plan[0].result?.observationStatus).toBe("unknown");
-    expect(backend.reviewStep).not.toHaveBeenCalled();
+    expect(backend.reviewStep).toHaveBeenCalledOnce();
   });
 
   it("主命令成功但程序校验失败时会调用一次模型复核", async () => {
@@ -5095,7 +5469,7 @@ describe("智能任务状态机", () => {
 
     expect(backend.reviewStep).toHaveBeenCalledTimes(1);
     expect(task.plan[0].status).toBe("failed");
-    expect(task.status).toBe("completed");
+    expect(task.status).toBe("needs_adjustment");
     expect(task.messages.some((message) =>
       message.content.includes("后置状态尚未稳定")
       && message.content.includes("有界窗口"),
@@ -5128,7 +5502,7 @@ describe("智能任务状态机", () => {
     expect(task.pauseReason).toContain("模型复核不可用");
   });
 
-  it("变更后置失败依次执行关联修复和原契约复验，保留原始失败状态", async () => {
+  it("变更后置失败仅有 recovery 元数据不能直接放行后续步骤", async () => {
     vi.useFakeTimers();
     vi.mocked(backend.executeCommand).mockResolvedValue({ output: "command completed", success: true, simulated: false, exitCode: 0 });
     const store = useOpsStore();
@@ -5180,13 +5554,13 @@ describe("智能任务状态机", () => {
 
     expect(backend.reviewStep).toHaveBeenCalledTimes(1);
     expect(task.plan[0].status).toBe("failed");
-    expect(task.plan[1].status).toBe("completed");
-    expect(task.plan[2].status).toBe("completed");
-    expect(task.status).toBe("completed");
+    expect(task.plan[1].status).toBe("pending");
+    expect(task.plan[2].status).toBe("pending");
+    expect(task.status).toBe("needs_adjustment");
     vi.useRealTimers();
   });
 
-  it("平台不兼容事实保留，但 Core 不覆盖模型的 continue 决定", async () => {
+  it("平台不兼容事实保留，缺恢复动作的 continue 不放行", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     task.status = "running";
@@ -5220,11 +5594,11 @@ describe("智能任务状态机", () => {
     expect(backend.reviewStep).toHaveBeenCalledTimes(1);
     expect(task.plan[0].status).toBe("failed");
     expect(task.plan[0].result?.facts.platformIncompatible).toBe(true);
-    expect(task.status).toBe("completed");
-    expect(task.pauseReason).toBeUndefined();
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.pauseReason).toContain("恢复动作");
   });
 
-  it("旧 HTTP 计划的独立校验冲突如实保留，流转遵循模型 complete", async () => {
+  it("旧 HTTP 计划的独立校验冲突不能被模型 complete 覆盖", async () => {
     vi.useFakeTimers();
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
@@ -5264,7 +5638,7 @@ describe("智能任务状态机", () => {
     expect(task.plan[0].status).toBe("failed");
     expect(task.plan[0].result?.executionStatus).toBe("success");
     expect(task.plan[0].result?.facts.evidenceConflict).toBe(true);
-    expect(task.status).toBe("completed");
+    expect(task.status).toBe("needs_adjustment");
     expect(task.plan[0].output).toContain("首次未通过");
     expect(task.currentExecutionId).toBeUndefined();
     vi.useRealTimers();
@@ -5296,7 +5670,7 @@ describe("智能任务状态机", () => {
       { passed: true, exitCode: 0, detail: "通过", output: "$ mysql\n1\n[exit: 0]" },
     );
     expect(created.result.observationStatus).toBe("unknown");
-    expect(created.needsModelReview).toBe(false);
+    expect(created.needsModelReview).toBe(true);
 
     const httpStep = ensureStepValidator({
       ...structuredClone(plan[0]),
@@ -5386,7 +5760,7 @@ describe("智能任务状态机", () => {
     expect(classified.accepted).toBe(true);
     expect(classified.result.observationStatus).toBe("warning");
     expect(classified.result.facts.blockingSignal).toBe(false);
-    expect(classified.needsModelReview).toBe(false);
+    expect(classified.needsModelReview).toBe(true);
   });
 
   it("复合安装命令按运行时目标校验且 ABI 失败不改写主命令状态", () => {
@@ -5587,12 +5961,12 @@ describe("智能任务状态机", () => {
 
     await store.advanceTask(task.id);
 
-    expect(task.status).toBe("completed");
+    expect(task.status).toBe("needs_adjustment");
     expect(task.plan[0].status).toBe("completed");
-    expect(task.plan[1].status).toBe("completed");
+    expect(task.plan[1].status).toBe("failed");
     expect(backend.executeCommand).toHaveBeenCalledTimes(1);
-    expect(backend.reviewStep).not.toHaveBeenCalled();
-    expect(backend.decideNextStage).toHaveBeenCalledTimes(1);
+    expect(backend.reviewStep).toHaveBeenCalledOnce();
+    expect(backend.decideNextStage).not.toHaveBeenCalled();
   });
 
   it("历史运行时阻断不替代模型对后续步骤的语义判断", async () => {
@@ -5641,13 +6015,13 @@ describe("智能任务状态机", () => {
 
     await store.advanceTask(task.id);
 
-    expect(task.status).toBe("completed");
-    expect(task.plan[2].status).toBe("completed");
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.plan[2].status).toBe("failed");
     expect(backend.executeCommand).toHaveBeenCalledTimes(1);
-    expect(backend.reviewStep).not.toHaveBeenCalled();
+    expect(backend.reviewStep).toHaveBeenCalledOnce();
   });
 
-  it("best_effort 计划直接进入执行器硬门禁，不再追加 recovery 语义复核", async () => {
+  it("best_effort 允许授权内执行尝试，但不免除结果验收", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
     store.pushMessage(task, {
@@ -5703,10 +6077,10 @@ describe("智能任务状态机", () => {
 
     await store.advanceTask(task.id);
 
-    expect(backend.reviewStep).not.toHaveBeenCalled();
+    expect(backend.reviewStep).toHaveBeenCalledOnce();
     expect(backend.executeCommand).toHaveBeenCalledTimes(1);
-    expect(task.plan[1].status).toBe("completed");
-    expect(task.status).toBe("completed");
+    expect(task.plan[1].status).toBe("failed");
+    expect(task.status).toBe("needs_adjustment");
   });
 
   it("运行时阻断有明确修复步骤时允许继续到环境修复审批", async () => {
@@ -5717,8 +6091,9 @@ describe("智能任务状态机", () => {
       ensureStepValidator({
         ...structuredClone(plan[0]),
         id: "node-compatibility-with-fix",
+        kind: "observe",
         title: "诊断 Node.js 环境兼容性",
-        command: "node -v && echo TOO_OLD",
+        command: "node --version && echo TOO_OLD",
         validation: "test -f /opt/app/package.json",
       }),
       {
@@ -5834,6 +6209,36 @@ describe("智能任务状态机", () => {
     expect(task.plan[0].review).toMatchObject({ decision: "adjust", source: "model" });
   });
 
+  it("失败后只执行独立步骤，并在后续依赖步骤前停止", async () => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", "safe", "model-deepseek");
+    task.status = "running";
+    task.plan = [
+      { ...structuredClone(plan[0]), id: "link", kind: "change", command: "test -n ''", validation: "test -f /opt/report/map.js" },
+      { ...structuredClone(plan[0]), id: "backend-check", kind: "observe", command: "pwd", validation: "" },
+      { ...structuredClone(plan[1]), id: "ui-build", kind: "change", command: "npm run build:prod" },
+    ];
+    vi.mocked(backend.executeCommand).mockResolvedValueOnce({ output: "SRC_MAP_DIR=", success: false, exitCode: 1 });
+    vi.mocked(backend.reviewStep).mockResolvedValueOnce({ decision: "continue", source: "model",
+      reason: "仅后端检查独立", summary: "前端需等待地图修复", recoveryAction: {
+        kind: "continue_independent", reason: "后端检查无需地图", steps: [
+          { stepId: "backend-check", relation: "independent", reason: "独立只读检查" },
+          { stepId: "ui-build", relation: "dependent", reason: "需要地图文件" },
+        ],
+      },
+    });
+    await store.runStep(task.id, "link");
+    expect(backend.executeCommand).toHaveBeenCalledTimes(2);
+    expect(task.plan.map(step => step.status)).toEqual(["failed", "completed", "pending"]);
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.pauseReason).toContain("需要地图文件");
+    task.plan = JSON.parse(JSON.stringify(task.plan));
+    task.status = "running";
+    await store.runStep(task.id, "ui-build");
+    expect(backend.executeCommand).toHaveBeenCalledTimes(2);
+    expect(task.status).toBe("needs_adjustment");
+  });
+
   it("变更执行失败后可继续模型规划的普通只读诊断，不要求 recovery 关系", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "managed", "model-deepseek");
@@ -5878,13 +6283,17 @@ describe("智能任务状态机", () => {
       reason: "需读取当前依赖树定位 ERESOLVE",
       summary: "继续执行已规划的只读诊断。",
       source: "model",
+      recoveryAction: { kind: "continue_independent", reason: "依赖树诊断无需安装成功", steps: [
+        { stepId: "inspect-dependency-tree", relation: "independent", reason: "读取当前依赖树定位失败，不要求完整安装" },
+      ] },
     });
 
     await store.runStep(task.id, "install-dependencies");
 
     expect(backend.executeCommand).toHaveBeenCalledTimes(2);
     expect(task.plan[0]).toMatchObject({ status: "failed", result: { executionStatus: "failed" } });
-    expect(task.plan[1]).toMatchObject({ status: "completed", recovery: undefined });
+    expect(task.plan[1]).toMatchObject({ status: "completed" });
+    expect(task.plan[1].recovery).toBeUndefined();
     expect(task.messages.every(message => !message.content.includes("缺少有效恢复关系"))).toBe(true);
   });
 
@@ -5937,11 +6346,14 @@ describe("智能任务状态机", () => {
       reason: "剩余计划使用隔离容器，不升级宿主机运行时且能处理构建失败",
       summary: "保留当前系统版本并继续使用兼容容器构建。",
       source: "model",
+      recoveryAction: { kind: "continue_independent", reason: "已规划独立的容器构建路线", steps: [
+        { stepId: "container-recovery", relation: "independent", reason: "容器构建不依赖宿主构建成功" },
+      ] },
     });
 
     await store.runStep(task.id, "failed-build-with-recovery");
 
-    expect(backend.reviewStep).toHaveBeenCalledTimes(1);
+    expect(backend.reviewStep).toHaveBeenCalledTimes(2);
     const reviewContext = JSON.parse(vi.mocked(backend.reviewStep).mock.calls[0][1]);
     expect(vi.mocked(backend.reviewStep).mock.calls[0][0]).toContain("不要升级系统运行时");
     expect(reviewContext).not.toHaveProperty("userRequirement");

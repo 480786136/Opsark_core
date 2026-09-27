@@ -385,11 +385,11 @@ flowchart TD
 
 规范格式：
 
-```text
-opsark-tool <tool-id> {"key":"value"}
+```json
+{"action":{"type":"tool","toolId":"files.read_content","arguments":{"path":"/app/package.json"}},"validation":""}
 ```
 
-当前也兼容 `--key value` 参数，但 JSON 对象是推荐且最稳定的格式。执行前校验工具 ID、启用状态、参数类型、必填项、未知字段、范围和数组长度。无法解析的工具命令不能回落成 Shell 执行。
+不接受旧 `opsark-tool` 命令字符串和 CLI 参数格式。执行前按 Schema 校验工具 ID、必填字段、类型、枚举、未知字段、范围及条件约束；工具参数不经过 Shell 解析。具体重试上限和升级处理见 [结构化工具调用](STRUCTURED_TOOL_ACTIONS.md)。
 
 ### 9.2 工具目录
 

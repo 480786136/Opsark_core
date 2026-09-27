@@ -1,9 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
-import { executeToolCall, parseToolCommand, parseUserInputArguments } from "@/features/tools/toolExecutor";
+import { executeToolCall, parseToolAction, parseUserInputArguments } from "@/features/tools/toolExecutor";
 import { ToolArgumentValidationError } from "@/features/tools/toolArgumentProtocol";
 import { resolveToolRegistry } from "@/features/tools/toolRegistry";
+import { ExecutionLedgerError } from "@/services/executionLedger";
 
 describe("tool executor", () => {
+  it("preserves a nested ledger storage failure instead of converting it into a retryable tool error", async () => {
+    const error = new ExecutionLedgerError("receipt storage failed", "result_commit", true, "op", "attempt");
+    await expect(executeToolCall({ id: "call", toolId: "files.get_structure", arguments: { rootPath: "/srv" } },
+      resolveToolRegistry([]), { getRemoteFileStructure: async () => { throw error; } })).rejects.toBe(error);
+  });
   const selectField = {
     key: "target",
     label: "目标目录",
@@ -34,8 +40,8 @@ describe("tool executor", () => {
     expect(request.fields[0].options).not.toBe(options);
     expect(parseUserInputArguments({ ...request })).toEqual(request);
     expect(parseUserInputArguments(JSON.parse(JSON.stringify(request)))).toEqual(request);
-    expect(parseToolCommand(
-      `opsark-tool user.request_input ${JSON.stringify(request)}`, "select-restored",
+    expect(parseToolAction(
+      { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify(request)) }, "select-restored",
     )?.arguments).toEqual(request);
   });
 
@@ -74,8 +80,8 @@ describe("tool executor", () => {
   ])("rejects invalid select arguments in direct and command parsing: $name", ({ patch }) => {
     const request = { title: "选择目标", fields: [{ ...selectField, ...patch }] };
     expect(() => parseUserInputArguments(request)).toThrow();
-    expect(() => parseToolCommand(
-      `opsark-tool user.request_input ${JSON.stringify(request)}`, "select-invalid",
+    expect(() => parseToolAction(
+      { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify(request)) }, "select-invalid",
     )).toThrow();
   });
 
@@ -116,15 +122,15 @@ describe("tool executor", () => {
       { key: "MYSQL_PASSWORD", label: "密码", description: "数据库密码", type: "password", required: true,
         credential: { group: "db", kind: "database", role: "secret", target: "db.internal:3306" } },
     ];
-    const command = () => `opsark-tool user.request_input ${JSON.stringify({ title: "数据库凭据", fields })}`;
-    const call = parseToolCommand(command(), "local-repair")!;
+    const command = () => ({ type: "tool" as const, toolId: "user.request_input", arguments: { title: "数据库凭据", fields } });
+    const call = parseToolAction(command(), "local-repair")!;
     expect(call.arguments.fields).toEqual([{ ...fields[0], type: "password" }, fields[1]]);
     expect(fields[0].type).toBe("text");
     fields[1].credential.target = "other.internal:3306";
-    expect(() => parseToolCommand(command(), "mismatch")).toThrow("必须完全一致");
+    expect(() => parseToolAction(command(), "mismatch")).toThrow("必须完全一致");
     fields[1].credential.target = "db.internal:3306";
     fields[0].required = false;
-    expect(() => parseToolCommand(command(), "optional-credential")).toThrow("必填");
+    expect(() => parseToolAction(command(), "optional-credential")).toThrow("必填");
   });
   it("accepts the logged select + socket credential form without model repair and preserves path case", () => {
     const fields = [
@@ -134,75 +140,51 @@ describe("tool executor", () => {
         description: "凭据", type: "password", required: true,
         credential: { group: "db", kind: "database", role, target: "/Run/My DB/mysql.sock" } })),
     ];
-    const command = `opsark-tool user.request_input ${JSON.stringify({ title: "数据库认证", fields })}`;
-    const first = parseToolCommand(command, "socket")!;
+    const command = ({ type: "tool" as const, toolId: "user.request_input", arguments: { title: "数据库认证", fields } });
+    const first = parseToolAction(command, "socket")!;
     expect(first.arguments.fields).toEqual(fields);
-    expect(parseToolCommand(`opsark-tool user.request_input ${JSON.stringify(first.arguments)}`, "again")!.arguments).toEqual(first.arguments);
+    expect(parseToolAction({ type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify(first.arguments)) }, "again")!.arguments).toEqual(first.arguments);
   });
   it("reads task-scoped evidence pages and rejects task overrides", async () => {
     const evidenceId = "a".repeat(64);
-    const readEvidence = vi.fn().mockResolvedValue({ text: "history", historical: true, nextOffset: null });
-    const call = parseToolCommand(`opsark-tool evidence.read ${JSON.stringify({ evidenceId, offset: 12, limit: 20 })}`, "read")!;
+    const readEvidence = vi.fn().mockResolvedValue({ evidenceId, text: "history", historical: true, nextOffset: null, metadata: {}, offset: 12, totalCharacters: 19, instruction: "历史记录" });
+    const call = parseToolAction({ type: "tool" as const, toolId: "evidence.read", arguments: JSON.parse(JSON.stringify({ evidenceId, offset: 12, limit: 20 })) }, "read")!;
     const result = await executeToolCall(call, resolveToolRegistry([]), { readEvidence, getRemoteFileStructure: vi.fn() });
     expect(readEvidence).toHaveBeenCalledWith(evidenceId, 12, 20);
     expect(result).toMatchObject({ success: true, data: { historical: true } });
-    expect(() => parseToolCommand(`opsark-tool evidence.read ${JSON.stringify({ evidenceId, taskId: "other-task" })}`, "read")).toThrow();
-    expect(() => parseToolCommand(`opsark-tool evidence.read ${JSON.stringify({ evidenceId, limit: 12001 })}`, "read")).toThrow();
+    expect(() => parseToolAction({ type: "tool" as const, toolId: "evidence.read", arguments: JSON.parse(JSON.stringify({ evidenceId, taskId: "other-task" })) }, "read")).toThrow();
+    expect(() => parseToolAction({ type: "tool" as const, toolId: "evidence.read", arguments: JSON.parse(JSON.stringify({ evidenceId, limit: 12001 })) }, "read")).toThrow();
   });
   it("parses the model-facing tool command protocol", () => {
-    expect(parseToolCommand(
-      'opsark-tool files.get_structure {"rootPath":"/opt/app","maxDepth":4}',
+    expect(parseToolAction(
+      { type: "tool" as const, toolId: "files.get_structure", arguments: {"rootPath":"/opt/app","maxDepth":4} },
       "call-1",
     )).toEqual({
       id: "call-1",
       toolId: "files.get_structure",
-      arguments: { rootPath: "/opt/app", maxDepth: 4 },
+      arguments: { rootPath: "/opt/app", maxDepth: 4, maxNodes: 600, includeHidden: false },
     });
-    expect(parseToolCommand(
-      'opsark-tool --files.get_structure {"rootPath":"/opt/app"}',
-      "call-legacy",
-    )?.toolId).toBe("files.get_structure");
-    expect(parseToolCommand(
-      'opsark-tool files.get_structure {"rootPath":"/","maxDepth":3,"maxNodes":600,"includeHidden":false,"excludeDirectories":["/proc","/sys","/dev","/run","/var/lib/docker/overlay2"]}',
+    expect(parseToolAction(
+      { type: "tool" as const, toolId: "files.get_structure", arguments: {"rootPath":"/","maxDepth":3,"maxNodes":600,"includeHidden":false,"excludeDirectories":["/proc","/sys","/dev","/run","/var/lib/docker/overlay2"]} },
       "call-root-scan",
     )?.arguments.excludeDirectories).toEqual(["/proc", "/sys", "/dev", "/run", "/var/lib/docker/overlay2"]);
-    expect(parseToolCommand("uname -a", "call-2")).toBeUndefined();
-    expect(() => parseToolCommand("opsark-tool files.get_structure []", "call-3")).toThrow("JSON 对象");
-    expect(() => parseToolCommand("opsark-tool files.get_structure", "call-4")).toThrow("唯一工具 ID");
-    expect(() => parseToolCommand('opsark-tool unknown.tool {"value":1}', "call-5")).toThrow("不存在或未注册");
-    expect(() => parseToolCommand('opsark-tool files.get_structure {"rootPath":"/opt/app","unknown":1}', "call-6")).toThrow("不支持字段");
+    expect(parseToolAction({ type: "shell", command: "uname -a" }, "call-2")).toBeUndefined();
+    expect(() => parseToolAction({ type: "tool", toolId: "files.get_structure", arguments: [] as any }, "call-3")).toThrow("arguments 对象");
+    expect(() => parseToolAction({ type: "tool", toolId: "files.get_structure" } as any, "call-4")).toThrow("arguments 对象");
+    expect(() => parseToolAction({ type: "tool" as const, toolId: "unknown.tool", arguments: {"value":1} }, "call-5")).toThrow("不存在或未注册");
+    expect(() => parseToolAction({ type: "tool" as const, toolId: "files.get_structure", arguments: {"rootPath":"/opt/app","unknown":1} }, "call-6")).toThrow("不支持字段");
     try {
-      parseToolCommand('opsark-tool files.get_structure {"rootPath":"/opt/app","excludeDirectories":["/proc"]}', "call-outside");
+      parseToolAction({ type: "tool" as const, toolId: "files.get_structure", arguments: {"rootPath":"/opt/app","excludeDirectories":["/proc"]} }, "call-outside");
       expect.unreachable("根路径外的绝对排除项应在计划预检时被拒绝");
     } catch (error) {
       expect(error).toBeInstanceOf(ToolArgumentValidationError);
       expect((error as ToolArgumentValidationError).argumentPath).toBe("excludeDirectories");
     }
-    expect(() => parseToolCommand('opsark-tool user.request_input {"title":"凭据","fields":[{"key":"PASSWORD","label":"密码","description":"用途","type":"password","required":true,"extra":1}]}', "call-7")).toThrow("不支持字段");
+    expect(() => parseToolAction({ type: "tool" as const, toolId: "user.request_input", arguments: {"title":"凭据","fields":[{"key":"PASSWORD","label":"密码","description":"用途","type":"password","required":true,"extra":1}]} }, "call-7")).toThrow("不支持字段");
   });
 
-  it.each([
-    [
-      "换行串联的多个调用",
-      'opsark-tool files.get_structure {"rootPath":"/opt/app"}\nopsark-tool files.get_structure {"rootPath":"/srv/app"}',
-    ],
-    [
-      "同一行串联的多个调用",
-      'opsark-tool files.get_structure {"rootPath":"/opt/app"} opsark-tool files.get_structure {"rootPath":"/srv/app"}',
-    ],
-    [
-      "跨行参数对象",
-      'opsark-tool files.get_structure {\n"rootPath":"/opt/app"\n}',
-    ],
-  ])("拒绝非原子的工具命令：%s", (_name, command) => {
-    expect(() => parseToolCommand(command, "call-non-atomic")).toThrow("单行原子调用");
-  });
-
-  it("拒绝在一个工具调用中拼接多个 JSON 参数对象", () => {
-    expect(() => parseToolCommand(
-      'opsark-tool files.get_structure {"rootPath":"/opt/app"} {"rootPath":"/srv/app"}',
-      "call-multiple-objects",
-    )).toThrow("单个 JSON 对象");
+  it.each(["opsark-tool files.get_structure {}", "opsark-tool files.get_structure --root-path=/opt", "opsark-tool --files.get_structure {}"])("rejects removed string entry: %s", value => {
+    expect(() => parseToolAction(value as any, "legacy")).toThrow();
   });
 
   it("拒绝把敏感凭据伪装成普通文本输入", () => {
@@ -234,8 +216,8 @@ describe("tool executor", () => {
       { group: "gitee_read", kind: "git-https", role: "username", target: "gitee.com" },
       { group: "gitee_read", kind: "git-https", role: "secret", target: "gitee.com" },
     ]);
-    expect(parseToolCommand(
-      `opsark-tool user.request_input ${JSON.stringify(request)}`,
+    expect(parseToolAction(
+      { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify(request)) },
       "call-structured-credential",
     )?.arguments).toEqual(request);
   });
@@ -292,8 +274,8 @@ describe("tool executor", () => {
     },
   ])("rejects an invalid credential contract: $name", ({ fields, error }) => {
     expect(() => parseUserInputArguments({ title: "Git credential", fields })).toThrow(error);
-    expect(() => parseToolCommand(
-      `opsark-tool user.request_input ${JSON.stringify({ title: "Git credential", fields })}`,
+    expect(() => parseToolAction(
+      { type: "tool" as const, toolId: "user.request_input", arguments: JSON.parse(JSON.stringify({ title: "Git credential", fields })) },
       "call-invalid-credential-contract",
     )).toThrow(error);
   });
@@ -323,29 +305,6 @@ describe("tool executor", () => {
     expect(readRemoteFileContent).toHaveBeenCalledWith({ path: "/opt/app/README.md", maxBytes: 4096 });
     expect(softwareResult.success).toBe(true);
     expect(checkSoftware).toHaveBeenCalledWith({ names: ["git"], includeVersions: true });
-  });
-
-  it("parses CLI-style tool arguments emitted by the planner", () => {
-    expect(parseToolCommand(
-      'opsark-tool server.resolve_connection --host "10.213.81.54" --port 22',
-      "call-cli-1",
-    )).toEqual({
-      id: "call-cli-1",
-      toolId: "server.resolve_connection",
-      arguments: { host: "10.213.81.54", port: 22 },
-    });
-    expect(parseToolCommand(
-      "opsark-tool files.get_structure --root-path=/opt/app --include-hidden false --max-depth 4",
-      "call-cli-2",
-    )?.arguments).toEqual({ rootPath: "/opt/app", includeHidden: false, maxDepth: 4 });
-    expect(() => parseToolCommand(
-      "opsark-tool server.resolve_connection --host one --host two",
-      "call-cli-3",
-    )).toThrow("参数重复");
-    expect(() => parseToolCommand(
-      "opsark-tool server.connect --host 192.168.1.237 --passwordSecretKey TARGET_SSH_PASSWORD",
-      "call-cli-4",
-    )).toThrow("同时提供 username 和 passwordSecretKey");
   });
 
   it("routes a validated file structure call", async () => {
@@ -443,7 +402,7 @@ describe("tool executor", () => {
       sourcePath: "/root/build/app.rpm",
       targetPath: "/root/app.rpm",
       transferredBytes: 42,
-      sha256: "abc",
+      sha256: "a".repeat(64),
       targetServerId: "server-b",
     });
     const result = await executeToolCall({
@@ -462,7 +421,7 @@ describe("tool executor", () => {
     expect(result.success).toBe(true);
     expect(transferFileBetweenServers).toHaveBeenCalledWith(expect.objectContaining({
       targetServer: "10.0.0.2",
-      overwrite: undefined,
+      overwrite: false,
     }));
   });
 
@@ -482,7 +441,7 @@ describe("tool executor", () => {
       arguments: {
         host: "192.168.1.23",
         username: "root",
-        passwordSecretKey: "ssh_password",
+        passwordSecretKey: "SSH_PASSWORD",
       },
     }, resolveToolRegistry([]), { getRemoteFileStructure: vi.fn(), connectServer });
 
@@ -537,8 +496,8 @@ describe("tool executor", () => {
     }, resolveToolRegistry([]), dependency);
 
     expect(disabledResult.error?.code).toBe("TOOL_DISABLED");
-    expect(invalidResult.error?.code).toBe("TOOL_EXECUTION_FAILED");
-    expect(outsideExcludeResult.error?.code).toBe("TOOL_EXECUTION_FAILED");
+    expect(invalidResult.error?.code).toBe("INVALID_ARGUMENTS");
+    expect(outsideExcludeResult.error?.code).toBe("INVALID_ARGUMENTS");
     expect(dependency.getRemoteFileStructure).not.toHaveBeenCalled();
   });
 });

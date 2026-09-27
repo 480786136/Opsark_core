@@ -2,13 +2,15 @@ import { defineStore } from "pinia";
 import { invoke } from "@tauri-apps/api/core";
 import { useOpsStore } from "@/stores/ops";
 import { officialPreferences } from "./officialModelSettings";
+import { validateModelConfiguration } from "@/features/agent/modelCapabilities";
 
 export interface AccountSnapshot {
   billingMode?: "direct" | "reserved";
   githubLinked?: boolean;
   user: { id: string; email: string };
   balance: { available: number; reserved: number; revision: number; unit: "tokens" };
-  models: { id: string; name?: string }[];
+  models: { id: string; name?: string; capabilities?: import("@/types").ModelCapabilities;
+    capabilitiesV2?: import("@/types").ModelCapabilitiesV2; apiProtocol?: import("@/types").ModelApiProtocol }[];
   endpoint: string;
   model_warning?: string;
 }
@@ -66,11 +68,18 @@ export const useAccountStore = defineStore("account", {
         const id = `official:${snapshot.user.id}:${item.id}`;
         ops.models.push({ name: item.name || item.id, timeoutSeconds: 90, ...officialPreferences(id),
           id, model: item.id, provider: "OpsArk", endpoint: snapshot.endpoint,
-          enabled: true, hasApiKey: true, source: "official" });
+          enabled: true, hasApiKey: true, source: "official", capabilities: item.capabilities,
+          ...(item.capabilitiesV2 ? { capabilitiesV2: item.capabilitiesV2,
+            apiProtocol: officialPreferences(id).apiProtocol ?? item.apiProtocol ?? item.capabilitiesV2.preferredProtocol } : {}) });
         // This is an identity marker, not a secret. Rust resolves the actual access token.
         ops.modelApiKeys[id] = `opsark-account:${snapshot.user.id}`;
         ops.modelAvailability[id] = { status: snapshot.balance.available > 0 ? "available" : "unavailable",
           reason: snapshot.balance.available > 0 ? "官方账号模型（按实际用量扣减积分）" : "官方积分不足，请前往账号页面" };
+        if (item.capabilitiesV2 || ops.models[ops.models.length - 1].apiProtocol === "responses") {
+          try { validateModelConfiguration(ops.models[ops.models.length - 1], { requireStructured: true }); }
+          catch (error) { ops.modelAvailability[id] = { status: "unavailable",
+            reason: `官方接入配置需要确认：${error instanceof Error ? error.message : String(error)}。请管理员核对后刷新官方模型。` }; }
+        }
       }
     },
     async initialize() {

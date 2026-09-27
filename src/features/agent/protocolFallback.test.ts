@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { decideTaskNextStage } from "./agentService";
-import { backend, buildPlanNormalizationRepair, PlanProtocolError } from "@/services/backend";
+import { backend, buildPlanNormalizationRepair, ModelInvocationError, PlanProtocolError } from "@/services/backend";
 import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 import type { ModelProfile, NextStageDecision, OpsTask, PlanStep } from "@/types";
 import missingSteps from "@/services/fixtures/next-stage-missing-steps.json";
@@ -50,6 +50,8 @@ describe("bounded protocol recovery", () => {
     const context = JSON.parse(decide.mock.calls[1][1].context);
     expect(context.protocolReplan.rule).toContain("PIPELINE_STATUS_LOST");
     expect(context.protocolRepairBudget.remainingModelCalls).toBe(1);
+    expect(context._modelRecovery).toEqual(JSON.parse(decide.mock.calls[0][1].context)._modelRecovery);
+    expect(rejected.repair.modelRecovery).toEqual(context._modelRecovery);
     expect(result.nextPlan[0].command).not.toContain("head -n");
     expect(input.task.plan).toEqual(saved);
   });
@@ -80,8 +82,8 @@ describe("bounded protocol recovery", () => {
     const input = fixture();
     const original = parseFailure();
     input.task.protocolRepair!.repair = original.repair;
-    const question = { ...observe('opsark-tool user.request_input {"title":"部署方式","description":"请选择部署方式","fields":[{"key":"mode","label":"部署方式","description":"选择运行方式","type":"select","required":true,"options":[{"value":"host","label":"主机服务"},{"value":"container","label":"容器"}]}]}'),
-      validation: "true" };
+    const question = { ...observe(""), action: { type: "tool" as const, toolId: "user.request_input", arguments: {"title":"部署方式","description":"请选择部署方式","fields":[{"key":"mode","label":"部署方式","description":"选择运行方式","type":"select","required":true,"options":[{"value":"host","label":"主机服务"},{"value":"container","label":"容器"}]}]} },
+      validation: "" };
     const decide = vi.fn().mockResolvedValueOnce({ ...next([question]), decision: "adjust" });
     const result = await decideTaskNextStage(input, decide);
     const context = JSON.parse(decide.mock.calls[0][1].context);
@@ -89,10 +91,7 @@ describe("bounded protocol recovery", () => {
     expect(context.protocolReplan.rejectedResponse.instruction).toContain("不能只在 summary 中声称已提问");
     expect(result.complete).toBe(false);
     expect(result.nextPlan).toHaveLength(1);
-    const prefix = "opsark-tool user.request_input ";
-    expect(result.nextPlan[0].command.startsWith(prefix)).toBe(true);
-    expect(JSON.parse(result.nextPlan[0].command.slice(prefix.length)))
-      .toEqual(JSON.parse(question.command.slice(prefix.length)));
+    expect(result.nextPlan[0].action).toEqual(question.action);
     expect(result.nextPlan[0].status).toBe("pending");
     expect(input.task.plan[0].status).toBe("completed");
   });
@@ -172,6 +171,32 @@ describe("bounded protocol recovery", () => {
     const decide = vi.fn().mockRejectedValue(error);
     await expect(decideTaskNextStage(fixture(), decide)).rejects.toBe(error);
     expect(decide).toHaveBeenCalledOnce();
+  });
+
+  it.each(["MODEL_RESULT_UNAVAILABLE", "MODEL_DISPATCH_UNKNOWN", "MODEL_RECOVERY_BUDGET_EXHAUSTED"])("does not replan after terminal %s", async (code) => {
+    const error = new ModelInvocationError("stopped", undefined, { code, origin: "core", retryable: false,
+      message: "stop", stage: code === "MODEL_RECOVERY_BUDGET_EXHAUSTED" ? "recovery_budget" : "request_recovery" });
+    const input = { ...fixture(), recoverProtocolFailures: true };
+    const saved = structuredClone(input.task);
+    const decide = vi.fn().mockRejectedValue(error);
+    await expect(decideTaskNextStage(input, decide)).rejects.toBe(error);
+    expect(decide).toHaveBeenCalledOnce();
+    expect(input.task).toEqual(saved);
+  });
+
+  it("uses a fresh operation for independent stages and resumes an active saved repair budget", async () => {
+    const input = fixture();
+    const identity = { operationId: "original-operation", startedAtMs: 1234567, maxGenerations: 3, maxTotalTokens: 12000 };
+    input.task.protocolRepair!.repair.modelRecovery = identity;
+    const decide = vi.fn().mockResolvedValue(next());
+    await decideTaskNextStage(input, decide);
+    expect(JSON.parse(decide.mock.calls[0][1].context)._modelRecovery).toEqual(identity);
+    delete input.task.protocolRepair;
+    await decideTaskNextStage(input, decide);
+    await decideTaskNextStage(input, decide);
+    const contexts = decide.mock.calls.map(call => JSON.parse(call[1].context)._modelRecovery);
+    expect(new Set(contexts.map(context => context.operationId)).size).toBe(3);
+    expect(input.task).not.toHaveProperty("_modelRecovery");
   });
 
   it("honors cancellation before another proposal", async () => {

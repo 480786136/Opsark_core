@@ -1,11 +1,14 @@
+import type { ToolFailureCategory, ToolDispatchState } from "./toolFailure";
 export interface ToolDefinition {
   id: string;
   implementation: string;
+  effect?: "read" | "change" | "interaction";
   name: string;
   description: string;
   usageInstructions: string;
   inputSchema: Record<string, unknown>;
   outputDescription: string;
+  outputSchema?: Record<string, unknown>;
   /** standalone is a planning boundary; read_batch observations can join ordered mixed plans. */
   planMode?: "regular" | "standalone" | "read_batch";
   /** Tells the generic orchestrator what to do after a successful tool call. */
@@ -55,7 +58,8 @@ export interface ToolResult<T = unknown> {
   toolId: string;
   success: boolean;
   data?: T;
-  error?: { code: string; message: string };
+  error?: { code: string; message: string; category?: ToolFailureCategory; dispatchState?: ToolDispatchState; argumentPath?: string; retryAfterMs?: number };
+  attempts?: Array<{ number: number; category?: ToolFailureCategory; dispatchState?: ToolDispatchState; code?: string }>;
   truncated?: boolean;
 }
 

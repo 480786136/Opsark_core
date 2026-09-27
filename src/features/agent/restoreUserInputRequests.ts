@@ -1,4 +1,4 @@
-import { parseToolCommand, parseUserInputArguments } from "@/features/tools/toolExecutor";
+import { parseToolAction, parseUserInputArguments } from "@/features/tools/toolExecutor";
 import type { PendingUserInput, ToolDefinition } from "@/features/tools/types";
 import type { OpsTask } from "@/types";
 
@@ -15,7 +15,8 @@ export function restoreUserInputRequests(
     if (unfinished.length !== 1 || unfinished[0].status !== "awaiting_input") continue;
     const step = unfinished[0];
     try {
-      const call = parseToolCommand(step.command, createCallId(), tools);
+      if (step.command || step.validation) continue;
+      const call = parseToolAction(step.action, createCallId(), tools);
       const tool = call && tools.find((item) => item.id === call.toolId);
       if (!call || !tool?.enabled || tool.executionMode !== "user-input") continue;
       const request = parseUserInputArguments(call.arguments);
@@ -27,7 +28,7 @@ export function restoreUserInputRequests(
         roundId: task.currentRoundId,
         workflowEpoch: task.workflowEpoch ?? 0,
         serverId: task.executionTargetServerId ?? task.serverId,
-        command: step.command,
+        command: JSON.stringify(step.action),
       });
     } catch {
       // An invalid saved command must not create a form or resume execution.

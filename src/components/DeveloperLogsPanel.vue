@@ -66,11 +66,11 @@ function normalizeDeveloperLogEntry(value: unknown): DeveloperLogEntry | undefin
   const usage = record.tokenUsage;
   if (usage && typeof usage === "object" && !Array.isArray(usage)) {
     const item = usage as Record<string, unknown>;
-    if (typeof item.input === "number" && Number.isFinite(item.input)
-      && typeof item.output === "number" && Number.isFinite(item.output)
-      && typeof item.total === "number" && Number.isFinite(item.total)
-      && (item.source === "api" || item.source === "estimated")) {
-      entry.tokenUsage = { input: item.input, output: item.output, total: item.total, source: item.source };
+    const number = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+    if ((item.source === "api" || item.source === "estimated") && [item.input, item.output, item.total].every(value => value == null || number(value) !== null)) {
+      entry.tokenUsage = { input: number(item.input), output: number(item.output), total: number(item.total), source: item.source };
+      const reasoning = number(item.reasoning);
+      if (reasoning !== null) entry.tokenUsage.reasoning = reasoning;
     }
   }
   return entry;
@@ -225,7 +225,12 @@ function openServer(key: string) { selectedServerId.value = key; selectedTaskId.
 function closeServer() { selectedServerId.value = null; selectedTaskId.value = ""; serverFilter.value = "all"; taskFilter.value = "all"; }
 function formatTime(value: string) { return new Date(value).toLocaleString(locale.value, { hour12: false }); }
 async function copyLog(entry: DeveloperLogEntry) { await navigator.clipboard?.writeText(JSON.stringify(entry, null, 2)); copiedId.value = entry.id; window.setTimeout(() => { if (copiedId.value === entry.id) copiedId.value = ""; }, 1500); }
-function tokenText(entry: DeveloperLogEntry) { const u = entry.tokenUsage; return u && [u.input, u.output, u.total].every(Number.isFinite) ? `${u.source === "api" ? t("logs.tokenExact") : t("logs.tokenEstimated")} ${u.total.toLocaleString()} (${u.input.toLocaleString()} → ${u.output.toLocaleString()})` : t("logs.tokenUnavailable"); }
+function tokenText(entry: DeveloperLogEntry) {
+  const u = entry.tokenUsage;
+  if (!u) return t("logs.tokenUnavailable");
+  const format = (n: number | null) => n?.toLocaleString() ?? (zh.value ? "未知" : "unknown");
+  return `${u.source === "api" ? t("logs.tokenExact") : t("logs.tokenEstimated")} ${format(u.total)} (${format(u.input)} → ${format(u.output)})${u.reasoning !== undefined ? ` · reasoning ${u.reasoning} (included in output)` : ""}`;
+}
 const diskErrorLabel = computed(() => diskError.value ? (zh.value ? "读取磁盘日志失败，请稍后重试" : "Failed to read disk logs. Try again later.") : "");
 const diskProgressLabel = computed(() => zh.value ? `磁盘已加载 ${diskLogs.value.length} / ${diskTotal.value}` : `Loaded ${diskLogs.value.length} / ${diskTotal.value} from disk`);
 const skippedLinesLabel = computed(() => zh.value ? `已跳过 ${skippedLines.value} 条无法读取的日志` : `Skipped ${skippedLines.value} unreadable logs`);

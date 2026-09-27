@@ -1,6 +1,8 @@
 import { backend, PlanProtocolError } from "@/services/backend";
 import { protocolRejectionFingerprint } from "@/services/planProtocolRepair";
+import { createModelRecoveryContext } from "@/services/modelRecovery";
 import { taskAttemptContext } from "@/features/agent/attemptState";
+import { OperationalRecoveryError, prepareOperationalDecision } from "./operationalRecovery";
 import { workflowLifetime, StaleWorkflowError } from "./workflowLifetime";
 import { activeProtocolRepair, freshProtocolReplanSteps, protocolReplanContext } from "./protocolReplan";
 import { markProtocolReplanApprovals } from "./protocolReplanApproval";
@@ -21,7 +23,7 @@ import {
   selectAdjustmentSteps,
   selectContinuationSteps,
 } from "@/features/agent/taskProgression";
-import { activeRoundSteps } from "@/features/agent/taskGoal";
+import { activeRoundSteps, TASK_REQUIREMENT_INSTRUCTION } from "@/features/agent/taskGoal";
 import { assertTaskPlanAuthorization, recoveryHistory, validateRecoveryReferences } from "./recoveryContract";
 import { buildSkillContext } from "@/features/skills/skillRegistry";
 import { compactReviewText } from "@/features/agent/longRunningReviewOutput";
@@ -161,6 +163,28 @@ function sanitizeSummaryText(value: string) {
     .trim();
 }
 
+/** Keep execution success separate from an explicitly failed acceptance.
+ * Ordinary not_found/unhealthy discovery is not itself a task blocker. */
+function hasFailedSummaryEvidence(step: PlanStep) {
+  const result = step.result;
+  return step.status === "failed" || result?.executionStatus === "failed"
+    || result?.executionStatus === "blocked" || result?.facts.blockingSignal === true
+    || result?.facts.validationPassed === false || result?.facts.acceptancePassed === false
+    || (result?.facts.semanticAcceptanceRequired === true
+      && result.facts.semanticAcceptanceStatus === "not_met");
+}
+
+function summaryBlockerReason(step: PlanStep | undefined) {
+  if (!step) return undefined;
+  return step.result?.failureReason
+    || (step.review?.decision === "adjust" ? step.review.reason : undefined)
+    || (step.result?.facts.semanticAcceptanceStatus === "not_met"
+      && typeof step.result.facts.semanticAcceptanceReason === "string"
+      ? step.result.facts.semanticAcceptanceReason : undefined)
+    || (step.result?.executionStatus === "success" && hasFailedSummaryEvidence(step)
+      ? "命令已执行，但验收未通过或结果存在明确阻断；退出码为 0 不代表目标达成。" : undefined);
+}
+
 /** Builds an authoritative, output-free failure ledger for the summary model. */
 export function buildFailedTaskSummaryContext(
   task: OpsTask,
@@ -170,13 +194,13 @@ export function buildFailedTaskSummaryContext(
   // The complete ledger remains local and is used only to locate the newest
   // blocker. The model-facing fact snapshot is deliberately bounded.
   const contextSteps = steps.slice(-FAILURE_SUMMARY_STEP_LIMIT);
-  const latestFailedStep = [...steps].reverse().find((step) => (
-    step.status === "failed"
-    || step.result?.executionStatus === "failed"
-    || step.result?.executionStatus === "blocked"
-  ));
-  const latestReason = latestFailedStep?.result?.failureReason
-    || latestFailedStep?.review?.reason
+  // A current undispatched step may have been stopped at its entry review.
+  // Prefer that actual stop over historical failures from abandoned paths.
+  const latestFailedStep = task.plan.find(step =>
+    ["pending", "awaiting_approval"].includes(step.status)
+    && !step.result && step.review?.decision === "adjust")
+    ?? [...steps].reverse().find(hasFailedSummaryEvidence);
+  const latestReason = summaryBlockerReason(latestFailedStep)
     || task.lastAdjustmentBlocker
     || task.pauseReason
     || deterministicFinalReason;
@@ -193,7 +217,8 @@ export function buildFailedTaskSummaryContext(
       executionStatus: latestFailedStep?.result?.executionStatus,
       exitCode: latestFailedStep?.result?.exitCode,
     },
-    confirmedFacts: contextSteps.filter((step) => step.status === "completed" && step.result).map((step) => ({
+    confirmedFacts: contextSteps.filter((step) => step.status === "completed" && step.result
+      && !hasFailedSummaryEvidence(step)).map((step) => ({
       stepTitle: sanitizeSummaryText(step.title).slice(0, FAILURE_SUMMARY_TEXT_LIMIT),
       executionStatus: step.result!.executionStatus,
       observationStatus: step.result!.observationStatus,
@@ -202,12 +227,13 @@ export function buildFailedTaskSummaryContext(
         ? { category: sanitizeSummaryText(step.result!.facts.category).slice(0, 80) }
         : {},
     })),
-    unconfirmedFacts: contextSteps.filter((step) => step.status !== "completed").map((step) => ({
+    unconfirmedFacts: contextSteps.filter((step) => step.status !== "completed"
+      || hasFailedSummaryEvidence(step)).map((step) => ({
       stepTitle: sanitizeSummaryText(step.title).slice(0, FAILURE_SUMMARY_TEXT_LIMIT),
       status: step.status,
       expected: sanitizeSummaryText(step.expected).slice(0, FAILURE_SUMMARY_TEXT_LIMIT),
-      reason: step.result?.failureReason
-        ? sanitizeSummaryText(step.result.failureReason).slice(0, FAILURE_SUMMARY_REASON_LIMIT)
+      reason: summaryBlockerReason(step)
+        ? sanitizeSummaryText(summaryBlockerReason(step)!).slice(0, FAILURE_SUMMARY_REASON_LIMIT)
         : undefined,
     })),
     authority: "以上程序结论不可被模型改写；模型只能解释原因，不得将未完成、失败、阻断或未验证事实总结为成功。",
@@ -276,7 +302,7 @@ export function buildCompactFailedSummarySteps(steps: PlanStep[]): PlanStep[] {
 /**
  * Applies an explicit overall-goal gate after the active queue is exhausted.
  * Finishing the current plan is only phase completion; the model must compare all
- * preserved evidence with rootGoal and every active Skill's final acceptance rules.
+ * preserved evidence with the active user requirements and relevant Skill guidance.
  */
 export async function reviewTaskGoal(
   input: ReviewTaskGoalInput,
@@ -297,7 +323,7 @@ export async function reviewTaskGoal(
     trigger: "overall_goal_completion",
     baseSnapshot: snapshot,
     activeSkillAcceptance: activeSkills,
-    instruction: `用外层用户目标、baseSnapshot 的真实输出与结构化结果和 activeSkillAcceptance 判断整体目标。阶段总结不等于成功证据；缺少最终验收证据时必须 adjust。若返回 adjust，reason 和 summary 必须指出未满足条件，区分未采集与上下文省略。${GOAL_DIRECTED_RECOVERY_INSTRUCTION}${DECISION_EVIDENCE_INSTRUCTION}`,
+    instruction: `用外层用户目标、baseSnapshot.taskRequirements、真实输出与结构化结果和 activeSkillAcceptance 判断整体目标。${TASK_REQUIREMENT_INSTRUCTION}阶段总结不等于成功证据；缺少最终验收证据时必须 adjust。若返回 adjust，reason 和 summary 必须指出未满足条件，区分未采集与上下文省略。${GOAL_DIRECTED_RECOVERY_INSTRUCTION}${DECISION_EVIDENCE_INSTRUCTION}`,
   };
   const decision = await review(
     requirement,
@@ -357,22 +383,41 @@ export async function decideTaskNextStage(
   }
   try {
     const previousFailure = activeProtocolRepair(input.task);
+    // The proposals and any nested protocol repairs are one bounded model
+    // operation. A later independent stage receives a fresh identity.
+    const modelRecovery = previousFailure?.repair.modelRecovery ?? createModelRecoveryContext();
     const seenPlans = new Set(previousFailure
       ? [protocolRejectionFingerprint(previousFailure.repair)] : []);
-    const maxProposals = previousFailure ? 2 : input.recoverProtocolFailures ? 3 : 1;
+    const maxProposals = previousFailure ? 2 : input.recoverProtocolFailures ? 3 : 2;
     let protocolRecovered = Boolean(previousFailure);
     let decision: NextStageDecision | undefined;
+    let prepared: ReturnType<typeof prepareOperationalDecision> | undefined;
     for (let attempt = 0; attempt < maxProposals; attempt += 1) {
       assertCurrent();
       try {
         decision = await decide(requirement, input.model.provider === "Built-in" ? undefined
           : createRuntimeModel(input.model, input.apiKey, JSON.stringify({ ...context,
-            ...(protocolRecovered ? { protocolRepairBudget: { remainingModelCalls: 1 } } : {}),
+            _modelRecovery: modelRecovery,
+            ...(protocolRecovered || attempt > 0 ? { protocolRepairBudget: { remainingModelCalls: 1 } } : {}),
           }), input.generationSettings));
+        assertCurrent();
+        if (decision.source === "model") {
+          if (protocolRecovered) decision = { ...decision, steps: freshProtocolReplanSteps(decision.steps) };
+          prepared = prepareOperationalDecision(input.task, decision);
+        }
         break;
       } catch (error) {
         assertCurrent();
+        if (error instanceof OperationalRecoveryError) {
+          const fingerprint = error.message;
+          if (attempt + 1 >= maxProposals || seenPlans.has(fingerprint)) throw error;
+          seenPlans.add(fingerprint);
+          context = { ...context, operationalRepair: { reason: error.message,
+            instruction: "上一方案尚未执行。只修正局部更新、重试或执行核对问题；证据不足时只安排只读诊断/提问，不重复失败变更。" } };
+          continue;
+        }
         if (!(error instanceof PlanProtocolError)) throw error;
+        error.repair.modelRecovery = modelRecovery;
         const fingerprint = protocolRejectionFingerprint(error.repair);
         if (maxProposals > 1 && (seenPlans.has(fingerprint) || attempt + 1 >= maxProposals)) {
           error.repair.businessReplanProgress = {
@@ -381,7 +426,7 @@ export async function decideTaskNextStage(
           };
           throw error;
         }
-        if (attempt + 1 >= maxProposals) throw error;
+        if ((!input.recoverProtocolFailures && !previousFailure) || attempt + 1 >= maxProposals) throw error;
         protocolRecovered = true;
         seenPlans.add(fingerprint);
         // Only the proposal changes: evidence, target and authority stay pinned.
@@ -426,14 +471,15 @@ export async function decideTaskNextStage(
         context,
         decision,
         complete: true,
+        reconciliationResolution: prepared?.resolution,
         nextPlan: [] as PlanStep[],
         policyFingerprint: context.policyFingerprint,
       };
     }
     const proposedSteps = protocolRecovered
       ? markProtocolReplanApprovals(input.task,
-        normalizePlanPreconditions(freshProtocolReplanSteps(decision.steps), requirement, input.tools))
-      : decision.steps;
+        normalizePlanPreconditions(prepared?.steps ?? decision.steps, requirement, input.tools))
+      : normalizePlanPreconditions(prepared?.steps ?? decision.steps, requirement, input.tools);
     const nextPlan = selectContinuationSteps(recoveryHistory(input.task), proposedSteps, taskAttemptContext(input.task));
     assertTaskPlanAuthorization(input.task, nextPlan);
     validateRecoveryReferences(recoveryHistory(input.task), nextPlan, taskAttemptContext(input.task));
@@ -447,6 +493,7 @@ export async function decideTaskNextStage(
       decision,
       complete: false,
       nextPlan,
+      reconciliationResolution: prepared?.resolution,
       policyFingerprint: context.policyFingerprint,
     };
   } catch (combinedError) {

@@ -5,6 +5,7 @@ import {
 } from "@/features/agent/executionLifecycle";
 import type { ExecuteStepCommandInput } from "@/features/agent/executionRunner";
 import { startLongRunningMonitor } from "@/features/agent/longRunningMonitor";
+import { freezeCommandExecutionPolicy } from "./executionPolicy";
 import type { OpsTask, PlanStep } from "@/types";
 
 function createStep(overrides: Partial<PlanStep> = {}): PlanStep {
@@ -39,6 +40,23 @@ function createTask(step: PlanStep): OpsTask {
 const noop = () => undefined;
 
 describe("execution lifecycle", () => {
+  it("passes a saved attempt policy to its monitor without renewing the deadline", async () => {
+    const step = createStep({ command: "du /", kind: "observe" });
+    const executionPolicy = JSON.parse(JSON.stringify(freezeCommandExecutionPolicy(step, "scan-exec", 0)));
+    let receivedDeadline: number | undefined;
+    const result = await runCommandLifecycle({ task: createTask(step), step, requirement: "scan", command: step.command,
+      validation: step.validation, executionId: "scan-exec", executionPolicy, secretValues: {},
+      isCancelled: () => false, onExecutionChange: noop, onProgress: noop, onHeartbeat: noop,
+      onEvent: noop, onAudit: noop, onError: noop,
+    }, async () => ({ success: true, output: "sizes", exitCode: 0, simulated: false }), input => {
+      receivedDeadline = input.executionPolicy?.deadlineAt;
+      return startLongRunningMonitor({ ...input, scheduler: {
+        now: () => 590_000, setInterval: () => 1, clearInterval: noop,
+      } });
+    });
+    expect(receivedDeadline).toBe(600_000);
+    expect(result.result.success).toBe(true);
+  });
   it("propagates the caller deadline and preserves failure when deadline cancellation returns exit 130", async () => {
     const step = createStep({ runtimeClass: "progressive" });
     let now = 0;

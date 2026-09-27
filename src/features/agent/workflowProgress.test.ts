@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { OpsTask, PlanStep } from "@/types";
-import { automaticContinuationBlocker, automaticContinuationStop, renewAutomaticPhaseBudget, observationIdentity, workflowProgress, MAX_AUTOMATIC_PHASES, MAX_OBSERVATION_PHASES } from "./workflowProgress";
+import { automaticContinuationBlocker, automaticContinuationStop, renewAutomaticPhaseBudget, observationIdentity, workflowProgress, MAX_AUTOMATIC_PHASES } from "./workflowProgress";
 import { workflowLifetime } from "./workflowLifetime";
+const LEGACY_OBSERVATION_LIMIT = 6;
 
 function observed(id: string, output = "STATE=ready", overrides: Partial<PlanStep> = {}): PlanStep {
   return { id, title: id, description: "observe", command: `inspect-${id}`, validation: "test state",
@@ -18,6 +19,16 @@ function task(steps: PlanStep[]): OpsTask {
 }
 
 describe("generic workflow progress", () => {
+  it("counts carried pending steps only when executed, not their earlier archived plan", () => {
+    const pending = observed("carried", "", { status: "pending", result: undefined });
+    const current = task([observed("first"), observed("carried", "built", { kind: "change" })]);
+    current.phaseHistory![0].plan.push(pending);
+    expect(workflowProgress(current)).toMatchObject({ completedPhases: 2, stagnantPhases: 0, observationPhases: 0 });
+    const exhausted = task(Array.from({ length: MAX_AUTOMATIC_PHASES }, (_, i) => observed(`${i}`, `built-${i}`, { kind: "change" })));
+    exhausted.phaseHistory![0].plan.push(pending);
+    expect(renewAutomaticPhaseBudget(exhausted, "now")).toBe(true);
+    expect(exhausted.automaticPhaseBudget!.stepIds).not.toContain("carried");
+  });
   it("does not treat different command wording and bookkeeping as new facts", () => {
     const first = observed("a");
     const next = observed("b", "STATE=ready\n[exit: 0]");
@@ -33,9 +44,9 @@ describe("generic workflow progress", () => {
     expect(observationIdentity(other)).not.toBe(observationIdentity(observed("a")));
     expect(automaticContinuationBlocker(task([observed("a"), other, observed("c", "STATE=active")]))).toBeUndefined();
   });
-  it("bounds repeated discovery even if output formatting keeps changing", () => {
-    const current = task(Array.from({ length: MAX_OBSERVATION_PHASES }, (_, i) => observed(`${i}`, `sample-${i}`)));
-    expect(automaticContinuationBlocker(current)).toContain("停留在取证");
+  it("allows distinct read-only evidence beyond six observation phases", () => {
+    const current = task(Array.from({ length: LEGACY_OBSERVATION_LIMIT }, (_, i) => observed(`${i}`, `sample-${i}`)));
+    expect(automaticContinuationBlocker(current)).toBeUndefined();
   });
   it("allows fresh verification after a mutation but bounds all automatic stages", () => {
     const changed = observed("change", "done", { kind: "change" });
@@ -61,11 +72,24 @@ describe("generic workflow progress", () => {
     restored.currentRoundId = "another-round";
     expect(workflowProgress(restored).automaticPhases).toBe(1);
   });
-  it("does not erase repeated evidence or stagnation when renewing an exhausted phase budget", () => {
+  it("retains evidence identities but reviews old stagnation on an explicit continuation", () => {
     const current = task(Array.from({ length: 12 }, (_, i) => observed(`${i}`)));
     expect(renewAutomaticPhaseBudget(current, "now")).toBe(true);
+    expect(automaticContinuationStop(current)).toBeUndefined();
+    expect(workflowProgress(current)).toMatchObject({ stagnantPhases: 0, evidenceCount: 1 });
+    current.phaseHistory!.push({ id: "last", roundId: "round", requirement: "inspect", reason: "adjustment", plan: current.plan, createdAt: "now", completedAt: "now" });
+    current.plan = [observed("repeat-1")];
+    expect(workflowProgress(current).stagnantPhases).toBe(1);
+    current.phaseHistory!.push({ id: "again", roundId: "round", requirement: "inspect", reason: "adjustment", plan: current.plan, createdAt: "now", completedAt: "now" });
+    current.plan = [observed("repeat-2")];
     expect(automaticContinuationStop(current)?.code).toBe("no_progress");
-    expect(workflowProgress(current).stagnantPhases).toBe(11);
+  });
+  it("does not inherit another target's phase exemptions when continuing a stagnant task", () => {
+    const current = task([observed("a"), observed("b"), observed("c")]);
+    current.automaticPhaseBudget = { roundId: "round", serverId: "server-b", stepIds: ["a", "b", "c"], renewedAt: "before" };
+    expect(renewAutomaticPhaseBudget(current, "now")).toBe(true);
+    expect(current.automaticPhaseBudget.stepIds).toEqual([]);
+    expect(workflowProgress(current)).toMatchObject({ automaticPhases: 3, stagnantPhases: 0 });
   });
   it("starts a fresh observation budget after a confirmed user decision", () => {
     const decision = observed("decision", JSON.stringify({ values: { registry: "mirror.example" } }), {
@@ -73,7 +97,7 @@ describe("generic workflow progress", () => {
         facts: { toolId: "user.request_input" }, warnings: [], evidenceIds: [] },
     });
     const current = task([
-      ...Array.from({ length: MAX_OBSERVATION_PHASES }, (_, i) => observed(`before-${i}`, `sample-${i}`)),
+      ...Array.from({ length: LEGACY_OBSERVATION_LIMIT }, (_, i) => observed(`before-${i}`, `sample-${i}`)),
       decision,
       observed("after", "new-state"),
     ]);
@@ -89,7 +113,7 @@ describe("generic workflow progress", () => {
         facts: { commandDispatched: true, category: "network_failure" }, warnings: [], evidenceIds: [] },
     });
     const current = task([
-      ...Array.from({ length: MAX_OBSERVATION_PHASES }, (_, i) => observed(`before-${i}`, `sample-${i}`)),
+      ...Array.from({ length: LEGACY_OBSERVATION_LIMIT }, (_, i) => observed(`before-${i}`, `sample-${i}`)),
       failedChange,
       observed("diagnose-new-failure", "registry timeout"),
     ]);

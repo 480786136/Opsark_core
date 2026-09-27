@@ -1,3 +1,9 @@
+import { normalizeOperationsRequest, type OperationsInspectionResult } from "./operationsInspection";
+import { operationsInputSchemas } from "./operationsContracts";
+import { enforceToolResult } from "./toolResultContract";
+import { toolFailure, ToolExecutionError } from "./toolFailure";
+import { ExecutionLedgerError } from "@/services/executionLedger";
+import type { StepAction } from "@/types";
 import { fillToolDefaults, validateSchemaValue } from "./toolParameterSchema";
 import { normalizeFileStructureRequest } from "@/features/tools/fileStructure";
 import { normalizeAuthenticationTarget } from "@/features/agent/authenticationTarget";
@@ -28,6 +34,7 @@ import type {
 } from "@/features/tools/types";
 
 export interface ToolExecutionDependencies {
+  inspectOperations?(toolId: string, request: Record<string, unknown>): Promise<OperationsInspectionResult>;
   readEvidence?(evidenceId: string, offset: number, limit: number): Promise<Record<string, unknown>>;
   expandPlanningContext?(skillId: string): Promise<{ skillId: string }>;
   getRemoteFileStructure(request: FileStructureRequest): Promise<FileStructureScanResult>;
@@ -39,7 +46,7 @@ export interface ToolExecutionDependencies {
   resolveServerConnection?(request: ServerConnectionLookupRequest): Promise<ServerConnectionLookupResult>;
 }
 
-const TOOL_COMMAND_ATOMICITY_ERROR = "opsark-tool 命令必须是单行原子调用：只能包含一个工具调用和一个参数对象";
+
 
 function parseFileContentArguments(value: Record<string, unknown>): FileContentRequest {
   const path = typeof value.path === "string" ? value.path.trim() : "";
@@ -91,89 +98,27 @@ function parseServerConnectArguments(value: Record<string, unknown>): ServerConn
   };
 }
 
-/** Decode atomic syntax only; repair scope must inspect invalid arguments without normalizing them. */
-export function decodeToolCommand(command: string): Pick<ToolCall, "toolId" | "arguments"> | undefined {
-  const trimmed = command.trim();
-  if (!/^opsark-tool(?:\s|$)/i.test(trimmed)) return undefined;
-  if (/[\r\n]/.test(command)) throw new Error(TOOL_COMMAND_ATOMICITY_ERROR);
-  const match = trimmed.match(/^opsark-tool\s+([a-z0-9_.-]+)\s+([\s\S]+)$/i);
-  if (!match) throw new Error("opsark-tool 命令必须包含唯一工具 ID 和参数对象");
-  const argumentText = match[2].trim();
-  if (hasUnquotedToolInvocation(argumentText)) throw new Error(TOOL_COMMAND_ATOMICITY_ERROR);
-  let parsed: unknown;
-  if (argumentText.startsWith("{") || argumentText.startsWith("[")
-    || ((argumentText.startsWith("'") && argumentText.endsWith("'"))
-      || (argumentText.startsWith('"') && argumentText.endsWith('"')))) {
-    let jsonText = argumentText;
-    if ((jsonText.startsWith("'") && jsonText.endsWith("'"))
-      || (jsonText.startsWith('"') && jsonText.endsWith('"'))) {
-      jsonText = jsonText.slice(1, -1);
-    }
-    try {
-      parsed = JSON.parse(jsonText) as unknown;
-    } catch {
-      throw new Error("工具命令参数必须是单个 JSON 对象");
-    }
-  } else {
-    parsed = parseCliToolArguments(argumentText);
+/** Structured calls only. Shell text is never decoded into a tool invocation. */
+export function parseToolAction(action: StepAction | undefined, callId: string, tools: ToolDefinition[] = defaultToolCatalog): ToolCall | undefined {
+  if (!action || action.type === "shell") return undefined;
+  if (action.type !== "tool" || Object.keys(action).some(key => !["type", "toolId", "arguments"].includes(key))
+    || typeof action.toolId !== "string" || !isRecord(action.arguments)) throw new ToolArgumentValidationError("工具 action 必须包含 type、toolId 和 arguments 对象");
+  const registered = tools.find(tool => tool.id === action.toolId);
+  if (!registered) throw new ToolArgumentValidationError(`工具不存在或未注册：${action.toolId}`);
+  return { id: callId, toolId: action.toolId, arguments: prepareToolArguments(effectiveOfficialTool(registered), action.arguments) };
+}
+
+function prepareToolArguments(tool: ToolDefinition, value: Record<string, unknown>, final = false) {
+  const supplied = fillToolDefaults(tool.inputSchema, value) as Record<string, unknown>;
+  validateToolArguments(tool, supplied);
+  let normalized: Record<string, unknown>;
+  try { normalized = normalizeKnownToolArguments(tool.id, supplied, final); }
+  catch (error) {
+    if (error instanceof ToolArgumentValidationError) throw error;
+    throw new ToolArgumentValidationError(error instanceof Error ? error.message : String(error));
   }
-  if (!isRecord(parsed)) throw new Error("工具命令参数必须是 JSON 对象");
-  // Older planners occasionally emitted `opsark-tool --files.get_structure ...`,
-  // treating the tool id like an option. Accept that one recoverable typo while
-  // keeping unknown tool ids and malformed arguments strict.
-  const toolId = match[1].replace(/^--(?=[a-z0-9])/, "");
-  return { toolId, arguments: parsed };
-}
-
-export function parseToolCommand(
-  command: string,
-  callId: string,
-  tools: ToolDefinition[] = defaultToolCatalog,
-): ToolCall | undefined {
-  const decoded = decodeToolCommand(command);
-  if (!decoded) return undefined;
-  const { toolId, arguments: parsed } = decoded;
-  const registered = tools.find((tool) => tool.id === toolId);
-  if (!registered) throw new Error(`工具不存在或未注册：${toolId}`);
-  const definition = effectiveOfficialTool(registered);
-  const supplied = prepareToolArguments(definition, parsed);
-  const argumentsValue = normalizeKnownToolArguments(toolId, supplied);
-  validateToolArguments(definition, argumentsValue);
-  return { id: callId, toolId, arguments: argumentsValue };
-}
-
-function hasUnquotedToolInvocation(value: string) {
-  let quote = "";
-  let escaped = false;
-  for (let index = 0; index < value.length; index += 1) {
-    const character = value[index];
-    if (quote) {
-      if (escaped) {
-        escaped = false;
-      } else if (character === "\\") {
-        escaped = true;
-      } else if (character === quote) {
-        quote = "";
-      }
-      continue;
-    }
-    if (character === "'" || character === '"') {
-      quote = character;
-      continue;
-    }
-    if ((index === 0 || /\s/.test(value[index - 1]))
-      && value.slice(index, index + 11).toLowerCase() === "opsark-tool"
-      && (index + 11 === value.length || /\s/.test(value[index + 11]))) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function prepareToolArguments(tool: ToolDefinition, value: Record<string, unknown>) {
-  const argumentsValue = tool.configurationVersion ? fillToolDefaults(tool.inputSchema, value) as Record<string, unknown> : value;
-  validateToolArguments(tool, argumentsValue);
-  return argumentsValue;
+  validateToolArguments(tool, normalized);
+  return normalized;
 }
 
 function validateToolArguments(tool: ToolDefinition, value: Record<string, unknown>) {
@@ -181,14 +126,40 @@ function validateToolArguments(tool: ToolDefinition, value: Record<string, unkno
 }
 
 
+/** Complete defaults and adapter normalization once, before approval. */
+export function prepareFinalToolArguments(tool: ToolDefinition, value: Record<string, unknown>): Record<string, unknown> {
+  // Serialization drops optional undefined values and prevents sharing mutable nested inputs.
+  return JSON.parse(JSON.stringify(prepareToolArguments(tool, value, true)));
+}
+
+function canonicalArguments(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalArguments).join(",")}]`;
+  if (isRecord(value)) return `{${Object.keys(value).filter(key => value[key] !== undefined).sort()
+    .map(key => `${JSON.stringify(key)}:${canonicalArguments(value[key])}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+
+/** A prepared dispatch can validate but must never change approved parameters. */
+export function validatePreparedToolArguments(tool: ToolDefinition, value: Record<string, unknown>): void {
+  validateToolArguments(tool, value);
+  if (canonicalArguments(prepareFinalToolArguments(tool, value)) !== canonicalArguments(value)) {
+    throw new ToolArgumentValidationError("工具参数不是已准备的最终参数，请重新准备并确认后执行");
+  }
+}
+
 /** Validates built-in atomic tool contracts before a plan reaches execution. */
-function normalizeKnownToolArguments(toolId: string, value: Record<string, unknown>) {
+function normalizeKnownToolArguments(toolId: string, value: Record<string, unknown>, final = false) {
+  if (operationsInputSchemas[toolId]) return normalizeOperationsRequest(toolId, value);
+  if (toolId === "files.read_content") return { ...parseFileContentArguments(value) };
+  if (toolId === "server.resolve_connection") return { ...parseConnectionTarget(value) };
+  if (toolId === "files.transfer_between_servers") return { ...parseServerTransferArguments(value) };
+  if (toolId === "software.check") return { ...normalizeSoftwareCheckRequest(value) };
   if (toolId === "server.connect") return { ...parseServerConnectArguments(value) };
   if (toolId === "files.get_structure") {
     // Keep the model-authored spelling in the plan, but reject semantic path
     // errors before the step reaches execution or opens an SSH/SFTP session.
-    parseFileStructureArguments(value);
-    return value;
+    const request = parseFileStructureArguments(value);
+    return final ? { ...request } : value;
   }
   if (toolId === "user.request_input") {
     // A declared credential username must use protected input/storage. This
@@ -201,57 +172,6 @@ function normalizeKnownToolArguments(toolId: string, value: Record<string, unkno
     }) : value.fields;
     return { ...parseUserInputArguments({ ...value, fields }) };
   }
-  return value;
-}
-
-function parseCliToolArguments(text: string): Record<string, unknown> {
-  const tokens: string[] = [];
-  let token = "";
-  let quote = "";
-  for (let index = 0; index < text.length; index += 1) {
-    const character = text[index];
-    if (quote) {
-      if (character === quote) quote = "";
-      else if (character === "\\" && quote === '"' && index + 1 < text.length) token += text[++index];
-      else token += character;
-    } else if (character === "'" || character === '"') {
-      quote = character;
-    } else if (/\s/.test(character)) {
-      if (token) tokens.push(token);
-      token = "";
-    } else {
-      token += character;
-    }
-  }
-  if (quote) throw new Error("工具命令参数包含未闭合的引号");
-  if (token) tokens.push(token);
-
-  const result: Record<string, unknown> = {};
-  for (let index = 0; index < tokens.length; index += 1) {
-    const option = tokens[index];
-    if (!option.startsWith("--") || option.length === 2) {
-      throw new Error(`工具命令参数必须使用 --key value 格式：${option}`);
-    }
-    const equalsIndex = option.indexOf("=");
-    const rawKey = option.slice(2, equalsIndex < 0 ? undefined : equalsIndex);
-    const key = rawKey.replace(/-([a-z])/g, (_, letter: string) => letter.toUpperCase());
-    if (!/^[A-Za-z][A-Za-z0-9]*$/.test(key)) throw new Error(`工具命令参数名无效：${rawKey}`);
-    if (Object.prototype.hasOwnProperty.call(result, key)) throw new Error(`工具命令参数重复：${rawKey}`);
-    let rawValue: string | undefined = equalsIndex < 0 ? undefined : option.slice(equalsIndex + 1);
-    if (rawValue === undefined && tokens[index + 1] && !tokens[index + 1].startsWith("--")) {
-      rawValue = tokens[++index];
-    }
-    result[key] = rawValue === undefined ? true : coerceCliToolValue(rawValue);
-  }
-  return result;
-}
-
-function coerceCliToolValue(value: string): unknown {
-  if (value === "true") return true;
-  if (value === "false") return false;
-  if (value === "null") return null;
-  if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(value)) return Number(value);
-  if (value.startsWith("{") || value.startsWith("[")) return JSON.parse(value) as unknown;
   return value;
 }
 
@@ -418,95 +338,123 @@ function parseFileStructureArguments(argumentsValue: Record<string, unknown>): F
   }
 }
 
+/** Validate each adapter result against the exact arguments used for dispatch. */
 export async function executeToolCall(
   call: ToolCall,
   tools: ToolDefinition[],
   dependencies: ToolExecutionDependencies,
+  options: { prepared?: boolean } = {},
 ): Promise<ToolResult> {
   const registered = tools.find((item) => item.id === call.toolId);
   if (!registered) {
-    return { callId: call.id, toolId: call.toolId, success: false, error: { code: "TOOL_NOT_FOUND", message: "工具不存在" } };
+    return { callId: call.id, toolId: call.toolId, success: false, error: { code: "TOOL_NOT_FOUND", category: "unavailable", dispatchState: "not_sent", message: "工具不存在" } };
   }
   const tool = effectiveOfficialTool(registered);
   if (!tool.enabled || !officialToolEnabled(tool.id)) {
-    return { callId: call.id, toolId: call.toolId, success: false, error: { code: "TOOL_DISABLED", message: "工具未启用" } };
+    return { callId: call.id, toolId: call.toolId, success: false, error: { code: "TOOL_DISABLED", category: "permission", dispatchState: "not_sent", message: "工具未启用" } };
   }
   if (!isRecord(call.arguments)) {
-    return { callId: call.id, toolId: call.toolId, success: false, error: { code: "INVALID_ARGUMENTS", message: "工具参数必须是对象" } };
+    return { callId: call.id, toolId: call.toolId, success: false, error: { code: "INVALID_ARGUMENTS", category: "arguments", dispatchState: "not_sent", message: "工具参数必须是对象" } };
   }
 
+  let started = false;
   try {
-    call = { ...call, arguments: prepareToolArguments(tool, call.arguments) };
+    if (options.prepared) validatePreparedToolArguments(tool, call.arguments);
+    else call = { ...call, arguments: prepareToolArguments(tool, call.arguments) };
     // Adapters can trim strings, deduplicate lists or supply compiled fallback values.
     // Recheck their final request so those transformations cannot bypass a published constraint.
     const checked = <T extends object>(request: T): T => {
-      if (tool.configurationVersion) validateSchemaValue(tool.inputSchema, request, `工具 ${tool.id} 参数`, "");
+      validateSchemaValue(tool.inputSchema, request, `工具 ${tool.id} 参数`, "");
+      if (options.prepared) {
+        if (canonicalArguments(request) !== canonicalArguments(call.arguments)) {
+          throw new ToolArgumentValidationError("工具派发参数与已确认快照不一致，请重新准备并确认");
+        }
+        return call.arguments as T;
+      }
       return request;
     };
     if (tool.implementation === "expandPlanningContext") {
       validateToolArguments(tool, call.arguments);
       if (!dependencies.expandPlanningContext) throw new Error("当前上下文不支持展开 Skill");
+      started = true;
       const data = await dependencies.expandPlanningContext(String(call.arguments.skillId));
-      return { callId: call.id, toolId: call.toolId, success: true, data };
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data });
     }
     if (tool.implementation === "readEvidence") {
       validateToolArguments(tool, call.arguments);
       if (!dependencies.readEvidence) throw new Error("当前任务不能读取存档证据");
       const request = checked({ evidenceId: String(call.arguments.evidenceId), offset: Number(call.arguments.offset ?? 0), limit: Number(call.arguments.limit ?? 6000) });
+      started = true;
       const data = await dependencies.readEvidence(request.evidenceId, request.offset, request.limit);
-      return { callId: call.id, toolId: call.toolId, success: true, data };
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data });
     }
     if (tool.implementation === "serverResolveConnection") {
       if (!dependencies.resolveServerConnection) throw new Error("当前执行环境不支持服务器连接资料查询");
+      started = true;
       const data = await dependencies.resolveServerConnection(checked(parseConnectionTarget(call.arguments)));
-      return { callId: call.id, toolId: call.toolId, success: true, data };
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data });
     }
     if (tool.implementation === "serverConnect") {
       if (!dependencies.connectServer) throw new Error("当前执行环境不支持纳管 SSH 连接");
+      started = true;
       const data = await dependencies.connectServer(checked(parseServerConnectArguments(call.arguments)));
-      return { callId: call.id, toolId: call.toolId, success: true, data };
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data });
     }
     if (tool.implementation === "userRequestInput") {
       if (!dependencies.requestUserInput) throw new Error("当前执行环境不支持用户输入交互");
+      started = true;
       const data = await dependencies.requestUserInput(checked(parseUserInputArguments(call.arguments)));
-      return { callId: call.id, toolId: call.toolId, success: true, data };
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data });
     }
     if (tool.implementation === "getRemoteFileStructure") {
       const request = checked(parseFileStructureArguments(call.arguments));
+      started = true;
       const data = await dependencies.getRemoteFileStructure(request);
       const modelData: FileStructureResult = {
         tree: data.tree, rootPath: request.rootPath, truncated: data.truncated, warnings: data.warnings,
         ...(data.pathStatus ? { pathStatus: data.pathStatus } : {}),
       };
-      return { callId: call.id, toolId: call.toolId, success: true, data: modelData, truncated: data.truncated };
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data: modelData, truncated: data.truncated });
     }
     if (tool.implementation === "readRemoteFileContent") {
       if (!dependencies.readRemoteFileContent) throw new Error("当前执行环境不支持远程文件内容读取");
+      started = true;
       const data = await dependencies.readRemoteFileContent(checked(parseFileContentArguments(call.arguments)));
-      return { callId: call.id, toolId: call.toolId, success: true, data, truncated: data.truncated };
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data, truncated: data.truncated });
+    }
+    if (tool.implementation === "inspectOperations") {
+      if (!dependencies.inspectOperations) throw new Error("当前执行环境不支持运维检查");
+      const request = checked(normalizeOperationsRequest(call.toolId, call.arguments));
+      started = true;
+      const data = await dependencies.inspectOperations(call.toolId, request);
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data, truncated: data.truncated });
     }
     if (tool.implementation === "checkSoftware") {
       if (!dependencies.checkSoftware) throw new Error("当前执行环境不支持软件检查");
+      started = true;
       const data = await dependencies.checkSoftware(checked(normalizeSoftwareCheckRequest(call.arguments)));
-      return { callId: call.id, toolId: call.toolId, success: true, data };
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data });
     }
     if (tool.implementation === "transferFileBetweenServers") {
       if (!dependencies.transferFileBetweenServers) throw new Error("当前执行环境不支持跨服务器文件传输");
+      started = true;
       const data = await dependencies.transferFileBetweenServers(checked(parseServerTransferArguments(call.arguments)));
-      return { callId: call.id, toolId: call.toolId, success: true, data };
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data });
     }
     return {
       callId: call.id,
       toolId: call.toolId,
       success: false,
-      error: { code: "TOOL_NOT_EXTERNALLY_CALLABLE", message: "该工具由内部工作流调用" },
+      error: { code: "TOOL_NOT_EXTERNALLY_CALLABLE", category: "permission", dispatchState: "not_sent", message: "该工具由内部工作流调用" },
     };
   } catch (error) {
+    if (error instanceof ExecutionLedgerError) throw error;
     return {
       callId: call.id,
       toolId: call.toolId,
       success: false,
-      error: { code: "TOOL_EXECUTION_FAILED", message: String(error) },
+      error: toolFailure(error, started),
+      ...(error instanceof ToolExecutionError && error.partialData ? { data: error.partialData } : {}),
     };
   }
 }

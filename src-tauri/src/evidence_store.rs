@@ -9,6 +9,28 @@ fn directory(root: &Path, task_id: &str) -> std::path::PathBuf {
         .join(format!("{:x}", Sha256::digest(task_id.as_bytes())))
 }
 
+// A synced file followed by rename is not sufficient to persist the new name
+// across a system crash. Sync the directories from the leaf up through the app
+// data directory's parent, including newly created evidence/task directories.
+// Windows std::fs cannot open directories for sync_all; that platform retains
+// file syncing without claiming the same directory-entry durability guarantee.
+#[cfg(unix)]
+fn sync_directories(root: &Path, dir: &Path) -> Result<(), String> {
+    for ancestor in dir.ancestors() {
+        fs::File::open(ancestor)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("Evidence directory sync failed: {error}"))?;
+        if Some(ancestor) == root.parent() {
+            break;
+        }
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn sync_directories(_root: &Path, _dir: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 pub(crate) fn save(root: &Path, task_id: &str, record: &Value) -> Result<String, String> {
     if task_id.is_empty() || !record["text"].is_string() {
         return Err("Invalid evidence record".into());
@@ -25,6 +47,7 @@ pub(crate) fn save(root: &Path, task_id: &str, record: &Value) -> Result<String,
         if fs::read(&path).map_err(|e| e.to_string())? != bytes {
             return Err("Evidence integrity mismatch".into());
         }
+        sync_directories(root, &dir)?;
         return Ok(id);
     }
     let temporary = dir.join(format!("{}.tmp", crate::task_logs::call_id()));
@@ -38,6 +61,7 @@ pub(crate) fn save(root: &Path, task_id: &str, record: &Value) -> Result<String,
         .map_err(|e| e.to_string())?;
     drop(file);
     fs::rename(&temporary, &path).map_err(|e| e.to_string())?;
+    sync_directories(root, &dir)?;
     Ok(id)
 }
 

@@ -4,6 +4,7 @@ import {
   type PeriodicReviewFailureInput,
 } from "@/features/agent/commandStepResult";
 import type { PlanStep, StepReview } from "@/types";
+import { applyFailureDisposition, applySemanticAcceptance, failureDependencyBlocker, releaseAcceptedDependency } from "./failureDisposition";
 
 export interface ReviewCoordinationResult {
   taskStatus: "running" | "needs_adjustment";
@@ -73,8 +74,9 @@ export function applyCommandFailureReview(
   review: StepReview,
 ): ReviewCoordinationResult {
   step.review = review;
-  if (review.decision === "adjust") {
-    const pauseReason = `执行异常复核建议调整：${review.reason}`;
+  const allowed = applyFailureDisposition(step, remainingSteps, review);
+  if (!allowed) {
+    const pauseReason = `执行异常需先落实恢复动作或补齐依赖判断：${review.reason}`;
     return {
       taskStatus: "needs_adjustment",
       pauseReason,
@@ -83,18 +85,9 @@ export function applyCommandFailureReview(
     };
   }
 
-  if (review.decision === "complete") {
-    remainingSteps.forEach((item) => transitionStep(item, "skipped"));
-    return {
-      taskStatus: "running",
-      eventMessage: `步骤执行失败已如实保留；模型结合用户目标判定无需继续剩余 ${remainingSteps.length} 个步骤。${review.summary}`,
-      shouldAdvance: true,
-    };
-  }
-
   return {
     taskStatus: "running",
-    eventMessage: `步骤执行失败已如实保留；模型确认剩余计划可以继续处理。${review.summary}`,
+    eventMessage: `步骤失败已保留；仅继续有明确独立性依据的步骤，遇到依赖阻断将调整。${review.summary}`,
     shouldAdvance: true,
   };
 }
@@ -110,7 +103,9 @@ export interface ApplyEvidenceReviewInput {
 function applyEvidenceStatus(step: PlanStep) {
   const failed = step.result?.executionStatus === "failed"
     || step.result?.executionStatus === "blocked"
-    || step.result?.facts.validationPassed === false;
+    || step.result?.facts.validationPassed === false
+    || (step.result?.facts.semanticAcceptanceRequired === true
+      && step.result.facts.semanticAcceptanceStatus !== "proven");
   transitionStep(step, failed ? "failed" : "completed");
 }
 
@@ -120,10 +115,11 @@ export function applyExecutionEvidenceReview(
 ): ReviewCoordinationResult {
   const { step, remainingSteps, review, reviewWasRequired } = input;
   step.review = review;
+  applySemanticAcceptance(step, review);
   applyEvidenceStatus(step);
-  const factMessage = step.status === "failed"
-    ? `${step.title}未通过执行或验收，失败事实已保留`
-    : `✓ ${step.title}完成`;
+  if (step.status === "failed") return applyCommandFailureReview(step, remainingSteps, review);
+  releaseAcceptedDependency(step, remainingSteps);
+  const factMessage = `✓ ${step.title}完成`;
   if (review.decision === "adjust") {
     const pauseReason = `模型复核建议调整：${review.reason}`;
     return {
@@ -134,7 +130,7 @@ export function applyExecutionEvidenceReview(
     };
   }
 
-  if (reviewWasRequired && review.decision === "complete") {
+  if (reviewWasRequired && review.decision === "complete" && !remainingSteps.some(item => failureDependencyBlocker(item))) {
     remainingSteps.forEach((item) => transitionStep(item, "skipped"));
     return {
       taskStatus: "running",

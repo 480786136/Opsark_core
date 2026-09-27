@@ -52,6 +52,29 @@ describe("ModelTransportLogsPanel", () => {
     host.remove();
   });
 
+  it("renders compatibility mode, budget and recovery without exposing request data", async () => {
+    vi.spyOn(backend, "queryTaskLogs").mockResolvedValue({ items: [{ recordId: "compat-1", event: "compatibility_attempt", timestampMs: 1000,
+      effectiveOutputMode: "json_object", effectiveOutputTokens: 5000, schemaDowngraded: true, compactRepair: true,
+      request: "DO_NOT_DISPLAY" }], hasMore: false, total: 1, malformedLines: 0, oversizedLines: 0 });
+    const app = createApp(ModelTransportLogsPanel).use(i18n); app.mount(host); await settle();
+    expect(host.textContent).toContain("模型兼容策略");
+    expect(host.textContent).toContain("5000 Token");
+    expect(host.textContent).toContain("已降级");
+    expect(host.textContent).not.toContain("DO_NOT_DISPLAY");
+    app.unmount();
+  });
+
+  it("renders missing usage as unknown and reasoning as part of output", async () => {
+    vi.spyOn(backend, "queryTaskLogs").mockResolvedValue({ items: [{ ...transportEvent("partial", "response_received", 1000),
+      tokenUsage: { input: null, output: 20, total: null, reasoning: 12, cacheHit: 4, source: "api" } }],
+      hasMore: false, total: 1, malformedLines: 0, oversizedLines: 0 });
+    const app = createApp(ModelTransportLogsPanel).use(i18n); app.mount(host); await settle();
+    expect(host.textContent).toContain("未知 tokens (未知 → 20)");
+    expect(host.textContent).toContain("reasoning 12 (included in output)");
+    expect(host.textContent).toContain("cache hit 4");
+    app.unmount();
+  });
+
   it("keeps the model-call view and clipboard restricted to safe metadata", async () => {
     const clipboard = { writeText: vi.fn().mockResolvedValue(undefined) };
     Object.defineProperty(navigator, "clipboard", { configurable: true, value: clipboard });

@@ -23,6 +23,23 @@ function createStep(status: PlanStep["status"]): PlanStep {
 }
 
 describe("step interruption", () => {
+  it("records cancellation intent without inventing a remote stop for a durable attempt", () => {
+    const step = createStep("running");
+    step.executionLedgerAttempts = [{ operationId: "operation-a", attemptId: "attempt-a", executionId: "execution-a", phase: "command" }];
+    cancelStep(step, "用户取消");
+    expect(step.status).toBe("skipped");
+    expect(step.progressMessage).toContain("远端结果待核对");
+    expect(step.result).toBeUndefined();
+  });
+  it("retains known main-command success when cancelling during validation", () => {
+    const step = createStep("validating");
+    step.executionLedgerAttempts = [{ operationId: "operation-a", attemptId: "attempt-a", executionId: "execution-a", phase: "command" }];
+    step.result = { executionStatus: "success", observationStatus: "unknown", facts: { commandCompleted: true, exitCode: 0 },
+      warnings: [], evidenceIds: ["command-evidence"] };
+    cancelStep(step, "停止验收");
+    expect(step.result).toMatchObject({ executionStatus: "success", evidenceIds: ["command-evidence"],
+      facts: { commandCompleted: true, exitCode: 0, cancelRequested: true, cancelConfirmed: false } });
+  });
   it("keeps collected evidence references when cancelling", () => {
     const step = createStep("running");
     step.evidence = [{

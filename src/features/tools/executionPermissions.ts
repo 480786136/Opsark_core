@@ -1,6 +1,6 @@
 import { defaultToolCatalog } from "./toolCatalog";
 import { officialToolEnabled } from "@/features/support/officialContent";
-import { parseToolCommand } from "./toolExecutor";
+import { parseToolAction } from "./toolExecutor";
 import type { SkillDefinition } from "@/features/skills/types";
 import type { OpsTask, PlanStep } from "@/types";
 
@@ -36,10 +36,10 @@ export function shellAllowed(_task: OpsTask, _skills: SkillDefinition[]) {
 }
 
 /** The controller calls this again immediately before dispatch, independently of model-visible schemas. */
-export function executionCapabilityBlocker(task: OpsTask, step: Pick<PlanStep, "command" | "validation">, skills: SkillDefinition[]): string | undefined {
+export function executionCapabilityBlocker(task: OpsTask, step: Pick<PlanStep, "command" | "validation" | "action">, skills: SkillDefinition[]): string | undefined {
   const policy = readExecutionPermissions();
   let call;
-  try { call = parseToolCommand(step.command, "permission-check"); } catch { return undefined; } // Existing dispatcher records malformed commands as failures without executing them.
+  try { call = parseToolAction(step.action, "permission-check"); } catch (error) { return String(error); }
   if (!call) return shellAllowed(task, skills) ? undefined : "执行权限禁止 Agent Shell；Skill 不能授予此权限。请调整权限或改用已授权工具。";
   if (!officialToolEnabled(call.toolId)) return `官方工具配置已停用或当前版本不支持：${call.toolId}`;
   if (!policy.toolIds.includes(call.toolId)) return `执行权限未授权工具：${call.toolId}`;

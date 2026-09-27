@@ -9,6 +9,8 @@ import {
   mergeTaskSkillIds,
   normalizeRequirementRelation,
   taskGoal,
+  taskAcceptanceRequirement,
+  taskRequirementSnapshot,
 } from "@/features/agent/taskGoal";
 import { buildTaskDecisionSnapshot } from "@/features/agent/taskDecisionSnapshot";
 import { initializeTaskHistoryCheckpoint, refreshTaskHistoryCheckpoint } from "./taskHistoryCheckpoint";
@@ -52,6 +54,126 @@ function task(): OpsTask {
 }
 
 describe("task goal lifecycle", () => {
+  it("retains a classified supplement after continue, side questions and cancellation without rewriting history", () => {
+    const current = task();
+    current.rootGoal = "磁盘还剩下多少空间";
+    current.currentInstruction = "现在有哪些大文件占用";
+    current.currentRoundId = "round-files";
+    current.lastRequirementRelation = "continue";
+    const initial = { ...current.messages[0], content: current.rootGoal, requirementRelation: "new_goal" as const };
+    const supplement = { ...current.messages[1], content: current.currentInstruction, requirementRelation: "supplement" as const };
+    current.messages = [initial, supplement,
+      { ...supplement, id: "continue", content: "继续", requirementRelation: "continue" },
+      { ...supplement, id: "side", content: "解释一下 du", requirementRelation: "side_question" },
+      { ...supplement, id: "cancel", content: "取消任务", requirementRelation: "cancel_goal" }];
+    current.planHistory = [{ id: "history", roundId: "round-space", requirement: current.rootGoal,
+      status: "completed", plan: [], messages: [initial], createdAt: "2026-01-01", completedAt: "2026-01-02" }];
+    const original = JSON.stringify(current);
+    const snapshot = taskRequirementSnapshot(current);
+    expect(snapshot.rootGoal).toBe(current.rootGoal);
+    expect(snapshot.requirements).toEqual([
+      expect.objectContaining({ content: current.rootGoal, sourceMessageId: "m1", sourceRoundId: "round-space" }),
+      expect.objectContaining({ content: current.currentInstruction, sourceMessageId: "m2" }),
+    ]);
+    expect(snapshot.requirements[1].sourceRoundId).toBeUndefined();
+    expect(taskAcceptanceRequirement(current)).toContain("补充要求 1：现在有哪些大文件占用");
+    expect(taskAcceptanceRequirement(current)).not.toContain("取消任务");
+    expect(taskRequirementSnapshot(JSON.parse(original))).toEqual(snapshot);
+    expect(JSON.stringify(current)).toBe(original);
+  });
+
+  it.each(["new_goal", "replace_goal"] as const)("starts a fresh requirement chain at %s", relation => {
+    const current = task();
+    current.rootGoal = "检查 Redis 内存";
+    current.currentInstruction = current.rootGoal;
+    current.lastRequirementRelation = relation;
+    current.messages = [
+      { ...current.messages[0], content: "旧目标", requirementRelation: "new_goal" },
+      { ...current.messages[1], content: "旧补充", requirementRelation: "supplement" },
+      { ...current.messages[1], id: "new", content: current.rootGoal, requirementRelation: relation },
+    ];
+    expect(taskRequirementSnapshot(current).requirements.map(item => item.content)).toEqual([current.rootGoal]);
+    expect(taskAcceptanceRequirement(current)).toBe(current.rootGoal);
+  });
+
+  it("retains explicit scope refinements verbatim and excludes unclassified legacy retries", () => {
+    const current = task();
+    expect(taskAcceptanceRequirement(current)).toBe(current.rootGoal);
+    current.messages.push({ ...current.messages[1], id: "scope", content: "只检查 /var，不检查其他目录",
+      requirementRelation: "supplement" });
+    current.currentInstruction = "只检查 /var，不检查其他目录";
+    current.lastRequirementRelation = "supplement";
+    const snapshot = taskRequirementSnapshot(current);
+    expect(snapshot.requirements.map(item => item.content)).toEqual([current.rootGoal, current.currentInstruction]);
+    expect(snapshot.instruction).toContain("以较新要求为准");
+  });
+
+  it("orders archived supplements by their original time and keeps both after continuation", () => {
+    const current = task();
+    current.rootGoal = "检查磁盘";
+    current.currentInstruction = "只扫描 /var";
+    current.currentRoundId = "round-new-continue";
+    current.lastRequirementRelation = "continue";
+    const initial = { ...current.messages[0], content: current.rootGoal, requirementRelation: "new_goal" as const };
+    const files = { ...current.messages[1], content: "列出大文件", requirementRelation: "supplement" as const };
+    const scope = { ...files, id: "scope", content: current.currentInstruction, createdAt: "2026-01-03" };
+    current.messages = [initial, files, scope,
+      { ...scope, id: "continue", content: "继续", requirementRelation: "continue", createdAt: "2026-01-04" }];
+    current.planHistory = [{ id: "history", roundId: "round-scope", requirement: scope.content,
+      status: "completed", plan: [], messages: [scope], createdAt: scope.createdAt, completedAt: "2026-01-04" }];
+    const snapshot = taskRequirementSnapshot(current);
+    expect(snapshot.requirements.map(item => item.content)).toEqual([current.rootGoal, files.content, scope.content]);
+    expect(snapshot.requirements[2].sourceRoundId).toBe("round-scope");
+    expect(snapshot.requirements[1].sourceRoundId).toBeUndefined();
+  });
+
+  it("recovers a classified supplement from a legacy instruction without inventing a source message", () => {
+    const current = task();
+    current.currentInstruction = "检查大文件";
+    current.lastRequirementRelation = "supplement";
+    const snapshot = taskRequirementSnapshot(current);
+    expect(snapshot.requirements[1]).toEqual({ content: "检查大文件", relation: "supplement",
+      source: "current_instruction", sourceRoundId: current.currentRoundId });
+    expect(snapshot.requirements[1].sourceMessageId).toBeUndefined();
+  });
+
+  it("retains full supplemental sources across compact persistence, continuation and another supplement", () => {
+    const current = task();
+    current.rootGoal = "检查磁盘剩余空间";
+    current.currentInstruction = `检查大文件${"并保留扫描范围".repeat(100)}`;
+    current.lastRequirementRelation = "supplement";
+    current.messages = [
+      { ...current.messages[0], content: current.rootGoal, requirementRelation: "new_goal" },
+      { ...current.messages[1], content: current.currentInstruction, requirementRelation: "supplement" },
+    ];
+    const retained = taskRequirementSnapshot(current);
+    current.persistedRequirements = { version: 1, sources: retained.requirements };
+    // Storage may omit the supplement or retain only its truncated conversation copy.
+    current.messages[1].content = "检查大文件…[持久化时已截断，完整实时输出不受影响]";
+    current.lastRequirementRelation = "continue";
+    current.currentRoundId = "later-round";
+    const restored: OpsTask = JSON.parse(JSON.stringify(current));
+    expect(taskRequirementSnapshot(restored).requirements).toEqual(retained.requirements);
+    restored.messages = [restored.messages[0]];
+    expect(taskRequirementSnapshot(restored).requirements).toEqual(retained.requirements);
+    restored.currentInstruction = "只扫描 /var";
+    restored.lastRequirementRelation = "supplement";
+    restored.messages.push({ ...current.messages[0], id: "scope", content: restored.currentInstruction,
+      requirementRelation: "supplement", createdAt: "2026-01-03" });
+    const continued = taskRequirementSnapshot(restored);
+    expect(continued.requirements.map(item => item.content)).toEqual([
+      current.rootGoal, retained.requirements[1].content, restored.currentInstruction,
+    ]);
+    expect(continued.requirements[1].sourceRoundId).toBe(retained.requirements[1].sourceRoundId);
+    expect(continued.requirements[2].sourceRoundId).toBe("later-round");
+    restored.rootGoal = "检查 Redis 内存";
+    restored.currentInstruction = restored.rootGoal;
+    restored.lastRequirementRelation = "replace_goal";
+    restored.messages.push({ ...restored.messages[0], id: "replacement", content: restored.rootGoal,
+      requirementRelation: "replace_goal", createdAt: "2026-01-04" });
+    expect(taskRequirementSnapshot(restored).requirements.map(item => item.content)).toEqual([restored.rootGoal]);
+  });
+
   it("carries a failed attempt explicitly across rounds and keeps its original acceptance after persistence", () => {
     const current = task();
     const originalContext = taskAttemptContext(current);

@@ -6,20 +6,21 @@ import {
   buildPlanNormalizationRepair,
   normalizePlanPreconditions,
 } from "@/services/backend";
-import type { PlanStep } from "@/types";
+import type { PlanStep, StepAction } from "@/types";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 const requirement = "部署一套k8s,将本机作为主节点";
 const legacyConflict = "Error: 只读批次不能混入变更、Shell 或 standalone 工具；全部步骤必须为 observe 且参数已确定";
 
-function observe(id: string, command: string): PlanStep {
+function observe(id: string, command: string | StepAction): PlanStep {
   return {
     id,
     kind: "observe",
     title: `检查 ${id}`,
     description: `为后续规划收集 ${id} 的真实证据`,
-    command,
+    command: typeof command === "string" ? command : "",
+    ...(typeof command === "string" ? {} : { action: command }),
     expected: "取得真实状态",
     validation: "",
     risk: "low",
@@ -30,9 +31,9 @@ function observe(id: string, command: string): PlanStep {
 }
 
 const readBatch = ["containerd", "kubeadm", "kubelet", "kubectl"].map((name) =>
-  observe(`software-${name}`, `opsark-tool software.check {"names":["${name}"],"includeVersions":true}`));
+  observe(`software-${name}`, { type: "tool", toolId: "software.check", arguments: { names: [name], includeVersions: true } }));
 const shellBatch = ["uname -a", "cat /etc/os-release"].map((command, index) => observe(`shell-${index}`, command));
-const standalone = observe("resolve-worker", 'opsark-tool server.resolve_connection {"host":"10.213.81.53","port":22}');
+const standalone = observe("resolve-worker", { type: "tool", toolId: "server.resolve_connection", arguments: { host: "10.213.81.53", port: 22 } });
 const mixedPlan = [...readBatch, ...shellBatch];
 
 function runtime(context: Record<string, unknown> = {}) {
@@ -83,8 +84,8 @@ describe("ordered mixed plans and standalone boundaries", () => {
 
   it("uses catalog planMode rather than software-specific matching", async () => {
     const readTools = [
-      observe("structure", 'opsark-tool files.get_structure {"rootPath":"/srv/app"}'),
-      observe("readme", 'opsark-tool files.read_content {"path":"/srv/app/README.md"}'),
+      observe("structure", { type: "tool", toolId: "files.get_structure", arguments: {"rootPath":"/srv/app"} }),
+      observe("readme", { type: "tool", toolId: "files.read_content", arguments: {"path":"/srv/app/README.md"} }),
     ];
     const original = [...readTools, ...shellBatch];
     vi.mocked(invoke).mockResolvedValueOnce(structuredClone(original));
@@ -162,8 +163,8 @@ describe("ordered mixed plans and standalone boundaries", () => {
   });
 
   it("keeps the full mixed plan after repairing one invalid tool argument", async () => {
-    const malformed = observe("schema-first", 'opsark-tool software.check {"names":[]}');
-    const corrected = { ...malformed, command: 'opsark-tool software.check {"names":["node"]}' };
+    const malformed = observe("schema-first", { type: "tool", toolId: "software.check", arguments: {"names":[]} });
+    const corrected = { ...malformed, command: "", action: { type: "tool" as const, toolId: "software.check", arguments: {"names":["node"]} } };
     const correctedPlan = [corrected, ...structuredClone(shellBatch)];
     vi.mocked(invoke)
       .mockResolvedValueOnce([malformed, ...structuredClone(shellBatch)])

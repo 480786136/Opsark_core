@@ -2,9 +2,21 @@ import { describe, expect, it } from "vitest";
 import { resolveStepDispatch } from "@/features/agent/executionDispatch";
 
 describe("execution dispatch", () => {
+  it.each([
+    { command: "id" }, { validation: "true" },
+    { validator: { type: "command" as const, command: "", validStates: ["unknown" as const] } },
+    { sessionContextChange: { cwd: "/tmp" } },
+  ])("rejects all Shell-only tool fields at dispatch: %j", fields => {
+    const decision = resolveStepDispatch({ command: "", validation: "",
+      action: { type: "tool", toolId: "server.resolve_connection", arguments: { host: "host.example" } },
+      ...fields,
+    }, [], "invalid-tool");
+    expect(decision).toMatchObject({ kind: "invalid", error: expect.stringContaining("工具步骤不能夹带 Shell") });
+  });
+
   it("routes a valid model tool command", () => {
     const decision = resolveStepDispatch({
-      command: 'opsark-tool files.get_structure {"rootPath":"/opt/app"}',
+      command: "", action: { type: "tool" as const, toolId: "files.get_structure", arguments: {"rootPath":"/opt/app"} },
     }, [], "call-1");
 
     expect(decision).toEqual({
@@ -12,14 +24,14 @@ describe("execution dispatch", () => {
       call: {
         id: "call-1",
         toolId: "files.get_structure",
-        arguments: { rootPath: "/opt/app" },
+        arguments: { rootPath: "/opt/app", maxDepth: 4, maxNodes: 600, includeHidden: false },
       },
     });
   });
 
   it("dispatches a connection tool when it is in the current capability directory", () => {
     const decision = resolveStepDispatch({
-      command: 'opsark-tool server.resolve_connection {"host":"gitee.com","port":443}',
+      command: "", action: { type: "tool" as const, toolId: "server.resolve_connection", arguments: {"host":"gitee.com","port":443} },
     }, [], "call-forbidden", undefined, [], ["server.resolve_connection", "server.connect"]);
 
     expect(decision).toMatchObject({ kind: "tool", call: { toolId: "server.resolve_connection" } });
@@ -27,7 +39,7 @@ describe("execution dispatch", () => {
 
   it("rejects a tool that was not exposed to the current planning context", () => {
     const decision = resolveStepDispatch({
-      command: 'opsark-tool files.get_structure {"rootPath":"/opt/app"}',
+      command: "", action: { type: "tool" as const, toolId: "files.get_structure", arguments: {"rootPath":"/opt/app"} },
     }, [], "call-hidden", undefined, [], ["software.check"]);
 
     expect(decision).toEqual({
@@ -42,7 +54,7 @@ describe("execution dispatch", () => {
     }, [], "call-2");
 
     expect(decision.kind).toBe("invalid");
-    if (decision.kind === "invalid") expect(decision.error).toContain("JSON 对象");
+    if (decision.kind === "invalid") expect(decision.error).toContain("TOOL_IN_SHELL");
   });
 
   it("rejects server.connect before execution when username or credential reference is missing", () => {
@@ -52,7 +64,7 @@ describe("execution dispatch", () => {
 
     expect(decision).toMatchObject({ kind: "invalid" });
     if (decision.kind === "invalid") {
-      expect(decision.error).toContain("同时提供 username 和 passwordSecretKey");
+      expect(decision.error).toContain("TOOL_IN_SHELL");
     }
   });
 

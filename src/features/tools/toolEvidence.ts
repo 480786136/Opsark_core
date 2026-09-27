@@ -1,9 +1,11 @@
+import { operationsInputSchemas } from "./operationsContracts";
+import { operationsResultIssue, type OperationsInspectionResult } from "./operationsInspection";
 import { normalizeFileStructureRequest } from "@/features/tools/fileStructure";
 import { normalizeSoftwareCheckRequest } from "@/features/tools/softwareCheck";
 import type { ToolCall, ToolResult } from "@/features/tools/types";
 
 export interface ToolEvidenceFacts extends Record<string, unknown> {
-  evidenceKind?: "directory_structure" | "path_state" | "file_content" | "software_check";
+  evidenceKind?: "directory_structure" | "path_state" | "file_content" | "software_check" | "operations_inspection";
   evidenceScope?: string;
   evidenceComplete: boolean;
   evidenceNonEmpty?: boolean;
@@ -161,6 +163,16 @@ export function buildToolEvidenceFacts(call: ToolCall, result: ToolResult): Tool
     || (result.truncated !== undefined && typeof result.truncated !== "boolean")
     || !isRecord(result.data)) {
     return { evidenceComplete: false };
+  }
+  if (operationsInputSchemas[call.toolId]) {
+    const data = result.data as unknown as OperationsInspectionResult;
+    try {
+      if (operationsResultIssue(call.toolId, call.arguments, data)) return { evidenceComplete: false };
+      return { evidenceKind: "operations_inspection", evidenceScope: JSON.stringify(data.request),
+        evidenceComplete: data.coverageComplete && !data.truncated,
+        inspectionStatus: data.status, scanCoverage: { request: data.request, skippedCount: data.skippedCount, skipped: data.skipped },
+        evidenceFingerprint: observationFingerprint(JSON.stringify(data.items)) };
+    } catch { return { evidenceComplete: false }; }
   }
   if (call.toolId === "files.read_content") return fileContentFacts(call, result, result.data);
   if (call.toolId === "files.get_structure") return directoryFacts(call, result, result.data);

@@ -66,16 +66,16 @@ describe("review coordination", () => {
     expect(step.review?.decision).toBe("adjust");
   });
 
-  it("skips remaining work when failed-command review completes the goal", () => {
+  it("does not skip pending work on unproven completion after failure", () => {
     const step = createStep("failed", "failed");
     step.kind = "observe";
     step.title = "检查服务状态";
     const remaining = [createStep("remaining-1", "pending"), createStep("remaining-2", "pending")];
     const outcome = applyCommandFailureReview(step, remaining, review("complete"));
 
-    expect(outcome.taskStatus).toBe("running");
-    expect(outcome.shouldAdvance).toBe(true);
-    expect(remaining.every((item) => item.status === "skipped")).toBe(true);
+    expect(outcome.taskStatus).toBe("needs_adjustment");
+    expect(outcome.shouldAdvance).toBe(false);
+    expect(remaining.every((item) => item.status === "pending")).toBe(true);
   });
 
   it("keeps remaining work pending after a continue decision", () => {
@@ -85,11 +85,11 @@ describe("review coordination", () => {
     const remaining = [createStep("remaining", "pending")];
     const outcome = applyCommandFailureReview(step, remaining, review("continue"));
 
-    expect(outcome.shouldAdvance).toBe(true);
+    expect(outcome.shouldAdvance).toBe(false);
     expect(remaining[0].status).toBe("pending");
   });
 
-  it("honors model completion for flow while preserving a failed change", () => {
+  it("requires goal verification rather than accepting completion of a failed change", () => {
     const failed = createStep("pull-images", "failed");
     failed.kind = "change";
     failed.command = "kubeadm config images pull --kubernetes-version=v1.28.2";
@@ -107,14 +107,14 @@ describe("review coordination", () => {
 
     const outcome = applyCommandFailureReview(failed, remaining, review("complete"));
 
-    expect(outcome).toMatchObject({ taskStatus: "running", shouldAdvance: true });
+    expect(outcome).toMatchObject({ taskStatus: "needs_adjustment", shouldAdvance: false });
     expect(failed.review).toMatchObject({ decision: "complete", source: "model" });
     expect(failed.status).toBe("failed");
     expect(failed.result?.executionStatus).toBe("failed");
-    expect(remaining[0].status).toBe("skipped");
+    expect(remaining[0].status).toBe("pending");
   });
 
-  it("honors model continuation without requiring recovery metadata", () => {
+  it("rejects legacy continuation without dependency judgments", () => {
     const failed = createStep("pull-images", "failed");
     failed.kind = "change";
     failed.command = "kubeadm config images pull --kubernetes-version=v1.28.2";
@@ -132,7 +132,7 @@ describe("review coordination", () => {
 
     const outcome = applyCommandFailureReview(failed, remaining, review("continue"));
 
-    expect(outcome).toMatchObject({ taskStatus: "running", shouldAdvance: true });
+    expect(outcome).toMatchObject({ taskStatus: "needs_adjustment", shouldAdvance: false });
     expect(failed.review).toMatchObject({ decision: "continue", source: "model" });
     expect(failed.status).toBe("failed");
     expect(remaining[0].status).toBe("pending");
@@ -165,7 +165,11 @@ describe("review coordination", () => {
     remaining[0].kind = "observe";
 
     const outcome = applyExecutionEvidenceReview({
-      step, remainingSteps: remaining, review: review("continue"), reviewWasRequired: true,
+      step, remainingSteps: remaining, review: { ...review("continue"), recoveryAction: {
+        kind: "continue_independent", reason: "诊断不需要变更成功", steps: [
+          { stepId: "diagnose", relation: "independent", reason: "读取现有失败日志" },
+        ],
+      } }, reviewWasRequired: true,
     });
 
     expect(step.status).toBe("failed");

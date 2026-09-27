@@ -1,8 +1,8 @@
+import { operationsProgressIdentity } from "@/features/tools/operationsObservation";
 import type { OpsTask, PlanStep } from "@/types";
 import { textFingerprint } from "./longRunningReviewOutput";
 
 export const MAX_AUTOMATIC_PHASES = 12;
-export const MAX_OBSERVATION_PHASES = 6;
 export const MAX_STAGNANT_PHASES = 2;
 const STATISTICS = /^(?:id|evidenceIds|executionId|collectedAt|updatedAt|createdAt|timestamp|durationMs|elapsedSeconds|lineCount|found|outputPresent|commandCompleted|validationCompleted|commandDispatched|category|toolId)$/i;
 
@@ -20,6 +20,8 @@ export function observationIdentity(step: PlanStep) {
     const context: unknown = JSON.parse(step.attemptContext ?? "null");
     if (Array.isArray(context)) target = [context[0], context[4]];
   } catch { /* Legacy opaque target identities remain distinct. */ }
+  const inspection = operationsProgressIdentity(step);
+  if (inspection) return textFingerprint(JSON.stringify({ target, inspection }));
   const output = (step.output ?? step.evidence?.map(item => item.rawOutput).join("\n") ?? "")
     .replace(/\[exit:\s*-?\d+\]/g, "").trim().replace(/\r\n/g, "\n");
   return textFingerprint(JSON.stringify({
@@ -57,8 +59,12 @@ export function workflowProgress(task: OpsTask) {
   const budget = task.automaticPhaseBudget;
   const excluded = new Set(budget?.roundId === task.currentRoundId
     && budget?.serverId === (task.executionTargetServerId ?? task.serverId) ? budget.stepIds : []);
+  const reviewed = new Set(budget?.roundId === task.currentRoundId
+    && budget?.serverId === (task.executionTargetServerId ?? task.serverId) ? budget.reviewedStepIds ?? [] : []);
   for (const phase of phases) {
-    const steps = phase.filter(step => !stepIds.has(step.id));
+    // Local patches carry pending IDs across phase snapshots. A planned step
+    // consumes no progress/budget until an actual terminal record exists.
+    const steps = phase.filter(step => ["completed", "failed", "skipped"].includes(step.status) && !stepIds.has(step.id));
     steps.forEach(step => stepIds.add(step.id));
     if (!steps.length || steps.every(step => step.status === "skipped"
       || ["terminal_transport", "terminal_recovery", "validation_protocol_exception"].includes(String(step.result?.facts.category)))) continue;
@@ -80,7 +86,7 @@ export function workflowProgress(task: OpsTask) {
       if (!seen.has(identity)) added = true;
       seen.add(identity);
     }
-    stagnantPhases = added || changed || decisionConfirmed ? 0 : stagnantPhases + 1;
+    stagnantPhases = steps.every(step => reviewed.has(step.id)) || added || changed || decisionConfirmed ? 0 : stagnantPhases + 1;
     observationPhases = changed || decisionConfirmed || changeAttempted ? 0 : observationPhases + 1;
   }
   return { completedPhases, automaticPhases, stagnantPhases, observationPhases,
@@ -92,9 +98,8 @@ export function automaticContinuationStop(task: OpsTask): { code: "no_progress" 
   if (progress.stagnantPhases >= MAX_STAGNANT_PHASES) {
     return { code: "no_progress", reason: "连续阶段没有新增执行事实，已停止自动重复取证。已保留原始证据，请检查已有证据或补充尚未满足的目标条件后继续。" };
   }
-  if (progress.observationPhases >= MAX_OBSERVATION_PHASES) {
-    return { code: "no_progress", reason: "连续多个阶段仍停留在取证，已停止自动循环。已有证据已保留并补充到决策上下文，请明确剩余目标或缺少的证据后继续。" };
-  }
+  // Read-only business goals may legitimately need many observation phases.
+  // Actual repeated facts and the independent finite phase budget still stop loops.
   if (progress.automaticPhases >= MAX_AUTOMATIC_PHASES) {
     return { code: "phase_budget_exhausted", reason: "本轮自动阶段预算已用完，不代表任务没有进展。目标与证据已保留；明确继续后将开启新的自动阶段预算。" };
   }
@@ -107,11 +112,20 @@ export function automaticContinuationBlocker(task: OpsTask): string | undefined 
 
 /** Call only from an explicit user continuation, never a timer/system handoff. */
 export function renewAutomaticPhaseBudget(task: OpsTask, renewedAt: string): boolean {
-  if (workflowProgress(task).automaticPhases < MAX_AUTOMATIC_PHASES) return false;
+  const progress = workflowProgress(task);
+  const exhausted = progress.automaticPhases >= MAX_AUTOMATIC_PHASES;
+  // Also release a legacy six-observation stop on an explicit continuation.
+  if (!exhausted && progress.stagnantPhases < MAX_STAGNANT_PHASES && task.managedStopReason !== "no_progress") return false;
   const plans = (task.phaseHistory ?? []).filter(phase => phase.roundId === task.currentRoundId).map(phase => phase.plan);
   if (task.plan.every(step => ["completed", "failed", "skipped"].includes(step.status))) plans.push(task.plan);
+  const previousBudget = task.automaticPhaseBudget;
+  const previousStepIds = previousBudget && previousBudget.roundId === task.currentRoundId
+    && previousBudget.serverId === (task.executionTargetServerId ?? task.serverId) ? previousBudget.stepIds : [];
   task.automaticPhaseBudget = { roundId: task.currentRoundId,
     serverId: task.executionTargetServerId ?? task.serverId,
-    stepIds: [...new Set(plans.flatMap(plan => plan.map(step => step.id)))], renewedAt };
+    stepIds: exhausted ? [...new Set(plans.flatMap(plan => plan
+      .filter(step => ["completed", "failed", "skipped"].includes(step.status)).map(step => step.id)))] : previousStepIds,
+    reviewedStepIds: [...new Set(plans.flatMap(plan => plan
+      .filter(step => ["completed", "failed", "skipped"].includes(step.status)).map(step => step.id)))], renewedAt };
   return true;
 }

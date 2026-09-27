@@ -1,0 +1,454 @@
+[
+  {
+    "id": "chat-json-document",
+    "apiProtocol": "chat_completions",
+    "payload": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "{\"ok\":true}"
+          },
+          "finish_reason": "stop"
+        }
+      ]
+    },
+    "expectedText": "{\"ok\":true}"
+  },
+  {
+    "id": "responses-json-document",
+    "apiProtocol": "responses",
+    "payload": {
+      "id": "resp_fixture",
+      "object": "response",
+      "status": "completed",
+      "output": [
+        {
+          "type": "message",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "{\"ok\":true}",
+              "annotations": []
+            }
+          ]
+        }
+      ]
+    },
+    "expectedText": "{\"ok\":true}"
+  },
+  {
+    "id": "responses-reasoning-text-parts",
+    "apiProtocol": "responses",
+    "payload": {
+      "id": "resp_fixture",
+      "object": "response",
+      "status": "completed",
+      "output": [
+        {
+          "type": "reasoning",
+          "summary": []
+        },
+        {
+          "type": "message",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "{\"ok\":",
+              "annotations": []
+            },
+            {
+              "type": "output_text",
+              "text": "true}",
+              "annotations": []
+            }
+          ]
+        }
+      ]
+    },
+    "expectedText": "{\"ok\":true}"
+  },
+  {
+    "id": "chat_completions-refused",
+    "apiProtocol": "chat_completions",
+    "payload": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "refusal": "Cannot comply"
+          },
+          "finish_reason": "stop"
+        }
+      ]
+    },
+    "expectedCode": "MODEL_OUTPUT_REFUSED"
+  },
+  {
+    "id": "chat_completions-unexpected-tools",
+    "apiProtocol": "chat_completions",
+    "payload": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "c1",
+                "type": "function",
+                "function": {
+                  "name": "run",
+                  "arguments": "{}"
+                }
+              }
+            ]
+          },
+          "finish_reason": "tool_calls"
+        }
+      ]
+    },
+    "expectedCode": "MODEL_TOOL_CALL_UNEXPECTED"
+  },
+  {
+    "id": "chat_completions-truncated",
+    "apiProtocol": "chat_completions",
+    "payload": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "{\"ok\":"
+          },
+          "finish_reason": "length"
+        }
+      ]
+    },
+    "expectedCode": "MODEL_OUTPUT_TRUNCATED"
+  },
+  {
+    "id": "chat_completions-filtered",
+    "apiProtocol": "chat_completions",
+    "payload": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": null
+          },
+          "finish_reason": "content_filter"
+        }
+      ]
+    },
+    "expectedCode": "MODEL_CONTENT_FILTERED"
+  },
+  {
+    "id": "responses-refused",
+    "apiProtocol": "responses",
+    "payload": {
+      "id": "resp_fixture",
+      "object": "response",
+      "status": "completed",
+      "output": [
+        {
+          "type": "message",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "refusal",
+              "refusal": "Cannot comply"
+            }
+          ]
+        }
+      ]
+    },
+    "expectedCode": "MODEL_OUTPUT_REFUSED"
+  },
+  {
+    "id": "responses-unexpected-tools",
+    "apiProtocol": "responses",
+    "payload": {
+      "id": "resp_fixture",
+      "object": "response",
+      "status": "completed",
+      "output": [
+        {
+          "type": "function_call",
+          "call_id": "c1",
+          "name": "run",
+          "arguments": "{}"
+        }
+      ]
+    },
+    "expectedCode": "MODEL_TOOL_CALL_UNEXPECTED"
+  },
+  {
+    "id": "responses-truncated",
+    "apiProtocol": "responses",
+    "payload": {
+      "status": "incomplete",
+      "incomplete_details": {
+        "reason": "max_output_tokens"
+      },
+      "output": [
+        {
+          "type": "message",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "{\"ok\":",
+              "annotations": []
+            }
+          ]
+        }
+      ]
+    },
+    "expectedCode": "MODEL_OUTPUT_TRUNCATED"
+  },
+  {
+    "id": "responses-filtered",
+    "apiProtocol": "responses",
+    "payload": {
+      "status": "incomplete",
+      "incomplete_details": {
+        "reason": "content_filter"
+      },
+      "output": []
+    },
+    "expectedCode": "MODEL_CONTENT_FILTERED"
+  },
+  {
+    "id": "responses-failed",
+    "apiProtocol": "responses",
+    "payload": {
+      "status": "failed",
+      "output": [
+        {
+          "type": "message",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "{\"ok\":true}",
+              "annotations": []
+            }
+          ]
+        }
+      ]
+    },
+    "expectedCode": "MODEL_PROVIDER_FAILED"
+  },
+  {
+    "id": "responses-cancelled",
+    "apiProtocol": "responses",
+    "payload": {
+      "status": "cancelled",
+      "output": [
+        {
+          "type": "message",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "{\"ok\":true}",
+              "annotations": []
+            }
+          ]
+        }
+      ]
+    },
+    "expectedCode": "MODEL_OUTPUT_CANCELLED"
+  },
+  {
+    "id": "responses-queued",
+    "apiProtocol": "responses",
+    "payload": {
+      "status": "queued",
+      "output": [
+        {
+          "type": "message",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "{\"ok\":true}",
+              "annotations": []
+            }
+          ]
+        }
+      ]
+    },
+    "expectedCode": "MODEL_OUTPUT_PENDING"
+  },
+  {
+    "id": "responses-in_progress",
+    "apiProtocol": "responses",
+    "payload": {
+      "status": "in_progress",
+      "output": [
+        {
+          "type": "message",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "{\"ok\":true}",
+              "annotations": []
+            }
+          ]
+        }
+      ]
+    },
+    "expectedCode": "MODEL_OUTPUT_PENDING"
+  },
+  {
+    "id": "responses-incomplete-unknown",
+    "apiProtocol": "responses",
+    "payload": {
+      "status": "incomplete",
+      "incomplete_details": {
+        "reason": "unknown"
+      },
+      "output": [
+        {
+          "type": "message",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "{\"ok\":true}",
+              "annotations": []
+            }
+          ]
+        }
+      ]
+    },
+    "expectedCode": "MODEL_OUTPUT_INCOMPLETE"
+  },
+  {
+    "id": "responses-multiple-documents",
+    "apiProtocol": "responses",
+    "payload": {
+      "id": "resp_fixture",
+      "object": "response",
+      "status": "completed",
+      "output": [
+        {
+          "type": "message",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "{\"ok\":",
+              "annotations": []
+            }
+          ]
+        },
+        {
+          "type": "message",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "true}",
+              "annotations": []
+            }
+          ]
+        }
+      ]
+    },
+    "expectedCode": "MODEL_RESPONSE_INVALID"
+  },
+  {
+    "id": "responses-missing-status",
+    "apiProtocol": "responses",
+    "payload": {
+      "output": [
+        {
+          "type": "message",
+          "role": "assistant",
+          "status": "completed",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "{\"ok\":true}",
+              "annotations": []
+            }
+          ]
+        }
+      ]
+    },
+    "expectedCode": "MODEL_RESPONSE_INVALID"
+  },
+  {
+    "id": "responses-unknown-item",
+    "apiProtocol": "responses",
+    "payload": {
+      "id": "resp_fixture",
+      "object": "response",
+      "status": "completed",
+      "output": [
+        {
+          "type": "new_future_item",
+          "text": "{\"ok\":true}"
+        }
+      ]
+    },
+    "expectedCode": "MODEL_OUTPUT_ITEM_UNSUPPORTED"
+  },
+  {
+    "id": "responses-partial-message",
+    "apiProtocol": "responses",
+    "payload": {
+      "id": "resp_fixture",
+      "object": "response",
+      "status": "completed",
+      "output": [
+        {
+          "type": "message",
+          "role": "assistant",
+          "status": "in_progress",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "{\"ok\":true}",
+              "annotations": []
+            }
+          ]
+        }
+      ]
+    },
+    "expectedCode": "MODEL_RESPONSE_INVALID"
+  },
+  {
+    "id": "chat-unsupported-finish",
+    "apiProtocol": "chat_completions",
+    "payload": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "{\"ok\":true}"
+          },
+          "finish_reason": "future_finish"
+        }
+      ]
+    },
+    "expectedCode": "MODEL_FINISH_UNSUPPORTED"
+  }
+]
