@@ -37,6 +37,7 @@ pub(crate) fn prepare(body: &Value) -> Result<Value, String> {
         if let Ok(mut context) = serde_json::from_str::<Value>(&raw) {
             // Recovery identity/limits belong to Core, never to the provider or prompt.
             let recovery = context.as_object_mut().and_then(|value| value.remove("_modelRecovery"));
+            if let Some(object) = context.as_object_mut() { object.remove("_modelOutputRecovery"); }
             if let Some(parameters) = context.as_object_mut().and_then(|value| value.remove("_requestParameters")) {
                 apply(&mut body, &parameters)?;
             }
@@ -91,10 +92,12 @@ mod tests {
     }
     #[test]
     fn removes_recovery_metadata_without_losing_business_context() {
-        let raw = json!({"_modelRecovery":{"operationId":"private-budget-id","maxGenerations":2},"evidence":"keep"}).to_string();
+        let raw = json!({"_modelRecovery":{"operationId":"private-budget-id","maxGenerations":2},
+            "_modelOutputRecovery":{"strategy":"regenerate"},"evidence":"keep"}).to_string();
         let result = prepare(&json!({"max_tokens":500,"_opsarkContext":raw,
             "messages":[{"role":"user","content":format!("服务器上下文：\n{raw}")}]})).unwrap();
         assert!(!result.to_string().contains("_modelRecovery"));
+        assert!(!result.to_string().contains("_modelOutputRecovery"));
         assert!(!result.to_string().contains("private-budget-id"));
         assert!(result.to_string().contains("keep"));
         assert_eq!(result["max_tokens"],500);

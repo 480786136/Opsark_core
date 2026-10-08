@@ -79,10 +79,96 @@ const basename = (word: string) => word.slice(word.lastIndexOf("/") + 1);
 const assignment = (word: string) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(word);
 const writeTargetSafe = (word: string) => shell.safeWriteTargets.includes(word) || /^&(?:\d+|-)$/.test(word);
 
+/** Recognize option spellings only for the explicitly configured CLI families.
+ * Consume values before inspecting flags, so header/script/URL data is not code. */
+function commandOptions(args: string[], rule: { shortValueOptions: string[]; longValueOptions: string[] }) {
+  const options: { name: string; value?: string }[] = [];
+  const positional: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === "--") { positional.push(...args.slice(index + 1)); break; }
+    if (arg.startsWith("--")) {
+      const equal = arg.indexOf("=");
+      const name = equal < 0 ? arg : arg.slice(0, equal);
+      const value = equal >= 0 ? arg.slice(equal + 1)
+        : rule.longValueOptions.includes(name) ? args[++index] : undefined;
+      options.push({ name, value });
+    } else if (arg.startsWith("-") && arg.length > 1) {
+      for (let offset = 1; offset < arg.length; offset += 1) {
+        const name = `-${arg[offset]}`;
+        if (rule.shortValueOptions.includes(name)) {
+          options.push({ name, value: arg.slice(offset + 1) || args[++index] });
+          break;
+        }
+        options.push({ name });
+      }
+    } else positional.push(arg);
+  }
+  return { options, positional };
+}
+
+/** Allow a single, explicit query, plus selectors. An unknown/mixed option is not
+ * made read-only merely because another argument contains --query or --list. */
+function firewallQueryArguments(args: string[]): boolean {
+  let queries = 0;
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (shell.firewallReadOnlyOptions.includes(arg)) { queries += 1; continue; }
+    if (arg === "--permanent" || arg === "--quiet") continue;
+    if (arg === "--zone" || arg.startsWith("--zone=")) {
+      const value = arg === "--zone" ? args[++index] : arg.slice("--zone=".length);
+      if (!value || !/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(value)) return false;
+      continue;
+    }
+    if (arg === "--query-port" || arg.startsWith("--query-port=")) {
+      const value = arg === "--query-port" ? args[++index] : arg.slice("--query-port=".length);
+      if (!value || !/^\d+(?:-\d+)?\/(?:tcp|udp|sctp|dccp)$/.test(value)) return false;
+      queries += 1; continue;
+    }
+    return false;
+  }
+  return queries === 1;
+}
+
+/** Deliberately narrow exemption for the whole script, not a shell sandbox.
+ * Reuse the recovery lexer so substitutions, branches and output captures cannot
+ * conceal a mutation behind a query. Unsupported execution stays high-risk. */
+export function isReadOnlyFirewallScript(command: string): boolean {
+  return command.includes("firewall-cmd") && commandMutation(command, 0, true) === undefined;
+}
+
+function readOnlyFirewallSegment(segment: string[]): boolean {
+  let at = 0;
+  while (["if", "then", "elif", "else", "!"].includes(segment[at])) at += 1;
+  const words = segment.slice(at);
+  if (!words.length) return true;
+  // Local result captures are supported. Do not exempt environment setup or
+  // assignment prefixes that could change how the following executable runs.
+  if (words.every(assignment)) return words.every(word => {
+    const [name] = word.split("=", 1);
+    return !/^(?:PATH|IFS|ENV|BASH.*|SHELL.*|CDPATH|GLOBIGNORE|LD_.*|DYLD_.*|PYTHON.*|PERL.*|RUBY.*|NODE_.*|PS[0-4]|PROMPT_COMMAND)$/.test(name);
+  });
+  if (words[0] === "sudo") {
+    words.shift();
+    while (["-n", "--non-interactive", "--"].includes(words[0])) words.shift();
+  }
+  const name = words[0]; const args = words.slice(1);
+  if (["firewall-cmd", "/usr/bin/firewall-cmd", "/bin/firewall-cmd"].includes(name)) return firewallQueryArguments(args);
+  if (["echo", "printf", "test", "[", ":", "true", "false", "exit"].includes(name)) {
+    // No computed printf destination or arithmetic test expressions.
+    return !(name === "printf" && args[0]?.startsWith("-v"))
+      && !(["test", "["].includes(name) && args.some(arg => ["-eq", "-ne", "-gt", "-ge", "-lt", "-le"].includes(arg)));
+  }
+  if (name === "set") return args.length > 0 && args.every((arg, index) =>
+    /^[-+][eu]+$/.test(arg) || (/^-[eu]*o$/.test(arg) && args[index + 1] === "pipefail")
+      || (arg === "pipefail" && /^-[eu]*o$/.test(args[index - 1] ?? "")));
+  return name === "fi" && args.length === 0;
+}
+
 /** A bounded shell lexer, not a sandbox. Quoted text is data; substitutions are code.
  * Policy data and conformance cases are shared with Rust. Unknown script execution
  * stays conservative; execution authorization and command safety remain separate. */
-export function commandMutation(command: string, depth = 0): string | undefined {
+export function commandMutation(command: string, depth = 0, firewallReadOnly = false): string | undefined {
   if (depth > shell.maxNestedDepth) return "nested-shell";
   const tokens: Token[] = [];
   let word = "";
@@ -94,6 +180,8 @@ export function commandMutation(command: string, depth = 0): string | undefined 
     if (char === quote) { quote = ""; continue; }
     if (!quote && (char === "'" || char === '"')) { quote = char; continue; }
     if (quote === "'") { word += char; continue; }
+    if (firewallReadOnly && ((char === "$" && ["{", "("].includes(command[i + 1]) && (command[i + 1] === "{" || command[i + 2] === "("))
+      || (["<", ">"].includes(char) && command[i + 1] === "("))) return "unsupported:expansion";
     if ((["$", "<", ">"].includes(char) && command[i + 1] === "(" && (!quote || char === "$")) || char === "`") {
       const backtick = char === "`";
       let nested = ""; let nesting = 1; let nestedQuote = ""; let end = i + (backtick ? 1 : 2);
@@ -107,7 +195,8 @@ export function commandMutation(command: string, depth = 0): string | undefined 
         else if (!nestedQuote && !backtick && current === ")" && --nesting === 0) break;
         nested += current;
       }
-      const mutation = commandMutation(nested, depth + 1);
+      if (firewallReadOnly && end >= command.length) return "unsupported:substitution";
+      const mutation = commandMutation(nested, depth + 1, firewallReadOnly);
       if (mutation) return mutation;
       word += "__substitution__"; i = end; continue;
     }
@@ -117,6 +206,8 @@ export function commandMutation(command: string, depth = 0): string | undefined 
     // expansion/delimiter semantics, decline them rather than scan data as code.
     const unsupported = shell.unsupportedShellOperators.find(op => command.startsWith(op, i));
     if (unsupported) return `unsupported:${unsupported}`;
+    if (firewallReadOnly && ((char === "&" && command[i + 1] !== "&" && command[i - 1] !== "&")
+      || (char === "|" && command[i + 1] !== "|" && command[i - 1] !== "|") || char === "<")) return `unsupported:${char}`;
     if (char === ">") {
       if (/^\d+$/.test(word)) word = ""; else flush();
       let op = ">";
@@ -128,10 +219,12 @@ export function commandMutation(command: string, depth = 0): string | undefined 
     if (/\s/.test(char)) { flush(); continue; }
     word += char;
   }
+  if (firewallReadOnly && quote) return "unsupported:quote";
   flush();
   let segment: string[] = [];
   let piped = false;
   const inspect = (): string | undefined => {
+    if (firewallReadOnly) return readOnlyFirewallSegment(segment) ? undefined : "unsupported:firewall-query-script";
     let at = 0;
     while (at < segment.length) {
       const value = basename(segment[at]);
@@ -148,11 +241,15 @@ export function commandMutation(command: string, depth = 0): string | undefined 
     }
     if (at >= segment.length) return undefined;
     const name = basename(segment[at]); const args = segment.slice(at + 1);
+    if (name === "firewall-cmd") return firewallQueryArguments(args) ? undefined : name;
     if (shell.readOnlyCommandRules.some(rule => rule.commands.includes(name)
       && (("noArguments" in rule && rule.noArguments && args.length === 0)
         || ("options" in rule && args.some(arg => rule.options?.includes(arg)))))) return undefined;
     if (shell.mutationCommands.includes(name)) return name;
-    if (shell.opaqueInterpreters.includes(name)) return args.length === 1 && shell.safeInterpreterOptions.includes(args[0]) ? undefined : name;
+    if (shell.opaqueInterpreters.includes(name)) {
+      const options = shell.interpreterReadOnlyOptions as Record<string, string[]>;
+      return args.length === 1 && (shell.safeInterpreterOptions.includes(args[0]) || options[name]?.includes(args[0])) ? undefined : name;
+    }
     if (shell.shells.includes(name)) {
       const flag = args.findIndex(arg => /^-[^-]*c/.test(arg));
       return flag >= 0 ? commandMutation(args[flag + 1] ?? "", depth + 1)
@@ -164,12 +261,19 @@ export function commandMutation(command: string, depth = 0): string | undefined 
     if (shell.sqlClients.includes(name) && args.some(arg => arg.split(/[^A-Za-z]+/).some(part => shell.sqlMutationWords.includes(part.toUpperCase())))) return name;
     for (const rule of shell.commandRules) {
       if (!rule.commands.includes(name)) continue;
-      if (("always" in rule && rule.always) || ("words" in rule && args.some(arg => rule.words?.includes(arg)))
-        || ("optionPrefixes" in rule && args.some(arg => rule.optionPrefixes?.some(prefix => arg.startsWith(prefix))))) return name;
-      if ("outputOptions" in rule && args.some((arg, index) => rule.outputOptions?.some(option =>
-        arg === option ? !["-", ...shell.safeWriteTargets].includes(args[index + 1] ?? "")
-          : arg.startsWith(`${option}=`) && !["-", ...shell.safeWriteTargets].includes(arg.slice(option.length + 1))))) return name;
-      if ("writeMethods" in rule && args.some((arg, index) => ["-X", "--request"].includes(arg) && rule.writeMethods?.includes(args[index + 1]))) return name;
+      if ("shortValueOptions" in rule && rule.shortValueOptions && rule.longValueOptions) {
+        const parsed = commandOptions(args, rule);
+        if (parsed.options.some(option => ("words" in rule && rule.words?.includes(option.name))
+          || ("optionPrefixes" in rule && rule.optionPrefixes?.some(prefix => option.name.startsWith(prefix)))
+          || ("outputOptions" in rule && rule.outputOptions?.includes(option.name)
+            && !["-", ...shell.safeWriteTargets].includes(option.value ?? ""))
+          || ("writeMethods" in rule && ["-X", "--request"].includes(option.name)
+            && rule.writeMethods?.includes((option.value ?? "").toUpperCase())))
+          || ("assignmentArguments" in rule && rule.assignmentArguments
+            && parsed.positional.some(arg => /^[A-Za-z_][A-Za-z0-9_./-]*=/.test(arg)))) return name;
+        continue;
+      }
+      if (("always" in rule && rule.always) || ("words" in rule && args.some(arg => rule.words?.includes(arg)))) return name;
     }
     return undefined;
   };

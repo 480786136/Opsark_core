@@ -1,11 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { ExecutionIntentSnapshot, ExecutionIntentSemantic } from "@/types";
+import type { ExecutionIntentSnapshot, ExecutionIntentSemantic, PlanStep } from "@/types";
 import { executionDigest } from "@/features/agent/planPreparation";
 import {
   cancelExecutionLedger, configureExecutionLedger, createMemoryExecutionLedgerRepository,
   ExecutionLedgerError, flushPendingReceipts, listExecutionLedger, pendingExecutionReceipts,
   redactExecutionValue, resetExecutionLedgerForTests, resolveExecutionOperation, runRecordedExecution,
-  type ExecutionLedgerRepository, type RecordedExecutionOptions,
+  deriveExecutionAttemptReview, type ExecutionAttemptReviewInput, type ExecutionLedgerRepository, type RecordedExecutionOptions,
 } from "./executionLedger";
 
 function intent(effect: "read" | "change" = "change", stepId = "step"): ExecutionIntentSnapshot {
@@ -29,6 +29,64 @@ function deferred<T>() { let resolve!: (value: T) => void; const promise = new P
 
 describe("durable execution coordination", () => {
   beforeEach(resetExecutionLedgerForTests);
+
+  it.each(["not_met", "unknown"] as const)("records a %s task-owned review separately from successful acceptance", async outcome => {
+    const { owner, store } = setup();
+    await runRecordedExecution(options(owner));
+    const operation = (await store.list())[0], attempt = operation.attempts[0];
+    const review: ExecutionAttemptReviewInput = { version: 1, operationId: operation.operationId, attemptId: attempt.id,
+      intentDigest: operation.intentDigest, outcome, disposition: "task_followup", evidenceRefs: ["evidence-1"],
+      reviewFingerprint: executionDigest({ outcome, reason: "inspect the actual listening port" }) };
+    const saved = await store.acknowledge(operation.operationId, attempt.id, false, review);
+    expect(saved).toMatchObject({ status: "succeeded", outcome: attempt.outcome, reviews: [{ ...review, recordedAt: expect.any(Number) }] });
+    expect(saved.reviewCompletedAt).toBeUndefined();
+    expect(saved.projectionAppliedAt).toEqual(expect.any(Number));
+    expect(await store.acknowledge(operation.operationId, attempt.id, false, review)).toEqual(saved);
+    await expect(store.acknowledge(operation.operationId, attempt.id, false, { ...review, outcome: outcome === "unknown" ? "not_met" : "unknown" }))
+      .rejects.toThrow("REVIEW_CONFLICT");
+    expect((await store.list())[0].reconciliation).toBeUndefined();
+  });
+
+  it("rejects foreign-attempt, foreign-evidence and cancelled review acknowledgements", async () => {
+    const { owner, store } = setup();
+    await runRecordedExecution(options(owner));
+    const operation = (await store.list())[0], attempt = operation.attempts[0];
+    const review: ExecutionAttemptReviewInput = { version: 1, operationId: operation.operationId, attemptId: attempt.id,
+      intentDigest: operation.intentDigest, outcome: "not_met", disposition: "task_followup", evidenceRefs: ["evidence-1"],
+      reviewFingerprint: executionDigest("review") };
+    for (const invalid of [{ ...review, attemptId: "other-attempt" }, { ...review, evidenceRefs: ["other-proof"] },
+      { ...review, intentDigest: executionDigest("other-intent") }, { ...review, disposition: "accepted" as const }]) {
+      await expect(store.acknowledge(operation.operationId, attempt.id, false, invalid)).rejects.toThrow("REVIEW_INVALID");
+    }
+    await store.cancel(operation.operationId, attempt.id);
+    await expect(store.acknowledge(operation.operationId, attempt.id, false, review)).rejects.toThrow("REVIEW_INVALID");
+    expect((await store.list())[0].attempts[0].reviews).toBeUndefined();
+  });
+
+  it("derives review ownership only from a complete review tied to the actual latest attempt", async () => {
+    const { owner, store } = setup();
+    await runRecordedExecution(options(owner));
+    const operation = (await store.list())[0], attempt = operation.attempts[0];
+    const step: PlanStep = { id: "step", title: "Start service", description: "", command: "touch /srv/config", risk: "medium",
+      expected: "检查真实结果", validation: "", status: "failed", executionIntent: operation.intent,
+      executionLedgerAttempts: [{ operationId: operation.operationId, attemptId: attempt.id, executionId: attempt.executionId, phase: operation.phase }],
+      ledgerAppliedAttemptIds: [attempt.id], result: { executionStatus: "success", observationStatus: "unknown", facts: {}, warnings: [], evidenceIds: ["step-proof"] },
+      review: { decision: "adjust", source: "model", reason: "wrong port", summary: "Inspect real listener",
+        acceptance: { status: "not_met", reason: "wrong port", evidenceIds: ["step-proof"] },
+        recoveryAction: { kind: "repair", reason: "verify actual port", steps: [] } } };
+    expect(deriveExecutionAttemptReview(operation, attempt, step)).toMatchObject({ disposition: "task_followup", outcome: "not_met", attemptId: attempt.id });
+    expect(deriveExecutionAttemptReview(operation, attempt, { ...step, review: { ...step.review!, decision: "continue",
+      recoveryAction: { kind: "continue_independent", reason: "independent checks can proceed", steps: [] } } }))
+      .toMatchObject({ disposition: "task_followup", outcome: "not_met" });
+    expect(deriveExecutionAttemptReview(operation, attempt, { ...step, review: undefined })).toBeUndefined();
+    expect(deriveExecutionAttemptReview(operation, attempt, { ...step, review: { ...step.review!, recoveryAction: undefined } })).toBeUndefined();
+    expect(deriveExecutionAttemptReview(operation, { ...attempt, late: true }, step)).toBeUndefined();
+    expect(deriveExecutionAttemptReview(operation, { ...attempt, status: "unknown" }, step)).toBeUndefined();
+    expect(deriveExecutionAttemptReview(operation, attempt, { ...step, executionLedgerAttempts: [...step.executionLedgerAttempts!,
+      { operationId: operation.operationId, attemptId: "new-attempt", executionId: "new-execution", phase: operation.phase }] })).toBeUndefined();
+    expect(deriveExecutionAttemptReview(operation, attempt, { ...step, review: { ...step.review!,
+      acceptance: { status: "proven", reason: "pass", evidenceIds: ["foreign-proof"] } }, status: "completed" })).toBeUndefined();
+  });
 
   it("persists intent and dispatch admission before I/O; archives receipt before returning", async () => {
     const { owner, store, writer } = setup(); const order: string[] = [];
@@ -188,13 +246,56 @@ describe("durable execution coordination", () => {
     expect((await listExecutionLedger(second))[0]?.attempts).toHaveLength(1);
   });
 
-  it("refuses a snapshot containing raw secrets rather than silently changing its approved digest", async () => {
+  it.each(["password", "passwd", "passphrase", "apiKey", "api-key", "access_token", "refreshToken",
+    "authorization", "private_key", "clientSecret", "secret"])("rejects explicit %s without saving, dispatching or exposing its value", async field => {
     const { owner, store, writer } = setup(); const execute = vi.fn(async () => "done");
-    const request = options(owner, execute); request.step.executionIntent!.semantic.action = { type: "shell", command: "echo raw-password" };
+    const request = options(owner, execute);
+    request.step.executionIntent!.semantic.action = { type: "tool", toolId: "fixture",
+      arguments: { nested: [{ [field]: "never-persist-this-credential" }] } };
     request.step.executionIntent!.digest = executionDigest({ version: "execution-intent@1", semantic: request.step.executionIntent!.semantic });
-    request.redact = value => value.replace("raw-password", "[SECRET]");
-    await expect(runRecordedExecution(request)).rejects.toMatchObject({ stage: "prepare", remoteResultKnown: false });
+    const failure = await runRecordedExecution(request).catch(error => error);
+    expect(failure).toMatchObject({ code: "EXECUTION_LEDGER_SECRET_VALUE", stage: "prepare", remoteResultKnown: false });
+    if (!(failure instanceof ExecutionLedgerError)) throw new Error("expected credential admission failure");
+    expect(failure.message).toContain(`/semantic/action/arguments/nested/0/${field}`);
+    expect(failure.message).not.toContain("never-persist-this-credential");
     expect(await store.list()).toHaveLength(0); expect(execute).not.toHaveBeenCalled(); expect(writer).not.toHaveBeenCalled();
+    // Rejection before admission cannot lock a subsequent task on the same host.
+    await expect(runRecordedExecution(options(owner, execute, "change", "next-step", "next-execution"))).resolves.toBe("done");
+    expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it("output redaction never rewrites or rejects approved intent and a later task still runs", async () => {
+    const { owner, store } = setup();
+    const redact = vi.fn((value: string) => value.split("1").join("[REDACTED]"));
+    for (const taskId of ["task-1", "task-2"]) {
+      const request = options(owner, async () => "output 1", "change", "step-1", `execution-${taskId}`);
+      request.task.id = taskId;
+      request.step.executionIntent!.semantic.taskId = taskId;
+      request.step.executionIntent!.semantic.targets[0].username = "user1";
+      request.step.executionIntent!.semantic.action = { type: "shell", command: "ls -ld /opt/project1" };
+      request.step.executionIntent!.digest = executionDigest({ version: "execution-intent@1", semantic: request.step.executionIntent!.semantic });
+      const original = JSON.parse(JSON.stringify(request.step.executionIntent));
+      await runRecordedExecution({ ...request, redact });
+      const [saved] = await store.list(taskId);
+      expect(saved.intent).toEqual(original);
+      expect(saved.attempts[0].outcome?.result).toBe("output [REDACTED]");
+    }
+    expect(redact.mock.calls).toEqual([["output 1"], ["output 1"]]);
+  });
+
+  it("keeps command placeholders and credential references out of the execution-only secret channel", async () => {
+    const { owner, store, writer } = setup();
+    const request = options(owner, async () => ({ password: "connection-secret", output: "runtime-token" }));
+    request.step.executionIntent!.semantic.action = { type: "shell", command: "deploy --token ${secret.TOKEN}" };
+    request.step.executionIntent!.semantic.targets[0].credentialRef = "keychain:server-1";
+    request.step.executionIntent!.digest = executionDigest({ version: "execution-intent@1", semantic: request.step.executionIntent!.semantic });
+    await runRecordedExecution({ ...request, redact: text => text.split("runtime-token").join("[REDACTED]") });
+    const [saved] = await store.list();
+    expect(saved.intent.semantic.action).toEqual(request.step.executionIntent!.semantic.action);
+    expect(saved.intent.semantic.targets[0].credentialRef).toBe("keychain:server-1");
+    for (const text of [JSON.stringify(saved), JSON.stringify(writer.mock.calls)]) {
+      expect(text).not.toContain("connection-secret"); expect(text).not.toContain("runtime-token");
+    }
   });
 
   it("uses a typed error for a known but explicitly uncertain return value", async () => {

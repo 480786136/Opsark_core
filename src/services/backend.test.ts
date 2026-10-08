@@ -119,22 +119,25 @@ describe("plan normalization repair feedback", () => {
       .toThrow("PLAN_STAGE_CONFLICT");
   });
 
-  it("rejects the first generated standalone conflict without a repair model call", async () => {
+  it("rejects repeated standalone conflicts after one full-candidate regeneration", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
     const runtime = { apiKey: "fixture", endpoint: "https://test.invalid", model: "test", context: "{}" };
-    vi.mocked(invoke).mockResolvedValueOnce(structuredClone(standaloneStagePlan));
+    vi.mocked(invoke).mockResolvedValue(structuredClone(standaloneStagePlan));
 
     await expect(backend.generatePlan("部署 k8s 集群", runtime)).rejects.toMatchObject({
       repairError: expect.stringContaining("PLAN_STAGE_CONFLICT"),
       repair: { previousModelOutput: standaloneStagePlan },
     });
-    expect(invoke).toHaveBeenCalledOnce();
-    expect(vi.mocked(invoke).mock.calls[0][0]).toBe("generate_ai_plan");
+    expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).toEqual(["generate_ai_plan", "generate_ai_plan"]);
+    expect(invokedContext(0)._modelOutputRecovery.strategy).toBe("initial");
+    expect(invokedContext(1)._modelOutputRecovery.strategy).toBe("regenerate");
+    expect(invokedContext(1)._modelRecovery).toEqual(invokedContext(0)._modelRecovery);
+    expect(invokedContext(1).planGenerationRepair).toBeUndefined();
   });
 
   it("does not use completed command fingerprints to delete a prefix", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
-    vi.mocked(invoke).mockResolvedValueOnce(structuredClone(standaloneStagePlan));
+    vi.mocked(invoke).mockResolvedValue(structuredClone(standaloneStagePlan));
 
     await expect(backend.generatePlan("部署 k8s 集群", {
       apiKey: "fixture",
@@ -142,12 +145,14 @@ describe("plan normalization repair feedback", () => {
       model: "test",
       context: JSON.stringify({ workflowPhase: "continue_after_discovery", completedCommandFingerprints: ["claimed"] }),
     })).rejects.toMatchObject({ repair: { previousModelOutput: standaloneStagePlan } });
-    expect(invoke).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invokedContext(1).completedCommandFingerprints).toEqual(["claimed"]);
+    expect(invokedContext(1)._modelRecovery).toEqual(invokedContext(0)._modelRecovery);
   });
 
   it("does not use nested continuation context to partially accept a repeated plan", async () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
-    vi.mocked(invoke).mockResolvedValueOnce(structuredClone(standaloneStagePlan));
+    vi.mocked(invoke).mockResolvedValue(structuredClone(standaloneStagePlan));
 
     await expect(backend.generatePlan("部署 k8s 集群", {
       apiKey: "fixture",
@@ -155,7 +160,9 @@ describe("plan normalization repair feedback", () => {
       model: "test",
       context: JSON.stringify({ originalContext: JSON.stringify({ completedCommandFingerprints: ["nested-claimed"] }) }),
     })).rejects.toMatchObject({ repair: { previousModelOutput: standaloneStagePlan } });
-    expect(invoke).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invokedContext(1).originalContext).toBe(invokedContext(0).originalContext);
+    expect(invokedContext(1)._modelRecovery).toEqual(invokedContext(0)._modelRecovery);
   });
 
   it("preserves the next-stage decision while atomically rejecting its steps", async () => {
@@ -194,14 +201,16 @@ describe("plan normalization repair feedback", () => {
       selectedSkillIds: [],
       plan: structuredClone(standaloneStagePlan),
     };
-    vi.mocked(invoke).mockResolvedValueOnce(result);
+    vi.mocked(invoke).mockResolvedValueOnce(result).mockResolvedValueOnce(structuredClone(standaloneStagePlan));
 
     await expect(backend.processRequirement("部署 k8s 集群", runtime, [])).rejects.toMatchObject({
       processed: result,
       repair: { previousModelOutput: standaloneStagePlan },
     });
     expect(vi.mocked(invoke).mock.calls.map(([command]) => command))
-      .toEqual(["process_ai_requirement"]);
+      .toEqual(["process_ai_requirement", "generate_ai_plan"]);
+    expect(invokedContext(1)._modelOutputRecovery.strategy).toBe("regenerate");
+    expect(invokedContext(1)._modelRecovery).toEqual(invokedContext(0)._modelRecovery);
   });
 
   it("upgrades and atomically rejects a saved legacy standalone repair", async () => {
@@ -257,17 +266,26 @@ describe("plan normalization repair feedback", () => {
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
     const runtime = { apiKey: "fixture", endpoint: "https://test.invalid", model: "test", context: "{}" };
     const result = { intent: "execute", relation: "new_goal", selectedSkillIds: ["database-inspection-operations"], plan: [malformedStep] };
-    vi.mocked(invoke).mockResolvedValueOnce(result).mockResolvedValueOnce([{ ...malformedStep, description: "业务被改写" }]);
+    vi.mocked(invoke).mockResolvedValueOnce(result)
+      .mockResolvedValueOnce([{ ...malformedStep, description: "业务被改写" }])
+      .mockResolvedValueOnce([malformedStep]);
     let error: unknown;
     try { await backend.processRequirement("查询数据库", runtime, []); } catch (caught) { error = caught; }
     expect(error).toBeInstanceOf(PlanProtocolError);
     expect((error as PlanProtocolError).processed).toEqual(result);
-    expect(vi.mocked(invoke).mock.calls.map(([command]) => command)).toEqual(["process_ai_requirement", "generate_ai_plan"]);
+    expect(vi.mocked(invoke).mock.calls.map(([command]) => command))
+      .toEqual(["process_ai_requirement", "generate_ai_plan", "generate_ai_plan"]);
     const initial = invokedContext(0)._modelRecovery;
     const localRepair = invokedContext(1);
     expect(initial).toMatchObject({ operationId: expect.any(String), startedAtMs: expect.any(Number) });
     expect(localRepair._modelRecovery).toEqual(initial);
     expect(localRepair.planGenerationRepair).not.toHaveProperty("modelRecovery");
+    const regenerated = invokedContext(2);
+    expect(regenerated._modelOutputRecovery.strategy).toBe("regenerate");
+    expect(regenerated._modelRecovery).toEqual(initial);
+    expect(regenerated.planGenerationRepair).toBeUndefined();
+    expect(regenerated.activeSkills).toEqual(localRepair.activeSkills);
+    expect((error as PlanProtocolError).repair.previousModelOutput).toEqual([malformedStep]);
     expect((error as PlanProtocolError).repair.modelRecovery).toEqual(initial);
     expect(runtime.context).toBe("{}");
     vi.mocked(invoke).mockClear();

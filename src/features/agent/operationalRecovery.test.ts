@@ -178,6 +178,10 @@ describe("local operational recovery", () => {
     current.plan = [executed(current, step("old"), false)];
     recordExecutionUncertainty(current, current.plan[0], "超时");
     current.plan.push(executed(current, step("check", "ps -ef", "observe")));
+    const context = operationalRecoveryContext(current).uncertainExecution!;
+    expect(context.availableEvidenceIds).toEqual(["check-proof"]);
+    expect(context.nextAction).toBe("reconcile_before_change");
+    expect(context.instruction).toContain("顶层 reconciliation");
     const reconciliation = { incidentId: current.executionReconciliation!.id, status: "safe_to_retry" as const,
       evidenceIds: ["check-proof"], reason: "原进程已退出，目标目录无半成品" };
     const retry = { ...step("retry"), retryBasis: { failedStepId: "old", kind: "changed_state" as const,

@@ -49,23 +49,24 @@ describe("bounded protocol recovery", () => {
     expect(decide).toHaveBeenCalledTimes(2);
     const context = JSON.parse(decide.mock.calls[1][1].context);
     expect(context.protocolReplan.rule).toContain("PIPELINE_STATUS_LOST");
-    expect(context.protocolRepairBudget.remainingModelCalls).toBe(1);
+    expect(context.protocolRepairBudget).toBeUndefined();
+    expect(context._modelOutputRecovery.strategy).toBe("regenerate");
     expect(context._modelRecovery).toEqual(JSON.parse(decide.mock.calls[0][1].context)._modelRecovery);
     expect(rejected.repair.modelRecovery).toEqual(context._modelRecovery);
     expect(result.nextPlan[0].command).not.toContain("head -n");
     expect(input.task.plan).toEqual(saved);
   });
 
-  it("caps ordinary adjustment at one original and two revised proposals", async () => {
+  it("caps ordinary adjustment at one original and one complete regenerated candidate", async () => {
     const input = { ...fixture(), recoverProtocolFailures: true };
     delete input.task.protocolRepair;
-    const last = failure("third", "PIPELINE_STATUS_LOST");
+    const last = failure("second", "PIPELINE_STATUS_LOST");
     const decide = vi.fn().mockRejectedValueOnce(failure("first"))
-      .mockRejectedValueOnce(failure("second")).mockRejectedValue(last);
+      .mockRejectedValue(last);
     await expect(decideTaskNextStage(input, decide)).rejects.toBe(last);
-    expect(decide).toHaveBeenCalledTimes(3);
-    expect(last.repair.businessReplanProgress).toEqual({ attemptCount: 2, stopReason: "budget_exhausted" });
-    expect(last.userMessage).toContain("已尝试 2 次");
+    expect(decide).toHaveBeenCalledTimes(2);
+    expect(last.repair.businessReplanProgress).toEqual({ attemptCount: 1, stopReason: "budget_exhausted" });
+    expect(last.userMessage).toContain("已尝试 1 次");
     expect(last.userMessage).toContain("PIPELINE_STATUS_LOST");
   });
 
@@ -96,7 +97,7 @@ describe("bounded protocol recovery", () => {
     expect(input.task.plan[0].status).toBe("completed");
   });
 
-  it("distinguishes different malformed responses but stops a repeated response regardless of JSON formatting", async () => {
+  it("distinguishes malformed responses without replenishing a saved candidate's regeneration slot", async () => {
     const input = fixture();
     const initial = parseFailure();
     input.task.protocolRepair!.repair = initial.repair;
@@ -109,23 +110,25 @@ describe("bounded protocol recovery", () => {
     const changed = parseFailure('{"decision":"adjust","reason":"more evidence","steps":{}}');
     expect(protocolRejectionFingerprint(initial.repair)).not.toBe(protocolRejectionFingerprint(changed.repair));
     const progress = vi.fn().mockRejectedValueOnce(changed).mockResolvedValueOnce(next());
-    await expect(decideTaskNextStage(input, progress)).resolves.toMatchObject({ complete: false });
-    expect(progress).toHaveBeenCalledTimes(2);
+    await expect(decideTaskNextStage(input, progress)).rejects.toBe(changed);
+    expect(progress).toHaveBeenCalledOnce();
+    expect(JSON.parse(progress.mock.calls[0][1].context)._modelOutputRecovery.strategy).toBe("regenerate");
   });
 
   it("caps successive different parse failures without changing completed evidence", async () => {
     const input = fixture();
     input.task.protocolRepair!.repair = parseFailure().repair;
     const saved = structuredClone(input.task.plan);
-    const last = parseFailure('{"decision":false,"steps":[]}');
-    const decide = vi.fn().mockRejectedValueOnce(parseFailure('{"steps":null}')).mockRejectedValue(last);
+    const last = parseFailure('{"steps":null}');
+    const decide = vi.fn().mockRejectedValue(last);
     await expect(decideTaskNextStage(input, decide)).rejects.toBe(last);
-    expect(decide).toHaveBeenCalledTimes(2);
+    expect(decide).toHaveBeenCalledOnce();
     expect(input.task.plan).toEqual(saved);
   });
 
   it("feeds the latest tool rejection back and accepts a new legal proposal without changing evidence", async () => {
     const input = fixture();
+    delete input.task.protocolRepair;
     const original = structuredClone(input.task);
     const error = failure("opsark-tool hidden.read {}");
     const decide = vi.fn().mockRejectedValueOnce(error).mockResolvedValueOnce(next());
@@ -156,13 +159,12 @@ describe("bounded protocol recovery", () => {
     expect(decide).toHaveBeenCalledOnce();
   });
 
-  it("caps changing protocol failures at two proposals", async () => {
+  it("allows only one complete candidate for an already rejected saved proposal", async () => {
     const input = fixture();
     const last = failure("opsark-tool missing.tool {}");
-    const decide = vi.fn().mockRejectedValueOnce(failure("opsark-tool hidden.read {}"))
-      .mockRejectedValue(last);
+    const decide = vi.fn().mockRejectedValue(last);
     await expect(decideTaskNextStage(input, decide)).rejects.toBe(last);
-    expect(decide).toHaveBeenCalledTimes(2);
+    expect(decide).toHaveBeenCalledOnce();
     expect(input.task.plan[0].status).toBe("completed");
   });
 
@@ -199,6 +201,25 @@ describe("bounded protocol recovery", () => {
     expect(input.task).not.toHaveProperty("_modelRecovery");
   });
 
+  it("an explicit new planning operation keeps the old incident while sharing its fresh budget across automatic repairs", async () => {
+    const input = { ...fixture(), freshModelOperation: true };
+    const old = { operationId: "old-manual-wait", startedAtMs: Date.now() - 17 * 60_000 };
+    input.task.protocolRepair!.repair.modelRecovery = old;
+    const original = structuredClone(input.task);
+    const rejected = failure("still-invalid", "another safety rule");
+    const decide = vi.fn().mockRejectedValueOnce(rejected).mockResolvedValueOnce(next());
+    const started = Date.now();
+    await decideTaskNextStage(input, decide);
+    const contexts = decide.mock.calls.map(call => JSON.parse(call[1].context));
+    expect(contexts).toHaveLength(2);
+    expect(contexts[0]._modelRecovery.operationId).not.toBe(old.operationId);
+    expect(contexts[0]._modelRecovery.startedAtMs).toBeGreaterThanOrEqual(started);
+    expect(contexts[1]._modelRecovery).toEqual(contexts[0]._modelRecovery);
+    expect(rejected.repair.modelRecovery).toEqual(contexts[0]._modelRecovery);
+    expect(contexts.every(context => !("planGenerationRepair" in context))).toBe(true);
+    expect(input.task).toEqual(original);
+  });
+
   it("honors cancellation before another proposal", async () => {
     let cancelled = false;
     const decide = vi.fn().mockImplementation(async () => {
@@ -212,14 +233,17 @@ describe("bounded protocol recovery", () => {
 
   it("accepts a genuine no-action result without inventing executable work", async () => {
     const decide = vi.fn().mockRejectedValueOnce(failure("opsark-tool hidden.read {}"))
-      .mockResolvedValueOnce(next([]));
-    const result = await decideTaskNextStage(fixture(), decide);
+      .mockResolvedValueOnce({ ...next([]), blocking: { kind: "external", reason: "目标处于维护窗口", requirementIds: [] } });
+    const input = fixture();
+    delete input.task.protocolRepair;
+    const result = await decideTaskNextStage(input, decide);
     expect(result.nextPlan).toEqual([]);
     expect(result.complete).toBe(false);
   });
 
   it("still rejects a mutating fallback under explicit read-only authorization", async () => {
     const input = fixture();
+    delete input.task.protocolRepair;
     input.task.executionConstraints = { changePolicy: "read_only", environmentPolicy: "preserve",
       failurePolicy: "strict", prohibitedActions: [], requiredConditions: [], userDirectives: ["只读"] };
     const decide = vi.fn().mockRejectedValueOnce(failure("opsark-tool hidden.read {}"))

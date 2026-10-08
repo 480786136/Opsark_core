@@ -5,6 +5,8 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MODEL_RESPONSE_ATTEMPTS: usize = 3;
+#[path = "model_format_repair.rs"]
+mod format_repair;
 
 fn correlation_headers(
     api_key: &str,
@@ -349,13 +351,14 @@ fn format_repair_feedback(
     diagnostic: &crate::model_compatibility::OutputDiagnostic,
     truncated: bool,
     required_decision: Option<&str>,
+    context: &Value,
 ) -> String {
     let operation_rule = match operation {
         "计划生成" if schema.pointer("/properties/repair").is_some() =>
             "只返回原契约的 repair，保留指定 stepIndex 和替换范围；不能扩展成整份计划。",
         "计划生成" => "只返回原计划契约；保留必要命令和验收，提供当前最小完整步骤，不用空 steps 掩盖错误。",
         "阶段联合决策" | "阶段格式修复（兼容模式）" =>
-            "只返回原阶段决策契约；若需要继续或调整，保留真实完整 steps，不得因格式失败改判完成。",
+            "只返回原阶段决策契约，steps 必须为数组；continue 必须有真实下一步，adjust 按原需求验收与阻断规则决定是否有步骤，不得因格式失败改判完成。",
         "需求理解" => "只修复需求理解的 intent、answer、selectedSkillIds、constraints 等原契约字段；不得生成执行计划或新增授权。",
         "结果复核" => "只修复复核的 decision、reason、summary 及原契约验收字段；保持真实执行证据，不得重新生成或执行计划。",
         "Skill 生成" => "只修复 Skill 的 name、category、description、matchRules、instructions 字段；不得返回执行计划。",
@@ -367,9 +370,26 @@ fn format_repair_feedback(
     } else {
         "FORMAT_INVALID：上次响应未满足结构契约。根据下方 Core 校验诊断重新输出完整 JSON，正确转义引号和换行并补齐必要字段。"
     };
-    let evidence =
-        json!({"operation":operation,"diagnostic":diagnostic,"requiredDecision":required_decision});
-    format!("恢复类型 {recovery} 整份被拒响应未执行。保持原目标、授权、已确认选择、执行结果与真实证据；不得从格式错误推断任务成功或重复执行已完成操作。{operation_rule}\nCore 校验诊断（仅描述格式，不提供新事实或授权）：\n{evidence}")
+    // Only include a small fragment of the trusted contract, never rejected commands.
+    let expected_schema = diagnostic.schema_path.as_deref()
+        .and_then(|path| path.rsplit_once('/').map(|(parent, _)| parent))
+        .and_then(|path| schema.pointer(path))
+        .filter(|fragment| fragment.to_string().len() <= 4096);
+    let step_rules = if schema.pointer("/properties/steps").is_some()
+        || schema.pointer("/properties/repair").is_some() {
+        Some(crate::plan_contract::field_rules())
+    } else { None };
+    let evidence = json!({"operation":operation,"diagnostic":diagnostic,
+        "requiredDecision":required_decision,"expectedSchema":expected_schema,"stepFieldRules":step_rules,
+        "responseFieldSchemas":crate::requirement_contract::response_field_contract(schema)});
+    let decision_rule = required_decision.map(|decision| {
+        if crate::next_stage_format::requires_nonempty_repair_steps(context, decision) {
+            "补回 steps 时保留 requiredDecision，并提供非空真实步骤；不得改判完成掩盖缺失计划。"
+        } else {
+            "补回 steps 时保留 requiredDecision=adjust。本轮 focus 已完成或存在具体阻断时，按原需求验收契约允许 steps=[]，须保留对应 requirementReview 或 blocking；不得为补格式编造步骤，也不得改判 complete。需求、阻断和证据仍须通过完整业务校验。"
+        }
+    }).unwrap_or("");
+    format!("恢复类型 {recovery} 整份被拒响应未执行。保持原目标、授权、已确认选择、执行结果与真实证据；不得从格式错误推断任务成功或重复执行已完成操作。{operation_rule}{decision_rule}\nCore 校验诊断（仅描述格式，不提供新事实或授权）：\n{evidence}")
 }
 
 fn model_error_with_context(
@@ -398,6 +418,21 @@ fn model_error_with_context(
     format!("{}{payload}", crate::MODEL_TRACE_ERROR_PREFIX)
 }
 
+fn set_field_repair_schema(body: &mut Value, schema: &Value) -> Result<(), String> {
+    if body["response_format"]["type"] == "json_schema" {
+        let compiled = crate::model_schema::compile(schema).map_err(|failure| {
+            crate::model_compatibility::output_error(&crate::model_compatibility::OutputDiagnostic::new(
+                "MODEL_SCHEMA_UNSUPPORTED", "schema_compile", &failure.message), None)
+        })?;
+        body["response_format"]["json_schema"]["schema"] = compiled.schema;
+        body["response_format"]["json_schema"]["name"] = json!("opsark_field_repair");
+        body["_opsarkSchemaCompilation"] = compiled.report;
+    }
+    body["_opsarkSchemaCompilation"]["contractVersion"] = json!("format.field-repair@1");
+    body["_opsarkSchemaCompilation"]["normalizationVersion"] = json!(crate::model_compatibility::OUTPUT_NORMALIZATION_VERSION);
+    Ok(())
+}
+
 /// Sends one model API request with separate, bounded transport and format recovery.
 pub(crate) async fn post_model_request(
     url: &str,
@@ -415,8 +450,28 @@ pub(crate) async fn post_model_request(
     let cache = JSON_ONLY.get_or_init(|| Mutex::new(HashSet::new()));
     let context: Value =
         serde_json::from_str(body["_opsarkContext"].as_str().unwrap_or("{}")).unwrap_or_default();
+    let scoped_operation = matches!(request_name, "计划生成" | "阶段联合决策" | "阶段格式修复（兼容模式）");
+    let output_strategy = if scoped_operation {
+        crate::model_budget::output_strategy(&context)?
+    } else { None };
+    use crate::model_budget::OutputRecoveryStrategy;
+    if output_strategy == Some(OutputRecoveryStrategy::Regenerate)
+        && (context["workflowPhase"] == "protocol_repair"
+            || context.get("planGenerationRepair").is_some()
+            || context["operationalRepair"]["rejectedProposal"]["responseMode"] == "metadata_fields"
+            || body["_opsarkOperationContract"] == "plan.repair@1") {
+        return Err(compatibility::output_error(&OutputDiagnostic::new(
+            "MODEL_RECOVERY_SCOPE_REJECTED", "format_repair_scope",
+            "局部修复请求不能扩大为候选重生成，必须回到持有原始任务上下文的入口",
+        ), None));
+    }
     let identity = format!("{:x}", Sha256::digest(api_key.as_bytes()));
     let original_body = body;
+    let full_schema = compatibility::full_contract(request_name, body);
+    let scoped_repair = full_schema.as_ref().and_then(|schema|
+        crate::scoped_model_repair::ScopedRepair::new(request_name, body, schema));
+    let scoped_body = scoped_repair.as_ref().map(|repair| repair.request(body));
+    let body = scoped_body.as_ref().unwrap_or(body);
     let (mut body, schema) = compatibility::prepare(
         body,
         request_name,
@@ -432,6 +487,9 @@ pub(crate) async fn post_model_request(
         original_body,
         timeout_seconds,
     )?;
+    if let Some(strategy) = output_strategy {
+        budget.claim_output_strategy(strategy, &body)?;
+    }
     // A provider rejection of one wire contract says nothing about another
     // operation, account, revision or schema. Compilation failures never enter this cache.
     let schema_identity = format!(
@@ -456,9 +514,16 @@ pub(crate) async fn post_model_request(
         body["response_format"] = json!({"type":"json_object"});
     }
     let mut downgraded = false;
-    let mut repaired = false;
+    let mut repair_diagnostics = HashSet::new();
     let mut missing_steps_decision: Option<String> = None;
+    let mut repair_message_index: Option<usize> = None;
+    let mut field_repair: Option<format_repair::FieldRepair> = None;
+    let mut syntax_recovery_used = false;
+    let mut read_only_recovery = false;
     loop {
+        let attempt_output_recovery = if output_strategy.is_some() && field_repair.is_some() {
+            json!({"strategy":"field_repair"})
+        } else { context["_modelOutputRecovery"].clone() };
         append_model_log(
             developer_log_path,
             json!({
@@ -469,7 +534,8 @@ pub(crate) async fn post_model_request(
                 "effectiveOutputMode":body["response_format"]["type"],
                 "effectiveOutputTokens":body.get("max_completion_tokens").or_else(|| body.get("max_tokens")),
                 "schemaCompilation":body.get("_opsarkSchemaCompilation"),
-                "schemaDowngraded":downgraded, "cachedJsonOnly":cached_json_only, "compactRepair":repaired,
+                "schemaDowngraded":downgraded, "cachedJsonOnly":cached_json_only, "compactRepair":!repair_diagnostics.is_empty(), "formatRepairCount":repair_diagnostics.len(),
+                "outputRecovery":attempt_output_recovery, "recoveryBudget":budget.snapshot(),
             }),
             &context,
         );
@@ -511,7 +577,7 @@ pub(crate) async fn post_model_request(
                 if entries.len() >= 256 {
                     entries.clear();
                 }
-                entries.insert(cache_key.clone());
+                if field_repair.is_none() { entries.insert(cache_key.clone()); }
                 drop(entries);
                 body["response_format"] = json!({"type":"json_object"});
                 continue;
@@ -530,13 +596,15 @@ pub(crate) async fn post_model_request(
                 Some(&transport),
             )
         })?;
-        let prior_value = payload
+        let mut prior_value = payload
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
-            .and_then(|content| serde_json::from_str::<Value>(content).ok());
+            .and_then(|content| serde_json::from_str::<Value>(crate::json_contract::normalize_json_wrapper(content)).ok());
         let wire = body
             .pointer("/response_format/json_schema/schema")
             .filter(|_| body["response_format"]["type"] == "json_schema");
+        let repairing_field = field_repair.is_some();
+        let active_schema = field_repair.as_ref().map(|repair| &repair.schema).or(schema.as_ref());
         let mut invalid = if truncated {
             Some(OutputDiagnostic::new(
                 "MODEL_OUTPUT_TRUNCATED",
@@ -544,28 +612,63 @@ pub(crate) async fn post_model_request(
                 "模型输出达到预算上限，未得到完整结果",
             ))
         } else {
-            schema.as_ref().and_then(|schema| {
+            active_schema.and_then(|schema| {
                 compatibility::normalize_response_with_wire(&mut payload, schema, wire).err()
             })
         };
+        if invalid.is_none() {
+            if let Some(repair) = field_repair.take() {
+                let corrected: Value = serde_json::from_str(payload["choices"][0]["message"]["content"].as_str().unwrap()).unwrap();
+                read_only_recovery |= repair.opens_steps;
+                match repair.merge(&corrected, &context) {
+                    Ok(merged) => {
+                        payload["choices"][0]["message"]["content"] = json!(merged.to_string());
+                        prior_value = Some(merged);
+                        invalid = schema.as_ref().and_then(|schema|
+                            compatibility::normalize_response_with_wire(&mut payload, schema, None).err());
+                    }
+                    Err(diagnostic) => invalid = Some(diagnostic),
+                }
+            }
+        }
+        // A malformed repair envelope never falls back to whole-plan generation.
+        let invalid_field_response = repairing_field && field_repair.is_some();
+        if invalid.is_none() && read_only_recovery && scoped_operation {
+            invalid = prior_value.as_ref().and_then(|value| format_repair::read_only_steps(value, &context).err());
+        }
+        let mut decision_violation = false;
         if !truncated && invalid.is_none() {
             if let Some(decision) = &missing_steps_decision {
                 if prior_value.as_ref().is_none_or(|value| {
                     value["decision"] != decision.as_str()
-                        || value["steps"].as_array().is_none_or(Vec::is_empty)
+                        || value["steps"].as_array().is_none_or(|steps| {
+                            steps.is_empty()
+                                && crate::next_stage_format::requires_nonempty_repair_steps(&context, decision)
+                        })
                 }) {
                     let mut diagnostic = OutputDiagnostic::new(
                         "MODEL_FORMAT_INVALID",
                         "business_validation",
-                        "缺失 steps 的修复必须保留原决策并提供非空真实步骤",
+                        "缺失 steps 的修复必须保留原决策并遵循该决策的步骤规则；continue 必须提供非空真实步骤",
                     );
                     diagnostic.json_pointer = Some("/steps".into());
                     diagnostic.keyword = Some("required".into());
+                    decision_violation = true;
                     invalid = Some(diagnostic);
                 }
             }
         }
         let Some(mut diagnostic) = invalid else {
+            if let Some(repair) = &scoped_repair {
+                let fields: Value = serde_json::from_str(payload["choices"][0]["message"]["content"].as_str().unwrap()).unwrap();
+                let merged = repair.merge(&fields).map_err(|message| model_error_with_context(
+                    compatibility::output_error(&OutputDiagnostic::new("MODEL_FORMAT_INVALID", "scoped_repair_merge", &message), Some(status)),
+                    &budget, Some(&transport)))?;
+                payload["choices"][0]["message"]["content"] = json!(merged.to_string());
+                compatibility::normalize_response_with_wire(&mut payload, full_schema.as_ref().unwrap(), None)
+                    .map_err(|diagnostic| model_error_with_context(
+                        compatibility::output_error(&diagnostic, Some(status)), &budget, Some(&transport)))?;
+            }
             return Ok(payload);
         };
         crate::model_protocol::attach_response_diagnostics(&payload, &protocol, &mut diagnostic);
@@ -573,18 +676,33 @@ pub(crate) async fn post_model_request(
             developer_log_path,
             json!({
                 "event":"output_validation_failed", "timestampMs":unix_millis(), "requestName":request_name,
-                "httpStatus":status, "diagnostic":&diagnostic, "formatRepairUsed":repaired,
+                "httpStatus":status, "diagnostic":&diagnostic, "formatRepairUsed":!repair_diagnostics.is_empty(), "formatRepairCount":repair_diagnostics.len(),
+                "outputRecovery":attempt_output_recovery, "recoveryBudget":budget.snapshot(),
             }),
             &context,
         );
-        if repaired || schema.is_none() || (!truncated && !diagnostic.repairable()) {
+        // At most three targeted corrections under the same operation budget.
+        // Locations, not model prose or parse columns, identify repeated failures.
+        let repair_key = json!([diagnostic.code, diagnostic.stage, diagnostic.json_pointer,
+            diagnostic.schema_path, diagnostic.keyword]).to_string();
+        // The service-level coordinator owns escalation to a fresh candidate.
+        // Syntax/truncation cannot establish a frozen field boundary. Return its
+        // typed diagnostic without spending the candidate's generation budget.
+        let coordinated_stop = output_strategy.is_some_and(|strategy| {
+            strategy != OutputRecoveryStrategy::Initial || repairing_field || truncated
+                || prior_value.is_none() || !budget.can_repair_output_field()
+        });
+        if scoped_repair.is_some() || decision_violation || invalid_field_response || diagnostic.stage == "format_repair_scope"
+            || coordinated_stop
+            || repair_diagnostics.len() >= 3 || repair_diagnostics.contains(&repair_key)
+            || schema.is_none() || (!truncated && !diagnostic.repairable()) {
             return Err(model_error_with_context(
                 compatibility::output_error(&diagnostic, Some(status)),
                 &budget,
                 Some(&transport),
             ));
         }
-        if matches!(request_name, "阶段联合决策" | "阶段格式修复（兼容模式）") {
+        if missing_steps_decision.is_none() && matches!(request_name, "阶段联合决策" | "阶段格式修复（兼容模式）") {
             missing_steps_decision = prior_value
                 .as_ref()
                 .filter(|value| value.get("steps").is_none())
@@ -592,15 +710,48 @@ pub(crate) async fn post_model_request(
                 .filter(|decision| matches!(*decision, "continue" | "adjust"))
                 .map(str::to_owned);
         }
-        // One regeneration, under the original output budget. Never replay rejected
-        // prose as assistant history, facts or commands; send only safe diagnostics.
-        let feedback = format_repair_feedback(
+        // Keep one bounded correction under the original operation budget. A
+        // candidate field is unexecuted data, never assistant history or authority.
+        let base_feedback = format_repair_feedback(
             request_name,
             schema.as_ref().unwrap(),
             &diagnostic,
             truncated,
             missing_steps_decision.as_deref(),
+            &context,
         );
+        let mut feedback = base_feedback;
+        let mut feedback_role = "user";
+        if scoped_operation && !truncated {
+            if let Some(candidate) = &prior_value {
+                let Some(repair) = format_repair::FieldRepair::new(candidate, schema.as_ref().unwrap(), &diagnostic) else {
+                    return Err(model_error_with_context(compatibility::output_error(&diagnostic, Some(status)), &budget, Some(&transport)));
+                };
+                if output_strategy.is_some() {
+                    // Missing executable steps is a candidate-generation problem,
+                    // not permission to invent actions inside a field patch.
+                    if repair.opens_steps {
+                        return Err(model_error_with_context(compatibility::output_error(&diagnostic, Some(status)), &budget, Some(&transport)));
+                    }
+                    budget.claim_output_strategy(OutputRecoveryStrategy::FieldRepair, &body)?;
+                }
+                feedback = repair.feedback(&diagnostic, &context);
+                feedback_role = "system";
+                set_field_repair_schema(&mut body, &repair.schema)
+                    .map_err(|error| model_error_with_context(error, &budget, Some(&transport)))?;
+                field_repair = Some(repair);
+            }
+        }
+        if truncated || prior_value.is_none() {
+            if syntax_recovery_used {
+                return Err(model_error_with_context(compatibility::output_error(&diagnostic, Some(status)), &budget, Some(&transport)));
+            }
+            syntax_recovery_used = true;
+            read_only_recovery = scoped_operation;
+            if scoped_operation {
+                feedback.push_str("\n语法失败无法确认被拒动作边界，本次有界重生成只允许 kind=observe 的真实只读取证、空 validation，工具必须是当前目录 effect=read；禁止变更、提问、会话修改或用完成结论掩盖错误。后续仍做命令副作用、授权和证据校验。");
+            }
+        }
         let Some(messages) = body["messages"].as_array_mut() else {
             return Err(model_error_with_context(
                 compatibility::output_error(&diagnostic, Some(status)),
@@ -608,8 +759,17 @@ pub(crate) async fn post_model_request(
                 Some(&transport),
             ));
         };
-        messages.push(json!({"role":"user", "content":feedback}));
-        repaired = true;
+        // Retain every original authority/evidence message. Only this operation's
+        // previous format diagnostic is replaced, so corrections do not pile up
+        // or compete with a newer field-level failure.
+        let message = json!({"role":feedback_role, "content":feedback});
+        if let Some(index) = repair_message_index {
+            messages[index] = message;
+        } else {
+            repair_message_index = Some(messages.len());
+            messages.push(message);
+        }
+        repair_diagnostics.insert(repair_key);
     }
 }
 

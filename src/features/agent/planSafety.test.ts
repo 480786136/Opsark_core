@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { commandMutation } from "@/services/recoveryRules";
 import {
   analyzeFailureMask,
   analyzePlanStepSafety,
@@ -93,6 +94,21 @@ describe("plan safety", () => {
     ).safe).toBe(true);
     const classifiedStatus = "pgrep -f -- '/opt/app/backend' >/dev/null; rc=$?; case \"$rc\" in 0) echo RUNNING;; 1) echo NOT_RUNNING;; *) exit \"$rc\";; esac";
     expect(analyzePlanStepSafety(classifiedStatus, classifiedStatus).safe).toBe(true);
+  });
+
+  it("accepts a no-file fail-fast HTTP, content and listener validator without relaxing failure echoes", () => {
+    const command = "npm run preview -- --port 8082 --strictPort";
+    const validation = [
+      'body=$(curl -fsS --max-time 5 http://localhost:8082/) || { rc=$?; printf "%s\\n" "HTTP failed"; exit "$rc"; }',
+      'printf "%s" "$body" | grep -q "fixture-marker" || { rc=$?; printf "%s\\n" "content failed"; exit "$rc"; }',
+      'curl -fsS -o /dev/null --max-time 5 http://localhost:8082/assets/fixture.js || { rc=$?; printf "%s\\n" "asset failed"; exit "$rc"; }',
+      'ss -ltn | grep -q ":8082 " || { rc=$?; printf "%s\\n" "listener failed"; exit "$rc"; }',
+    ].join("\n");
+    expect(commandMutation(validation)).toBeUndefined();
+    expect(analyzePlanStepSafety(command, validation)).toMatchObject({ safe: true, issues: [] });
+    expect(analyzePlanStepSafety(command,
+      'ss -ltn | grep -q ":8082 " || echo missing; rc=0; exit "$rc"',
+    )).toMatchObject({ safe: false, issue: { ruleId: "VALIDATION_FAILURE_ECHOED" } });
   });
 
   it("allows bare HTTPS Git URLs but keeps usernames in the controlled PTY channel", () => {

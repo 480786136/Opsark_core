@@ -1,8 +1,10 @@
 <script setup lang="ts">
+import { currentRequestCompleted } from "@/features/agent/taskDecisionResolution";
 import { stepOperationText } from "@/features/agent/stepAction";
+import TaskHistoryEntries from "./TaskHistoryEntries.vue";
 import PreparedExecutionTargets from "./PreparedExecutionTargets.vue";
-import ExecutionLedgerRecoveryCard from "./ExecutionLedgerRecoveryCard.vue";
-import type { ExecutionLedgerRecoveryAction, ExecutionLedgerRecoveryItem } from "@/features/agent/executionLedgerRecovery";
+import SavedEvidenceViewer from "./SavedEvidenceViewer.vue";
+import { missingInspectionReceipts } from "@/features/agent/executionLedgerRecovery";
 
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
@@ -51,6 +53,8 @@ import {
   currentConversationRoundStartIndex,
   currentConversationTimeline,
 } from "@/features/agent/conversationHistory";
+import { modelServiceErrorMessage, restoreLegacyPlanProtocolFailure } from "@/services/backend";
+import { isExplicitModelPlanningRetryable, isModelRecoveryScopeRejection } from "@/services/modelRecovery";
 import { localizeCoreText } from "@/features/preferences/coreText";
 import { useAccountStore } from "@/features/account/accountStore";
 import { useOfficialCatalogStore } from "@/features/account/officialCatalogStore";
@@ -69,9 +73,6 @@ const { t, locale } = useI18n();
 const taskMenuTrigger = ref<HTMLElement>();
 const taskMenu = ref<HTMLElement>();
 const workspaceState = agentWorkspaces.ensureServer(props.serverId);
-watch(() => props.active, (active) => {
-  if (active !== false) agentWorkspaces.updateServer(props.serverId, { activeTaskId: "", showTasks: false });
-}, { immediate: true });
 const taskQuery = ref("");
 const persistedField = <K extends keyof typeof workspaceState>(key: K) => computed({
   get: () => workspaceState[key],
@@ -93,6 +94,18 @@ const userInputValues = ref<Record<string, string>>({});
 const submittingUserInputs = ref(new Set<PendingUserInput>());
 const submittingApprovals = ref(new Set<string>());
 const timeline = ref<HTMLElement>();
+const panelIsActive = () => props.active !== false;
+let savedTimelineScrollTop: number | undefined;
+watch(() => props.active, async active => {
+  if (active === false) {
+    savedTimelineScrollTop = timeline.value?.scrollTop;
+  } else {
+    await nextTick();
+    if (props.active !== false && timeline.value && savedTimelineScrollTop !== undefined) {
+      timeline.value.scrollTop = savedTimelineScrollTop;
+    }
+  }
+});
 type PendingPreviousPlan = {
   taskId: string;
   messageIds: string[];
@@ -128,7 +141,8 @@ const permissionOptions = computed(() => [
   { value: "safe", label: t("agent.permissionSafe") },
   { value: "managed", label: t("agent.permissionManaged") },
 ]);
-const coreText = (value?: string | null) => localizeCoreText(value, locale.value);
+const coreText = (value?: string | null) => localizeCoreText(
+  restoreLegacyPlanProtocolFailure(value ?? undefined)?.userMessage ?? value, locale.value);
 
 const serverTasks = computed(() => store.tasks.filter((task) => task.serverId === props.serverId));
 const task = computed(() => serverTasks.value.find((item) => item.id === workspaceState.activeTaskId));
@@ -144,7 +158,8 @@ const submissionError = computed(() => {
   const error = submissionErrorState.value;
   return error && error.taskId === task.value?.id ? error.message : "";
 });
-const filteredTasks = computed(() => serverTasks.value.filter(item => item.title.toLowerCase().includes(taskQuery.value.toLowerCase())));
+const taskListCount = ref<number>();
+watch(() => props.serverId, () => { taskListCount.value = undefined; });
 const conversationRounds = computed(() => task.value ? conversationHistoryRounds(serverTasks.value, task.value) : []);
 const canApprovePlan = computed(() => Boolean(task.value
   && task.value.status === "awaiting_plan_approval"
@@ -161,9 +176,24 @@ const modelCreditsTitle = computed(() => task.value?.modelPlanningBlocker
   ? t(task.value.modelPlanningBlocker.error.code === "CREDITS_RECONCILIATION_REQUIRED"
     ? "agent.modelCreditsReconciliation" : "agent.modelCreditsPaused")
   : "");
+const modelRecoveryScopeRejected = computed(() => isModelRecoveryScopeRejection(task.value?.modelPlanningBlocker?.error));
+const modelFormatFailure = computed(() => task.value?.modelPlanningBlocker?.error.code === "MODEL_FORMAT_INVALID" && !modelRecoveryScopeRejected.value);
+const modelRecoveryLimitReached = computed(() => task.value?.modelPlanningBlocker?.error.code === "MODEL_RECOVERY_BUDGET_EXHAUSTED");
+const explicitModelRetryAvailable = computed(() => isExplicitModelPlanningRetryable(task.value?.modelPlanningBlocker?.error));
+const formatRetryBlocked = computed(() => Boolean(task.value?.requirementProcessing || task.value?.adjustmentInProgress
+  || task.value?.cancelRequested || modelRecoveryLimitReached.value && !explicitModelRetryAvailable.value));
+const retryPlanningTitle = computed(() => task.value?.requirementProcessing || task.value?.adjustmentInProgress
+  ? t("agent.formatRetryBlocked") : undefined);
 const modelCompatibilityTitle = computed(() => task.value?.modelPlanningBlocker && !modelCreditsTitle.value
-  ? t(task.value.modelPlanningBlocker.error.code === "MODEL_OUTPUT_TRUNCATED" ? "agent.modelOutputTruncated" : "agent.modelCompatibilityPaused") : "");
+  ? t(modelRecoveryScopeRejected.value ? "agent.modelRecoveryScopePaused" : modelFormatFailure.value ? "agent.modelFormatPaused" : modelRecoveryLimitReached.value ? "agent.modelRecoveryPaused"
+    : task.value.modelPlanningBlocker.error.code === "MODEL_OUTPUT_TRUNCATED" ? "agent.modelOutputTruncated" : "agent.modelCompatibilityPaused") : "");
 const usesOfficialModel = computed(() => store.models.find(model => model.id === task.value?.modelId)?.source === "official");
+const modelPauseDetail = computed(() => modelRecoveryScopeRejected.value && task.value?.modelPlanningBlocker
+  ? coreText(modelServiceErrorMessage(task.value.modelPlanningBlocker.error))
+  : modelRecoveryLimitReached.value && explicitModelRetryAvailable.value
+  ? t("agent.modelRecoveryRetryHint")
+  : usesOfficialModel.value && modelCompatibilityTitle.value && !modelFormatFailure.value && !modelRecoveryLimitReached.value
+    ? t("agent.officialModelCompatibilityHint") : coreText(task.value?.pauseReason ?? ""));
 const currentPlanAction = computed(() => task.value ? planAction(task.value) : "continuation");
 const normalContinuation = computed(() => Boolean(task.value && isNormalContinuation(task.value)));
 const planningCopy = computed(() => ({
@@ -176,6 +206,7 @@ const planningCopy = computed(() => ({
 const adjustmentLabel = computed(() =>
   modelCreditsTitle.value ? modelCreditsTitle.value
     : modelCompatibilityTitle.value ? modelCompatibilityTitle.value
+    : task.value?.protocolRepair && /(?:executionScope|validationScope|runtimeClass) 不合法/.test(task.value.protocolRepair.repair.validationError) ? t("agent.nextStageResponsePaused")
     : needsExecutionReconciliation.value ? t("agent.executionReconciliationRequired")
     : currentPlanAction.value === "transport"
     ? t("agent.terminalRecoveryRequired")
@@ -260,6 +291,7 @@ const showManualAdjustmentButton = computed(() => Boolean(task.value && (
 )));
 const canRequestAdjustment = computed(() => Boolean(task.value
   && ["needs_adjustment", "awaiting_continuation"].includes(task.value.status)
+  && !task.value.cancelRequested
   && showManualAdjustmentButton.value
   && (!task.value.autoAdjustmentSeconds || needsTransportRecoveryCheck.value)
   && !task.value.adjustmentInProgress
@@ -276,18 +308,12 @@ const needsUserAction = computed(() => Boolean(
 
 async function requestTaskAdjustment() {
   if (!task.value || !canRequestAdjustment.value) return;
-  if (needsTransportRecoveryCheck.value) {
+  if (explicitModelRetryAvailable.value) {
+    await store.retryModelPlanning(task.value.id);
+  } else if (needsTransportRecoveryCheck.value) {
     await store.routeAutomaticAdjustment(task.value.id, { transportRecovery: true });
   } else {
     await store.requestAdjustment(task.value.id);
-  }
-}
-
-async function handleExecutionLedgerRecovery(action: ExecutionLedgerRecoveryAction, item: ExecutionLedgerRecoveryItem) {
-  if (!task.value) return;
-  if (action === "retry_storage") await store.retryExecutionLedgerStorage(task.value.id, item.attemptId);
-  else if ((action === "reconcile" || action === "verify") && item.attemptId) {
-    await store.reconcileExecutionAttempt(task.value.id, item.attemptId);
   }
 }
 
@@ -407,6 +433,7 @@ const activeRecordId = computed(() => isBusy.value
   ? currentRecords.value[currentRecords.value.length - 1]?.id
   : undefined);
 const currentRecordPreview = computed(() => currentRecords.value.slice(-3));
+const archivedOutputSupplements = computed(() => task.value ? missingInspectionReceipts(task.value) : []);
 
 type SummaryBlock =
   | { type: "heading" | "paragraph"; text: string }
@@ -446,7 +473,9 @@ watch(needsUserAction, (awaitingUser) => {
 watch(
   () => [task.value?.messages.length, task.value?.plan.length, task.value?.phaseHistory?.length, task.value?.status],
   async () => {
+    if (!panelIsActive()) return;
     await nextTick();
+    if (!panelIsActive()) return;
     timeline.value?.scrollTo({ top: timeline.value.scrollHeight, behavior: "smooth" });
   },
 );
@@ -579,6 +608,11 @@ async function submit() {
 async function retryPlanning() {
   const current = task.value;
   if (!current) return;
+  if (explicitModelRetryAvailable.value) {
+    await store.retryModelPlanning(current.id);
+    return;
+  }
+  if (modelRecoveryLimitReached.value) return;
   input.value = current.currentInstruction
     || current.rootGoal
     || [...current.messages].reverse().find((message) => message.role === "user")?.content
@@ -682,7 +716,8 @@ function stepObservationText(step: PlanStep) {
   return step.result?.observationStatus ? t(keys[step.result.observationStatus]) : t("agent.observationNone");
 }
 
-function statusText(status?: string) {
+function statusText(status?: string, owner?: OpsTask) {
+  if (owner && status === "awaiting_continuation" && currentRequestCompleted(owner)) return locale.value.startsWith("en") ? "Current request completed" : "本轮已完成";
   const labels: Record<string, string> = {
     draft: "agent.statusDraft",
     planning: "agent.statusPlanning",
@@ -701,7 +736,8 @@ function statusText(status?: string) {
   return status ? (labels[status] ? t(labels[status]) : status) : "";
 }
 
-function summaryTitle(status?: string) {
+function summaryTitle(status?: string, owner?: OpsTask) {
+  if (owner && status === "awaiting_continuation" && currentRequestCompleted(owner)) return locale.value.startsWith("en") ? "Current request completed" : "本轮结果";
   const labels: Record<string, string> = {
     completed: "agent.summaryCompleted",
     failed: "agent.summaryFailed",
@@ -737,7 +773,7 @@ async function deleteTaskItem(item: OpsTask) {
   if (!taskCanBeDeleted(item)) {
     await store.terminateTask(item.id);
   }
-  if (store.deleteTask(item.id)) startNewTask();
+  if (await store.deleteTask(item.id)) startNewTask();
 }
 
 function selectTaskItem(taskId: string) {
@@ -753,6 +789,7 @@ function startNewTask() {
 }
 
 function closeTaskMenuOnOutsidePointer(event: PointerEvent) {
+  if (props.active === false) return;
   const target = event.target as Node;
   if (showTasks.value && !taskMenu.value?.contains(target) && !taskMenuTrigger.value?.contains(target)) {
     showTasks.value = false;
@@ -764,7 +801,11 @@ onMounted(() => {
   if (import.meta.env.MODE !== "test") void officialCatalog.refresh();
   void restoreAutomation();
 });
-onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuOnOutsidePointer));
+onBeforeUnmount(() => {
+  document.removeEventListener("pointerdown", closeTaskMenuOnOutsidePointer);
+  // A closed view no longer owns task selection or draft updates from pending requests.
+  activeSubmissionOwner.value = undefined;
+});
 </script>
 
 <template>
@@ -786,7 +827,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
       </div>
       <button ref="taskMenuTrigger" :class="['text-icon-button', 'task-menu-trigger', { active: showTasks }]" @click="showTasks = !showTasks">
         <span class="task-menu-trigger-icon"><History :size="14" /></span>
-        <span class="task-menu-trigger-copy"><strong>{{ t("agent.tasks") }}</strong><small>{{ task ? statusText(task.status) : t("agent.noActiveTask") }}</small></span>
+        <span class="task-menu-trigger-copy"><strong>{{ t("agent.tasks") }}</strong><small>{{ task ? statusText(task.status, task) : t("agent.noActiveTask") }}</small></span>
         <b>{{ serverTasks.length }}</b>
       </button>
     </header>
@@ -815,28 +856,28 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
       <div v-if="showTasks" ref="taskMenu" class="task-strip" @keydown.esc.stop="showTasks = false">
         <header class="task-strip-head">
           <span class="task-strip-heading"><History :size="14" /><span><strong>{{ t("agent.taskListTitle") }}</strong><small>{{ t("agent.taskListHint") }}</small></span></span>
-          <strong>{{ serverTasks.length }}</strong>
+          <strong>{{ taskListCount ?? serverTasks.length }}</strong>
           <button class="icon-button" type="button" :aria-label="t('agent.closeTaskList')" @click="showTasks = false"><X :size="14"/></button>
         </header>
         <label class="task-menu-search"><Search :size="14"/><input v-model="taskQuery" :aria-label="t('agent.searchTasks')" :placeholder="t('agent.searchTasks')"/></label>
         <div class="task-strip-list">
-        <TransitionGroup name="task-list">
-        <div v-for="item in filteredTasks" :key="item.id" :class="['task-strip-item', item.status, { active: item.id === task?.id }]">
-          <button class="task-select" :title="item.title" @click="selectTaskItem(item.id)">
-            <span :class="['task-status-mini', item.status]"></span>
-            <span><strong>{{ item.title }}</strong><small>{{ t("agent.rounds", { count: (item.planHistory?.length ?? 0) + (item.messages.some((message) => message.role === 'user' && message.kind === 'message') ? 1 : 0), status: statusText(item.status) }) }}</small></span>
+        <TaskHistoryEntries :key="props.serverId" :server-id="props.serverId" :query="taskQuery" :active-task-id="task?.id"
+          @count="taskListCount = $event" @opened="selectTaskItem">
+        <template #default="{ entry, openTask, busy }">
+          <button class="task-select" :title="entry.title" :disabled="busy" @click="openTask">
+            <span :class="['task-status-mini', entry.status]"></span>
+            <span><strong>{{ entry.title }}</strong><small>{{ t("agent.rounds", { count: entry.roundCount ?? 0, status: statusText(entry.status, entry.task) }) }}</small></span>
           </button>
           <button
+            v-if="entry.task"
             class="task-delete"
             type="button"
             :title="t('agent.removeTask')"
-            :aria-label="t('agent.removeTaskNamed', { name: item.title })"
-            @click.stop="deleteTaskItem(item)"
+            :aria-label="t('agent.removeTaskNamed', { name: entry.title })"
+            @click.stop="deleteTaskItem(entry.task)"
           ><Trash2 :size="13" /></button>
-        </div>
-        </TransitionGroup>
-        <div v-if="!serverTasks.length" class="task-strip-empty">{{ t("agent.emptyTitle") }}</div>
-        <div v-else-if="!filteredTasks.length" class="task-strip-empty">{{ t("agent.noMatchingTasks") }}</div>
+        </template>
+        </TaskHistoryEntries>
         </div>
         <button class="new-task" @click="startNewTask"><MessageSquarePlus :size="14" />{{ t("agent.newTask") }}</button>
       </div>
@@ -1014,7 +1055,6 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
             />
           </template>
 
-          <ExecutionLedgerRecoveryCard :task-id="task.id" :recovery="task.executionLedgerRecovery" @action="handleExecutionLedgerRecovery" />
           <div v-if="(task.plan.length || hasTransportRecovery || needsUserAction) && !pendingPreviousPlanIsCurrent" :class="['plan-card', 'current-plan-card', `task-card-${task.status}`]">
             <div class="plan-card-head">
               <span class="plan-title-block">
@@ -1025,7 +1065,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                     <ArrowRight v-if="normalContinuation" :size="13" />
                     <Clock3 v-else-if="task.status.includes('awaiting')" :size="13" />
                     <CheckCircle2 v-else-if="task.status === 'completed'" :size="13" />
-                    {{ statusText(task.status) }}
+                    {{ statusText(task.status, task) }}
                   </span>
                   <small class="plan-processed">{{ planProgressText(task) }}</small>
                   <button
@@ -1165,12 +1205,19 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
             <div v-else-if="task.status === 'planning_failed'" class="approval-bar warning" :role="modelCreditsTitle || modelCompatibilityTitle ? 'alert' : undefined">
               <span class="adjustment-copy">
                 <ShieldAlert :size="15" />
-                <span><strong>{{ modelCreditsTitle || modelCompatibilityTitle || t("agent.summaryPlanningFailed") }}</strong><small v-if="task.pauseReason">{{ coreText(task.pauseReason) }}</small></span>
+                <span><strong>{{ modelCreditsTitle || modelCompatibilityTitle || t("agent.summaryPlanningFailed") }}</strong><small v-if="task.pauseReason">{{ modelPauseDetail }}</small></span>
               </span>
               <button class="button secondary" @click="store.rejectTask(task.id)">{{ t("agent.endTask") }}</button>
               <button v-if="modelCreditsTitle" class="button secondary" @click="router.push(usesOfficialModel ? '/account' : '/models')">{{ t(usesOfficialModel ? 'agent.manageModelCredits' : 'agent.manageModels') }}</button>
-              <button v-else-if="modelCompatibilityTitle" class="button secondary" @click="showModelSettings = true">{{ t('agent.adjustModelSettings') }}</button>
-              <button class="button primary" @click="retryPlanning">{{ t("agent.retryPlanning") }}</button>
+              <button v-else-if="modelCompatibilityTitle && !modelFormatFailure && !modelRecoveryScopeRejected && !modelRecoveryLimitReached" class="button secondary" @click="showModelSettings = true">{{ t(usesOfficialModel ? 'agent.viewModelOptions' : 'agent.adjustModelSettings') }}</button>
+              <button class="button primary" :disabled="formatRetryBlocked" :title="retryPlanningTitle" @click="retryPlanning">{{ t("agent.retryPlanning") }}</button>
+            </div>
+            <div v-else-if="task.status === 'awaiting_continuation' && currentRequestCompleted(task)" class="approval-bar continuation">
+              <span class="adjustment-copy"><CheckCircle2 :size="15" /><span>
+                <strong>{{ locale.startsWith('en') ? 'Current request completed' : '本轮需求已完成' }}</strong>
+                <small>{{ task.currentRequestReview?.summary }}</small>
+                <small>{{ locale.startsWith('en') ? 'Other unfinished requirements are retained. Send a message to continue or change the scope.' : '其他未完成要求已保留，可继续追加需求或明确下一步范围。' }}</small>
+              </span></span>
             </div>
             <div v-else-if="['needs_adjustment', 'awaiting_continuation'].includes(task.status)" :class="['approval-bar', normalContinuation ? 'continuation' : 'warning']" :role="modelCreditsTitle || modelCompatibilityTitle ? 'alert' : undefined">
               <span class="adjustment-copy">
@@ -1178,14 +1225,14 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                 <ShieldAlert v-else :size="15" />
                 <span>
                   <strong>{{ adjustmentLabel }}</strong>
-                  <small v-if="task.pauseReason">{{ coreText(task.pauseReason) }}</small>
+                  <small v-if="task.pauseReason">{{ modelPauseDetail }}</small>
                   <small v-if="normalContinuation">{{ t('agent.nextPlanHint') }}</small>
-                  <small v-else-if="currentPlanAction === 'blocked'">{{ t(task.latestGoalReview?.decision.decision === 'adjust' && task.latestGoalReview.nextPlan?.length === 0 ? 'agent.noActionHint' : 'agent.nextStepBlockedHint') }}</small>
+                  <small v-else-if="currentPlanAction === 'blocked' && !task.protocolRepair && !modelFormatFailure && !modelRecoveryScopeRejected && !modelRecoveryLimitReached">{{ t(task.latestGoalReview?.decision.decision === 'adjust' && task.latestGoalReview.nextPlan?.length === 0 ? 'agent.noActionHint' : 'agent.nextStepBlockedHint') }}</small>
                 </span>
               </span>
               <button class="button secondary" @click="store.rejectTask(task.id)">{{ t(task.protocolRepair || needsExecutionReconciliation ? "agent.keepResultsAndEnd" : "agent.endTask") }}</button>
               <button v-if="modelCreditsTitle" class="button secondary" @click="router.push(usesOfficialModel ? '/account' : '/models')">{{ t(usesOfficialModel ? 'agent.manageModelCredits' : 'agent.manageModels') }}</button>
-              <button v-else-if="modelCompatibilityTitle" class="button secondary" @click="showModelSettings = true">{{ t('agent.adjustModelSettings') }}</button>
+              <button v-else-if="modelCompatibilityTitle && !modelFormatFailure && !modelRecoveryScopeRejected && !modelRecoveryLimitReached" class="button secondary" @click="showModelSettings = true">{{ t(usesOfficialModel ? 'agent.viewModelOptions' : 'agent.adjustModelSettings') }}</button>
               <span v-if="isWaitingForTerminalRecovery" class="managed-approval-countdown">
                 <LoaderCircle class="spin" :size="13" />{{ t('agent.waitingTerminalRecovery') }}
               </span>
@@ -1198,13 +1245,13 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
               <span v-else-if="task.permission === 'managed' && !showManualAdjustmentButton" class="managed-approval-countdown">
                 <LoaderCircle class="spin" :size="13" />{{ t('agent.managedAutoContinuing') }}
               </span>
-              <button v-else-if="canRequestAdjustment" class="button primary" @click="requestTaskAdjustment">
-                {{ t(needsTransportRecoveryCheck ? 'agent.checkTerminalRecovery' : needsExecutionReconciliation ? 'agent.generateReconciliationPlan' : planningCopy.button) }}
+              <button v-else-if="canRequestAdjustment" class="button primary" :disabled="formatRetryBlocked" :title="retryPlanningTitle" @click="requestTaskAdjustment">
+                {{ t(explicitModelRetryAvailable || task.protocolRepair ? 'agent.retryPlanning' : needsTransportRecoveryCheck ? 'agent.checkTerminalRecovery' : needsExecutionReconciliation ? 'agent.generateReconciliationPlan' : planningCopy.button) }}
               </button>
             </div>
           </div>
 
-          <div v-if="currentRecords.length || task.plan.some((step) => step.output)" class="plan-card execution-record-card">
+          <div v-if="currentRecords.length || task.plan.some((step) => step.output) || archivedOutputSupplements.length" class="plan-card execution-record-card">
             <button class="plan-card-head archived-head" @click="toggleRecords('current')">
               <span><LoaderCircle v-if="isBusy" class="spin execution-record-running" :size="15" /><ListTree v-else :size="15" /><span><strong>{{ t("agent.executionRecord") }}</strong><small>{{ t("agent.recordsHint", { count: currentRecords.length }) }}</small></span></span>
               <span><ChevronDown v-if="expandedRecords.includes('current')" :size="15" /><ChevronRight v-else :size="15" /></span>
@@ -1223,6 +1270,11 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
                 <strong>{{ step.title }}</strong><code>{{ stepOperationText(step) }}</code><pre>{{ step.output }}</pre>
                 <p v-if="step.review" class="execution-review">{{ t("agent.reviewPrefix", { summary: step.review.summary, reason: step.review.reason }) }}</p>
               </div>
+              <div v-for="receipt in archivedOutputSupplements" :key="receipt.attemptId" class="execution-output archived-output-supplement">
+                <strong>{{ receipt.title }}</strong>
+                <small>{{ locale.startsWith('en') ? 'Earlier saved output' : '较早保存的输出' }}<template v-if="receipt.recordedAt"> · {{ new Date(receipt.recordedAt).toLocaleString(locale) }}</template></small>
+                <SavedEvidenceViewer :task-id="task.id" :evidence-refs="receipt.evidenceRefs" />
+              </div>
             </div>
           </div>
 
@@ -1237,7 +1289,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
               <Square v-else :size="15" />
             </div>
             <div class="summary-card-content">
-              <span class="summary-eyebrow">{{ summaryTitle(task.status) }}</span>
+              <span class="summary-eyebrow">{{ summaryTitle(task.status, task) }}</span>
               <div class="summary-content">
                 <template v-for="(block, index) in summaryBlocks(coreText(task.summary ?? task.pauseReason))" :key="index">
                   <h4 v-if="block.type === 'heading'">{{ block.text }}</h4>
@@ -1291,6 +1343,7 @@ onBeforeUnmount(() => document.removeEventListener("pointerdown", closeTaskMenuO
     </template>
     <ModelSettingsModal
       :open="showModelSettings"
+      :model-id="task?.modelId"
       @close="showModelSettings = false"
       @saved="handleModelsSaved"
     />

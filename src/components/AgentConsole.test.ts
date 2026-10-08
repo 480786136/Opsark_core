@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createApp, defineComponent, h, nextTick } from "vue";
+import { createApp, defineComponent, h, nextTick, ref } from "vue";
 import { createPinia } from "pinia";
 import { createMemoryHistory, createRouter } from "vue-router";
 import { i18n } from "@/features/preferences/i18n";
@@ -17,7 +17,9 @@ vi.mock("@/components/ModelSettingsModal.vue", () => ({
   default: defineComponent(() => () => h("div")),
 }));
 
+import invalidScope from "@/services/fixtures/next-stage-invalid-scope.json";
 import AgentConsole from "./AgentConsole.vue";
+import { backend } from "@/services/backend";
 
 function clarificationTask(ops: ReturnType<typeof useOpsStore>) {
   const task = ops.createTask("server-a", "safe", "model-deepseek");
@@ -96,6 +98,79 @@ describe("AgentConsole 服务器工作区隔离", () => {
     input.dispatchEvent(new Event("input", { bubbles: true }));
     return input;
   }
+
+  it("retains the selected conversation, draft and scroll position across workspace switches", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    vi.spyOn(ops, "refreshModelAvailability").mockResolvedValue();
+    vi.spyOn(ops, "refreshExecutionLedger").mockResolvedValue();
+    const task = ops.createTask("server-a", "safe", "model-deepseek");
+    task.title = "原先的部署对话";
+    task.messages.push({ id: "visible-message", role: "assistant", kind: "message", content: "继续检查原有部署", createdAt: task.createdAt });
+    const workspace = useAgentWorkspaceStore(pinia);
+    workspace.updateServer("server-a", { activeTaskId: task.id, automationEnabled: true, draft: "尚未发送的补充需求" });
+    const active = ref(true);
+    const app = createApp(defineComponent(() => () => h(AgentConsole, { serverId: "server-a", active: active.value }))).use(pinia).use(i18n);
+    app.mount(host);
+    try {
+      await nextTick();
+      expect(host.querySelector(".agent-title")?.textContent).toContain(task.title);
+      const timeline = host.querySelector<HTMLElement>(".agent-timeline")!;
+      timeline.scrollTop = 137;
+      active.value = false;
+      await nextTick();
+      timeline.scrollTop = 0;
+      active.value = true;
+      await nextTick(); await nextTick();
+      expect(workspace.ensureServer("server-a").activeTaskId).toBe(task.id);
+      expect(host.querySelector(".agent-title")?.textContent).toContain(task.title);
+      expect(host.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("尚未发送的补充需求");
+      expect(timeline.scrollTop).toBe(137);
+    } finally { app.unmount(); }
+  });
+
+  it("keeps recorded results out of the conversation without clearing their evidence", async () => {
+    const pinia = createPinia(), ops = useOpsStore(pinia);
+    vi.spyOn(ops, "refreshExecutionLedger").mockResolvedValue();
+    const task = clarificationTask(ops);
+    task.executionLedgerRecovery = { version: "execution-ledger-recovery@1", items: [
+      { kind: "recorded_result", operationId: "operation-hidden", attemptId: "attempt-hidden", title: "远端操作",
+        summary: "主命令成功已记录", knownFacts: ["等待验收"], action: "none" },
+    ] };
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      expect(host.querySelector(".execution-ledger-recovery")).toBeNull();
+      expect(host.textContent).not.toContain("任务结果待确认");
+      expect(host.textContent).not.toContain("operation-hidden");
+      expect(host.querySelector(".user-input-card")).not.toBeNull();
+      expect(task.executionLedgerRecovery.items).toHaveLength(1);
+      expect(task.status).toBe("awaiting_input");
+    } finally { app.unmount(); }
+  });
+
+  it("shows completed current request without a misleading blocked continuation bar", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = ops.createTask("server-a", "managed", "model-deepseek");
+    task.currentRoundId = "firewall-round";
+    task.status = "awaiting_continuation";
+    task.requirementLifecycle = { version: 1, revision: 4, items: [],
+      focus: { roundId: task.currentRoundId, requirementIds: ["firewall"] } };
+    task.currentRequestReview = { roundId: task.currentRoundId, requirementRevision: 4,
+      completed: true, summary: "8081 永久规则已验收，外部访问入口仍待验证。", remainingRequirementIds: ["external-access"] };
+    task.pauseReason = task.currentRequestReview.summary;
+    task.managedStopReason = "request_completed";
+    task.plan = [{ id: "query", title: "查询永久规则", kind: "observe", command: "firewall-cmd --query-port=8081/tcp",
+      description: "检查", expected: "已放行", validation: "", risk: "low", status: "completed" }];
+    const app = mountTask(pinia, task);
+    await nextTick();
+    expect(host.textContent).toContain("本轮需求已完成");
+    expect(host.textContent).toContain("外部访问入口仍待验证");
+    expect(host.textContent).not.toContain("下一步需要先处理当前阻断");
+    expect(host.textContent).not.toContain("完全托管模式正在自动继续");
+    app.unmount();
+  });
 
   function submitClarification(form = host.querySelector<HTMLFormElement>(".user-input-card")!) {
     form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
@@ -238,6 +313,146 @@ describe("AgentConsole 服务器工作区隔离", () => {
     } finally { app.unmount(); }
   });
 
+  it("旧错误事件显示简短协议原因，原始消息留作审计", async () => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = ops.createTask("server-a", "safe", "model-deepseek");
+    task.status = "needs_adjustment";
+    const raw = `后续流程暂不可用：ModelInvocationError: ${JSON.stringify(invalidScope)}。已完成步骤及其执行证据保持有效，可检查后继续。`;
+    task.pauseReason = raw;
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      expect(host.textContent).toContain("validationScope 不合法");
+      expect(host.textContent).not.toContain("ModelInvocationError");
+      expect(host.textContent).not.toContain("rejectedPlanExecuted");
+      expect(task.pauseReason).toBe(raw);
+    } finally { app.unmount(); }
+  });
+
+  it.each(["planning_failed", "needs_adjustment", "awaiting_continuation"] as const)("格式错误展示字段诊断，官方模型不显示无效设置入口：%s", async status => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    ops.models.push({ id: "official-format", name: "Opsark", model: "Opsark", provider: "official",
+      endpoint: "https://example.invalid/v1", source: "official", enabled: true, hasApiKey: true });
+    const task = ops.createTask("server-a", "safe", "official-format");
+    task.status = status;
+    ops.recordModelPlanningBlocker(task, { code: "MODEL_FORMAT_INVALID", message: "invalid", retryable: false,
+      stage: "business_validation", jsonPointer: "/steps/0/action/timeoutSeconds", keyword: "additionalProperties" });
+    const request = vi.spyOn(ops, "retryModelPlanning").mockResolvedValue();
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      const bar = host.querySelector<HTMLElement>(".approval-bar.warning")!;
+      expect(bar.textContent).toContain("/steps/0/action/timeoutSeconds");
+      expect(bar.textContent).not.toContain("查看可用模型");
+      expect(bar.textContent).not.toContain("官方模型由平台统一配置");
+      expect(bar.textContent).not.toContain("请根据当前情况补充信息");
+      const retry = bar.querySelector<HTMLButtonElement>(".button.primary")!;
+      expect(retry.disabled).toBe(false);
+      retry.click();
+      await nextTick();
+      expect(request).toHaveBeenCalledWith(task.id);
+      task.adjustmentInProgress = true;
+      await nextTick();
+      const generatingRetry = host.querySelector<HTMLButtonElement>(".approval-bar.warning .button.primary");
+      expect(generatingRetry === null || generatingRetry.disabled).toBe(true);
+    } finally { app.unmount(); }
+  });
+
+  it.each([
+    ["planning_failed", "MODEL_RECOVERY_SCOPE_REJECTED", true],
+    ["needs_adjustment", "MODEL_RECOVERY_SCOPE_REJECTED", false],
+    ["awaiting_continuation", "MODEL_RECOVERY_SCOPE_REJECTED", true],
+    ["planning_failed", "MODEL_FORMAT_INVALID", false],
+    ["needs_adjustment", "MODEL_FORMAT_INVALID", true],
+    ["awaiting_continuation", "MODEL_FORMAT_INVALID", false],
+  ] as const)("只读范围拒绝使用策略提示，兼容历史格式错误码：%s %s official=%s", async (status, code, official) => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    if (official) ops.models.push({ id: "official-scope", name: "Opsark", model: "Opsark", provider: "official",
+      endpoint: "https://example.invalid/v1", source: "official", enabled: true, hasApiKey: true });
+    const task = ops.createTask("server-a", "safe", official ? "official-scope" : "model-deepseek");
+    task.status = status;
+    ops.recordModelPlanningBlocker(task, { code, origin: "core", stage: "format_repair_scope",
+      jsonPointer: "/steps/1/action/command", message: "raw private content", retryable: false });
+    // A saved pauseReason may predate the classification fix; render its typed diagnostic.
+    task.pauseReason = "模型响应格式修复未成功。字段 /steps/1未通过契约校验。";
+    const retry = vi.spyOn(ops, "retryModelPlanning").mockResolvedValue();
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      const bar = host.querySelector<HTMLElement>(".approval-bar.warning")!;
+      expect(bar.textContent).toContain("恢复方案未通过只读安全校验，任务已暂停");
+      expect(bar.textContent).toContain("第 2 个步骤的 Shell 命令");
+      expect(bar.textContent).toContain("无法被当前规则确认只读");
+      for (const text of ["格式修复未成功", "格式不符合契约", "查看可用模型", "调整模型与输出预算", "raw private content"]) {
+        expect(bar.textContent).not.toContain(text);
+      }
+      const button = bar.querySelector<HTMLButtonElement>(".button.primary")!;
+      expect(button.disabled).toBe(false);
+      button.click();
+      await nextTick();
+      expect(retry).toHaveBeenCalledWith(task.id);
+    } finally { app.unmount(); }
+  });
+
+  it.each([
+    ["planning_failed", true], ["needs_adjustment", true], ["awaiting_continuation", false],
+  ] as const)("恢复预算耗尽显示人工重试，不提示更改模型配置：%s official=%s", async (status, official) => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    if (official) ops.models.push({ id: "official-budget", name: "Opsark", model: "Opsark", provider: "official",
+      endpoint: "https://example.invalid/v1", source: "official", enabled: true, hasApiKey: true });
+    const task = ops.createTask("server-a", "safe", official ? "official-budget" : "model-deepseek");
+    task.status = status;
+    ops.recordModelPlanningBlocker(task, { code: "MODEL_RECOVERY_BUDGET_EXHAUSTED", message: "模型操作总等待时间已耗尽",
+      retryable: false, origin: "core", stage: "recovery_budget", modelOperationId: "expired-operation",
+      recoveryBudget: { modelOperationId: "expired-operation", recoveryBlocked: false,
+        elapsedMs: 1_039_189, maxElapsedMs: 360_000, generations: 4, maxGenerations: 6 } });
+    const retry = vi.spyOn(ops, "retryModelPlanning").mockResolvedValue();
+    const submit = vi.spyOn(ops, "submitRequirement").mockResolvedValue();
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      const bar = host.querySelector<HTMLElement>(".approval-bar.warning")!;
+      expect(bar.textContent).toContain("本次自动规划已暂停");
+      expect(bar.textContent).toContain("目标和已完成结果已保留，可手动重新生成后续方案");
+      expect(bar.textContent).not.toContain("模型格式或参数不兼容");
+      expect(bar.textContent).not.toContain("查看可用模型");
+      expect(bar.textContent).not.toContain("调整模型与输出预算");
+      expect(bar.textContent).not.toContain("官方模型由平台统一配置");
+      const button = bar.querySelector<HTMLButtonElement>(".button.primary")!;
+      expect(button.disabled).toBe(false);
+      button.click();
+      await nextTick();
+      expect(retry).toHaveBeenCalledWith(task.id);
+      expect(submit).not.toHaveBeenCalled();
+    } finally { app.unmount(); }
+  });
+
+  it.each([true, undefined])("恢复结果仍被阻断或元数据缺失时不提供新预算入口：%s", async recoveryBlocked => {
+    const pinia = createPinia();
+    const ops = useOpsStore(pinia);
+    const task = ops.createTask("server-a", "safe", "model-deepseek");
+    task.status = "needs_adjustment";
+    ops.recordModelPlanningBlocker(task, { code: "MODEL_RECOVERY_BUDGET_EXHAUSTED", message: "恢复仍被阻断",
+      retryable: false, origin: "core", stage: "recovery_budget", recoveryBudget: { recoveryBlocked } });
+    const retry = vi.spyOn(ops, "retryModelPlanning").mockResolvedValue();
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      const bar = host.querySelector<HTMLElement>(".approval-bar.warning")!;
+      expect(bar.textContent).toContain("本次自动规划已暂停");
+      expect(bar.textContent).not.toContain("可手动重新生成后续方案");
+      const button = bar.querySelector<HTMLButtonElement>(".button.primary")!;
+      expect(button.disabled).toBe(true);
+      button.click();
+      await nextTick();
+      expect(retry).not.toHaveBeenCalled();
+    } finally { app.unmount(); }
+  });
+
   it.each(["planning_failed", "needs_adjustment", "awaiting_continuation"] as const)("额度阻断展示明确警告和账户入口：%s", async (status) => {
     const pinia = createPinia();
     const ops = useOpsStore(pinia);
@@ -278,7 +493,9 @@ describe("AgentConsole 服务器工作区隔离", () => {
       ops.recordModelPlanningBlocker(task, { httpStatus: 422, code: "MODEL_OUTPUT_TRUNCATED", message: "输出截断", retryable: false });
       await nextTick();
       expect(alert.querySelector("strong")?.textContent).not.toContain("额度");
-      expect(alert.textContent).toContain("调整模型与输出预算");
+      expect(alert.textContent).toContain("查看可用模型");
+      expect(alert.textContent).toContain("官方模型由平台统一配置");
+      expect(alert.textContent).not.toContain("调整模型与输出预算");
       expect(alert.textContent).not.toContain("查看账户额度");
     } finally { app.unmount(); }
   });
@@ -407,7 +624,7 @@ describe("AgentConsole 服务器工作区隔离", () => {
       await nextTick();
       const hint = host.querySelector(".user-input-actions > span");
       if (kind === "text") expect(hint).toBeNull();
-      else expect(hint?.textContent).toContain("系统钥匙串");
+      else expect(hint?.textContent).toContain("本地加密凭据库");
     } finally { app.unmount(); }
   });
 
@@ -1800,6 +2017,37 @@ describe("AgentConsole 服务器工作区隔离", () => {
     expect(input.value).toBe("temporary-token");
     expect(host.textContent).toContain("安全保存失败：钥匙串已锁定");
     app.unmount();
+  });
+
+  it("keeps one execution-record entry and supplements only an output missing from the task", async () => {
+    const pinia = createPinia(), ops = useOpsStore(pinia);
+    vi.spyOn(ops, "refreshExecutionLedger").mockResolvedValue();
+    const read = vi.spyOn(backend, "readTaskEvidence").mockResolvedValue({ text: "saved missing output" });
+    const task = ops.createTask("server-a", "safe", "model-deepseek");
+    task.status = "failed";
+    task.plan = [{ id: "shown", title: "目录检查", command: "ls /opt", expected: "目录状态", validation: "", description: "", risk: "low", status: "completed",
+      output: "already visible", executionLedgerAttempts: [{ operationId: "op-shown", attemptId: "attempt-shown", executionId: "exec-shown", phase: "command" }] }];
+    task.executionLedgerRecovery = { version: "execution-ledger-recovery@1", items: [], recordedReads: [
+      { operationId: "op-shown", attemptId: "attempt-shown", stepId: "shown", title: "目录检查", status: "succeeded", late: false, evidenceRefs: ["proof-shown"] },
+    ] };
+    const app = mountTask(pinia, task);
+    try {
+      await nextTick();
+      expect(host.querySelector(".execution-history")).toBeNull();
+      expect(host.querySelectorAll(".execution-record-card")).toHaveLength(1);
+      host.querySelector<HTMLButtonElement>(".execution-record-card .plan-card-head")!.click(); await nextTick();
+      expect(host.querySelector(".execution-record-body")?.textContent).toContain("already visible");
+      expect(host.querySelector(".archived-output-supplement")).toBeNull();
+      expect(read).not.toHaveBeenCalled();
+      task.plan[0].output = undefined;
+      await nextTick();
+      expect(host.querySelectorAll(".execution-record-card")).toHaveLength(1);
+      expect(host.querySelectorAll(".archived-output-supplement")).toHaveLength(1);
+      host.querySelector<HTMLButtonElement>(".archived-output-supplement button")!.click();
+      await nextTick(); await nextTick();
+      expect(read).toHaveBeenCalledWith(task.id, "proof-shown", 0, 8000);
+      expect(host.querySelector(".saved-evidence-output")?.textContent).toBe("saved missing output");
+    } finally { app.unmount(); }
   });
 
   it("执行中默认保持收起，用户可手动展开过程记录", async () => {

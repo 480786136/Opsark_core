@@ -20,6 +20,14 @@ spec.loader.exec_module(probe)
 
 
 class ProbeTests(unittest.TestCase):
+    def test_old_python_reports_actual_version_without_scanning(self):
+        with patch.object(probe.sys, "version_info", (3, 6, 8)):
+            result = probe.run("disk.inspect", dict(path="/", check="capacity", timeoutSeconds=3))
+        self.assertEqual(result["status"], "unsupported")
+        self.assertEqual(result["scannedEntries"], 0)
+        self.assertEqual(result["items"], [])
+        self.assertIn("python3>=3.8 (actual 3.6.8)", [item["path"] for item in result["skipped"]])
+
     def service(self, **values):
         return dict(check="ports", timeoutSeconds=3, logLines=50, sinceMinutes=30, **values)
 

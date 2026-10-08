@@ -1,4 +1,5 @@
 import { defineStore } from "pinia";
+import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
 
 export const LOCAL_WORKSPACE_ID = "local";
 export const WORKSPACE_TABS_STORAGE_KEY = "opsark.workspaceTabs.v2";
@@ -111,6 +112,7 @@ export const useServerWorkspaceTabsStore = defineStore("serverWorkspaceTabs", {
       if (!id) return;
       if (!this.openTabs.some(tab => tab.id === id)) {
         const kind = id === LOCAL_WORKSPACE_ID ? "local" : "server";
+        if (kind === "server") useAgentWorkspaceStore().resetConversation(id);
         if (kind === "server" && this.openServerIds.length >= MAX_OPEN_SERVER_WINDOWS) {
           const oldestServer = this.openTabs.findIndex(tab => tab.kind === "server");
           this.openTabs.splice(oldestServer, 1);
@@ -130,6 +132,7 @@ export const useServerWorkspaceTabsStore = defineStore("serverWorkspaceTabs", {
       const index = this.openTabs.findIndex(tab => tab.id === id);
       if (index < 0) return this.activeTabId;
       this.openTabs.splice(index, 1);
+      if (id !== LOCAL_WORKSPACE_ID) useAgentWorkspaceStore().resetConversation(id);
       if (!this.openTabs.length) this.openTabs.push(localTab());
       if (this.activeTabId === id) {
         this.activeTabId = this.openTabs[Math.min(index, this.openTabs.length - 1)].id;

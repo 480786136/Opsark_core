@@ -1,3 +1,4 @@
+import { stepHasResolvedIssue } from "./taskDecisionResolution";
 import type { OpsTask, PlanStep } from "@/types";
 import { isMutatingStepCommand } from "@/services/validation";
 import { supplementalRecoveryAcceptance, validationHasAcceptanceCheck } from "./planSafety";
@@ -266,7 +267,7 @@ export function unresolvedRecoveryBlockers(task: OpsTask, beforeStep?: PlanStep)
   const history = recoveryHistory(task);
   const end = beforeStep ? history.findIndex(step => step.id === beforeStep.id) : history.length;
   const previous = history.slice(0, end < 0 ? history.length : end);
-  return previous.filter((step, index) => isBlockingFailure(step)
+  return previous.filter((step, index) => isBlockingFailure(step) && !stepHasResolvedIssue(task, step)
     && !previous.slice(index + 1).some(candidate => hasVerifiedRecovery(step, candidate, previous)));
 }
 
@@ -274,7 +275,7 @@ export function recoveryPlanningContext(task: OpsTask) {
   // Expose recorded execution facts without asking Core to decide whether the
   // business goal is still blocked or a later observation was sufficient.
   // That interpretation belongs to the model's next-stage decision.
-  const failedAttempts = recoveryHistory(task).filter(isBlockingFailure);
+  const failedAttempts = recoveryHistory(task).filter(step => isBlockingFailure(step) && !stepHasResolvedIssue(task, step));
   return {
     currentTargetContext: JSON.stringify([task.executionTargetServerId ?? task.serverId,
       task.currentRoundId ?? "", task.agentSessionId ?? "", task.agentSessionGeneration ?? 0,

@@ -4,7 +4,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { useAccountStore, type AccountSnapshot } from "./accountStore";
 import { useOpsStore } from "@/stores/ops";
 import { backend } from "@/services/backend";
-import { saveOfficialPreferences } from "./officialModelSettings";
 import { directCapabilities, newModelCapabilities } from "@/features/agent/modelCapabilities";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const snapshot: AccountSnapshot = {
@@ -71,6 +70,7 @@ it("keeps the account during a temporary session-check network failure", async (
 
 it("different accounts never share an official model ID", () => {
   const account = useAccountStore(), ops = useOpsStore(); account.apply(snapshot);
+  expect(useOpsStore().models.find(m => m.source === "official")?.requestParameters).toBeUndefined();
   account.apply({ ...snapshot, user: { id: "user-two", email: "second@example.test" } });
   expect(ops.modelApiKeys["official:user-one:trial-model"]).toBeUndefined();
   expect(ops.models.map(m => m.id)).toEqual(["own", "official:user-two:trial-model"]);
@@ -93,14 +93,15 @@ it("previously persisted official profiles are ignored at startup", () => {
   expect(useOpsStore().models).toEqual([]);
 });
 
-it("uses the Admin display name and only restores account-scoped editable preferences", () => {
+it("uses only Admin configuration and ignores old official parameter overrides", () => {
   const account = useAccountStore(); account.apply({ ...snapshot, models: [{ id: "trial-model", name: "Admin public name" }] });
   const official = useOpsStore().models.find(m => m.source === "official")!;
   expect(official.name).toBe("Admin public name");
   localStorage.setItem("opsark.officialModelSettings", "null");
-  saveOfficialPreferences({ ...official, name: "My label", timeoutSeconds: 123, requestParameters: { temperature: 0.2 } });
+  localStorage.setItem("opsark.officialModelSettings", JSON.stringify({ [official.id]: { timeoutSeconds: 123, requestParameters: { temperature: 0.2, outputBudget: 5000 } } }));
   account.apply({ ...snapshot, models: [{ id: "trial-model", name: "Renamed by Admin" }] });
-  expect(useOpsStore().models.find(m => m.source === "official")).toMatchObject({ name: "Renamed by Admin", timeoutSeconds: 123, endpoint: snapshot.endpoint, model: "trial-model" });
+  expect(useOpsStore().models.find(m => m.source === "official")).toMatchObject({ name: "Renamed by Admin", timeoutSeconds: 90, endpoint: snapshot.endpoint, model: "trial-model" });
+  expect(useOpsStore().models.find(m => m.source === "official")?.requestParameters).toBeUndefined();
   account.apply({ ...snapshot, user: { id: "user-two", email: "second@example.test" } });
   expect(useOpsStore().models.find(m => m.source === "official")?.name).toBe("trial-model");
 });
@@ -116,15 +117,14 @@ it("preserves legacy catalog availability but blocks explicitly unknown V2 struc
   expect(ops.models.find(model => model.source === "official")?.validationSnapshot).toBeUndefined();
 });
 
-it("blocks a saved Responses preference when the refreshed catalog no longer declares V2 protocol support", () => {
+it("ignores a stale user protocol preference when refreshing official models", () => {
   const account = useAccountStore(), ops = useOpsStore();
   account.apply(snapshot);
   const model = ops.models.find(item => item.source === "official")!;
-  saveOfficialPreferences({ ...model, timeoutSeconds: 90, apiProtocol: "responses" });
+  localStorage.setItem("opsark.officialModelSettings", JSON.stringify({ [model.id]: { timeoutSeconds: 90, apiProtocol: "responses" } }));
   account.apply(snapshot);
-  expect(ops.models.find(item => item.source === "official")?.apiProtocol).toBe("responses");
-  expect(ops.modelAvailability[model.id].status).toBe("unavailable");
-  expect(ops.modelAvailability[model.id].reason).toContain("重新选择协议");
+  expect(ops.models.find(item => item.source === "official")?.apiProtocol).toBeUndefined();
+  expect(ops.modelAvailability[model.id].status).toBe("available");
 });
 
 it("waits for GitHub authorization without passing codes or tokens through frontend state", async () => {

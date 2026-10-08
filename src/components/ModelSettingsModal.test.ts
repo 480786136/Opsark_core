@@ -43,7 +43,7 @@ it("always exposes the budget and discards unsaved budget when closed", async ()
   document.querySelector('.shared-model-settings')!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
   await nextTick(); expect(state.open).toBe(false);
   state.open = true; await nextTick();
-  expect(document.querySelector<HTMLInputElement>('.budget-settings input[type="number"]')!.value).toBe(String(initial));
+  expect(document.querySelector<HTMLInputElement>('.budget-settings input[type="number"]')!.value).toBe(initial === undefined ? "" : String(initial));
 });
 
 it("saves budget explicitly without testing any model", async () => {
@@ -66,4 +66,34 @@ it("uses a separate model draft and makes the parent modal inert while editing",
   await nextTick(); await nextTick();
   expect(store.models[0].name).toBe("Saved model");
   expect(document.querySelector<HTMLElement>('.shared-model-settings')!.inert).toBe(false);
+});
+
+it("allows clearing a saved custom budget back to the connection limit", async () => {
+  const { store, state } = await mount();
+  store.aiGenerationSettings.maxOutputTokens = 8000;
+  state.open = false; await nextTick(); state.open = true; await nextTick();
+  const input = document.querySelector<HTMLInputElement>('.budget-settings input[type="number"]')!;
+  expect(input.value).toBe("8000");
+  input.value = ""; input.dispatchEvent(new Event("input")); await nextTick();
+  document.querySelector('.budget-settings')!.dispatchEvent(new Event("submit", { cancelable: true })); await nextTick();
+  expect(store.aiGenerationSettings.maxOutputTokens).toBeUndefined();
+  expect(JSON.parse(localStorage.getItem("opsark.aiGenerationSettings")!)).not.toHaveProperty("maxOutputTokens");
+});
+
+it("migrates the old implicit 5000 once and preserves later explicit choices", () => {
+  localStorage.clear();
+  localStorage.setItem("opsark.aiGenerationSettings", JSON.stringify({ maxOutputTokens: 5000 }));
+  setActivePinia(createPinia());
+  expect(useOpsStore().aiGenerationSettings.maxOutputTokens).toBeUndefined();
+  useOpsStore().aiGenerationSettings.maxOutputTokens = 5000; useOpsStore().persist(true);
+  setActivePinia(createPinia());
+  expect(useOpsStore().aiGenerationSettings.maxOutputTokens).toBe(5000);
+});
+
+it("does not show a user budget when only official models are available", async () => {
+  const { store } = await mount();
+  store.models = [{ id: "official", name: "Official", provider: "OpsArk", model: "official",
+    endpoint: "https://example.test/v1", enabled: true, hasApiKey: true, source: "official" }];
+  await nextTick();
+  expect(document.querySelector('.budget-settings')).toBeNull();
 });

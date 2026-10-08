@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { PlanStep } from "@/types";
 import { classifyChangeOperations, semanticRiskForCommand, validateAuthorizedChangeOperations } from "./changeOperation";
+import firewallCases from "../../../shared/firewall-query-cases.json";
 
 const step = (command: string): PlanStep => ({
   id: "change-1", kind: "change", title: "change", description: "change", command,
@@ -8,6 +9,12 @@ const step = (command: string): PlanStep => ({
 });
 
 describe("semantic change operations", () => {
+  for (const testCase of firewallCases) {
+    it(`firewall classification: ${testCase.name}`, () => {
+      expect(classifyChangeOperations(testCase.command).includes("network_policy_change")).toBe(!testCase.readonly);
+      if (!testCase.readonly) expect(semanticRiskForCommand(testCase.command)).toBe("high");
+    });
+  }
   it("does not treat package removal as a low-risk keyword accident", () => {
     expect(classifyChangeOperations("dnf remove nodejs npm")).toContain("package_remove");
     expect(semanticRiskForCommand("dnf remove nodejs npm")).toBe("high");

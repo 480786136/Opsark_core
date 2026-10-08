@@ -79,6 +79,30 @@ struct State {
     known_tokens: u64,
     unknown_attempts: u64,
     blocked: bool,
+    output_field_repairs: u64,
+    output_regenerations: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OutputRecoveryStrategy {
+    Initial,
+    FieldRepair,
+    Regenerate,
+}
+
+/// This control is Core-owned request metadata, never read from model output.
+pub(crate) fn output_strategy(context: &Value) -> Result<Option<OutputRecoveryStrategy>, String> {
+    let Some(control) = context.get("_modelOutputRecovery") else { return Ok(None); };
+    let strategy = match control.get("strategy").and_then(Value::as_str) {
+        Some("initial") => OutputRecoveryStrategy::Initial,
+        Some("field_repair") => OutputRecoveryStrategy::FieldRepair,
+        Some("regenerate") => OutputRecoveryStrategy::Regenerate,
+        _ => return Err(budget_error("MODEL_RECOVERY_BUDGET_INVALID", "输出恢复策略无效", None)),
+    };
+    if context.get("_modelRecovery").is_none() {
+        return Err(budget_error("MODEL_RECOVERY_BUDGET_INVALID", "输出恢复必须沿用原模型操作预算", None));
+    }
+    Ok(Some(strategy))
 }
 
 fn registry() -> &'static Mutex<HashMap<String, Arc<Mutex<State>>>> {
@@ -108,6 +132,8 @@ fn snapshot(state: &State) -> Value {
         "maxElapsedMs":state.limits.elapsed_ms,"elapsedMs":state.started.elapsed().as_millis() as u64,
         "maxTotalTokens":state.limits.tokens,"accountedTokens":state.tokens,
         "knownUsageTokens":state.known_tokens,"unknownUsageAttempts":state.unknown_attempts,
+        "maxFieldRepairs":1,"fieldRepairs":state.output_field_repairs,
+        "maxCandidateRegenerations":1,"candidateRegenerations":state.output_regenerations,
         "usageEstimator":"utf8-request-bytes-plus-output-plus-1024", "exactTokens":state.unknown_attempts == 0,
         "recoveryBlocked":state.blocked})
 }
@@ -297,6 +323,8 @@ impl OperationBudget {
             known_tokens: 0,
             unknown_attempts: 0,
             blocked: false,
+            output_field_repairs: 0,
+            output_regenerations: 0,
         }));
         entries.insert(id.to_owned(), state.clone());
         Ok(Self(state))
@@ -339,6 +367,55 @@ impl OperationBudget {
             operation: self.clone(),
             reservation,
         })
+    }
+
+    /// Strategy slots are shared by Rust repairs and later frontend invokes.
+    /// Preserve a generation and transport attempt for a whole candidate;
+    /// never replenish the ledger.
+    pub(crate) fn claim_output_strategy(
+        &self,
+        strategy: OutputRecoveryStrategy,
+        body: &Value,
+    ) -> Result<(), String> {
+        if strategy == OutputRecoveryStrategy::Initial { return Ok(()); }
+        let reservation = estimate(body)?;
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        Self::check(&state)?;
+        if state.generations >= state.limits.generations
+            || state.attempts >= state.limits.transports
+            || state.tokens.saturating_add(reservation) > state.limits.tokens {
+            return Err(budget_error("MODEL_RECOVERY_BUDGET_EXHAUSTED", "模型操作总预算不足，不能切换恢复策略", Some(&state)));
+        }
+        match strategy {
+            OutputRecoveryStrategy::FieldRepair => {
+                if state.output_field_repairs > 0 || state.output_regenerations > 0
+                    || state.limits.generations - state.generations <= 1
+                    || state.limits.transports - state.attempts <= 1 {
+                    let mut error = serde_json::from_str::<Value>(
+                        budget_error("MODEL_OUTPUT_REPAIR_EXHAUSTED", "字段修复机会已用完或已为候选重生成保留预算", Some(&state))
+                            .strip_prefix(crate::MODEL_TRACE_ERROR_PREFIX).unwrap(),
+                    ).unwrap();
+                    error["modelError"]["stage"] = json!("output_recovery");
+                    return Err(format!("{}{error}", crate::MODEL_TRACE_ERROR_PREFIX));
+                }
+                state.output_field_repairs += 1;
+            }
+            OutputRecoveryStrategy::Regenerate => {
+                if state.output_regenerations > 0 {
+                    return Err(budget_error("MODEL_RECOVERY_BUDGET_EXHAUSTED", "当前候选重生成机会已用完", Some(&state)));
+                }
+                state.output_regenerations += 1;
+            }
+            OutputRecoveryStrategy::Initial => unreachable!(),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn can_repair_output_field(&self) -> bool {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        Self::check(&state).is_ok() && state.output_field_repairs == 0 && state.output_regenerations == 0
+            && state.limits.generations.saturating_sub(state.generations) > 1
+            && state.limits.transports.saturating_sub(state.attempts) > 1
     }
 
     pub(crate) fn remaining_timeout_seconds(&self, configured: u64) -> Result<u64, String> {
@@ -460,6 +537,58 @@ mod tests {
     }
     fn budget(body: &Value) -> OperationBudget {
         OperationBudget::for_request("http://test/v1/chat/completions", "key", body, 90).unwrap()
+    }
+    #[test]
+    fn output_strategy_slots_are_atomic_shared_and_never_reset_budget() {
+        let body = body(json!({}));
+        let first = budget(&body);
+        first.start_generation(&body).unwrap();
+        let resumed = budget(&body);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8).map(|_| {
+            let budget = resumed.clone(); let body = body.clone(); let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                budget.claim_output_strategy(OutputRecoveryStrategy::FieldRepair, &body).is_ok()
+            })
+        }).collect();
+        assert_eq!(threads.into_iter().map(|thread| thread.join().unwrap()).filter(|ok| *ok).count(), 1);
+        assert_eq!(first.snapshot()["fieldRepairs"], 1);
+        assert_eq!(first.snapshot()["generations"], 1);
+        resumed.claim_output_strategy(OutputRecoveryStrategy::Regenerate, &body).unwrap();
+        assert!(first.claim_output_strategy(OutputRecoveryStrategy::Regenerate, &body).unwrap_err().contains("MODEL_RECOVERY_BUDGET_EXHAUSTED"));
+    }
+
+    #[test]
+    fn output_strategy_preserves_last_generation_and_honors_terminal_gates() {
+        let body = body(json!({"maxGenerations":2}));
+        let budget = budget(&body);
+        budget.start_generation(&body).unwrap();
+        assert!(!budget.can_repair_output_field());
+        let error = budget.claim_output_strategy(OutputRecoveryStrategy::FieldRepair, &body).unwrap_err();
+        assert!(error.contains("MODEL_OUTPUT_REPAIR_EXHAUSTED"));
+        budget.claim_output_strategy(OutputRecoveryStrategy::Regenerate, &body).unwrap();
+        budget.block_recovery();
+        assert!(budget.start_generation(&body).err().unwrap().contains("MODEL_RECOVERY_BUDGET_EXHAUSTED"));
+        assert_eq!(budget.snapshot()["generations"], 1);
+    }
+    #[test]
+    fn output_strategy_preserves_last_transport_attempt_for_the_candidate() {
+        let body = body(json!({"maxGenerations":6,"maxTransportAttempts":2}));
+        let budget = budget(&body);
+        let initial = budget.start_generation(&body).unwrap();
+        initial.start_attempt().unwrap().not_dispatched();
+        assert!(!budget.can_repair_output_field());
+        let error = budget.claim_output_strategy(OutputRecoveryStrategy::FieldRepair, &body).unwrap_err();
+        assert!(error.contains("MODEL_OUTPUT_REPAIR_EXHAUSTED"));
+        assert_eq!(budget.snapshot()["fieldRepairs"], 0);
+        budget.claim_output_strategy(OutputRecoveryStrategy::Regenerate, &body).unwrap();
+        let candidate = budget.start_generation(&body).unwrap();
+        candidate.start_attempt().unwrap().not_dispatched();
+        assert_eq!(budget.snapshot()["transportAttempts"], 2);
+        assert_eq!(budget.snapshot()["candidateRegenerations"], 1);
+        assert!(budget.claim_output_strategy(OutputRecoveryStrategy::FieldRepair, &body)
+            .unwrap_err().contains("MODEL_RECOVERY_BUDGET_EXHAUSTED"));
     }
     #[test]
     fn nested_generations_and_new_handles_share_frozen_limits() {

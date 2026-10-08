@@ -4,7 +4,7 @@ import {
   type PeriodicReviewFailureInput,
 } from "@/features/agent/commandStepResult";
 import type { PlanStep, StepReview } from "@/types";
-import { applyFailureDisposition, applySemanticAcceptance, failureDependencyBlocker, releaseAcceptedDependency } from "./failureDisposition";
+import { applyFailureDisposition, applySemanticAcceptance, releaseAcceptedDependency } from "./failureDisposition";
 
 export interface ReviewCoordinationResult {
   taskStatus: "running" | "needs_adjustment";
@@ -113,7 +113,7 @@ function applyEvidenceStatus(step: PlanStep) {
 export function applyExecutionEvidenceReview(
   input: ApplyEvidenceReviewInput,
 ): ReviewCoordinationResult {
-  const { step, remainingSteps, review, reviewWasRequired } = input;
+  const { step, remainingSteps, review } = input;
   step.review = review;
   applySemanticAcceptance(step, review);
   applyEvidenceStatus(step);
@@ -130,14 +130,8 @@ export function applyExecutionEvidenceReview(
     };
   }
 
-  if (reviewWasRequired && review.decision === "complete" && !remainingSteps.some(item => failureDependencyBlocker(item))) {
-    remainingSteps.forEach((item) => transitionStep(item, "skipped"));
-    return {
-      taskStatus: "running",
-      eventMessage: `${factMessage}；模型判定无需继续剩余 ${remainingSteps.length} 个步骤。${review.summary}`,
-      shouldAdvance: true,
-    };
-  }
+  // A step review accepts this step only. Remaining work is owned by the
+  // stage/requirement decision; local acceptance cannot silently discard it.
 
   return {
     taskStatus: "running",

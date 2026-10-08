@@ -107,24 +107,20 @@ it("keeps the editor open on backdrop clicks and saves the per-model timeout", a
   expect(store.models[0].timeoutSeconds).toBe(360);
 });
 
-it("official model editor exposes budget and timeout while keeping the Admin connection identity read-only", async () => {
-  vi.mocked(fetchOfficialCatalog).mockResolvedValue({ models: [{ id: "model", name: "Official display" }] });
+it("official models have no parameter editor", async () => {
   const store = await mount();
   useAccountStore().apply({ user: { id: "one", email: "one@example.test" }, balance: { available: 100, reserved: 0, revision: 1, unit: "tokens" }, models: [{ id: "model", name: "Official display" }], endpoint: "https://official.example.test/v1" });
-  await nextTick();
-  expect(document.querySelector(".model-card")?.textContent).not.toContain("example.test");
-  document.querySelector<HTMLButtonElement>(".official-model-open")!.click(); await nextTick();
-  const dialog = document.querySelector('[role="dialog"]')!;
-  expect(dialog.querySelectorAll(".connection-fields input")).toHaveLength(2);
-  expect(dialog.textContent).not.toContain("settings.configName");
-  expect(dialog.querySelector('input[type="password"]')).toBeNull();
-  expect(dialog.querySelector("select")).toBeNull();
-  const timeout = dialog.querySelector<HTMLInputElement>('input[aria-label="timeoutSeconds"]')!;
-  timeout.value = "240"; timeout.dispatchEvent(new Event("input")); await nextTick();
-  document.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); await nextTick();
-  expect(store.models.find(m => m.source === "official")).toMatchObject({ name: "Official display", timeoutSeconds: 240, endpoint: "https://official.example.test/v1" });
-  expect(localStorage.getItem("opsark.officialModelSettings")).not.toContain("endpoint");
-  expect(localStorage.getItem("opsark.officialModelSettings")).not.toContain('"name"');
+  // The public catalog may be empty while the authenticated account is available.
+  vi.mocked(fetchOfficialCatalog).mockResolvedValue({ models: [{ id: "model", name: "Official display" }] });
+  const { useOfficialCatalogStore } = await import("@/features/account/officialCatalogStore");
+  await useOfficialCatalogStore().refresh(); await nextTick();
+  const card = document.querySelector<HTMLElement>(".official-model-open")!;
+  expect(card).not.toBeNull();
+  expect(card.tagName).toBe("DIV");
+  card.click(); await nextTick();
+  expect(document.querySelector('[role="dialog"]')).toBeNull();
+  expect(card.textContent).toContain("No setup needed");
+  expect(store.models.find(m => m.source === "official")?.requestParameters).toBeUndefined();
 });
 
 it("automatically lists public official models first and overlays login without granting execution", async () => {
@@ -132,7 +128,7 @@ it("automatically lists public official models first and overlays login without 
   const store = await mount();
   expect(fetchOfficialCatalog).toHaveBeenCalledOnce();
   expect(document.querySelector(".model-grid > :first-child")?.textContent).toContain("Official trial");
-  expect(document.querySelector<HTMLButtonElement>(".official-model-open")?.disabled).toBe(true);
+  expect(document.querySelector("button.official-model-open")).toBeNull();
   expect(document.querySelector(".official-model-lock")?.textContent).toContain("Sign in to use");
   expect(document.querySelector(".official-model-lock")?.getAttribute("href")).toBe("/account");
   expect(document.body.textContent).not.toContain("Refresh official models");
@@ -147,6 +143,7 @@ it("saves a new connection without fabricating confirmed output capabilities or 
   const check = vi.spyOn(backend, "checkModel");
   document.querySelector<HTMLButtonElement>(".page-header button")!.click(); await nextTick();
   expect(document.querySelector<HTMLDetailsElement>(".model-options")!.open).toBe(false);
+  expect(document.querySelector<HTMLInputElement>('[aria-label="outputBudget"]')!.value).toBe("");
   const inputs = document.querySelectorAll<HTMLInputElement>(".basic-connection-fields input");
   expect(inputs).toHaveLength(3);
   for (const [index, value] of ["https://example.test/v1", "synthetic-key", "custom-model"].entries()) {

@@ -1,9 +1,11 @@
+import invalidScope from "@/services/fixtures/next-stage-invalid-scope.json";
+import { restoreLegacyPlanProtocolFailure } from "@/services/backend";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { useConnectionStore } from "@/features/connection/connectionStore";
 import { confirmedInputScope } from "@/features/agent/confirmedUserInputs";
-import { backend, PlanProtocolError, type PlanNormalizationRepair } from "@/services/backend";
-import type { NextStageDecision, OpsTask, PermissionLevel, PlanStep, ServerProfile } from "@/types";
+import { backend, ModelInvocationError, PlanProtocolError, type PlanNormalizationRepair } from "@/services/backend";
+import type { ModelServiceError, NextStageDecision, OpsTask, PermissionLevel, PlanStep, ServerProfile } from "@/types";
 import { useOpsStore } from "./ops";
 import missingSteps from "@/services/fixtures/next-stage-missing-steps.json";
 
@@ -127,8 +129,193 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
   });
 
   afterEach(() => {
-    useOpsStore().tasks.forEach(task => { task.cancelRequested = true; });
+    const store = useOpsStore();
+    store.tasks.forEach(task => { task.cancelRequested = true; });
+    store.stopConnectionMonitor();
+    store.persist(true);
     vi.restoreAllMocks();
+  });
+
+  it.each(["manual-protocol", "manual-budget", "explicit-budget"] as const)(
+    "%s starts a fresh bounded operation after 17 minutes of user wait and preserves the rejected incident", async mode => {
+      const { store, task } = fixture();
+      const old = { operationId: "model-operation-expired", startedAtMs: Date.now() - 17 * 60_000 };
+      task.protocolRepair!.repair.modelRecovery = old;
+      const originalPlan = clone(task.plan), originalRepair = clone(task.protocolRepair);
+      const originalGoal = task.rootGoal, originalInputs = clone(task.submittedInputs);
+      const exhausted: ModelServiceError = { code: "MODEL_RECOVERY_BUDGET_EXHAUSTED", origin: "core", stage: "recovery_budget",
+        message: "模型操作总等待时间已耗尽", retryable: false, modelOperationId: old.operationId,
+        recoveryBudget: { recoveryBlocked: false, generations: 4, maxGenerations: 6, elapsedMs: 17 * 60_000, maxElapsedMs: 360_000 } };
+      if (mode !== "manual-protocol") store.recordModelPlanningBlocker(task, exhausted);
+      vi.mocked(backend.decideNextStage).mockImplementation(async (_requirement, model) => {
+        const context = JSON.parse(model!.context);
+        if (context._modelRecovery.operationId === old.operationId) {
+          throw new ModelInvocationError("old operation already expired", undefined, exhausted);
+        }
+        return nextStage([step()]);
+      });
+      await store.requestAdjustment(task.id, true);
+      expect(backend.decideNextStage).not.toHaveBeenCalled();
+      if (mode !== "manual-protocol") store.aiGenerationSettings.maxOutputTokens = (store.aiGenerationSettings.maxOutputTokens ?? 4096) + 1;
+      const started = Date.now();
+      if (mode === "explicit-budget") await store.retryModelPlanning(task.id);
+      else await store.requestAdjustment(task.id);
+      expect(backend.decideNextStage).toHaveBeenCalledOnce();
+      expect(generatedContext()._modelRecovery.operationId).not.toBe(old.operationId);
+      expect(generatedContext()._modelRecovery.startedAtMs).toBeGreaterThanOrEqual(started);
+      expect(generatedContext()).not.toHaveProperty("planGenerationRepair");
+      expect(task.status, task.pauseReason).toBe("awaiting_plan_approval");
+      expect(task.modelPlanningBlocker).toBeUndefined();
+      expect(task.rootGoal).toBe(originalGoal);
+      expect(task.submittedInputs).toEqual(originalInputs);
+      expect(task.currentRoundId).toBe("protocol-round");
+      expect(task.phaseHistory?.flatMap(phase => phase.plan).find(item => item.id === originalPlan[0].id)).toEqual(originalPlan[0]);
+      expect(task.protocolRepairHistory?.[0]).toMatchObject({ ...originalRepair, status: "accepted" });
+      expect(backend.generatePlan).not.toHaveBeenCalled();
+      expect(backend.executeCommand).not.toHaveBeenCalled();
+      expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+    });
+
+  it.each(["system_initial", "system_continuation"] as const)("%s retains the original budget instead of starting an automatic fresh operation", async source => {
+    const { store, task } = fixture();
+    const old = { operationId: "original-automatic-operation", startedAtMs: Date.now() - 17 * 60_000 };
+    task.protocolRepair!.repair.modelRecovery = old;
+    vi.spyOn(store, "approvePlan").mockResolvedValue();
+    await store.beginAdjustment(task.id, false, undefined, source);
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(generatedContext()._modelRecovery).toEqual(old);
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("coalesces explicit budget-retry clicks with the manual adjustment entry", async () => {
+    const { store, task } = fixture();
+    const old = { operationId: "old-budget", startedAtMs: Date.now() - 17 * 60_000 };
+    task.protocolRepair!.repair.modelRecovery = old;
+    store.recordModelPlanningBlocker(task, { code: "MODEL_RECOVERY_BUDGET_EXHAUSTED", origin: "core", stage: "recovery_budget",
+      message: "expired", retryable: false, recoveryBudget: { recoveryBlocked: false } });
+    let finish!: (value: NextStageDecision) => void;
+    vi.mocked(backend.decideNextStage).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const first = store.requestAdjustment(task.id);
+    const duplicate = store.retryModelPlanning(task.id);
+    await vi.waitFor(() => expect(backend.decideNextStage).toHaveBeenCalledOnce());
+    await store.requestAdjustment(task.id);
+    await store.retryModelPlanning(task.id);
+    finish(nextStage([step()]));
+    await Promise.all([first, duplicate]);
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(task.protocolRepairHistory).toHaveLength(1);
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it.each(["cancelled", "waiting-input", "classifying", "planning"] as const)("explicit budget retry cannot bypass %s", async mode => {
+    const { store, task } = fixture();
+    store.recordModelPlanningBlocker(task, { code: "MODEL_RECOVERY_BUDGET_EXHAUSTED", origin: "core", stage: "recovery_budget",
+      message: "expired", retryable: false, recoveryBudget: { recoveryBlocked: false } });
+    if (mode === "cancelled") task.cancelRequested = true;
+    if (mode === "waiting-input") task.plan.push(step({ status: "awaiting_input" }));
+    if (mode === "classifying") task.requirementProcessing = true;
+    if (mode === "planning") task.adjustmentInProgress = true;
+    const saved = clone(task.modelPlanningBlocker);
+    await store.requestAdjustment(task.id);
+    await store.retryModelPlanning(task.id);
+    expect(task.modelPlanningBlocker).toEqual(saved);
+    expect(backend.decideNextStage).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it.each(["unknown-budget", "missing-budget-detail", "MODEL_DISPATCH_UNKNOWN", "MODEL_RESULT_UNAVAILABLE",
+    "MODEL_AUTH_UNAVAILABLE", "INSUFFICIENT_CREDITS", "CREDITS_RECONCILIATION_REQUIRED"])("manual retry cannot bypass %s", async cause => {
+    const { store, task } = fixture();
+    const code = cause.endsWith("budget") || cause === "missing-budget-detail" ? "MODEL_RECOVERY_BUDGET_EXHAUSTED" : cause;
+    store.recordModelPlanningBlocker(task, { code, origin: "core", stage: code === "MODEL_RECOVERY_BUDGET_EXHAUSTED" ? "recovery_budget" : "request_recovery",
+      message: "blocked", retryable: false, ...(cause === "unknown-budget" ? { recoveryBudget: { recoveryBlocked: true } } : {}) });
+    const saved = clone(task.modelPlanningBlocker);
+    await store.requestAdjustment(task.id);
+    await store.retryModelPlanning(task.id);
+    expect(task.modelPlanningBlocker).toEqual(saved);
+    expect(backend.decideNextStage).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it.each(["unknown-budget", "missing-budget-detail", "MODEL_DISPATCH_UNKNOWN", "MODEL_RESULT_UNAVAILABLE",
+    "MODEL_REQUEST_CONFLICT", "IDEMPOTENCY_KEY_CONFLICT", "REQUEST_ALREADY_ACCEPTED", "REQUEST_STATE_CONFLICT"])(
+    "changing generation settings cannot clear unresolved %s for manual or automatic planning", async cause => {
+      const { store, task } = fixture();
+      const code = cause === "unknown-budget" || cause === "missing-budget-detail" ? "MODEL_RECOVERY_BUDGET_EXHAUSTED" : cause;
+      store.recordModelPlanningBlocker(task, { code, origin: "core", stage: code === "MODEL_RECOVERY_BUDGET_EXHAUSTED" ? "recovery_budget" : "request_recovery",
+        message: "unresolved", retryable: false, ...(cause === "unknown-budget" ? { recoveryBudget: { recoveryBlocked: true } } : {}) });
+      const saved = clone(task.modelPlanningBlocker), originalPlan = clone(task.plan);
+      store.aiGenerationSettings.maxOutputTokens = (store.aiGenerationSettings.maxOutputTokens ?? 4096) + 1;
+      expect(store.modelPlanningConditions(task)).not.toBe(saved!.conditionsFingerprint);
+      expect(store.stopBlockedModelPlanning(task)).toBe(true);
+      await store.requestAdjustment(task.id);
+      await store.retryModelPlanning(task.id);
+      await store.requestAdjustment(task.id, true);
+      await store.beginAdjustment(task.id, false, undefined, "system_continuation");
+      expect(task.modelPlanningBlocker).toEqual(saved);
+      expect(task.plan).toEqual(originalPlan);
+      expect(backend.decideNextStage).not.toHaveBeenCalled();
+      expect(backend.executeCommand).not.toHaveBeenCalled();
+    });
+
+  it("a pending execution owns the task and prevents either manual model retry entry", async () => {
+    const { store, task } = fixture();
+    task.protocolRepair = undefined;
+    task.status = "running";
+    task.plan = [step({ id: "busy-read", command: "pwd", expected: "current directory" })];
+    let finish!: (value: Awaited<ReturnType<typeof backend.executeCommand>>) => void;
+    vi.mocked(backend.executeCommand).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    vi.spyOn(store, "advanceTask").mockResolvedValue();
+    const running = store.runStep(task.id, "busy-read");
+    await vi.waitFor(() => expect(backend.executeCommand).toHaveBeenCalledOnce());
+    task.status = "needs_adjustment";
+    store.recordModelPlanningBlocker(task, { code: "MODEL_RECOVERY_BUDGET_EXHAUSTED", origin: "core", stage: "recovery_budget",
+      message: "expired", retryable: false, recoveryBudget: { recoveryBlocked: false } });
+    const saved = clone(task.modelPlanningBlocker);
+    await store.requestAdjustment(task.id);
+    await store.retryModelPlanning(task.id);
+    expect(task.modelPlanningBlocker).toEqual(saved);
+    expect(backend.decideNextStage).not.toHaveBeenCalled();
+    finish({ success: true, simulated: true, output: "/opt/app", exitCode: 0 });
+    await running;
+    expect(backend.executeCommand).toHaveBeenCalledOnce();
+  });
+
+  it("a fresh manual model budget cannot authorize replay while a prior change remains uncertain", async () => {
+    const { store, task } = fixture();
+    task.executionReconciliation = { id: "unresolved-change", stepId: "original-build", serverId: task.serverId,
+      recordedAt: new Date().toISOString(), command: "build", expected: "confirmed build", knownStepIds: [task.plan[0].id], reason: "unknown result" };
+    const incident = clone(task.executionReconciliation);
+    store.recordModelPlanningBlocker(task, { code: "MODEL_RECOVERY_BUDGET_EXHAUSTED", origin: "core", stage: "recovery_budget",
+      message: "expired", retryable: false, recoveryBudget: { recoveryBlocked: false } });
+    await store.retryModelPlanning(task.id);
+    expect(backend.decideNextStage).toHaveBeenCalled();
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.executionReconciliation).toEqual(incident);
+    expect(task.plan[0].id).toBe("completed-inspection");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it("结构化 action 的旧阻断手动重试只生成后续方案，保留已完成证据和审批", async () => {
+    const { store, task } = fixture("safe");
+    const completed = clone(task.plan[0]);
+    const failure = restoreLegacyPlanProtocolFailure(`后续流程暂不可用：ModelInvocationError: ${JSON.stringify(invalidScope)}。已完成步骤及其执行证据保持有效，可检查后继续。`)!;
+    task.protocolRepair = { roundId: task.currentRoundId, serverId: task.serverId,
+      repair: failure.repair, repairError: failure.repairError };
+    task.pauseReason = failure.userMessage;
+    const originalId = task.id;
+    await store.requestAdjustment(task.id);
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(backend.generatePlan).not.toHaveBeenCalled();
+    expect(task.id).toBe(originalId);
+    expect(store.tasks).toHaveLength(1);
+    expect(task.phaseHistory?.flatMap(phase => phase.plan)).toContainEqual(completed);
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.executeAgentCommand).not.toHaveBeenCalled();
+    expect(JSON.stringify(generatedContext().protocolReplan)).toContain("validationScope 不合法");
   });
 
   it("普通调整首次遇到退出码协议错误时自动重规划并保留证据与审批", async () => {
@@ -261,14 +448,15 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     const { store, task } = fixture("managed");
     const originalPlan = clone(task.plan);
     vi.mocked(backend.decideNextStage).mockResolvedValueOnce(nextStage([], {
-      reason: "当前缺少继续操作所需的用户授权",
-      summary: "没有可执行的安全动作，等待用户补充授权。",
+      blocking: { kind: "external", reason: "目标维护窗口尚未结束", requirementIds: [] },
+      reason: "目标维护窗口尚未结束",
+      summary: "目标正在维护，等待外部服务恢复。",
     }));
 
     await store.requestAdjustment(task.id);
 
     expect(task.status).toBe("awaiting_continuation");
-    expect(task.pauseReason).toBe("没有可执行的安全动作，等待用户补充授权。");
+    expect(task.pauseReason).toBe("目标正在维护，等待外部服务恢复。");
     expect(task.plan).toEqual(originalPlan);
     expect(task.protocolRepair).toBeUndefined();
     expect(task.latestGoalReview).toMatchObject({
@@ -278,7 +466,7 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     expect(task.protocolRepairHistory?.[0]).toMatchObject({
       status: "accepted",
       replacementStepIds: [],
-      outcome: "blocked/no_action: 没有可执行的安全动作，等待用户补充授权。",
+      outcome: "blocked/no_action: 目标正在维护，等待外部服务恢复。",
     });
     expect(task.managedAdjustmentPhase).toBe("manual_required");
     expect(task.managedStopReason).toBe("no_action");
@@ -406,7 +594,8 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
     const { store, task } = completedPhaseFixture("managed");
     const originalPlan = clone(task.plan);
     vi.mocked(backend.decideNextStage).mockResolvedValueOnce(nextStage([], {
-      reason: "缺少继续执行所需的事实或用户决定",
+      blocking: { kind: "external", reason: "目标维护窗口尚未结束", requirementIds: [] },
+      reason: "目标正在维护，等待外部服务恢复",
       summary: "当前没有可执行的后续步骤，保留证据等待补充",
     }));
     const runStep = vi.spyOn(store, "runStep");
@@ -648,7 +837,9 @@ describe("协议阻断后的人工业务重规划与重新审批", () => {
 
     await store.advanceTask(task.id);
 
-    expect(backend.decideNextStage).toHaveBeenCalledTimes(3);
+    expect(backend.decideNextStage).toHaveBeenCalledTimes(2);
+    expect(generatedContext(1)._modelRecovery).toEqual(generatedContext(0)._modelRecovery);
+    expect(generatedContext(1)._modelOutputRecovery.strategy).toBe("regenerate");
     expect(backend.generatePlan).not.toHaveBeenCalled();
     expect(task.status).toBe("needs_adjustment");
     expect(task.managedAdjustmentPhase).toBe("manual_required");

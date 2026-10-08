@@ -180,7 +180,7 @@ fn model_plan_ids_never_collide_across_same_second_generations() {
 #[test]
 fn next_stage_recovery_failure_retains_original_business_decision_for_local_patch() {
     let decision = AiNextStageDecision {
-        plan_update: None, reconciliation: None,
+        plan_update: None, reconciliation: None, requirement_review: None, blocking: None, issue_resolutions: None,
         decision: "adjust".into(),
         reason: "Inspect the existing failure".into(),
         summary: "Read-only diagnosis".into(),
@@ -207,7 +207,7 @@ fn next_stage_recovery_failure_retains_original_business_decision_for_local_patc
 #[test]
 fn next_stage_hidden_tool_failure_preserves_the_rejected_plan_for_business_replanning() {
     let decision = AiNextStageDecision {
-        plan_update: None, reconciliation: None,
+        plan_update: None, reconciliation: None, requirement_review: None, blocking: None, issue_resolutions: None,
         decision: "continue".into(), reason: "Read project declarations".into(),
         summary: "Deployment is not complete".into(),
         steps: vec![AiPlanStep {

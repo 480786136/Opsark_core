@@ -4,6 +4,7 @@ import { backend } from "./backend";
 import { directExecutionLedgerOwner, fileContentIdentity } from "./directExecutionLedger";
 import { configureExecutionLedger, createMemoryExecutionLedgerRepository, flushPendingReceipts,
   listExecutionLedger, resetExecutionLedgerForTests, runRecordedExecution } from "./executionLedger";
+import { projectExecutionLedgerRecovery, readExecutionLedger } from "@/features/agent/executionLedgerRecovery";
 import { executionDigest } from "@/features/agent/planPreparation";
 import type { ExecutionIntentSemantic } from "@/types";
 
@@ -18,6 +19,24 @@ describe("direct backend durable execution boundary", () => {
   });
   afterEach(() => Reflect.deleteProperty(window, "__TAURI_INTERNALS__"));
 
+  it.each(["1", "root", "core-case", "directory", "sha256"])("keeps delete intent exact despite a credential collision: %s", async password => {
+    const current = { ...connection, username: "root", password };
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await backend.deleteSftpEntry(current, "/opt/core-case", "directory");
+    await backend.deleteSftpEntry(current, "/root/core-case", "directory");
+    const rows = await listExecutionLedger(directExecutionLedgerOwner);
+    expect(rows).toHaveLength(2);
+    for (const [index, path] of ["/opt/core-case", "/root/core-case"].entries()) {
+      const semantic = rows[index].intent.semantic;
+      expect(semantic.action).toEqual({ type: "tool", toolId: "core.sftp.delete", arguments: { path, kind: "directory" } });
+      expect(semantic.targets).toEqual([{ role: "execution", host: current.host, port: 22, username: "root" }]);
+      expect(semantic.targets[0]).not.toHaveProperty("password");
+      expect(rows[index].intent.digest).toBe(executionDigest({ version: "execution-intent@1", semantic }));
+      expect(rows[index].state).toBe("succeeded");
+      expect(invoke).toHaveBeenNthCalledWith(index + 1, "delete_sftp_entry", { ...current, path, kind: "directory" });
+    }
+  });
+
   it("persists a direct SSH dispatch before invoking Tauri and stores its actual result", async () => {
     vi.mocked(invoke).mockImplementation(async (command, args) => {
       expect(command).toBe("execute_ssh_command"); expect(args).toMatchObject({ executionId: "direct-shell" });
@@ -27,6 +46,20 @@ describe("direct backend durable execution boundary", () => {
     await backend.executeCommand("touch /srv/a", connection, false, { executionId: "direct-shell" });
     expect((await listExecutionLedger(directExecutionLedgerOwner))[0]).toMatchObject({ state: "succeeded",
       intent: { semantic: { action: { type: "shell", command: "touch /srv/a" } } } });
+  });
+
+  it("keeps successful SFTP deletes as history without inventing a business-task review", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await backend.deleteSftpEntry(connection, "/opt/core-case", "directory");
+    await backend.deleteSftpEntry(connection, "/root/core-case", "directory");
+    const rows = await listExecutionLedger(directExecutionLedgerOwner), before = JSON.stringify(rows);
+    expect(readExecutionLedger(rows).compatible).toBe(true);
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map(row => row.taskId)).size).toBe(1);
+    expect(rows.every(row => row.attempts[0].status === "succeeded" && row.attempts[0].reviewCompletedAt === undefined)).toBe(true);
+    expect(projectExecutionLedgerRecovery(rows).items).toEqual([]);
+    expect(JSON.stringify(rows)).toBe(before);
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 
   it("reuses only the identical Agent execution ID and does not create a second operation", async () => {
@@ -70,6 +103,7 @@ describe("direct backend durable execution boundary", () => {
     await expect(backend.createSftpDirectory(connection, "/srv/new")).rejects.toMatchObject({ stage: "result_commit", remoteResultKnown: true });
     await flushPendingReceipts(directExecutionLedgerOwner);
     expect(invoke).toHaveBeenCalledTimes(1); expect((await listExecutionLedger(directExecutionLedgerOwner))[0]?.state).toBe("succeeded");
+    expect(projectExecutionLedgerRecovery(await listExecutionLedger(directExecutionLedgerOwner)).items).toEqual([]);
   });
 
   it("keeps a direct mutation uncertain after transport loss and prevents another write", async () => {

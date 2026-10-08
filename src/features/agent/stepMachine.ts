@@ -2,7 +2,7 @@ import type { PlanStep, StepStatus } from "@/types";
 
 const TRANSITIONS: Record<StepStatus, StepStatus[]> = {
   pending: ["awaiting_approval", "awaiting_input", "running", "failed", "skipped"],
-  awaiting_approval: ["awaiting_input", "running", "failed", "skipped"],
+  awaiting_approval: ["pending", "awaiting_input", "running", "failed", "skipped"],
   awaiting_input: ["pending", "failed", "skipped"],
   running: ["validating", "completed", "failed", "skipped"],
   validating: ["completed", "failed", "skipped"],

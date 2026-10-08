@@ -4,7 +4,7 @@ import {
   ensureStepValidator,
 } from "@/features/agent/evidenceReview";
 import { transitionStep } from "@/features/agent/stepMachine";
-import type { ExecutionEvidence, PlanStep, StepResult, StepReview } from "@/types";
+import type { ExecutionEvidence, ExecutionScopeEvidence, PlanStep, StepResult, StepReview } from "@/types";
 
 export interface CommandFailureOutcome {
   result: StepResult;
@@ -21,6 +21,8 @@ export interface PeriodicReviewFailureInput {
   validationPassed: boolean;
   evidenceId: string;
   collectedAt: string;
+  /** Captured before dispatch, never inferred from current task state. */
+  scope?: ExecutionScopeEvidence;
 }
 
 export interface CommandFailureInput {
@@ -28,6 +30,8 @@ export interface CommandFailureInput {
   exitCode?: number;
   evidenceId: string;
   collectedAt: string;
+  /** Captured before dispatch, never inferred from current task state. */
+  scope?: ExecutionScopeEvidence;
 }
 
 /** Builds the failed result produced when periodic review stops a long command. */
@@ -45,6 +49,7 @@ export function buildPeriodicReviewFailure(
     },
     rawOutput: input.output,
     collectedAt: input.collectedAt,
+    ...(input.scope ? { scope: structuredClone(input.scope) } : {}),
   }];
   return {
     review: input.review,
@@ -76,6 +81,7 @@ export function buildCommandFailure(input: CommandFailureInput): CommandFailureO
     facts: { success: false, exitCode: input.exitCode, ...failure.facts },
     rawOutput: input.output,
     collectedAt: input.collectedAt,
+    ...(input.scope ? { scope: structuredClone(input.scope) } : {}),
   }];
   return {
     failure,

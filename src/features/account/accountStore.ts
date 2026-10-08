@@ -1,7 +1,6 @@
 import { defineStore } from "pinia";
 import { invoke } from "@tauri-apps/api/core";
 import { useOpsStore } from "@/stores/ops";
-import { officialPreferences } from "./officialModelSettings";
 import { validateModelConfiguration } from "@/features/agent/modelCapabilities";
 
 export interface AccountSnapshot {
@@ -66,11 +65,11 @@ export const useAccountStore = defineStore("account", {
       const ops = useOpsStore();
       for (const item of snapshot.models) {
         const id = `official:${snapshot.user.id}:${item.id}`;
-        ops.models.push({ name: item.name || item.id, timeoutSeconds: 90, ...officialPreferences(id),
+        ops.models.push({ name: item.name || item.id, timeoutSeconds: 90,
           id, model: item.id, provider: "OpsArk", endpoint: snapshot.endpoint,
           enabled: true, hasApiKey: true, source: "official", capabilities: item.capabilities,
           ...(item.capabilitiesV2 ? { capabilitiesV2: item.capabilitiesV2,
-            apiProtocol: officialPreferences(id).apiProtocol ?? item.apiProtocol ?? item.capabilitiesV2.preferredProtocol } : {}) });
+            apiProtocol: item.apiProtocol ?? item.capabilitiesV2.preferredProtocol } : {}) });
         // This is an identity marker, not a secret. Rust resolves the actual access token.
         ops.modelApiKeys[id] = `opsark-account:${snapshot.user.id}`;
         ops.modelAvailability[id] = { status: snapshot.balance.available > 0 ? "available" : "unavailable",

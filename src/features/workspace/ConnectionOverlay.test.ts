@@ -109,6 +109,7 @@ describe("ConnectionOverlay", () => {
     });
     button("修改凭据").click();
     await nextTick();
+    expect(host.querySelector(".connection-remember")?.textContent).toBe("验证成功后保存到本地加密凭据库");
     const input = host.querySelector<HTMLInputElement>('input[type="password"]')!;
     input.value = "typed-test-password";
     input.dispatchEvent(new Event("input", { bubbles: true }));

@@ -16,7 +16,7 @@ import { modelLogContext } from "./modelLogContext";
 import { authenticationContext } from "./authenticationEvidence";
 import { confirmedUserInputsContext } from "./confirmedUserInputs";
 import { isUserInputStep, modelContextStep } from "./executionContextEvidence";
-import { taskRequirementSnapshot } from "./taskGoal";
+import { modelTaskRequirementSnapshot } from "./taskGoal";
 
 const REVIEW_HISTORY_STEP_LIMIT = 6;
 const REVIEW_REMAINING_STEP_LIMIT = 6;
@@ -58,7 +58,7 @@ export interface LongRunningProgressStatus {
 }
 
 function taskSnapshot(task: OpsTask) {
-  return { _log: modelLogContext(task), title: task.title, ...taskRequirementSnapshot(task),
+  return { _log: modelLogContext(task), title: task.title, ...modelTaskRequirementSnapshot(task),
     permission: task.permission, status: task.status };
 }
 
@@ -248,9 +248,17 @@ export function buildEvidenceReviewContext(
       ? validationProtocolIncomplete
         ? "主命令执行成功，但独立后置校验通道未返回真实结束标记"
         : "主命令执行成功，但独立后置校验未通过"
-      : "程序发现证据不可解释或相互冲突",
+      : step.result?.facts.evidenceConflict === true
+        ? "程序发现相互冲突的证据，请核对当前步骤 expected"
+        : "当前步骤执行结果已返回，请验收当前 expected 是否得到真实证据支持",
     failureDisposition: failureDispositionContext(remainingSteps),
     acceptanceRequired: step.result?.facts.semanticAcceptanceRequired === true,
+    acceptanceScope: {
+      kind: "current_step",
+      stepId: step.id,
+      expected: step.expected,
+      instruction: "只判断当前步骤 expected。整体目标尚有后续工作不构成本步骤验收失败；本步骤 complete 不代表整体任务完成，也不能跳过剩余步骤。",
+    },
     authentication: authenticationContext(task),
     confirmedUserInputs: confirmedUserInputsContext(task),
     reviewPolicy: postconditionReview ? {

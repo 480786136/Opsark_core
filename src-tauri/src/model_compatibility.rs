@@ -2,6 +2,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+pub(crate) const OUTPUT_NORMALIZATION_VERSION: &str = "json-wrapper-and-shell-placement@3";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Capabilities {
@@ -107,22 +109,34 @@ fn step(tools: &Value) -> Value {
         json!({"kind":{"type":"string","enum":["observe","change"]},
         "title":{"type":"string"},"description":{"type":"string"},"action":action_schema(tools),
         "expected":{"type":"string"},"validation":{"type":"string"},"risk":{"type":"string","enum":["low","medium","high"]}}),
-        json!({"executionScope":nullable(json!({"type":"string"})),"validationScope":nullable(json!({"type":"string"})),
-            "runtimeClass":nullable(json!({"type":"string"})),"sessionContextChange":metadata(),"recovery":metadata(),"retryBasis":metadata()}),
+        json!({"executionScope":nullable(json!({"type":"string","enum":crate::plan_contract::EXECUTION_SCOPES})),"validationScope":nullable(json!({"type":"string","enum":crate::plan_contract::VALIDATION_SCOPES})),
+            "runtimeClass":nullable(json!({"type":"string","enum":crate::plan_contract::RUNTIME_CLASSES})),"sessionContextChange":metadata(),"recovery":metadata(),"retryBasis":metadata()}),
     )
 }
 
 /// A separate contract per operation; a review must never receive the plan schema.
 pub(crate) fn contract(name: &str, body: &Value) -> Option<Value> {
+    let full = full_contract(name, body)?;
+    Some(crate::scoped_model_repair::ScopedRepair::new(name, body, &full)
+        .map_or(full, |repair| repair.schema))
+}
+
+pub(crate) fn full_contract(name: &str, body: &Value) -> Option<Value> {
     let context: Value =
         serde_json::from_str(body["_opsarkContext"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
     let steps = json!({"type":"array","items":step(&context["tools"])});
     let decision = json!({"type":"string","enum":["continue","adjust","complete"]});
     match name {
-        "阶段联合决策" | "阶段格式修复（兼容模式）" => Some(object(
-            json!({"decision":decision,"reason":{"type":"string"},"summary":{"type":"string"},"steps":steps}),
-            json!({"planUpdate":metadata(),"reconciliation":metadata()}),
-        )),
+        "阶段联合决策" | "阶段格式修复（兼容模式）" => {
+            let mut required = json!({"decision":decision,"reason":{"type":"string"},"summary":{"type":"string"},"steps":steps});
+            let mut optional = json!({"planUpdate":metadata(),"reconciliation":metadata(),"blocking":nullable(crate::requirement_contract::blocking()),"issueResolutions":nullable(crate::requirement_contract::resolutions())});
+            if crate::requirement_contract::requires_review(&context) {
+                required["requirementReview"] = crate::requirement_contract::review();
+            } else {
+                optional["requirementReview"] = nullable(crate::requirement_contract::review());
+            }
+            Some(object(required, optional))
+        },
         "计划生成" | "模型业务测试" => {
             let focused = body["_opsarkOperationContract"] == "plan.repair@1"
                 || body["messages"].as_array().is_some_and(|messages| {
@@ -147,7 +161,7 @@ pub(crate) fn contract(name: &str, body: &Value) -> Option<Value> {
             "answer":{"type":"string"},"selectedSkillIds":strings(),"constraints":nullable(object(json!({
                 "changePolicy":{"type":"string"},"environmentPolicy":{"type":"string"},"failurePolicy":{"type":"string"},
                 "prohibitedActions":strings(),"requiredConditions":strings(),"userDirectives":strings()}),json!({})))}),
-            json!({"relation":nullable(json!({"type":"string"})),"terminalContextLines":nullable(json!({"type":"integer"}))}),
+            json!({"relation":nullable(json!({"type":"string"})),"terminalContextLines":nullable(json!({"type":"integer"})),"requirementUpdate":nullable(crate::requirement_contract::update())}),
         )),
         "结果复核" => Some(object(
             json!({"decision":decision,"reason":{"type":"string"},"summary":{"type":"string"}}),
@@ -171,8 +185,10 @@ pub(crate) fn contract(name: &str, body: &Value) -> Option<Value> {
 fn contract_version(name: &str, schema: &Value) -> &'static str {
     match name {
         "计划生成" if schema["properties"].get("repair").is_some() => "plan.repair@1",
+        "计划生成" if schema["properties"].get("steps").is_none() => "plan.fields-repair@1",
         "计划生成" => "plan.generate@1",
-        "阶段联合决策" | "阶段格式修复（兼容模式）" => "stage.decide@1",
+        "阶段联合决策" if schema["properties"].get("steps").is_none() => "stage.metadata-repair@2",
+        "阶段联合决策" | "阶段格式修复（兼容模式）" => "stage.decide@2",
         "需求理解" => "requirement.classify@1",
         "结果复核" => "result.review@1",
         "Skill 生成" => "skill.draft@1",
@@ -316,6 +332,10 @@ pub(crate) fn prepare(
     let mut body = body.clone();
     let raw = body["_opsarkContext"].as_str().unwrap_or("{}").to_owned();
     let mut context: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
+    // Official requests are configured by the platform, including old saved overrides.
+    if gateway {
+        context.as_object_mut().map(|c| c.remove("_requestParameters"));
+    }
     let integration = crate::model_protocol::integration(&context)?;
     context.as_object_mut().map(|c| c.remove("_modelIntegration"));
     let caps = context
@@ -440,9 +460,12 @@ pub(crate) fn prepare(
     if let Some(value) = body.as_object_mut().unwrap().remove(other) {
         body[field] = value;
     }
-    let budget = body[field]
-        .as_u64()
-        .unwrap_or(caps["defaultOutputTokens"].as_u64().unwrap_or(5000));
+    let connection_limit = caps["maxOutputTokens"].as_u64().unwrap_or(16384);
+    let budget = if gateway {
+        connection_limit
+    } else {
+        body[field].as_u64().unwrap_or(connection_limit)
+    };
     if budget == 0 || budget > caps["maxOutputTokens"].as_u64().unwrap_or(1_000_000) {
         return Err(error(
             "MODEL_OUTPUT_BUDGET_INVALID",
@@ -489,7 +512,20 @@ pub(crate) fn prepare(
                 }
             }
         }
+        let fields = crate::requirement_contract::response_fields(schema);
+        if fields.as_object().is_some_and(|fields| !fields.is_empty()) {
+            if let Some(messages) = body["messages"].as_array_mut() {
+                let contract = crate::requirement_contract::response_field_contract(schema);
+                let instruction = format!("以下是当前操作补充字段的 JSON Schema。required 中字段必须存在并满足类型，不得用 null 代替必填对象；其余字段提供时也须满足契约。不得混用汇总状态与单项验收状态：{contract}");
+                if let Some(message) = messages.iter_mut().find(|message| message["role"] == "system" && message["content"].is_string()) {
+                    message["content"] = json!(format!("{}\n{instruction}", message["content"].as_str().unwrap()));
+                } else {
+                    messages.insert(0, json!({"role":"system", "content":instruction}));
+                }
+            }
+        }
         body["_opsarkSchemaCompilation"]["contractVersion"] = json!(contract_version(name, schema));
+        body["_opsarkSchemaCompilation"]["normalizationVersion"] = json!(OUTPUT_NORMALIZATION_VERSION);
         body["_opsarkSchemaCompilation"]["capabilityVersion"] = caps["version"].clone();
         body["_opsarkSchemaCompilation"]["protocol"] = integration["apiProtocol"].clone();
         crate::schema_validation::preflight(schema).map_err(|_| {
@@ -509,6 +545,37 @@ pub(crate) fn prepare(
 
 fn pointer_segment(key: &str) -> String {
     key.replace('~', "~0").replace('/', "~1")
+}
+
+/// Shell scopes/runtime belong to the step. Accept only lossless placement
+/// correction: an already valid string, with an absent or identical destination.
+/// Do not descend into tool arguments or infer defaults from null/conflicting data.
+fn normalize_shell_execution_scope(value: &mut Value, schema: &Value) {
+    for (value_path, schema_path) in [
+        ("/steps", "/properties/steps/items"),
+        ("/repair/replacementSteps", "/properties/repair/properties/replacementSteps/items"),
+    ] {
+        let Some(step_schema) = schema.pointer(schema_path) else { continue };
+        let Some(steps) = value.pointer_mut(value_path).and_then(Value::as_array_mut) else { continue };
+        for step in steps {
+            if step.pointer("/action/type").and_then(Value::as_str) != Some("shell") { continue; }
+            for field in ["executionScope", "validationScope", "runtimeClass"] {
+                let Some(scope_schema) = step_schema["properties"].get(field) else { continue };
+                let Some(scope) = step["action"].get(field).filter(|value| value.is_string()).cloned() else { continue };
+                if !validates(&scope, scope_schema)
+                    || step.get(field).is_some_and(|existing| existing != &scope) {
+                    continue;
+                }
+                step[field] = scope;
+                step["action"].as_object_mut().unwrap().remove(field);
+            }
+            for field in ["arguments", "toolId"] {
+                if step["action"].get(field).is_some_and(Value::is_null) {
+                    step["action"].as_object_mut().unwrap().remove(field);
+                }
+            }
+        }
+    }
 }
 
 fn decode_metadata(value: &mut Value, schema: &Value) -> Result<(), OutputDiagnostic> {
@@ -649,6 +716,7 @@ pub(crate) fn normalize_response_with_wire(
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
         .ok_or_else(envelope_error)?;
+    let content = crate::json_contract::normalize_json_wrapper(content);
     let mut value: Value = serde_json::from_str(content).map_err(|error| {
         let mut diagnostic = OutputDiagnostic::new(
             "MODEL_FORMAT_INVALID",
@@ -659,6 +727,7 @@ pub(crate) fn normalize_response_with_wire(
         diagnostic.column = Some(error.column());
         diagnostic
     })?;
+    normalize_shell_execution_scope(&mut value, schema);
     if let Some(wire) = wire {
         check_value(&value, wire, "wire_validation")?;
         omit_optional_nulls(&mut value, schema);
@@ -676,6 +745,164 @@ fn normalize_response(payload: &mut Value, schema: &Value) -> Result<(), OutputD
 }
 
 #[cfg(test)]
+mod json_wrapper_tests {
+    use super::*;
+
+    fn payload(content: &str) -> Value {
+        json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}]})
+    }
+
+    #[test]
+    fn complete_fences_and_exterior_bom_are_normalized_without_generation() {
+        let schema = object(json!({"ok":{"type":"boolean"}}), json!({}));
+        for content in [
+            "```json\n{\"ok\":true}\n```",
+            "```\n{\"ok\":true}\n```",
+            " \u{feff}\r\n```json\r\n{\"ok\":true}\r\n```\r\n ",
+            "\u{feff} {\"ok\":true} \n",
+        ] {
+            let mut response = payload(content);
+            normalize_response_with_wire(&mut response, &schema, None).unwrap();
+            assert_eq!(
+                response["choices"][0]["message"]["content"],
+                "{\"ok\":true}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_wrapped_json_is_not_repaired_or_parsed_as_json5() {
+        let schema = json!({"type":"object"});
+        for content in [
+            "```json\n{\"ok\":true\n```",
+            "```json\n{ok:true,}\n```",
+            "```json\n{\"pattern\":\"\\s+\"}\n```",
+            "```json\n{\"ok\":true}\n",
+            "{\"ok\":true}\n```",
+        ] {
+            let mut response = payload(content);
+            let original = response.clone();
+            let issue = normalize_response_with_wire(&mut response, &schema, None).unwrap_err();
+            assert_eq!(issue.stage, "json_parse");
+            assert_eq!(response, original);
+        }
+    }
+
+    #[test]
+    fn prose_multiple_documents_and_non_json_fences_are_never_extracted() {
+        let schema = json!({"type":"object"});
+        for content in [
+            "Here is the output:\n```json\n{}\n```",
+            "```json\n{}\n```\nDone.",
+            "```json\n{}\n{}\n```",
+            "```json\n{}\n```\n```json\n{}\n```",
+            "```javascript\n{}\n```",
+            "```json {} ```",
+        ] {
+            let issue =
+                normalize_response_with_wire(&mut payload(content), &schema, None).unwrap_err();
+            assert_eq!(issue.stage, "json_parse");
+        }
+    }
+
+    #[test]
+    fn wrapper_removal_preserves_shell_and_tool_argument_string_bytes() {
+        let command = "printf '%s\\n' '```json' '\\s+\\.jar' '$HOME'\n\t# 保留原文\u{feff}";
+        let arguments = json!({"text":"  ```json\n{literal}\\path\t\"quote\"\u{feff}  "});
+        let context = json!({"tools":[{"id":"files.read","inputSchema":{
+            "type":"object","properties":{"text":{"type":"string"}},
+            "required":["text"],"additionalProperties":false
+        }}]});
+        let schema = contract("计划生成", &json!({"_opsarkContext":context.to_string()})).unwrap();
+        let step = |action| {
+            json!({"kind":"observe","title":"read","description":"read",
+            "action":action,"expected":"read output","validation":"","risk":"low"})
+        };
+        let value = json!({"steps":[
+            step(json!({"type":"shell","command":command})),
+            step(json!({"type":"tool","toolId":"files.read","arguments":arguments}))
+        ]});
+        let raw = value.to_string();
+        let wrapped = format!("\u{feff}\n```json\n{raw}\n```");
+        assert_eq!(
+            crate::json_contract::normalize_json_wrapper(&wrapped).as_bytes(),
+            raw.as_bytes()
+        );
+        let mut response = payload(&wrapped);
+        normalize_response_with_wire(&mut response, &schema, None).unwrap();
+        let normalized: Value = serde_json::from_str(
+            response["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(normalized, value);
+        assert_eq!(
+            normalized["steps"][0]["action"]["command"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+            command.as_bytes()
+        );
+        assert_eq!(
+            normalized["steps"][1]["action"]["arguments"]["text"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+            arguments["text"].as_str().unwrap().as_bytes()
+        );
+    }
+
+    #[test]
+    fn wrapper_removal_keeps_wire_business_and_metadata_validation() {
+        let schema = object(
+            json!({"command":{"type":"string"}}),
+            json!({"limit":{"type":"integer","minimum":1}}),
+        );
+        let wire = crate::model_schema::compile(&schema).unwrap().schema;
+        let mut response = payload("```json\n{\"command\":\"pwd\"}\n```");
+        let issue = normalize_response_with_wire(&mut response, &schema, Some(&wire)).unwrap_err();
+        assert_eq!(issue.stage, "wire_validation");
+        let mut response = payload("```json\n{\"command\":\"pwd\",\"limit\":0}\n```");
+        let issue = normalize_response_with_wire(&mut response, &schema, None).unwrap_err();
+        assert_eq!(issue.stage, "business_validation");
+        let schema = contract("阶段联合决策", &json!({})).unwrap();
+        let value = json!({"decision":"adjust","reason":"r","summary":"s","steps":[],"planUpdate":"{invalid"});
+        let mut response = payload(&format!("```json\n{value}\n```"));
+        let issue = normalize_response_with_wire(&mut response, &schema, None).unwrap_err();
+        assert_eq!(issue.stage, "metadata_decode");
+    }
+
+    #[test]
+    fn valid_fenced_content_cannot_override_refusal_or_invalid_envelope() {
+        let schema = json!({"type":"object"});
+        let mut response = payload("```json\n{}\n```");
+        response["choices"][0]["message"]["refusal"] = json!("refused");
+        assert_eq!(
+            normalize_response_with_wire(&mut response, &schema, None)
+                .unwrap_err()
+                .code,
+            "MODEL_OUTPUT_REFUSED"
+        );
+        let mut response = payload("```json\n{}\n```");
+        response["choices"][0]["message"]["tool_calls"] = json!([{"id":"unexpected"}]);
+        assert_eq!(
+            normalize_response_with_wire(&mut response, &schema, None)
+                .unwrap_err()
+                .stage,
+            "response_envelope"
+        );
+        let mut response = json!({"content":"```json\n{}\n```"});
+        assert_eq!(
+            normalize_response_with_wire(&mut response, &schema, None)
+                .unwrap_err()
+                .stage,
+            "response_envelope"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn configured(adapter: &str, format: &str, params: Value) -> Value {
@@ -684,6 +911,31 @@ mod tests {
             "defaultOutputTokens":5000,"maxOutputTokens":16000},"_requestParameters":params}).to_string();
         json!({"_opsarkContext":context,"messages":[{"role":"user","content":context}],"thinking":{"type":"disabled"}})
     }
+    #[test]
+    fn blank_budget_uses_connection_limit_but_direct_overrides_are_preserved() {
+        let mut input = configured("portable", "json_object", json!({}));
+        let (body, _) = prepare(&input, "计划生成", false).unwrap();
+        assert_eq!(body["max_completion_tokens"], 16000);
+        input["max_tokens"] = json!(777);
+        let (body, _) = prepare(&input, "计划生成", false).unwrap();
+        assert_eq!(body["max_completion_tokens"], 777);
+    }
+
+    #[test]
+    fn official_budget_and_parameters_ignore_old_client_overrides() {
+        let mut input = configured("gateway", "json_object", json!({"max_tokens":5000,"reasoning_effort":"invalid-stale-value","temperature":0.9}));
+        input["max_tokens"] = json!(5000);
+        let (body, _) = prepare(&input, "计划生成", true).unwrap();
+        assert_eq!(body["max_completion_tokens"], 16000);
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("temperature").is_none());
+        assert!(!body["messages"].to_string().contains("invalid-stale-value"));
+        for name in ["模型结构测试", "模型参数测试"] {
+            let (body, _) = prepare(&input, name, true).unwrap();
+            assert_eq!(body["max_completion_tokens"], 64);
+        }
+    }
+
     #[test]
     fn explicit_probe_budget_is_small_without_changing_business_budget() {
         let input = configured("portable", "json_object", json!({"max_tokens":8000}));
@@ -820,7 +1072,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(body["max_tokens"], 5000);
+        assert_eq!(body["max_tokens"], 16384);
         assert!(body.get("thinking").is_none());
         assert_eq!(body["response_format"]["type"], "json_object");
     }
@@ -1161,5 +1413,61 @@ mod j0_boundary_tests {
             log["schemaCompilation"],
             prepared["_opsarkSchemaCompilation"]
         );
+    }
+}
+
+#[cfg(test)]
+mod stage_scope_regressions {
+    use super::*;
+
+    #[test]
+    fn both_apis_and_output_modes_reject_task_timeout_and_scope_failures_before_admission() {
+        let schema = contract("阶段联合决策", &json!({})).unwrap();
+        let wire = crate::model_schema::compile(&schema).unwrap().schema;
+        for protocol in ["chat_completions", "responses"] {
+            for strict in [false, true] {
+                let mut value = json!({"decision":"continue","reason":"not deployed","summary":"clone",
+                    "steps":[{"kind":"change","title":"clone","description":"clone repository",
+                    "action":{"type":"shell","command":"git clone https://example.invalid/repo /opt/repo"},
+                    "expected":"worktree exists","validation":"git -C /opt/repo rev-parse HEAD","risk":"low"}]});
+                if strict {
+                    for field in ["executionScope","validationScope","runtimeClass","sessionContextChange","recovery","retryBasis"] {
+                        value["steps"][0][field] = Value::Null;
+                    }
+                    value["planUpdate"] = Value::Null;
+                    value["reconciliation"] = Value::Null;
+                    for field in ["requirementReview", "blocking", "issueResolutions"] { value[field] = Value::Null; }
+                }
+                let check = |value: &Value| {
+                    let mut response = if protocol == "responses" {
+                        json!({"status":"completed","output":[{"type":"message","role":"assistant","status":"completed",
+                            "content":[{"type":"output_text","text":value.to_string()}]}]})
+                    } else { json!({"choices":[{"message":{"content":value.to_string()},"finish_reason":"stop"}]}) };
+                    crate::model_protocol::normalize_response(&mut response, protocol).unwrap();
+                    normalize_response_with_wire(&mut response, &schema, strict.then_some(&wire))
+                };
+                check(&value).unwrap();
+                let mut invalid = value.clone();
+                invalid["steps"][0]["action"]["timeoutSeconds"] = json!(600);
+                let error = check(&invalid).unwrap_err();
+                assert_eq!(error.keyword.as_deref(), Some("additionalProperties"));
+                assert_eq!(error.json_pointer.as_deref(), Some("/steps/0/action/timeoutSeconds"));
+                for (field, allowed) in [
+                    ("executionScope", crate::plan_contract::EXECUTION_SCOPES),
+                    ("validationScope", crate::plan_contract::VALIDATION_SCOPES),
+                    ("runtimeClass", crate::plan_contract::RUNTIME_CLASSES),
+                ] {
+                    let mut invalid = value.clone();
+                    invalid["steps"][0][field] = json!("只读校验工作树和 HEAD");
+                    let error = check(&invalid).unwrap_err();
+                    assert_eq!(error.code, "MODEL_FORMAT_INVALID");
+                    assert_eq!(error.json_pointer, Some(format!("/steps/0/{field}")));
+                    for allowed_value in allowed {
+                        invalid["steps"][0][field] = json!(allowed_value);
+                        check(&invalid).unwrap();
+                    }
+                }
+            }
+        }
     }
 }

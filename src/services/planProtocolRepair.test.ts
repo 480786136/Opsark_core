@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import type { PlanStep } from "@/types";
-import { backend, buildPlanNormalizationRepair, assertPlanRepairScope, PlanProtocolError } from "./backend";
+import { backend, buildPlanNormalizationRepair, assertPlanRepairScope, PlanProtocolError, restoreLegacyPlanProtocolFailure } from "./backend";
 import { normalizePlanPreconditions } from "@/features/agent/planNormalizer";
-import { compactProtocolRepairContext, planSemanticFingerprint } from "./planProtocolRepair";
+import { compactProtocolRepairContext, planSemanticFingerprint, protocolRepairScopeFingerprint } from "./planProtocolRepair";
 import { RecoveryProtocolError, RECOVERY_RULE_VERSION } from "./recoveryRules";
 import incident from "./fixtures/recovery-20260915.json";
 import missingSteps from "./fixtures/next-stage-missing-steps.json";
+
+import invalidScope from "./fixtures/next-stage-invalid-scope.json";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -54,6 +56,29 @@ describe("bounded protocol repair", () => {
     },
   );
 
+  it("preserves structured shell/tool actions and invalid scope as rejected audit proposals", async () => {
+    vi.mocked(invoke).mockRejectedValueOnce(JSON.stringify(invalidScope));
+    const error = await backend.decideNextStage("继续部署", runtime()).catch(error => error);
+    expect(error).toBeInstanceOf(PlanProtocolError);
+    expect(error.repair.previousModelOutput).toEqual(invalidScope.steps.map(step => ({ ...step,
+      command: step.action.type === "shell" ? step.action.command : "" })));
+    expect(error.repair.nextStageDecision).toEqual(invalidScope.nextStageDecision);
+    expect(error.userMessage).toContain("validationScope 不合法");
+    expect(error.userMessage).not.toContain("git clone");
+    expect(error.repair.progress.stopCode).toBe("PROTOCOL_REPAIR_SCOPE_UNKNOWN");
+    expect(invoke).toHaveBeenCalledOnce();
+  });
+
+  it("restores only a known unexecuted legacy failure without making model calls", () => {
+    const wrap = (envelope: unknown) => `后续流程暂不可用：ModelInvocationError: ${JSON.stringify(envelope)}。已完成步骤及其执行证据保持有效，可检查后继续。`;
+    const restored = restoreLegacyPlanProtocolFailure(wrap(invalidScope));
+    expect(restored).toBeInstanceOf(PlanProtocolError);
+    expect(restored?.repair.previousModelOutput[0].validationScope).toBe(invalidScope.steps[0].validationScope);
+    expect(restoreLegacyPlanProtocolFailure(wrap({ ...invalidScope, rejectedPlanExecuted: true }))).toBeUndefined();
+    expect(restoreLegacyPlanProtocolFailure("网络断开")).toBeUndefined();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
   it("classifies a backend capability rejection as recoverable planning feedback, not a service outage", async () => {
     const steps = [{ ...diagnose("opsark-tool hidden.read {}"), recovery: undefined }];
     const decision = { decision: "continue", reason: "缺少声明原文", summary: "补读已有证据" };
@@ -74,14 +99,14 @@ describe("bounded protocol repair", () => {
     expect(invoke).toHaveBeenCalledOnce();
   });
 
-  it("hands the full rejected deployment to business replanning without executing its acceptance tail", async () => {
+  it("regenerates the full rejected deployment once without accepting its detached acceptance tail", async () => {
     const steps: PlanStep[] = [
       { ...diagnose("ls -ld /srv"), id: "discover", recovery: undefined },
       { ...diagnose("mkdir -p /srv/lucky-wheel; python3 -m http.server 8091 &"),
         id: "deploy", kind: "change", validation: "curl -f http://127.0.0.1:8091/", recovery: undefined },
       { ...diagnose("curl -f http://127.0.0.1:8091/"), id: "verify", recovery: undefined },
     ];
-    vi.mocked(invoke).mockRejectedValueOnce(JSON.stringify({
+    vi.mocked(invoke).mockRejectedValue(JSON.stringify({
       kind: "plan_protocol_failure", steps, rejectedPlanExecuted: false,
       validationError: "第 2 个计划步骤将进程脱离执行器跟踪；必须重新规划部署及验收",
     }));
@@ -89,6 +114,18 @@ describe("bounded protocol repair", () => {
     expect(error).toBeInstanceOf(PlanProtocolError);
     expect(error.repair.previousModelOutput).toEqual(steps);
     expect(error.repair.progress.stopCode).toBe("PROTOCOL_REPAIR_SCOPE_UNKNOWN");
+    expect(invoke).toHaveBeenCalledTimes(2);
+    const [initial, regenerated] = vi.mocked(invoke).mock.calls.map(([, payload]) => {
+      const request = payload as { requirement: string; context: string };
+      expect(request.requirement).toBe("部署抽奖页面");
+      return JSON.parse(request.context);
+    });
+    expect(initial._modelOutputRecovery.strategy).toBe("initial");
+    expect(regenerated._modelOutputRecovery.strategy).toBe("regenerate");
+    expect(regenerated._modelRecovery).toEqual(initial._modelRecovery);
+    expect(regenerated.taskGoal).toEqual(initial.taskGoal);
+    expect(regenerated.executionConstraints).toEqual(initial.executionConstraints);
+    expect(regenerated.planGenerationRepair).toBeUndefined();
     // Reopening the saved local repair cannot dispatch, accept the suffix, or
     // consume another model request; the existing business-replan path owns it.
     const restored = JSON.parse(JSON.stringify(error.repair));
@@ -97,7 +134,7 @@ describe("bounded protocol repair", () => {
     delete restored.businessReplanRequired;
     await expect(backend.generatePlan("部署抽奖页面", runtime({ planGenerationRepair: restored })))
       .rejects.toBeInstanceOf(PlanProtocolError);
-    expect(invoke).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 
   it("revalidates a persisted retired acceptance-copy rejection without calling the model", async () => {
@@ -214,15 +251,18 @@ describe("bounded protocol repair", () => {
     expect(repairOf([steps[0]]).diagnostic).toMatchObject({ code: "RECOVERY_DIAGNOSE_MUTATION", matchedToken: "mktemp" });
     expect(() => normalizePlanPreconditions([{ ...steps[0], command: incident.command.replace('rm -rf "$TMPD"', "") }]))
       .toThrow("RECOVERY_DIAGNOSE_MUTATION");
-    vi.mocked(invoke).mockResolvedValueOnce([steps[0]]).mockResolvedValueOnce([steps[1]]);
+    vi.mocked(invoke).mockResolvedValueOnce([steps[1]]);
     let failure: PlanProtocolError | undefined;
-    try { await backend.generatePlan("复验原事故", runtime()); } catch (error) { failure = error as PlanProtocolError; }
+    try { await backend.generatePlan("复验原事故", runtime({ planGenerationRepair: repairOf([steps[0]]) })); }
+    catch (error) { failure = error as PlanProtocolError; }
     expect(failure!.repair.progress?.stopCode).toBe("PROTOCOL_REPAIR_NO_PROGRESS");
     for (const _step of steps.slice(2)) {
       await expect(backend.generatePlan("重试协议修复", runtime({ planGenerationRepair: failure!.repair })))
         .rejects.toThrow("PROTOCOL_REPAIR_NO_PROGRESS");
     }
-    expect(vi.mocked(invoke).mock.calls.map(([name]) => name)).toEqual(["generate_ai_plan", "generate_ai_plan"]);
+    expect(vi.mocked(invoke).mock.calls.map(([name]) => name)).toEqual(["generate_ai_plan"]);
+    const context = JSON.parse((vi.mocked(invoke).mock.calls[0][1] as { context: string }).context);
+    expect(context._modelOutputRecovery.strategy).toBe("field_repair");
   });
 
   it("reports the actual mutation and its command path instead of missing recovery fields", () => {
@@ -249,18 +289,19 @@ describe("bounded protocol repair", () => {
 
   it("rejects a no-change repair once and sends no request on repeated or restored retry", async () => {
     const invalid = diagnose();
-    vi.mocked(invoke).mockResolvedValueOnce([invalid]).mockResolvedValueOnce([{ ...invalid, id: "generated-2" }]);
+    vi.mocked(invoke).mockResolvedValueOnce([{ ...invalid, id: "generated-2" }]);
     let failure: PlanProtocolError | undefined;
-    try { await backend.generatePlan("部署应用", runtime()); } catch (error) { failure = error as PlanProtocolError; }
+    try { await backend.generatePlan("部署应用", runtime({ planGenerationRepair: repairOf([invalid]) })); }
+    catch (error) { failure = error as PlanProtocolError; }
     expect(failure).toBeInstanceOf(PlanProtocolError);
     expect(failure!.repair.progress).toMatchObject({ attemptCount: 1, stopCode: "PROTOCOL_REPAIR_NO_PROGRESS" });
-    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke).toHaveBeenCalledOnce();
     const persisted = JSON.parse(JSON.stringify(failure!.repair));
     await expect(backend.generatePlan("继续修复", runtime({ planGenerationRepair: persisted })))
       .rejects.toThrow("PROTOCOL_REPAIR_NO_PROGRESS");
     await expect(backend.generatePlan("再次修复", runtime({ planGenerationRepair: persisted })))
       .rejects.toThrow("PROTOCOL_REPAIR_NO_PROGRESS");
-    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke).toHaveBeenCalledOnce();
   });
 
   it("merges a single repaired step at its original position without asking the model to rewrite other steps", async () => {
@@ -338,11 +379,11 @@ describe("bounded protocol repair", () => {
     ]);
   });
 
-  it("does not call the model when no field-local repair scope is known", async () => {
+  it("does not call the model when a saved local repair has no known field scope", async () => {
     const invalid = { ...diagnose("uname -a"), recovery: { ...diagnose().recovery!, failedStepId: "" } };
-    vi.mocked(invoke).mockResolvedValueOnce([invalid]);
-    await expect(backend.generatePlan("部署应用", runtime())).rejects.toThrow("PROTOCOL_REPAIR_SCOPE_UNKNOWN");
-    expect(invoke).toHaveBeenCalledOnce();
+    await expect(backend.generatePlan("部署应用", runtime({ planGenerationRepair: repairOf([invalid]) })))
+      .rejects.toThrow("PROTOCOL_REPAIR_SCOPE_UNKNOWN");
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it("preserves a stopped Rust repair and its budget through a traced error and restart", async () => {
@@ -350,16 +391,21 @@ describe("bounded protocol repair", () => {
     const envelope = { issue: repairOf().diagnostic, steps: [original], repairAttempted: true,
       repairStopCode: "PROTOCOL_REPAIR_NO_PROGRESS", modelCalls: 2, focusedRepairCalls: 1 };
     const trace = { attempts: [], normalizations: [] };
-    vi.mocked(invoke).mockRejectedValueOnce(`OPSARK_MODEL_TRACE_V1:${JSON.stringify({ message: JSON.stringify(envelope), developerTrace: trace })}`);
+    vi.mocked(invoke).mockRejectedValue(`OPSARK_MODEL_TRACE_V1:${JSON.stringify({ message: JSON.stringify(envelope), developerTrace: trace })}`);
     let failure: PlanProtocolError | undefined;
     try { await backend.generatePlan("部署应用", runtime()); } catch (error) { failure = error as PlanProtocolError; }
     expect(failure).toBeInstanceOf(PlanProtocolError);
     expect(failure!.repair.previousModelOutput).toEqual([original]);
     expect(failure!.repair.progress?.stopCode).toBe("PROTOCOL_REPAIR_NO_PROGRESS");
     expect(failure!.developerTrace).toEqual(trace);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    const contexts = vi.mocked(invoke).mock.calls.map(([, payload]) => JSON.parse((payload as { context: string }).context));
+    expect(contexts.map(context => context._modelOutputRecovery.strategy)).toEqual(["initial", "regenerate"]);
+    expect(contexts[1]._modelRecovery).toEqual(contexts[0]._modelRecovery);
+    expect(failure!.repair.modelRecovery).toEqual(contexts[0]._modelRecovery);
     await expect(backend.generatePlan("重试", runtime({ planGenerationRepair: JSON.parse(JSON.stringify(failure!.repair)) })))
       .rejects.toThrow("PROTOCOL_REPAIR_NO_PROGRESS");
-    expect(invoke).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 
   it.each([
@@ -370,7 +416,7 @@ describe("bounded protocol repair", () => {
   ])("preserves %s and its original reason across the Rust boundary and a restored retry", async (code, reason) => {
     const envelope = { issue: repairOf().diagnostic, steps: [diagnose()], repairAttempted: true,
       repairStopCode: code, reason, modelCalls: 2, focusedRepairCalls: 1 };
-    vi.mocked(invoke).mockRejectedValueOnce(JSON.stringify(envelope));
+    vi.mocked(invoke).mockRejectedValue(JSON.stringify(envelope));
     let failure: PlanProtocolError | undefined;
     try { await backend.generatePlan("部署应用", runtime()); } catch (error) { failure = error as PlanProtocolError; }
     expect(failure).toBeInstanceOf(PlanProtocolError);
@@ -381,18 +427,18 @@ describe("bounded protocol repair", () => {
     const persisted = JSON.parse(JSON.stringify(failure!.repair));
     await expect(backend.generatePlan("重试协议修复", runtime({ planGenerationRepair: persisted })))
       .rejects.toMatchObject({ repairError: `${code}：${reason}` });
-    expect(invoke).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 
   it("does not invent no-progress evidence when an older Rust error omitted its stop code", async () => {
     const envelope = { issue: repairOf().diagnostic, steps: [diagnose()], repairAttempted: true,
       reason: "修复响应解析失败", focusedRepairCalls: 1 };
-    vi.mocked(invoke).mockRejectedValueOnce(JSON.stringify(envelope));
+    vi.mocked(invoke).mockRejectedValue(JSON.stringify(envelope));
     await expect(backend.generatePlan("部署应用", runtime())).rejects.toMatchObject({
       repairError: "PROTOCOL_REPAIR_FAILED：修复响应解析失败",
       repair: { progress: { stopCode: "PROTOCOL_REPAIR_FAILED", stopReason: "修复响应解析失败" } },
     });
-    expect(invoke).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledTimes(2);
   });
 
   it("retains a scope violation from a compact Rust repair instead of replacing it with no-progress", async () => {
@@ -402,10 +448,10 @@ describe("bounded protocol repair", () => {
     const envelope = { issue: repairOf().diagnostic, steps: [invalid], repairAttempted: true,
       repairStopCode: "PROTOCOL_REPAIR_SCOPE_VIOLATION", reason, focusedRepairCalls: 1 };
     const trace = { attempts: [], normalizations: [] };
-    vi.mocked(invoke).mockResolvedValueOnce([previous, invalid])
-      .mockRejectedValueOnce(`OPSARK_MODEL_TRACE_V1:${JSON.stringify({ message: JSON.stringify(envelope), developerTrace: trace })}`);
+    vi.mocked(invoke).mockRejectedValueOnce(`OPSARK_MODEL_TRACE_V1:${JSON.stringify({ message: JSON.stringify(envelope), developerTrace: trace })}`);
     let failure: PlanProtocolError | undefined;
-    try { await backend.generatePlan("部署应用", runtime()); } catch (error) { failure = error as PlanProtocolError; }
+    try { await backend.generatePlan("部署应用", runtime({ planGenerationRepair: repairOf([previous, invalid]) })); }
+    catch (error) { failure = error as PlanProtocolError; }
     expect(failure!.repair.previousModelOutput).toEqual([previous, invalid]);
     expect(failure!.repair.diagnostic?.fieldPath).toBe("steps[1].command");
     expect(failure!.repair.progress).toMatchObject({ stopCode: "PROTOCOL_REPAIR_SCOPE_VIOLATION", stopReason: reason });
@@ -413,35 +459,37 @@ describe("bounded protocol repair", () => {
     expect(failure!.developerTrace).toEqual(trace);
     await expect(backend.generatePlan("重试", runtime({ planGenerationRepair: JSON.parse(JSON.stringify(failure!.repair)) })))
       .rejects.toMatchObject({ repairError: `PROTOCOL_REPAIR_SCOPE_VIOLATION：${reason}` });
-    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke).toHaveBeenCalledOnce();
   });
 
   it("classifies a frontend field-scope violation before a retry can disguise it as no-progress", async () => {
     const invalid = diagnose();
-    vi.mocked(invoke).mockResolvedValueOnce([invalid]).mockResolvedValueOnce([
+    vi.mocked(invoke).mockResolvedValueOnce([
       { ...invalid, command: "uname -a", description: "擅自改变的业务说明" },
     ]);
     let failure: PlanProtocolError | undefined;
-    try { await backend.generatePlan("部署应用", runtime()); } catch (error) { failure = error as PlanProtocolError; }
+    try { await backend.generatePlan("部署应用", runtime({ planGenerationRepair: repairOf([invalid]) })); }
+    catch (error) { failure = error as PlanProtocolError; }
     expect(failure!.repair.previousModelOutput).toEqual([invalid]);
     expect(failure!.repair.progress).toMatchObject({ stopCode: "PROTOCOL_REPAIR_SCOPE_VIOLATION",
       stopReason: "协议修复不得改写 steps[0].description" });
     const persisted = JSON.parse(JSON.stringify(failure!.repair));
     await expect(backend.generatePlan("重试", runtime({ planGenerationRepair: persisted })))
       .rejects.toMatchObject({ repairError: "PROTOCOL_REPAIR_SCOPE_VIOLATION：协议修复不得改写 steps[0].description" });
-    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke).toHaveBeenCalledOnce();
   });
 
   it("uses the persisted stop code's own explanation when legacy records have no reason", async () => {
     const invalid = diagnose();
-    vi.mocked(invoke).mockResolvedValueOnce([invalid]).mockResolvedValueOnce([invalid]);
+    vi.mocked(invoke).mockResolvedValueOnce([invalid]);
     let failure: PlanProtocolError | undefined;
-    try { await backend.generatePlan("部署应用", runtime()); } catch (error) { failure = error as PlanProtocolError; }
+    try { await backend.generatePlan("部署应用", runtime({ planGenerationRepair: repairOf([invalid]) })); }
+    catch (error) { failure = error as PlanProtocolError; }
     const persisted = JSON.parse(JSON.stringify(failure!.repair));
     persisted.progress.stopCode = "PROTOCOL_REPAIR_SCOPE_VIOLATION";
     await expect(backend.generatePlan("重试", runtime({ planGenerationRepair: persisted })))
       .rejects.toMatchObject({ repairError: "PROTOCOL_REPAIR_SCOPE_VIOLATION：修复改变了允许字段之外的步骤内容，需要生成业务调整方案并重新审批" });
-    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke).toHaveBeenCalledOnce();
   });
 
   it("retains requirement classification when Rust returns a protocol failure inside planError", async () => {
@@ -449,13 +497,38 @@ describe("bounded protocol repair", () => {
       repairStopCode: "PROTOCOL_REPAIR_NO_PROGRESS", modelCalls: 2, focusedRepairCalls: 1 };
     const processed = { intent: "execute", relation: "continue", selectedSkillIds: [], plan: [],
       constraints: { changePolicy: "read_only" }, planError: `需求已判定为执行类，但计划生成失败：${JSON.stringify(envelope)}` };
-    vi.mocked(invoke).mockResolvedValueOnce(processed);
+    vi.mocked(invoke).mockResolvedValueOnce(processed).mockRejectedValueOnce(JSON.stringify(envelope));
     let failure: PlanProtocolError | undefined;
     try { await backend.processRequirement("继续", runtime()); } catch (error) { failure = error as PlanProtocolError; }
     expect(failure).toBeInstanceOf(PlanProtocolError);
     expect(failure!.processed).toEqual(processed);
     expect(failure!.repair.diagnostic?.code).toBe("RECOVERY_DIAGNOSE_MUTATION");
-    expect(invoke).toHaveBeenCalledOnce();
+    expect(vi.mocked(invoke).mock.calls.map(([name]) => name)).toEqual(["process_ai_requirement", "generate_ai_plan"]);
+    const contexts = vi.mocked(invoke).mock.calls.map(([, payload]) => JSON.parse((payload as { context: string }).context));
+    expect(contexts[1]._modelOutputRecovery.strategy).toBe("regenerate");
+    expect(contexts[1]._modelRecovery).toEqual(contexts[0]._modelRecovery);
+    expect(contexts[1].executionConstraints).toEqual(processed.constraints);
+  });
+
+  it("regenerates an initial rejected plan without repeating or losing requirement classification", async () => {
+    const envelope = { issue: repairOf().diagnostic, steps: [diagnose()], repairAttempted: true,
+      repairStopCode: "PROTOCOL_REPAIR_NO_PROGRESS", modelCalls: 2, focusedRepairCalls: 1 };
+    const processed = { intent: "execute", relation: "continue", selectedSkillIds: [], plan: [],
+      constraints: { changePolicy: "read_only" }, planError: `需求已判定为执行类，但计划生成失败：${JSON.stringify(envelope)}` };
+    const valid = { ...diagnose("uname -a"), recovery: undefined };
+    vi.mocked(invoke).mockResolvedValueOnce(processed).mockResolvedValueOnce([valid]);
+
+    const result = await backend.processRequirement("继续", runtime());
+
+    expect(result).toEqual({ ...processed, plan: normalizePlanPreconditions([valid]), planError: undefined });
+    expect(vi.mocked(invoke).mock.calls.map(([name]) => name)).toEqual(["process_ai_requirement", "generate_ai_plan"]);
+    const [initial, regenerated] = vi.mocked(invoke).mock.calls.map(([, payload]) => JSON.parse((payload as { context: string }).context));
+    expect(regenerated._modelOutputRecovery.strategy).toBe("regenerate");
+    expect(regenerated._modelRecovery).toEqual(initial._modelRecovery);
+    expect(regenerated.executionConstraints).toEqual(processed.constraints);
+    expect(regenerated.planGenerationRepair).toBeUndefined();
+    expect(processed.plan).toEqual([]);
+    expect(processed.planError).toContain("PROTOCOL_REPAIR_NO_PROGRESS");
   });
 
   it("retains newly classified constraints and selected Skill instructions during an initial repair", async () => {
@@ -469,6 +542,38 @@ describe("bounded protocol repair", () => {
     const context = JSON.parse((vi.mocked(invoke).mock.calls[1][1] as { context: string }).context);
     expect(context.executionConstraints).toEqual(processed.constraints);
     expect(context.activeSkills).toEqual([skill]);
+  });
+
+  it("repairs the initial plan against the newly classified port and surviving private-access requirement", async () => {
+    const provenance = { source: "user_message", sourceMessageId: "original", relation: "new_goal", content: "端口8080，仅内网访问" };
+    const lifecycle = { version: 1, revision: 2, items: [
+      { id: "port", kind: "constraint", content: "端口8080", status: "active", evidenceIds: [], source: provenance },
+      { id: "private", kind: "constraint", content: "仅内网访问", status: "active", evidenceIds: [], source: provenance },
+    ], focus: { roundId: "previous", requirementIds: ["port", "private"] } };
+    const constraints = { changePolicy: "read_only", environmentPolicy: "preserve", failurePolicy: "strict",
+      prohibitedActions: [], userDirectives: [], requiredConditions: ["端口8080", "仅内网访问"] };
+    const processed = { intent: "execute", relation: "supplement", selectedSkillIds: [], plan: [diagnose()],
+      constraints: { ...constraints, requiredConditions: ["端口8081"] }, requirementUpdate: {
+        baseRevision: 2, sourceMessageId: "new", additions: [{ id: "new-port", kind: "constraint", content: "端口8081",
+          sourceQuote: "改用8081", supersedes: ["port"] }], changes: [], focusIds: ["new-port"],
+      } };
+    const original = runtime({ executionConstraints: undefined, previousExecution: { executionConstraints: constraints },
+      taskGoal: { rootGoal: "部署应用", lifecycle, currentRoundId: "previous" },
+      requirementSubmission: { sourceMessageId: "new", baseRevision: 2, content: "改用8081", baseLifecycle: lifecycle } });
+    vi.mocked(invoke).mockResolvedValueOnce(processed).mockResolvedValueOnce([diagnose("uname -a")]);
+    await backend.processRequirement("改用8081", original);
+    const context = JSON.parse((vi.mocked(invoke).mock.calls[1][1] as { context: string }).context);
+    expect(context.taskGoal.lifecycle.revision).toBe(3);
+    expect(context.taskGoal.requirementContext.focus.map((item: { id: string }) => item.id)).toEqual(["new-port"]);
+    expect(context.executionConstraints.requiredConditions).toEqual(["仅内网访问", "端口8081"]);
+    expect(context).not.toHaveProperty("requirementSubmission.baseLifecycle");
+    expect(protocolRepairScopeFingerprint(original.context)).not.toBe(protocolRepairScopeFingerprint(JSON.stringify(context)));
+  });
+
+  it("binds local repair reuse to the lifecycle version even when the root and policy stay unchanged", () => {
+    const original = runtime({ taskGoal: { rootGoal: "部署应用", lifecycle: { revision: 2, focus: { requirementIds: ["deploy"] } } } });
+    const next = runtime({ taskGoal: { rootGoal: "部署应用", lifecycle: { revision: 3, focus: { requirementIds: ["firewall"] } } } });
+    expect(protocolRepairScopeFingerprint(original.context)).not.toBe(protocolRepairScopeFingerprint(next.context));
   });
 
   it("repairs a rejected Rust next-stage plan without losing the joint decision or regenerating the business", async () => {

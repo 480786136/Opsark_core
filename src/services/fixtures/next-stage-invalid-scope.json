@@ -1,0 +1,10 @@
+{
+  "kind": "plan_protocol_failure",
+  "rejectedPlanExecuted": false,
+  "nextStageDecision": { "decision": "continue", "reason": "只读检查完成，尚未拉取和部署", "summary": "克隆仓库并读取 README" },
+  "validationError": "第 1 个计划步骤 validationScope 不合法",
+  "steps": [
+    { "id": "rejected-clone", "kind": "change", "title": "克隆仓库", "description": "前台克隆", "action": { "type": "shell", "command": "cd /opt && GIT_TERMINAL_PROMPT=0 git clone --progress https://gitee.com/Kingzm/core-case.git /opt/core-case" }, "expected": "克隆成功", "validation": "git -C /opt/core-case rev-parse --verify HEAD", "validationScope": "只读校验 /opt/core-case 是 Git 工作树且 HEAD 可解析", "risk": "low", "status": "pending" },
+    { "id": "rejected-readme", "kind": "observe", "title": "读取 README", "description": "读取部署说明", "action": { "type": "tool", "toolId": "files.read_content", "arguments": { "path": "/opt/core-case/README.md", "maxBytes": 65536 } }, "expected": "获取真实说明", "validation": "", "risk": "low", "status": "pending" }
+  ]
+}

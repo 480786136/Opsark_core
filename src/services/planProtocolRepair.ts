@@ -90,6 +90,7 @@ export function protocolRepairAuthority(context: string) {
     _modelCapabilities: source._modelCapabilities,
     _modelIntegration: source._modelIntegration,
     _modelRecovery: source._modelRecovery,
+    _modelOutputRecovery: source._modelOutputRecovery,
     taskGoal: source.taskGoal ?? snapshot.taskGoal ?? { rootGoal: snapshot.rootGoal ?? task.rootGoal },
     permission: source.permission ?? task.permission,
     executionConstraints: source.executionConstraints ?? snapshot.executionConstraints,
@@ -107,6 +108,7 @@ export function protocolRepairScopeFingerprint(context: string, diagnostic?: Pla
   const goal = record(authority.taskGoal);
   return textFingerprint(stableProtocolValue({
     ruleVersion: diagnostic?.ruleVersion, rootGoal: goal.rootGoal,
+    requirementLifecycle: goal.lifecycle,
     permission: authority.permission, executionConstraints: authority.executionConstraints,
     confirmedUserInputs: authority.confirmedUserInputs, activeSkills: authority.activeSkills,
     target: record(authority.recovery).currentTargetContext,
@@ -161,6 +163,7 @@ export function compactProtocolRepairContext<T extends {
       })),
       originalStepIndices: indices,
       originalPlanMergedLocally: true,
+      responseMode: "rejected_fields",
       responseInstruction: "只返回 previousModelOutput 中被拒步骤的完整修正版，按原顺序排列；Core 在本地合并其他步骤并校验 allowedRepairPaths。",
     },
     // Rust must not start another independent repair loop for this attempt.

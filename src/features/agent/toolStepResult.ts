@@ -1,5 +1,5 @@
 import { enforceToolResult } from "@/features/tools/toolResultContract";
-import type { ExecutionEvidence, PlanStep, StepResult, StepReview } from "@/types";
+import type { ExecutionEvidence, ExecutionScopeEvidence, PlanStep, StepResult, StepReview } from "@/types";
 import type { ToolCall, ToolResult } from "@/features/tools/types";
 import { buildToolEvidenceFacts } from "@/features/tools/toolEvidence";
 
@@ -19,6 +19,7 @@ export interface BuildToolStepOutcomeInput {
   result: ToolResult;
   completedAt: string;
   evidenceId: string;
+  scope?: ExecutionScopeEvidence;
 }
 
 /** Builds the deterministic step fields produced by a model-invoked tool call. */
@@ -82,6 +83,7 @@ export function buildToolStepOutcome(input: BuildToolStepOutcomeInput): ToolStep
     error: "检查返回错误，请结合真实退出码和范围处理。",
   };
   const inspectionMessage = facts.evidenceKind === "operations_inspection" ? inspectionMessages[String(facts.inspectionStatus)] : undefined;
+  const unsupported = facts.evidenceKind === "operations_inspection" && facts.inspectionStatus === "unsupported";
   if (call.toolId === "context.expand" && result.data && typeof result.data === "object"
     && "skillId" in result.data && typeof result.data.skillId === "string") {
     Object.assign(facts, { expandedSkillId: result.data.skillId });
@@ -90,7 +92,7 @@ export function buildToolStepOutcome(input: BuildToolStepOutcomeInput): ToolStep
     ? "工具已返回部分结构化证据。"
     : "工具已返回结构化证据。");
   return {
-    status: "completed",
+    status: unsupported ? "failed" : "completed",
     output,
     progressMessage: inspectionMessage ?? (missingPath ? "已确认路径不存在" : truncated ? "工具结果已截断" : "工具调用完成"),
     evidence: [{
@@ -100,6 +102,7 @@ export function buildToolStepOutcome(input: BuildToolStepOutcomeInput): ToolStep
       facts,
       rawOutput: output,
       collectedAt: completedAt,
+      scope: input.scope,
     }],
     result: {
       executionStatus: "success",
@@ -109,11 +112,16 @@ export function buildToolStepOutcome(input: BuildToolStepOutcomeInput): ToolStep
       evidenceIds: [evidenceId],
     },
     review: {
-      decision: "continue",
-      reason: "工具调用成功并返回结构化证据",
+      decision: unsupported ? "adjust" : "continue",
+      reason: unsupported ? "工具已返回，但环境不支持该检查，尚未取得请求范围的检查结果。" : "工具调用成功并返回结构化证据",
       summary: successSummary,
       source: "rules",
+      ...(unsupported ? {
+        acceptance: { status: "unknown" as const, reason: successSummary, evidenceIds: [evidenceId] },
+        recoveryAction: { kind: "replan" as const, reason: "根据已有不支持证据选择已授权的替代方法，不重复原检查，不自动安装依赖或提权。", steps: [] },
+      } : {}),
     },
+    ...(unsupported ? { pauseReason: successSummary } : {}),
     eventMessage: inspectionMessage ? `工具 ${call.toolId}：${inspectionMessage}` : missingPath ? `工具 ${call.toolId} 已确认路径不存在：${facts.evidenceScope}` : truncated
       ? `工具 ${call.toolId} 已返回部分结果，达到处理限制。`
       : `工具 ${call.toolId} 已返回完整结果。`,

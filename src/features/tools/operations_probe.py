@@ -262,8 +262,13 @@ def run(tool, request):
             return None
 
     if sys.version_info < (3, 8) or not hasattr(os, "O_NOFOLLOW"):
+        missing = []
+        if sys.version_info < (3, 8):
+            missing.append(dict(path="python3>=3.8 (actual %s)" % ".".join(map(str, sys.version_info[:3])), reason="unsupported"))
+        if not hasattr(os, "O_NOFOLLOW"):
+            missing.append(dict(path="POSIX os.O_NOFOLLOW", reason="unsupported"))
         result.update(status="unsupported", coverageComplete=False, truncated=True,
-                      skippedCount=1, skipped=[dict(path="python3>=3.8/POSIX", reason="unsupported")],
+                      skippedCount=len(missing), skipped=missing,
                       finishedAt=datetime.datetime.now(datetime.timezone.utc).isoformat())
         return result
     previous = {}

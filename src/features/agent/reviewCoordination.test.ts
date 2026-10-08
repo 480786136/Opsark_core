@@ -178,7 +178,7 @@ describe("review coordination", () => {
     expect(remaining[0].status).toBe("pending");
   });
 
-  it("completes evidence and skips remaining work when the reviewed goal is complete", () => {
+  it("accepts the current step without skipping pending work on local completion", () => {
     const step = createStep("validate", "validating");
     const remaining = [createStep("remaining", "pending")];
     const outcome = applyExecutionEvidenceReview({
@@ -189,8 +189,8 @@ describe("review coordination", () => {
     });
 
     expect(step.status).toBe("completed");
-    expect(remaining[0].status).toBe("skipped");
-    expect(outcome.eventMessage).toContain("无需继续剩余 1 个");
+    expect(remaining[0].status).toBe("pending");
+    expect(outcome.shouldAdvance).toBe(true);
   });
 
   it("does not skip remaining work for a deterministic completion without model review", () => {

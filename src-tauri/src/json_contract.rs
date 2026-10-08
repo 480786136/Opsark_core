@@ -1,16 +1,27 @@
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-fn clean_json_content(content: &str) -> &str {
+/// Removes only an exterior BOM, whitespace, and a complete Markdown JSON fence.
+/// The returned JSON text is otherwise unchanged; parsing and validation remain
+/// the caller's responsibility. Partial fences and surrounding prose stay intact.
+pub(crate) fn normalize_json_wrapper(content: &str) -> &str {
     let trimmed = content.trim();
-    let without_open = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .unwrap_or(trimmed);
-    without_open
-        .strip_suffix("```")
-        .unwrap_or(without_open)
-        .trim()
+    let trimmed = trimmed
+        .strip_prefix('\u{feff}')
+        .unwrap_or(trimmed)
+        .trim_start();
+    let Some((opening, rest)) = trimmed.split_once('\n') else {
+        return trimmed;
+    };
+    if !matches!(opening.trim_end_matches('\r'), "```json" | "```") {
+        return trimmed;
+    }
+    // Both fence markers must occupy their own lines. Never extract a JSON
+    // fragment from prose or try to complete an interrupted model response.
+    let Some(body) = rest.strip_suffix("\n```") else {
+        return trimmed;
+    };
+    body.trim()
 }
 
 fn repair_invalid_json_escapes(content: &str) -> String {
@@ -56,7 +67,7 @@ fn repair_invalid_json_escapes(content: &str) -> String {
 
 /// Parses model output while preserving strict JSON preference and compatibility repairs.
 pub(crate) fn parse_model_json<T: DeserializeOwned>(content: &str) -> Result<T, String> {
-    let cleaned = clean_json_content(content);
+    let cleaned = normalize_json_wrapper(content);
     let repaired = repair_invalid_json_escapes(cleaned);
     serde_json::from_str(cleaned)
         .or_else(|_| serde_json::from_str(&repaired))

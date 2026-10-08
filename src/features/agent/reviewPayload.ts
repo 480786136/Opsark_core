@@ -181,7 +181,12 @@ export function compactReviewPlanStep(
     targetContext: step.attemptContext,
     title: compactReviewText(step.title, 180),
     description: compactReviewText(step.description, 320),
-    action: step.action,
+    // This is review context, never a dispatchable action. The shell body is
+    // already projected below; keeping action.command would resend the whole
+    // script and silently bypass commandLimit in every review/history entry.
+    action: step.action?.type === "shell"
+      ? { type: "shell" as const, commandRef: "command" }
+      : step.action,
     command: compactReviewText(step.command, options.commandLimit ?? 640),
     commandFingerprint: textFingerprint(JSON.stringify(step.action ?? step.command)),
     expected: compactReviewText(step.expected, 320),

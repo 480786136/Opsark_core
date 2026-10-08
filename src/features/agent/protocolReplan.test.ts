@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { activeProtocolRepair, freshProtocolReplanSteps, protocolReplanContext } from "./protocolReplan";
 import { buildAdjustmentContext, buildNextStageContext } from "./agentContext";
+import { analyzePlanStepSafety } from "./planSafety";
 import type { OpsTask, PlanStep } from "@/types";
 
 const rejected: PlanStep = {
@@ -53,6 +54,52 @@ describe("protocol failure to business plan boundary", () => {
     task.currentRoundId = "round";
     task.executionTargetServerId = "other-server";
     expect(activeProtocolRepair(task)).toBeUndefined();
+  });
+
+  it.each([
+    "curl -fsS -o /tmp/fixture-index.html http://localhost:8082/; rc=$?; grep -q 'fixture-marker' /tmp/fixture-index.html && echo matched || echo missing; exit $rc",
+    'ok=1; ss -ltn | grep -q ":8082 " && echo listening=yes || echo listening=no; [ "$ok" = "1" ]',
+    'code=200; ss -ltn | grep -q ":8082 " && echo listening=yes || echo listening=no; [ "$code" = "200" ]; rc=$?; exit "$rc"',
+  ])("retains the rejected validation and precise safety rule for the phase-9-shaped proposal", validation => {
+    const task = fixture();
+    const step = { ...rejected, kind: "change" as const, command: "npm run preview -- --port 8082 --strictPort",
+      expected: "服务由执行器跟踪，HTTP、内容与监听均通过验收", validation };
+    task.protocolRepair!.repair = {
+      errorCode: "plan_normalization_failed", fieldPath: "steps[0]", previousModelOutput: [step],
+      validationError: "第 1 个计划步骤的 validation 未通过执行前安全检查（VALIDATION_FAILURE_ECHOED：后置校验失败后仅输出提示，无法证明预期结果）；必须修复该安全问题且保留真实退出状态",
+      instruction: "重新规划",
+    };
+    const context = protocolReplanContext(task)!;
+    expect(context).toMatchObject({ fieldPath: "steps[0].validation", ruleId: "VALIDATION_FAILURE_ECHOED",
+      rejectedPlanExecuted: false, rejectedStep: { command: step.command, validation } });
+    expect(context.correctionInstruction).toContain("即使末尾另有 exit 或断言");
+    expect(context.correctionInstruction).toContain("只读、无落盘");
+    expect(context.correctionInstruction).toContain("不要仅为消除此错误改变部署动作、端口或增加步骤");
+    expect(context.correctionInstruction).toContain("完整校验与审批");
+    expect(analyzePlanStepSafety(step.command, validation)).toMatchObject({ safe: false,
+      issue: { field: "validation", ruleId: "VALIDATION_FAILURE_ECHOED" } });
+    expect(task.protocolRepair!.repair.previousModelOutput[0]).toEqual(step);
+  });
+
+  it("keeps the offending validator intact even when its failed branch is in the middle of long text", () => {
+    const task = fixture();
+    const validation = `printf '%s' '${"fixture".repeat(350)}'; test -f fixture || echo missing; printf '%s' '${"fixture".repeat(400)}'; exit "$rc"`;
+    task.protocolRepair!.repair = { errorCode: "plan_normalization_failed", fieldPath: "steps[0]",
+      validationError: "第 1 个计划步骤的 validation 未通过执行前安全检查（VALIDATION_FAILURE_ECHOED：失败状态丢失）",
+      instruction: "重新规划", previousModelOutput: [{ ...rejected, kind: "change", validation }] };
+    expect(protocolReplanContext(task)!.rejectedStep!.validation).toBe(validation);
+  });
+
+  it("does not replace a structured diagnostic or invent one from unmatched prose", () => {
+    const task = fixture();
+    task.protocolRepair!.repair.previousModelOutput = [{ ...rejected, validation: "test -f fixture || echo missing" }];
+    task.protocolRepair!.repair.validationError = "第 1 个计划步骤的 validation 未通过执行前安全检查（VALIDATION_FAILURE_ECHOED：失败状态丢失）";
+    expect(protocolReplanContext(task)).toMatchObject({ fieldPath: "steps[0].command", ruleId: "OBSERVE_COMMAND_MUTATION" });
+    expect(protocolReplanContext(task)!.correctionInstruction).toBeUndefined();
+    delete task.protocolRepair!.repair.diagnostic;
+    task.protocolRepair!.repair.validationError = "模型文字提到 VALIDATION_FAILURE_ECHOED，但实际拒绝原因为另一协议错误";
+    expect(protocolReplanContext(task)!.ruleId).toBeUndefined();
+    expect(protocolReplanContext(task)!.fieldPath).toBe("steps[0].command");
   });
 
   it("allocates fresh pending attempts and never copies approval or execution claims", () => {

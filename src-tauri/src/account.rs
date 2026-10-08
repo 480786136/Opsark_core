@@ -53,7 +53,7 @@ pub(crate) fn origin() -> Result<String, String> {
 
 fn entry(base: &str) -> Result<keyring::Entry, String> {
     let name = format!("refresh:{:x}", Sha256::digest(base.as_bytes()));
-    keyring::Entry::new("com.opsark.desktop.account", &name)
+    crate::credential::system_entry("com.opsark.desktop.account", &name)
         .map_err(|_| "无法访问账号钥匙串".into())
 }
 

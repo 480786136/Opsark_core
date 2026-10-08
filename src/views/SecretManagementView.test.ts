@@ -48,6 +48,8 @@ describe("SecretManagementView", () => {
 
     expect(host.querySelector(".secret-server-picker summary")?.textContent).toContain("Beta · 10.0.0.2 · 1");
     expect(host.querySelector(".secret-row-copy strong")?.textContent).toBe("GIT_HTTP_CREDENTIAL");
+    expect(host.textContent).toContain("敏感信息按服务器隔离保存在本地加密凭据库");
+    expect(host.textContent).toContain("主密钥由系统凭据库保护");
     expect(host.textContent).toContain("Beta · 10.0.0.2 · 1");
     expect(host.querySelector(".secret-empty-state")).toBeNull();
 

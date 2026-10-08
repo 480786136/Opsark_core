@@ -127,12 +127,12 @@ describe("bounded task transport recovery", () => {
     expect(backend.executeAgentCommand).not.toHaveBeenCalled();
   });
 
-  it("restores an interrupted write into a persisted verification hold, retaining evidence", () => {
+  it("restores an interrupted write into a persisted verification hold, retaining evidence", async () => {
     const { ops, task } = fixture("managed");
     task.status = "running";
     task.plan[0].status = "running";
     task.plan[0].output = "partial remote output";
-    ops.persist(true);
+    await ops.persist(true);
     setActivePinia(createPinia());
     const restored = useOpsStore().tasks.find(item => item.id === task.id)!;
     expect(restored.status).toBe("needs_adjustment");
@@ -382,10 +382,10 @@ describe("bounded task transport recovery", () => {
     expect(ops.transportRecoveryTaskIds).not.toContain(task.id);
   });
 
-  it("restores persisted waits as an explicit manual check, never as a live worker", () => {
+  it("restores persisted waits as an explicit manual check, never as a live worker", async () => {
     const { ops, task } = fixture("managed");
     ops.transportRecoveryTaskIds.push(task.id);
-    ops.persist(true);
+    await ops.persist(true);
     setActivePinia(createPinia());
     const restored = useOpsStore();
     expect(restored.transportRecoveryTaskIds).toEqual([]);

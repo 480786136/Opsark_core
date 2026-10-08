@@ -140,6 +140,9 @@ export interface StepReview {
 /** One model decision that either completes the goal or supplies its next bounded stage. */
 export interface NextStageDecision extends StepReview {
   steps: PlanStep[];
+  requirementReview?: TaskRequirementReview;
+  blocking?: { kind: "external" | "user_input"; reason: string; requirementIds: string[] };
+  issueResolutions?: Array<{ issueId: string; evidenceIds: string[]; reason: string }>;
   planUpdate?: { basePlanFingerprint: string; replaceStepIds: string[]; reason: string };
   reconciliation?: {
     incidentId: string;
@@ -542,6 +545,7 @@ export type ManagedAdjustmentPhase =
   | "manual_required";
 
 export type ManagedStopReason =
+  | "request_completed"
   | "workflow_error"
   | "no_progress"
   | "phase_budget_exhausted"
@@ -560,6 +564,62 @@ export interface TaskRequirementSource {
   sourceMessageId?: string;
   sourceRoundId?: string;
   createdAt?: string;
+}
+
+export type TaskRequirementStatus = "active" | "satisfied" | "deferred" | "superseded" | "cancelled";
+export type TaskRequirementOutcome = "satisfied" | "unmet" | "unknown";
+
+export interface TaskRequirementItem {
+  id: string;
+  kind: "goal" | "constraint";
+  content: string;
+  source: TaskRequirementSource;
+  /** When a user last created or reactivated this obligation, independent of its original source. */
+  lastChangedAt?: string;
+  status: TaskRequirementStatus;
+  supersedes?: string[];
+  supersededBy?: string;
+  evidenceIds: string[];
+  lastReview?: {
+    outcome: TaskRequirementOutcome;
+    reason: string;
+    evidenceIds: string[];
+    revision: number;
+    roundId?: string;
+  };
+}
+
+/** Exact effective requirements survive history compaction; historical execution prose need not. */
+export interface TaskRequirementLifecycle {
+  version: 1;
+  revision: number;
+  items: TaskRequirementItem[];
+  focus: { roundId?: string; sourceMessageId?: string; requirementIds: string[] };
+  lastReview?: { revision: number; roundId?: string; focusOutcome: "completed" | "pending"; overallOutcome: "completed" | "pending" };
+}
+
+/** A semantic delta grounded in the current user message. Classification cannot grant completion. */
+export interface TaskRequirementUpdate {
+  baseRevision: number;
+  sourceMessageId: string;
+  additions: Array<{
+    id: string;
+    kind: "goal" | "constraint";
+    content: string;
+    sourceQuote: string;
+    supersedes: string[];
+  }>;
+  changes: Array<{ id: string; status: "active" | "deferred" | "cancelled"; sourceQuote: string; reason: string }>;
+  focusIds: string[];
+}
+
+/** Acceptance is bound to the requirement revision and the executor-owned evidence set. */
+export interface TaskRequirementReview {
+  baseRevision: number;
+  roundId: string;
+  focusOutcome: "completed" | "pending";
+  overallOutcome: "completed" | "pending";
+  items: Array<{ requirementId: string; outcome: TaskRequirementOutcome; evidenceIds: string[]; reason: string }>;
 }
 
 export interface OpsTask {
@@ -612,6 +672,7 @@ export interface OpsTask {
   modelPlanningBlocker?: {
     error: ModelServiceError;
     conditionsFingerprint: string;
+    contractRevision?: string;
     recordedAt: string;
     accountBalance?: { userId: string; available: number; reserved: number };
   };
@@ -624,6 +685,9 @@ export interface OpsTask {
   currentInstruction?: string;
   /** Original requirement sources survive display/history compaction; not a completion verdict. */
   persistedRequirements?: { version: 1; sources: TaskRequirementSource[] };
+  requirementLifecycle?: TaskRequirementLifecycle;
+  currentRequestReview?: { roundId: string; requirementRevision: number; summary: string; completed: boolean; remainingRequirementIds: string[] };
+  issueResolutions?: import("@/features/agent/taskDecisionResolution").TaskIssueResolution[];
   lastRequirementRelation?: RequirementRelation;
   currentRoundId?: string;
   /** Earlier plans from the active round that were superseded by an adjustment. */
@@ -825,7 +889,8 @@ export interface ModelAvailability {
 export interface AiGenerationSettings {
   limitOutput: boolean;
   maxPlanSteps: number;
-  maxOutputTokens: number;
+  /** Omitted means use the connection's declared output limit. Official models always use it. */
+  maxOutputTokens?: number;
   maxTextChars: number;
   maxCommandChars: number;
 }
@@ -833,6 +898,7 @@ export interface AiGenerationSettings {
 export interface RequirementProcessingResult {
   intent: "answer" | "execute" | "terminal_context";
   relation?: RequirementRelation;
+  requirementUpdate?: TaskRequirementUpdate;
   answer?: string;
   plan: PlanStep[];
   constraints?: ExecutionConstraints;
@@ -874,6 +940,8 @@ export interface ModelServiceError {
   reserved?: number;
   actual?: number;
   recoveryBudget?: {
+    fieldRepairs?: number;
+    candidateRegenerations?: number;
     generations?: number;
     transportAttempts?: number;
     elapsedMs?: number;

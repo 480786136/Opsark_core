@@ -10,6 +10,7 @@ import { transitionStep } from "@/features/agent/stepMachine";
 import type { PlanStep } from "@/types";
 import type { ToolCall, ToolResult } from "@/features/tools/types";
 import { ExecutionLedgerError } from "@/services/executionLedger";
+import { toolExecutionScope } from "./toolEvidenceScope";
 
 type ToolExecutor = () => Promise<ToolResult>;
 
@@ -47,6 +48,7 @@ export async function runToolStepLifecycle(
   input: RunToolStepLifecycleInput,
 ): Promise<{ cancelled: true } | ({ cancelled: false } & ToolStepCoordination)> {
   if (input.isCancelled()) return { cancelled: true };
+  const evidenceScope = toolExecutionScope(input.step, input.call.toolId);
   transitionStep(input.step, "running");
   const startedAt = input.now();
   input.step.startedAt = startedAt;
@@ -85,6 +87,7 @@ export async function runToolStepLifecycle(
     result,
     completedAt,
     evidenceId: input.createEvidenceId(),
+    scope: evidenceScope,
   });
   transitionStep(input.step, outcome.status);
   applyToolStepOutcome(input.step, outcome);

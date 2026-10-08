@@ -116,8 +116,30 @@ export function archivedConversationTimeline(round: TaskPlanHistory): CurrentCon
 
 /** Execution events are already represented by previousExecution/decision evidence. */
 export function requirementConversationContext(task: OpsTask) {
-  return task.messages.filter(message => message.kind === "message" && message.role !== "system")
-    .slice(-24).map(({ role, kind, content }) => ({ role, kind, content }));
+  const messages = task.messages.filter(message => message.kind === "message" && message.role !== "system");
+  const result: Array<{ role: TaskMessage["role"]; kind: TaskMessage["kind"]; content: string;
+    truncated?: boolean; originalCharacters?: number; omittedEarlierMessages?: number }> = [];
+  let remaining = 6_000;
+  for (const message of messages.slice(-24).reverse()) {
+    if (remaining <= 0) break;
+    const limit = Math.min(800, remaining);
+    const truncated = message.content.length > limit;
+    let content = message.content;
+    if (truncated) {
+      const marker = "\n…[历史参考已压缩]…\n";
+      const available = Math.max(0, limit - marker.length);
+      const head = Math.ceil(available * 0.65);
+      const tail = available - head;
+      content = limit <= marker.length ? "…".repeat(limit)
+        : `${content.slice(0, head)}${marker}${tail ? content.slice(-tail) : ""}`;
+    }
+    result.push({ role: message.role, kind: message.kind, content,
+      ...(truncated ? { truncated: true, originalCharacters: message.content.length } : {}) });
+    remaining -= content.length;
+  }
+  result.reverse();
+  if (result.length && messages.length > result.length) result[0].omittedEarlierMessages = messages.length - result.length;
+  return result;
 }
 
 /** Recover legacy links only from explicit task creation audit records. */

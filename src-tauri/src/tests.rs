@@ -344,7 +344,7 @@ fn raw_shell_acceptance_requires_real_evidence_references() {
 fn next_stage_complete_requires_empty_steps_and_serializes_the_public_contract() {
     let settings = AiGenerationSettings::default();
     let complete = AiNextStageDecision {
-        plan_update: None, reconciliation: None,
+        plan_update: None, reconciliation: None, requirement_review: None, blocking: None, issue_resolutions: None,
         decision: " complete ".into(),
         reason: " 已有作用域匹配的结构化证据 ".into(),
         summary: " 整体目标已经验收 ".into(),
@@ -372,7 +372,7 @@ fn next_stage_complete_requires_empty_steps_and_serializes_the_public_contract()
     );
 
     let invalid = AiNextStageDecision {
-        plan_update: None, reconciliation: None,
+        plan_update: None, reconciliation: None, requirement_review: None, blocking: None, issue_resolutions: None,
         decision: "complete".into(),
         reason: "错误地同时给出计划".into(),
         summary: "契约不一致".into(),
@@ -389,7 +389,7 @@ fn next_stage_complete_requires_empty_steps_and_serializes_the_public_contract()
 fn next_stage_continue_requires_a_plan_but_adjust_can_report_no_action() {
     let settings = AiGenerationSettings::default();
     let empty_continue = AiNextStageDecision {
-        plan_update: None, reconciliation: None,
+        plan_update: None, reconciliation: None, requirement_review: None, blocking: None, issue_resolutions: None,
         decision: "continue".into(),
         reason: "目标尚未完成".into(),
         summary: "需要下一阶段".into(),
@@ -401,7 +401,7 @@ fn next_stage_continue_requires_a_plan_but_adjust_can_report_no_action() {
     assert!(error.contains("steps 至少需要 1 个元素"), "{error}");
 
     let no_action = AiNextStageDecision {
-        plan_update: None, reconciliation: None,
+        plan_update: None, reconciliation: None, requirement_review: None, blocking: None, issue_resolutions: None,
         decision: "adjust".into(),
         reason: "当前没有合法且有意义的可执行动作".into(),
         summary: "保留现有证据并停止生成步骤".into(),
@@ -449,7 +449,7 @@ fn next_stage_request_has_an_evidence_gate_and_independent_output_budget() {
         r#"{"baseSnapshot":{},"activeSkills":[]}"#,
         &unlimited,
     );
-    assert_eq!(body["max_tokens"], 5000);
+    assert!(body.get("max_tokens").is_none());
     let system = body["messages"][0]["content"].as_str().unwrap();
     assert!(system.contains(GENERAL_PLAN_SYSTEM));
     assert!(system.contains("完成证据指引"));
@@ -463,7 +463,7 @@ fn next_stage_request_has_an_evidence_gate_and_independent_output_budget() {
     let limited = AiGenerationSettings {
         limit_output: true,
         max_plan_steps: 4,
-        max_output_tokens: 777,
+        max_output_tokens: Some(777),
         max_text_chars: 160,
         max_command_chars: 1800,
     };
@@ -2231,4 +2231,17 @@ fn classification_feedback_identifies_the_invalid_field() {
         classification_contract_error(&constraints, Some("unknown Skill".into())).as_deref(),
         Some("unknown Skill")
     );
+}
+
+#[test]
+fn plan_and_stage_prompts_share_scope_enums_and_shell_action_fields() {
+    let fields = crate::plan_contract::field_rules();
+    for repair in [false, true] {
+        let prompt = plan_generation_system(repair, PLAN_STEP_OUTPUT_CONTRACT, "");
+        assert!(prompt.contains(&fields));
+    }
+    let body = build_next_stage_request_body("fixture", "部署", "{}", &AiGenerationSettings::default());
+    assert!(body["messages"][0]["content"].as_str().unwrap().contains(&fields));
+    assert!(fields.contains("validationScope 只能为 isolated_exec|fresh_interactive_shell|fresh_login_shell"));
+    assert!(fields.contains("禁止 timeoutSeconds"));
 }

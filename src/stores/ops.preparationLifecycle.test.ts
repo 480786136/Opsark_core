@@ -112,4 +112,56 @@ describe("J1 preparation and composite connection lifecycle", () => {
     expect(backend.saveCredential).toHaveBeenCalledWith("server", target.id, "fixture-secret");
     expect(store.tasks).toHaveLength(0);
   });
+
+  it.each([
+    ["planning", "pending", "planning_failed"],
+    ["running", "pending", "needs_adjustment"],
+    ["validating", "completed", "needs_adjustment"],
+  ] as const)("restores an ownerless %s phase without replaying its %s step", (status, stepStatus, restoredStatus) => {
+    const task = runningTask();
+    task.status = status;
+    task.requirementProcessing = true;
+    task.managedAdjustmentPhase = "generating";
+    task.autoAdjustmentSeconds = 5;
+    task.plan = [{ id: "preserved", title: "已有步骤", description: "保留原执行记录", command: "printf READY",
+      action: { type: "shell", command: "printf READY" }, validation: "true", expected: "READY",
+      kind: "observe", risk: "low", status: stepStatus,
+      ...(stepStatus === "completed" ? { output: "READY", result: { executionStatus: "success", observationStatus: "matched",
+        facts: { validationPassed: true }, warnings: [], evidenceIds: ["proof"] },
+        evidence: [{ id: "proof", type: "command-output", source: "main", rawOutput: "READY", facts: {}, collectedAt: "2026-10-02T00:00:00Z" }] } : {}) }];
+    const original = JSON.parse(JSON.stringify(task.plan));
+    const execute = vi.spyOn(backend, "executeCommand");
+    const decide = vi.spyOn(backend, "decideNextStage");
+    const classify = vi.spyOn(backend, "processRequirement");
+    localStorage.setItem("opsark.tasks", JSON.stringify([task]));
+    setActivePinia(createPinia());
+    const restored = useOpsStore().tasks.find(item => item.id === task.id)!;
+    expect(restored.status).toBe(restoredStatus);
+    expect(restored.requirementProcessing).toBe(false);
+    expect(restored.managedAdjustmentPhase).toBe("manual_required");
+    expect(restored.autoAdjustmentSeconds).toBeUndefined();
+    expect(restored.pauseReason).toContain("重启中断");
+    expect(restored.plan).toEqual(original);
+    expect(execute).not.toHaveBeenCalled();
+    expect(decide).not.toHaveBeenCalled();
+    expect(classify).not.toHaveBeenCalled();
+  });
+
+  it("preserves an unknown model request blocker while releasing an interrupted review spinner", async () => {
+    const store = useOpsStore();
+    const task = runningTask();
+    task.status = "validating";
+    store.recordModelPlanningBlocker(task, { code: "MODEL_DISPATCH_UNKNOWN", message: "原模型请求结果未知",
+      retryable: false, origin: "core", stage: "request_recovery", requestKey: "original-request" });
+    const blocker = JSON.parse(JSON.stringify(task.modelPlanningBlocker));
+    localStorage.setItem("opsark.tasks", JSON.stringify([task]));
+    setActivePinia(createPinia());
+    const restoredStore = useOpsStore();
+    const restored = restoredStore.tasks.find(item => item.id === task.id)!;
+    const decide = vi.spyOn(backend, "decideNextStage");
+    expect(restored.status).toBe("needs_adjustment");
+    expect(restored.modelPlanningBlocker).toEqual(blocker);
+    await restoredStore.requestAdjustment(restored.id);
+    expect(decide).not.toHaveBeenCalled();
+  });
 });

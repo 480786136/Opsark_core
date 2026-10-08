@@ -6,6 +6,7 @@ import {
   buildPeriodicReviewFailure,
 } from "@/features/agent/commandStepResult";
 import type { PlanStep } from "@/types";
+import { buildExecutionScopeEvidence } from "./executionScope";
 
 function createStep(): PlanStep {
   return {
@@ -21,6 +22,19 @@ function createStep(): PlanStep {
 }
 
 describe("command step result", () => {
+  it("preserves the frozen dispatch scope for ordinary and periodic failures", () => {
+    const scope = buildExecutionScopeEvidence({ targetId: "original-server", scope: "agent_session", sessionId: "session", generation: 2 });
+    const base = { output: "failed", exitCode: 1, evidenceId: "proof", collectedAt: "2026-10-02T03:00:00.000Z", scope };
+    const ordinary = buildCommandFailure(base);
+    const periodic = buildPeriodicReviewFailure({ ...base, reviewRound: 3, validationPassed: false,
+      review: { decision: "adjust", reason: "retries exhausted", summary: "inspect alternatives", source: "model" } });
+    scope.targetId = "new-server";
+    for (const outcome of [ordinary, periodic]) {
+      expect(outcome.evidence[0].scope).toMatchObject({ targetId: "original-server", scope: "agent_session", sessionId: "session", generation: 2 });
+      expect(outcome.result.executionStatus).toBe("failed");
+    }
+  });
+
   it("builds consistent evidence when periodic review stops a command", () => {
     const outcome = buildPeriodicReviewFailure({
       review: { decision: "adjust", reason: "无持续进展", summary: "需要调整", source: "model" },

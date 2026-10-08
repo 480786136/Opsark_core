@@ -59,9 +59,11 @@ pub(crate) fn change_operations(command: &str) -> Vec<ChangeOperation> {
     {
         operations.push(ChangeOperation::ResourceDelete);
     }
-    if [" iptables ", " nft ", " ufw ", " firewall-cmd "]
+    if [" iptables ", " nft ", " ufw "]
         .iter()
         .any(|token| lower.contains(token))
+        || (lower.contains("firewall-cmd")
+            && !crate::recovery_rules::is_read_only_firewall_script(command))
     {
         operations.push(ChangeOperation::NetworkPolicyChange);
     }
@@ -118,6 +120,25 @@ pub(crate) fn requires_high_risk_approval(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{change_operations, requires_high_risk_approval, risk_for, ChangeOperation};
+
+    #[test]
+    fn firewall_queries_use_the_shared_whole_script_policy() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("../../shared/firewall-query-cases.json")).unwrap();
+        for case in cases.as_array().unwrap() {
+            let command = case["command"].as_str().unwrap();
+            let readonly = case["readonly"].as_bool().unwrap();
+            assert_eq!(
+                change_operations(command).contains(&ChangeOperation::NetworkPolicyChange),
+                !readonly,
+                "{}",
+                case["name"]
+            );
+            if !readonly {
+                assert_eq!(risk_for(command), "high", "{}", case["name"]);
+            }
+        }
+    }
 
     #[test]
     fn classifies_commands_by_highest_known_risk() {

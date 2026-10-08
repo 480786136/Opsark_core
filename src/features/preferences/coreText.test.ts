@@ -62,5 +62,10 @@ describe("Core system message presentation", () => {
     expect(localizeCoreText(error, "zh-CN")).toBe("上传开关已关闭，队列已暂停");
     expect(localizeCoreText("知识服务返回 HTTP 503", "en-US")).toBe("Knowledge service returned HTTP 503");
     expect(localizeCoreText("Knowledge service returned HTTP 503", "zh-CN")).toBe("知识服务返回 HTTP 503");
+    const loadingError = "加密凭据尚未完整加载，已取消保存以避免误删已有凭据数据";
+    expect(localizeCoreText(loadingError, "en-US")).toBe("Encrypted credentials have not finished loading. Save cancelled to protect existing credential data.");
+    expect(localizeCoreText(localizeCoreText(loadingError, "en-US"), "zh-CN")).toBe(loadingError);
+    expect(localizeCoreText("加密凭据读取失败，请手动填写 SSH 密码", "en-US"))
+      .toBe("Could not read encrypted credentials. Enter the SSH password manually.");
   });
 });

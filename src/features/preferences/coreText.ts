@@ -87,6 +87,8 @@ const messages: ReadonlyArray<readonly [string, string]> = [
   ["用户名与密码/令牌必须作为同一凭据组完整提交", "Submit the username and password/token together as a complete credential group"],
   ["系统凭据尚未完整加载，已取消保存以避免误删钥匙串数据", "System credentials have not finished loading. Save cancelled to protect existing keychain data."],
   ["系统凭据读取失败，请手动填写 SSH 密码", "Could not read system credentials. Enter the SSH password manually."],
+  ["加密凭据尚未完整加载，已取消保存以避免误删已有凭据数据", "Encrypted credentials have not finished loading. Save cancelled to protect existing credential data."],
+  ["加密凭据读取失败，请手动填写 SSH 密码", "Could not read encrypted credentials. Enter the SSH password manually."],
 ];
 
 const english = new Map(messages);

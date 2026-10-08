@@ -68,6 +68,51 @@ describe("J1 current plan approval through the real store", () => {
     expect(backend.executeCommand).not.toHaveBeenCalled();
     expect(backend.validateStep).not.toHaveBeenCalled();
     expect(task.plan[0]!.approvalGrant).toBeUndefined();
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(task.plan[0]!.status).toBe("pending");
+    expect(task.planApproval).toBeUndefined();
+    expect(() => store.assertPreparedStep(task, task.plan[0]!)).not.toThrow();
+    expect(backend.decideNextStage).not.toHaveBeenCalled();
+  });
+
+  it("prepares changed approval locally and continues only after approving the new plan and step", async () => {
+    const { store, task } = await waitingApproval();
+    const originalDigest = task.plan[0]!.executionIntent!.digest;
+    task.plan[0]!.expected = "READY 且退出码为 0";
+    await store.approveStep(task.id, "prepared-step");
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(task.plan[0]!.executionIntent!.digest).not.toBe(originalDigest);
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    await store.approvePlan(task.id);
+    expect(task.status).toBe("awaiting_step_approval");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    await store.approveStep(task.id, "prepared-step");
+    expect(backend.executeCommand).toHaveBeenCalledOnce();
+    expect(task.status).toBe("completed");
+  });
+
+  it.each([false, true])("releases an invalid waiting approval when preparation fails (restored=%s)", async restored => {
+    const { store, task } = await waitingApproval();
+    if (restored) task.plan[0]!.executionIntent = undefined;
+    task.plan[0]!.action = { type: "tool", toolId: "unavailable-tool", arguments: {} };
+    task.plan[0]!.command = "";
+    task.plan[0]!.validation = "";
+    await store.approveStep(task.id, "prepared-step");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(task.status).toBe("needs_adjustment");
+    expect(task.plan[0]!.status).toBe("pending");
+    expect(task.plan[0]!.approvalGrant).toBeUndefined();
+    expect(task.planApproval).toBeUndefined();
+  });
+
+  it("refreshes a stale displayed snapshot even when preparation normalizes back to the old intent", async () => {
+    const { store, task } = await waitingApproval();
+    task.plan[0]!.executionScope = "invalid-scope" as PlanStep["executionScope"];
+    await store.approveStep(task.id, "prepared-step");
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(task.plan[0]!.status).toBe("pending");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(backend.decideNextStage).not.toHaveBeenCalled();
   });
 
   it("permits renamed display text with the same prepared execution and accepts exactly once", async () => {

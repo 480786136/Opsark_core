@@ -37,7 +37,16 @@ pub struct RecoveryProtocolIssue {
 
 fn issue(code: &str, step: &Value, index: usize, matched: Option<String>) -> RecoveryProtocolIssue {
     let rule = &rules()["errors"][code];
-    let field_path = |field: &str| format!("steps[{index}].{}", if field == "command" && step["action"]["type"] == "shell" { "action.command" } else { field });
+    let field_path = |field: &str| {
+        format!(
+            "steps[{index}].{}",
+            if field == "command" && step["action"]["type"] == "shell" {
+                "action.command"
+            } else {
+                field
+            }
+        )
+    };
     RecoveryProtocolIssue {
         code: code.into(),
         step_index: index,
@@ -64,8 +73,13 @@ pub fn metadata_issue(step: &Value, index: usize) -> Option<RecoveryProtocolIssu
         {
             return None;
         }
-        command_mutation(step["action"]["command"].as_str().or_else(|| step["command"].as_str()).unwrap_or(""))
-            .map(|matched| issue("OBSERVE_COMMAND_MUTATION", step, index, Some(matched)))
+        command_mutation(
+            step["action"]["command"]
+                .as_str()
+                .or_else(|| step["command"].as_str())
+                .unwrap_or(""),
+        )
+        .map(|matched| issue("OBSERVE_COMMAND_MUTATION", step, index, Some(matched)))
     };
     let relation = &step["recovery"];
     if relation.is_null() {
@@ -102,7 +116,12 @@ pub fn metadata_issue(step: &Value, index: usize) -> Option<RecoveryProtocolIssu
         return Some(issue("RECOVERY_KIND_MISMATCH", step, index, None));
     }
     if purpose["readonly"].as_bool() == Some(true) {
-        if let Some(mutation) = command_mutation(step["action"]["command"].as_str().or_else(|| step["command"].as_str()).unwrap_or("")) {
+        if let Some(mutation) = command_mutation(
+            step["action"]["command"]
+                .as_str()
+                .or_else(|| step["command"].as_str())
+                .unwrap_or(""),
+        ) {
             return Some(issue(
                 "RECOVERY_DIAGNOSE_MUTATION",
                 step,
@@ -155,10 +174,149 @@ fn flush(tokens: &mut Vec<Token>, word: &mut String) {
 }
 
 pub fn command_mutation(command: &str) -> Option<String> {
-    mutation(command, 0)
+    mutation(command, 0, false)
 }
 
-fn mutation(command: &str, depth: u64) -> Option<String> {
+/// A narrow whole-script exemption, not a shell sandbox. The ordinary recovery
+/// lexer checks substitutions; the strict mode permits only query/receipt code.
+pub fn is_read_only_firewall_script(command: &str) -> bool {
+    command.contains("firewall-cmd") && mutation(command, 0, true).is_none()
+}
+
+fn firewall_query_arguments(args: &[String]) -> bool {
+    let mut queries = 0;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if contains(&rules()["shell"]["firewallReadOnlyOptions"], arg) {
+            queries += 1;
+        } else if matches!(arg, "--permanent" | "--quiet") {
+        } else if arg == "--zone" || arg.starts_with("--zone=") {
+            let value = if arg == "--zone" {
+                index += 1;
+                args.get(index).map(String::as_str)
+            } else {
+                arg.strip_prefix("--zone=")
+            };
+            if value.is_none_or(|value| {
+                value.is_empty()
+                    || !value.chars().enumerate().all(|(at, c)| {
+                        c.is_ascii_alphanumeric() || c == '_' || at > 0 && matches!(c, '.' | '-')
+                    })
+            }) {
+                return false;
+            }
+        } else if arg == "--query-port" || arg.starts_with("--query-port=") {
+            let value = if arg == "--query-port" {
+                index += 1;
+                args.get(index).map(String::as_str)
+            } else {
+                arg.strip_prefix("--query-port=")
+            };
+            let valid =
+                value
+                    .and_then(|value| value.split_once('/'))
+                    .is_some_and(|(port, protocol)| {
+                        let ports: Vec<_> = port.split('-').collect();
+                        ports.len() <= 2
+                            && ports.iter().all(|part| {
+                                !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())
+                            })
+                            && ["tcp", "udp", "sctp", "dccp"].contains(&protocol)
+                    });
+            if !valid {
+                return false;
+            }
+            queries += 1;
+        } else {
+            return false;
+        }
+        index += 1;
+    }
+    queries == 1
+}
+
+fn read_only_firewall_segment(segment: &[String]) -> bool {
+    let mut at = 0;
+    while segment
+        .get(at)
+        .is_some_and(|word| ["if", "then", "elif", "else", "!"].contains(&word.as_str()))
+    {
+        at += 1;
+    }
+    let words = &segment[at..];
+    if words.is_empty() {
+        return true;
+    }
+    if words.iter().all(|word| assignment(word)) {
+        return words.iter().all(|word| {
+            let name = word.split_once('=').unwrap().0;
+            ![
+                "PATH",
+                "IFS",
+                "ENV",
+                "CDPATH",
+                "GLOBIGNORE",
+                "PS0",
+                "PS1",
+                "PS2",
+                "PS3",
+                "PS4",
+                "PROMPT_COMMAND",
+            ]
+            .contains(&name)
+                && ![
+                    "BASH", "SHELL", "LD_", "DYLD_", "PYTHON", "PERL", "RUBY", "NODE_",
+                ]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        });
+    }
+    at = 0;
+    if words[at] == "sudo" {
+        at += 1;
+        while words
+            .get(at)
+            .is_some_and(|word| ["-n", "--non-interactive", "--"].contains(&word.as_str()))
+        {
+            at += 1;
+        }
+    }
+    let Some(name) = words.get(at).map(String::as_str) else {
+        return false;
+    };
+    let args = &words[at + 1..];
+    if ["firewall-cmd", "/usr/bin/firewall-cmd", "/bin/firewall-cmd"].contains(&name) {
+        return firewall_query_arguments(args);
+    }
+    if ["echo", "printf", "test", "[", ":", "true", "false", "exit"].contains(&name) {
+        return !(name == "printf" && args.first().is_some_and(|arg| arg.starts_with("-v")))
+            && !(["test", "["].contains(&name)
+                && args.iter().any(|arg| {
+                    ["-eq", "-ne", "-gt", "-ge", "-lt", "-le"].contains(&arg.as_str())
+                }));
+    }
+    if name == "set" {
+        let pipefail_option = |arg: &str| {
+            arg.strip_prefix('-')
+                .and_then(|value| value.strip_suffix('o'))
+                .is_some_and(|value| value.chars().all(|c| matches!(c, 'e' | 'u')))
+        };
+        return !args.is_empty()
+            && args.iter().enumerate().all(|(index, arg)| {
+                let mut chars = arg.chars();
+                matches!(chars.next(), Some('-' | '+'))
+                    && arg.len() > 1
+                    && chars.all(|c| matches!(c, 'e' | 'u'))
+                    || (pipefail_option(arg)
+                        && args.get(index + 1).is_some_and(|next| next == "pipefail"))
+                    || (arg == "pipefail" && index > 0 && pipefail_option(&args[index - 1]))
+            });
+    }
+    name == "fi" && args.is_empty()
+}
+
+fn mutation(command: &str, depth: u64, firewall_read_only: bool) -> Option<String> {
     let shell = &rules()["shell"];
     if depth > shell["maxNestedDepth"].as_u64().unwrap() {
         return Some("nested-shell".into());
@@ -193,6 +351,14 @@ fn mutation(command: &str, depth: u64) -> Option<String> {
             word.push(c);
             i += 1;
             continue;
+        }
+        if firewall_read_only
+            && (c == '$'
+                && (chars.get(i + 1) == Some(&'{')
+                    || chars.get(i + 1) == Some(&'(') && chars.get(i + 2) == Some(&'('))
+                || matches!(c, '<' | '>') && chars.get(i + 1) == Some(&'('))
+        {
+            return Some("unsupported:expansion".into());
         }
         if matches!(c, '$' | '<' | '>')
             && chars.get(i + 1) == Some(&'(')
@@ -233,7 +399,10 @@ fn mutation(command: &str, depth: u64) -> Option<String> {
                 nested.push(current);
                 end += 1;
             }
-            if let Some(found) = mutation(&nested, depth + 1) {
+            if firewall_read_only && end >= chars.len() {
+                return Some("unsupported:substitution".into());
+            }
+            if let Some(found) = mutation(&nested, depth + 1, firewall_read_only) {
                 return Some(found);
             }
             word.push_str("__substitution__");
@@ -267,6 +436,14 @@ fn mutation(command: &str, depth: u64) -> Option<String> {
             {
                 return Some(format!("unsupported:{op}"));
             }
+        }
+        if firewall_read_only
+            && (matches!(c, '&' | '|')
+                && chars.get(i + 1) != Some(&c)
+                && (i == 0 || chars.get(i - 1) != Some(&c))
+                || c == '<')
+        {
+            return Some(format!("unsupported:{c}"));
         }
         if c == '>' {
             if !word.is_empty() && word.chars().all(|c| c.is_ascii_digit()) {
@@ -307,6 +484,9 @@ fn mutation(command: &str, depth: u64) -> Option<String> {
         word.push(c);
         i += 1;
     }
+    if firewall_read_only && quote.is_some() {
+        return Some("unsupported:quote".into());
+    }
     flush(&mut tokens, &mut word);
     let mut segment: Vec<String> = Vec::new();
     let mut piped = false;
@@ -319,7 +499,7 @@ fn mutation(command: &str, depth: u64) -> Option<String> {
             continue;
         }
         if token.value.starts_with('>') {
-            if let Some(found) = inspect(&segment, piped, depth) {
+            if let Some(found) = inspect(&segment, piped, depth, firewall_read_only) {
                 return Some(found);
             }
             i += 1;
@@ -336,17 +516,72 @@ fn mutation(command: &str, depth: u64) -> Option<String> {
             i += 2;
             continue;
         }
-        if let Some(found) = inspect(&segment, piped, depth) {
+        if let Some(found) = inspect(&segment, piped, depth, firewall_read_only) {
             return Some(found);
         }
         segment.clear();
         piped = token.value == "|";
         i += 1;
     }
-    inspect(&segment, piped, depth)
+    inspect(&segment, piped, depth, firewall_read_only)
 }
 
-fn inspect(segment: &[String], piped: bool, depth: u64) -> Option<String> {
+// Only configured CLI families use option parsing. Values are consumed before
+// flags, so a header, expression or URL cannot masquerade as a write option.
+fn command_options(args: &[String], rule: &Value) -> (Vec<(String, Option<String>)>, Vec<String>) {
+    let mut options = Vec::new();
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            positional.extend_from_slice(&args[index + 1..]);
+            break;
+        }
+        if arg.starts_with("--") {
+            let (name, value) = if let Some((name, value)) = arg.split_once('=') {
+                (name, Some(value.to_string()))
+            } else if contains(&rule["longValueOptions"], arg) {
+                index += 1;
+                (arg.as_str(), args.get(index).cloned())
+            } else {
+                (arg.as_str(), None)
+            };
+            options.push((name.to_string(), value));
+        } else if arg.starts_with('-') && arg.len() > 1 {
+            for (offset, flag) in arg.char_indices().skip(1) {
+                let name = format!("-{flag}");
+                if contains(&rule["shortValueOptions"], &name) {
+                    let tail = &arg[offset + flag.len_utf8()..];
+                    let value = if tail.is_empty() {
+                        index += 1;
+                        args.get(index).cloned()
+                    } else {
+                        Some(tail.to_string())
+                    };
+                    options.push((name, value));
+                    break;
+                }
+                options.push((name, None));
+            }
+        } else {
+            positional.push(arg.clone());
+        }
+        index += 1;
+    }
+    (options, positional)
+}
+
+fn inspect(
+    segment: &[String],
+    piped: bool,
+    depth: u64,
+    firewall_read_only: bool,
+) -> Option<String> {
+    if firewall_read_only {
+        return (!read_only_firewall_segment(segment))
+            .then(|| "unsupported:firewall-query-script".into());
+    }
     let shell = &rules()["shell"];
     let mut at = 0;
     while at < segment.len() {
@@ -372,6 +607,9 @@ fn inspect(segment: &[String], piped: bool, depth: u64) -> Option<String> {
     }
     let name = basename(&segment[at]);
     let args = &segment[at + 1..];
+    if name == "firewall-cmd" {
+        return (!firewall_query_arguments(args)).then(|| name.to_string());
+    }
     if shell["readOnlyCommandRules"]
         .as_array()
         .unwrap()
@@ -389,7 +627,8 @@ fn inspect(segment: &[String], piped: bool, depth: u64) -> Option<String> {
         return found();
     }
     if contains(&shell["opaqueInterpreters"], name) {
-        return if args.len() == 1 && contains(&shell["safeInterpreterOptions"], &args[0]) {
+        return if args.len() == 1 && (contains(&shell["safeInterpreterOptions"], &args[0])
+            || contains(&shell["interpreterReadOnlyOptions"][name], &args[0])) {
             None
         } else {
             found()
@@ -400,7 +639,11 @@ fn inspect(segment: &[String], piped: bool, depth: u64) -> Option<String> {
             .iter()
             .position(|arg| arg.starts_with('-') && !arg.starts_with("--") && arg.contains('c'))
         {
-            return mutation(args.get(flag + 1).map_or("", String::as_str), depth + 1);
+            return mutation(
+                args.get(flag + 1).map_or("", String::as_str),
+                depth + 1,
+                false,
+            );
         }
         return if piped || args.iter().any(|arg| !arg.starts_with('-')) {
             found()
@@ -440,41 +683,33 @@ fn inspect(segment: &[String], piped: bool, depth: u64) -> Option<String> {
         if !contains(&rule["commands"], name) {
             continue;
         }
-        if rule["always"].as_bool() == Some(true)
-            || args.iter().any(|arg| contains(&rule["words"], arg))
-            || rule["optionPrefixes"].as_array().is_some_and(|prefixes| {
-                args.iter().any(|arg| {
-                    prefixes
-                        .iter()
-                        .any(|prefix| arg.starts_with(prefix.as_str().unwrap()))
-                })
-            })
-        {
-            return found();
-        }
-        if let Some(options) = rule["outputOptions"].as_array() {
-            if args.iter().enumerate().any(|(index, arg)| {
-                options.iter().any(|option| {
-                    let option = option.as_str().unwrap();
-                    let target = if arg == option {
-                        Some(args.get(index + 1).map_or("", String::as_str))
-                    } else {
-                        arg.strip_prefix(&format!("{option}="))
-                    };
-                    target.is_some_and(|target| {
-                        target != "-" && !contains(&shell["safeWriteTargets"], target)
+        if rule["shortValueOptions"].is_array() {
+            let (options, positional) = command_options(args, rule);
+            if options.iter().any(|(option, value)| {
+                let value = value.as_deref().unwrap_or("");
+                contains(&rule["words"], option)
+                    || rule["optionPrefixes"].as_array().is_some_and(|prefixes| {
+                        prefixes.iter().any(|prefix| option.starts_with(prefix.as_str().unwrap()))
+                    })
+                    || contains(&rule["outputOptions"], option)
+                        && value != "-" && !contains(&shell["safeWriteTargets"], value)
+                    || ["-X", "--request"].contains(&option.as_str())
+                        && contains(&rule["writeMethods"], &value.to_uppercase())
+            }) || rule["assignmentArguments"].as_bool() == Some(true)
+                && positional.iter().any(|arg| {
+                    arg.split_once('=').is_some_and(|(key, _)| {
+                        key.as_bytes().first().is_some_and(|first| first.is_ascii_alphabetic() || *first == b'_')
+                            && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_./-".contains(&byte))
                     })
                 })
-            }) {
+            {
                 return found();
             }
+            continue;
         }
-        if args.iter().enumerate().any(|(index, arg)| {
-            ["-X", "--request"].contains(&arg.as_str())
-                && args
-                    .get(index + 1)
-                    .is_some_and(|method| contains(&rule["writeMethods"], method))
-        }) {
+        if rule["always"].as_bool() == Some(true)
+            || args.iter().any(|arg| contains(&rule["words"], arg))
+        {
             return found();
         }
     }
@@ -484,6 +719,26 @@ fn inspect(segment: &[String], piped: bool, depth: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_firewall_query_cases() {
+        let cases: Value =
+            serde_json::from_str(include_str!("../../shared/firewall-query-cases.json")).unwrap();
+        for case in cases.as_array().unwrap() {
+            let command = case["command"].as_str().unwrap();
+            assert_eq!(
+                is_read_only_firewall_script(command),
+                case["readonly"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+            assert_eq!(
+                command_mutation(command).as_deref(),
+                case["mutation"].as_str(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
     #[test]
     fn shared_shell_recovery_cases() {
         let cases: Value =

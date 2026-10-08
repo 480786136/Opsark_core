@@ -163,7 +163,7 @@ defineExpose({ serverId: props.serverId, reconnect });
       <form v-if="editingCredentials && !readOnly" class="connection-credentials" @submit.prevent="submitCredentials">
         <label :for="`connection-password-${serverId}`">{{ zh ? 'SSH 密码' : 'SSH password' }}</label>
         <input :id="`connection-password-${serverId}`" ref="passwordInput" v-model="password" type="password" autocomplete="current-password" :disabled="busy" :aria-invalid="Boolean(error)" :aria-describedby="error ? `connection-error-${serverId}` : undefined" :placeholder="zh ? '输入服务器密码' : 'Enter the server password'"/>
-        <label class="connection-remember"><input v-model="remember" type="checkbox" :disabled="busy"/>{{ zh ? '验证成功后保存到系统钥匙串' : 'Save in the system keychain after verification' }}</label>
+        <label class="connection-remember"><input v-model="remember" type="checkbox" :disabled="busy"/>{{ zh ? '验证成功后保存到本地加密凭据库' : 'Save in the local encrypted vault after verification' }}</label>
         <div class="connection-form-actions">
           <button class="connection-primary" type="submit" :disabled="!password || busy"><KeyRound :size="14"/>{{ busy ? (zh ? '正在验证连接' : 'Verifying connection') : (zh ? '验证并连接' : 'Verify and connect') }}</button>
           <button type="button" :disabled="busy" @click="editingCredentials = false">{{ zh ? '收起' : 'Hide' }}</button>

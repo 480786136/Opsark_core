@@ -1,6 +1,9 @@
-import { backend, PlanProtocolError } from "@/services/backend";
+import { prepareTaskDecision, TaskDecisionError } from "./taskDecisionResolution";
+import { assertDecisionRepairPreserved, decisionRepairContext, decisionRepairFingerprint } from "./decisionRepair";
+import { backend, canRegenerateModelCandidate, exhaustedCandidateRecovery, modelCandidateDiagnostic, PlanProtocolError } from "@/services/backend";
 import { protocolRejectionFingerprint } from "@/services/planProtocolRepair";
-import { createModelRecoveryContext } from "@/services/modelRecovery";
+import { candidateRegenerationContext, createModelRecoveryContext } from "@/services/modelRecovery";
+import type { ModelOutputStrategy } from "@/services/modelRecovery";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { OperationalRecoveryError, prepareOperationalDecision } from "./operationalRecovery";
 import { workflowLifetime, StaleWorkflowError } from "./workflowLifetime";
@@ -16,6 +19,7 @@ import {
   buildAdjustmentContext,
   buildContinuationContext,
   buildNextStageContext,
+  nextStagePolicyFingerprint,
   GOAL_DIRECTED_RECOVERY_INSTRUCTION,
 } from "@/features/agent/agentContext";
 import {
@@ -117,8 +121,12 @@ export interface ReviewTaskGoalInput {
 }
 
 export interface DecideTaskNextStageInput extends ReviewTaskGoalInput {
-  /** Ordinary adjustment has no outer protocol handoff; recover in this call. */
+  /** Audit/progress only; the service still owns the recovery and its budget. */
+  onCandidateRegeneration?(error: unknown): void;
+  /** Compatibility flag; candidate output recovery is now always bounded in this service. */
   recoverProtocolFailures?: boolean;
+  /** A new, explicit user regeneration; automatic repair keeps the old budget. */
+  freshModelOperation?: boolean;
   server?: ServerProfile;
   metrics?: Metrics;
   tools: ToolDefinition[];
@@ -337,9 +345,9 @@ export async function reviewTaskGoal(
 
 /**
  * Performs the overall-goal decision and next-stage planning in one model
- * request. Proposals remain atomic. Protocol recovery allows at most two fresh
- * proposals, including when an opted-in adjustment first encounters rejection.
- * Service failures and stale workflows never enter this recovery loop.
+ * request. One field correction may precede one fresh candidate, under the
+ * same Rust-owned operation budget. Service failures and stale workflows never
+ * enter output recovery. Rejected proposals never mutate the task.
  */
 export async function decideTaskNextStage(
   input: DecideTaskNextStageInput,
@@ -347,8 +355,9 @@ export async function decideTaskNextStage(
   _fallbackReview: GoalReviewer = backend.reviewGoal.bind(backend),
 ) {
   const lifetime = workflowLifetime(input.task);
+  const initialPolicy = nextStagePolicyFingerprint(input);
   const assertCurrent = () => {
-    if (!lifetime.current() || input.isCancelled?.()) throw new StaleWorkflowError();
+    if (!lifetime.current() || input.isCancelled?.() || nextStagePolicyFingerprint(input) !== initialPolicy) throw new StaleWorkflowError();
   };
   assertCurrent();
   const requirement = latestTaskRequirement(input.task);
@@ -385,55 +394,79 @@ export async function decideTaskNextStage(
     const previousFailure = activeProtocolRepair(input.task);
     // The proposals and any nested protocol repairs are one bounded model
     // operation. A later independent stage receives a fresh identity.
-    const modelRecovery = previousFailure?.repair.modelRecovery ?? createModelRecoveryContext();
-    const seenPlans = new Set(previousFailure
-      ? [protocolRejectionFingerprint(previousFailure.repair)] : []);
-    const maxProposals = previousFailure ? 2 : input.recoverProtocolFailures ? 3 : 2;
+    const modelRecovery = input.freshModelOperation ? createModelRecoveryContext()
+      : previousFailure?.repair.modelRecovery ?? createModelRecoveryContext();
+    const originalContext = context;
+    let strategy: ModelOutputStrategy = previousFailure && !input.freshModelOperation ? "regenerate" : "initial";
+    const rejectedCandidates = new Set(previousFailure ? [protocolRejectionFingerprint(previousFailure.repair)] : []);
+    let fieldRepairUsed = false;
+    let fieldRepairCause: "operational" | "decision" | undefined;
+    const maxProposals = 3; // initial, at most one local correction, at most one new candidate
     let protocolRecovered = Boolean(previousFailure);
     let decision: NextStageDecision | undefined;
     let prepared: ReturnType<typeof prepareOperationalDecision> | undefined;
+    let taskDecision: ReturnType<typeof prepareTaskDecision> | undefined;
+    let repairFingerprint: string | undefined;
     for (let attempt = 0; attempt < maxProposals; attempt += 1) {
       assertCurrent();
       try {
-        decision = await decide(requirement, input.model.provider === "Built-in" ? undefined
+        const runtime = input.model.provider === "Built-in" ? undefined
           : createRuntimeModel(input.model, input.apiKey, JSON.stringify({ ...context,
             _modelRecovery: modelRecovery,
-            ...(protocolRecovered || attempt > 0 ? { protocolRepairBudget: { remainingModelCalls: 1 } } : {}),
-          }), input.generationSettings));
+            _modelOutputRecovery: { strategy },
+            ...(strategy === "field_repair" ? { protocolRepairBudget: { remainingModelCalls: 1 } } : {}),
+          }), input.generationSettings);
+        if (runtime) runtime.assertCurrent = assertCurrent;
+        decision = await decide(requirement, runtime);
         assertCurrent();
         if (decision.source === "model") {
+          if (repairFingerprint) assertDecisionRepairPreserved(repairFingerprint, decision);
           if (protocolRecovered) decision = { ...decision, steps: freshProtocolReplanSteps(decision.steps) };
           prepared = prepareOperationalDecision(input.task, decision);
+          taskDecision = prepareTaskDecision(input.task, decision);
         }
         break;
       } catch (error) {
         assertCurrent();
-        if (error instanceof OperationalRecoveryError) {
-          const fingerprint = error.message;
-          if (attempt + 1 >= maxProposals || seenPlans.has(fingerprint)) throw error;
-          seenPlans.add(fingerprint);
-          context = { ...context, operationalRepair: { reason: error.message,
-            instruction: "上一方案尚未执行。只修正局部更新、重试或执行核对问题；证据不足时只安排只读诊断/提问，不重复失败变更。" } };
-          continue;
-        }
-        if (!(error instanceof PlanProtocolError)) throw error;
-        error.repair.modelRecovery = modelRecovery;
-        const fingerprint = protocolRejectionFingerprint(error.repair);
-        if (maxProposals > 1 && (seenPlans.has(fingerprint) || attempt + 1 >= maxProposals)) {
-          error.repair.businessReplanProgress = {
-            attemptCount: attempt + (previousFailure ? 1 : 0),
-            stopReason: seenPlans.has(fingerprint) ? "no_progress" : "budget_exhausted",
-          };
+        if (strategy === "field_repair" && fieldRepairCause === "operational") {
+          if (error instanceof PlanProtocolError) error.repair.businessReplanProgress = { attemptCount: 0, stopReason: "no_progress" };
           throw error;
         }
-        if ((!input.recoverProtocolFailures && !previousFailure) || attempt + 1 >= maxProposals) throw error;
+        if (error instanceof OperationalRecoveryError || error instanceof TaskDecisionError) {
+          // Execution reconciliation has its own bounded correction; it is not
+          // an output-format failure that permits a fresh execution proposal.
+          if (strategy === "regenerate" || error instanceof OperationalRecoveryError && fieldRepairUsed) throw error;
+          if (!fieldRepairUsed) {
+            fieldRepairUsed = true;
+            fieldRepairCause = error instanceof OperationalRecoveryError ? "operational" : "decision";
+            strategy = "field_repair";
+            if (error instanceof TaskDecisionError && decision) {
+              repairFingerprint ??= decisionRepairFingerprint(decision);
+            }
+            context = { ...context, operationalRepair: { reason: error.message,
+              ...(repairFingerprint && decision ? { rejectedProposal: decisionRepairContext(decision) } : {}),
+              instruction: "上一方案尚未执行。只修正指出的决策、需求验收、阻断或执行核对问题；已提供的真实证据应复用，不重复失败变更或已成功检查。" } };
+            continue;
+          }
+        } else if (!canRegenerateModelCandidate(error)) throw error;
+        if (error instanceof PlanProtocolError) error.repair.modelRecovery = modelRecovery;
+        if (strategy === "regenerate" || attempt + 1 >= maxProposals) {
+          throw exhaustedCandidateRecovery(error, error instanceof PlanProtocolError
+            && rejectedCandidates.has(protocolRejectionFingerprint(error.repair)) ? "no_progress" : "budget_exhausted");
+        }
+        if (error instanceof PlanProtocolError) rejectedCandidates.add(protocolRejectionFingerprint(error.repair));
+        input.onCandidateRegeneration?.(error);
+        assertCurrent();
+        strategy = "regenerate";
         protocolRecovered = true;
-        seenPlans.add(fingerprint);
-        // Only the proposal changes: evidence, target and authority stay pinned.
-        // Model requests log each rejection; no rejected step enters task.plan.
-        context = { ...context, protocolReplan: protocolReplanContext({
-          ...input.task,
-          protocolRepair: { roundId: input.task.currentRoundId,
+        repairFingerprint = undefined;
+        // Rebuild from the original full context, not the compact/frozen patch.
+        // This changes the candidate only, never the budget, evidence or authority.
+        context = JSON.parse(candidateRegenerationContext(JSON.stringify(originalContext),
+          error instanceof OperationalRecoveryError || error instanceof TaskDecisionError
+            ? { code: error.name, reason: error.message.slice(0, 1200) } : modelCandidateDiagnostic(error)));
+        if (error instanceof PlanProtocolError) context = { ...context, protocolReplan: protocolReplanContext({
+          ...input.task, protocolRepair: { roundId: input.task.currentRoundId,
             serverId: input.task.executionTargetServerId ?? input.task.serverId,
             repair: error.repair, repairError: error.repairError },
         }) };
@@ -460,6 +493,11 @@ export async function decideTaskNextStage(
         combinedError: decision.reason,
       };
     }
+    // The accepted review changes the lifecycle revision. Cache the accompanying
+    // plan against that committed projection, rather than immediately expiring it.
+    const acceptedPolicyFingerprint = taskDecision ? nextStagePolicyFingerprint({
+      ...input, task: { ...input.task, ...taskDecision },
+    }) : context.policyFingerprint;
     if (!matchesNextStageDecision(decision.decision)) {
       throw new Error("下一阶段联合决策返回了不支持的 decision");
     }
@@ -471,9 +509,11 @@ export async function decideTaskNextStage(
         context,
         decision,
         complete: true,
+        taskDecision,
+        outputRegenerated: strategy === "regenerate",
         reconciliationResolution: prepared?.resolution,
         nextPlan: [] as PlanStep[],
-        policyFingerprint: context.policyFingerprint,
+        policyFingerprint: acceptedPolicyFingerprint,
       };
     }
     const proposedSteps = protocolRecovered
@@ -493,8 +533,10 @@ export async function decideTaskNextStage(
       decision,
       complete: false,
       nextPlan,
+      taskDecision,
+      outputRegenerated: strategy === "regenerate",
       reconciliationResolution: prepared?.resolution,
-      policyFingerprint: context.policyFingerprint,
+      policyFingerprint: acceptedPolicyFingerprint,
     };
   } catch (combinedError) {
     assertCurrent();
@@ -526,13 +568,19 @@ export async function planDiscoveryContinuation(
     secretMetadata: input.secretMetadata,
     skills: input.skills,
   }));
+  const policy = nextStagePolicyFingerprint(input);
+  const assertCurrent = () => {
+    lifetime.assertCurrent();
+    if (nextStagePolicyFingerprint(input) !== policy) throw new StaleWorkflowError();
+  };
+  const runtime = input.model.provider === "Built-in" ? undefined
+    : createRuntimeModel(input.model, input.apiKey, context, input.generationSettings);
+  if (runtime) runtime.assertCurrent = assertCurrent;
   const candidates = await generatePlan(
     `整体目标：${latestTaskRequirement(input.task)}\n当前指令：${input.requirement}\n\n当前阶段已完成，请依据已确认输入和真实证据，在原目标与授权边界内规划剩余目标的最少必要步骤。缺少环境事实时可进行有限只读取证；缺少必须由用户作出的决定时，只返回一个 user.request_input 步骤并等待。只读目标不得生成变更，不得重复已完成且仍有效的步骤。`,
-    input.model.provider === "Built-in"
-      ? undefined
-      : createRuntimeModel(input.model, input.apiKey, context, input.generationSettings),
+    runtime,
   );
-  lifetime.assertCurrent();
+  assertCurrent();
   const continuation = selectContinuationSteps(recoveryHistory(input.task), candidates, taskAttemptContext(input.task));
   assertTaskPlanAuthorization(input.task, continuation);
   validateRecoveryReferences(recoveryHistory(input.task), continuation, taskAttemptContext(input.task));
@@ -580,13 +628,19 @@ export async function planTaskAdjustment(
     : input.failedStep
     ? "上次执行未达到预期，请根据失败事实与最新证据，为未完成目标生成安全的调整计划。按影响范围修正失败步骤、补充前置检查或重规划剩余目标；模型先前生成的验收方法可修正，但不得降低用户明确要求的验收标准或扩大授权。保留历史失败，不要求被替代的旧路径逐条重试成功。"
     : "当前阶段已成功完成，但整体目标尚未验收；请仅规划剩余目标，不得将已成功步骤改写为失败或重复执行。";
+  const policy = nextStagePolicyFingerprint(input);
+  const assertCurrent = () => {
+    lifetime.assertCurrent();
+    if (nextStagePolicyFingerprint(input) !== policy) throw new StaleWorkflowError();
+  };
+  const runtime = input.model.provider === "Built-in" ? undefined
+    : createRuntimeModel(input.model, input.apiKey, JSON.stringify(context), input.generationSettings);
+  if (runtime) runtime.assertCurrent = assertCurrent;
   const replacement = await generatePlan(
     `${requirement}\n\n${adjustmentInstruction}`,
-    input.model.provider === "Built-in"
-      ? undefined
-      : createRuntimeModel(input.model, input.apiKey, JSON.stringify(context), input.generationSettings),
+    runtime,
   );
-  lifetime.assertCurrent();
+  assertCurrent();
   if (safetyFields.length && input.failedStep) {
     if (replacement.length !== 1) {
       throw new Error("安全门禁局部调整只能返回一个替代步骤");

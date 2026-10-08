@@ -7,6 +7,7 @@ import {
 } from "@/features/agent/reviewContext";
 import type { OpsTask, PlanStep } from "@/types";
 import { confirmedInputScope } from "@/features/agent/confirmedUserInputs";
+import { buildTaskDecisionSnapshot } from "@/features/agent/taskDecisionSnapshot";
 
 const step = (id: string, status: PlanStep["status"]): PlanStep => ({
   id,
@@ -36,6 +37,33 @@ function task(): OpsTask {
 }
 
 describe("review context", () => {
+  it("does not resend full shell actions around bounded command projections", () => {
+    const currentTask = task();
+    for (const item of currentTask.plan) {
+      item.command = `printf start\n${"# large script\n".repeat(2_000)}MIDDLE_SCRIPT_BODY\n${"# large script\n".repeat(2_000)}printf end`;
+      item.action = { type: "shell", command: item.command };
+    }
+    const [blocker, current, remaining] = currentTask.plan;
+    current.status = "failed";
+    const original = JSON.stringify(currentTask.plan);
+    const contexts = [
+      buildPreconditionReviewContext(currentTask, current, blocker),
+      buildExecutionFailureReviewContext(currentTask, current, [remaining]),
+      buildEvidenceReviewContext(currentTask, current, [remaining], true),
+      buildTaskDecisionSnapshot(currentTask, current),
+    ];
+    for (const context of contexts) {
+      const serialized = JSON.stringify(context);
+      expect(serialized).not.toContain("MIDDLE_SCRIPT_BODY");
+      expect(serialized.length).toBeLessThan(20_000);
+      expect(serialized).toContain("printf start");
+      expect(serialized).toContain("printf end");
+      expect(serialized).toContain("commandFingerprint");
+    }
+    // Context compaction must not change executable actions or stored evidence.
+    expect(JSON.stringify(currentTask.plan)).toBe(original);
+  });
+
   it.each(["facts", "command"] as const)("does not reintroduce out-of-scope legacy form values in any review (%s identity)", identity => {
     const currentTask = task();
     currentTask.rootGoal = `检查服务${"并保持完整目标".repeat(180)}`;

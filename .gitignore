@@ -1,10 +1,9 @@
 node_modules/
 dist/
 src-tauri/target/
-<<<<<<< HEAD
 src-tauri/target-knowledge/
-=======
->>>>>>> origin/master
+__pycache__/
+*.pyc
 .DS_Store
 *.log
 .idea/

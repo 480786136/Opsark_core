@@ -1,9 +1,18 @@
 import { describe, expect, it } from "vitest";
 import cases from "../../shared/recovery-cases.json";
 import metadataCases from "../../shared/recovery-metadata-cases.json";
-import { commandMutation, recoveryMetadataIssue, RecoveryProtocolError, readRecoveryProtocolError, RECOVERY_RULE_VERSION } from "./recoveryRules";
+import firewallCases from "../../shared/firewall-query-cases.json";
+import { commandMutation, isReadOnlyFirewallScript, recoveryMetadataIssue, RecoveryProtocolError, readRecoveryProtocolError, RECOVERY_RULE_VERSION } from "./recoveryRules";
 
 describe("shared Rust/TS recovery policy", () => {
+  for (const testCase of firewallCases) {
+    it(`firewall read-only policy: ${testCase.name}`, () => {
+      expect(isReadOnlyFirewallScript(testCase.command)).toBe(testCase.readonly);
+      expect(commandMutation(testCase.command) ?? null).toBe(testCase.mutation);
+      if (testCase.mutation) expect(recoveryMetadataIssue({ id: "query", kind: "observe", command: testCase.command }))
+        .toMatchObject({ code: "OBSERVE_COMMAND_MUTATION", matchedToken: testCase.mutation });
+    });
+  }
   for (const testCase of metadataCases) {
     it(testCase.name, () => {
       const issue = recoveryMetadataIssue(testCase.step, 3);

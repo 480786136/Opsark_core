@@ -534,6 +534,91 @@ fn business_context(protocol: &str, generations: u64) -> String {
     context["_modelRecovery"]["maxGenerations"] = json!(generations);
     context.to_string()
 }
+
+#[test]
+fn missing_steps_adjust_repair_keeps_legal_requirement_outcomes_and_operation_budget() {
+    for protocol in ["chat_completions", "responses"] {
+        for policy in ["json_only", "require_schema"] {
+            for focus_outcome in ["completed", "pending"] {
+                let mut context: Value = serde_json::from_str(&business_context(protocol, 2)).unwrap();
+                context["_modelIntegration"]["outputPolicy"] = json!(policy);
+                context["taskGoal"] = json!({"lifecycle":{"version":1,"revision":3},"currentRoundId":"round-current"});
+                context["executionConstraints"] = json!({"changePolicy":"read_only"});
+                context["confirmedUserInputs"] = json!({"choice":"preserve-data"});
+                context["baseSnapshot"] = json!({"currentToolResults":[{"evidenceId":"proof-current","scope":{"targetId":"server-current"},"content":"trusted current evidence"}]});
+                let mut repaired = json!({"decision":"adjust","reason":"Report current focus or concrete blocker",
+                    "summary":"Other goals remain pending","steps":[],"planUpdate":null,"reconciliation":null,"issueResolutions":null,
+                    "requirementReview":{"baseRevision":3,"roundId":"round-current","focusOutcome":focus_outcome,
+                        "overallOutcome":"pending","items":[{"requirementId":"goal-current","outcome":if focus_outcome == "completed" {"satisfied"} else {"unmet"},
+                            "evidenceIds":["proof-current"],"reason":"Based on current evidence"}]},"blocking":null});
+                if focus_outcome == "pending" {
+                    repaired["blocking"] = json!({"kind":"external","reason":"External service is unavailable","requirementIds":["goal-current"]});
+                }
+                let mut rejected = repaired.clone();
+                rejected.as_object_mut().unwrap().remove("steps");
+                let payload = |value: &Value| if protocol == "responses" {
+                    completed(&value.to_string())
+                } else {
+                    json!({"choices":[{"message":{"content":value.to_string()},"finish_reason":"stop"}]})
+                };
+                let (endpoint, provider) = server(vec![(200, payload(&rejected)), (200, payload(&json!({"value":[]})))]);
+                let raw_context = context.to_string();
+                let settings = crate::AiGenerationSettings::default();
+                let body = crate::build_next_stage_request_body("offline-model", "Inspect current target", &raw_context, &settings);
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                let result = runtime.block_on(post_model_request(&endpoint, "offline-key", &body,
+                    "阶段联合决策", 5, None)).unwrap();
+                let parsed = crate::parse_next_stage_with_format_guard(&result, &raw_context).unwrap();
+                let converted = crate::validate_next_stage_preserving_recovery(parsed, &settings, None).unwrap();
+                assert_eq!(converted.decision, "adjust");
+                assert!(converted.steps.is_empty());
+                assert_eq!(converted.requirement_review.as_ref().unwrap()["focusOutcome"], focus_outcome);
+                assert_eq!(converted.blocking.is_some(), focus_outcome == "pending");
+                let error = runtime.block_on(post_model_request(&endpoint, "offline-key", &body,
+                    "阶段联合决策", 5, None)).unwrap_err();
+                assert_eq!(error_code(&error), "MODEL_RECOVERY_BUDGET_EXHAUSTED");
+                let requests = provider.join().unwrap();
+                assert_eq!(requests.len(), 2);
+                let field = if protocol == "responses" { "input" } else { "messages" };
+                let first = requests[0].1[field].as_array().unwrap();
+                let second = requests[1].1[field].as_array().unwrap();
+                assert_eq!(&second[..first.len()], first.as_slice());
+                assert_eq!(second.len(), first.len() + 1);
+                let feedback = second.last().unwrap()["content"].as_str().unwrap();
+                assert!(feedback.contains("允许 steps=[]"));
+                assert!(feedback.contains("完整业务校验"));
+                for (_, request) in &requests {
+                    let text = request.to_string();
+                    assert!(text.contains("trusted current evidence"));
+                    assert!(text.contains("preserve-data"));
+                    assert!(text.contains("read_only"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn lifecycle_format_repair_still_rejects_empty_continue_or_manufactured_completion() {
+    for protocol in ["chat_completions", "responses"] {
+        for (original_decision, repaired_decision) in [("continue", "continue"), ("adjust", "complete")] {
+            let mut body = with_context(request(protocol, "json_only"), |context| {
+                context["taskGoal"] = json!({"lifecycle":{"version":1,"revision":3}});
+            });
+            body["_opsarkContext"] = json!(crate::model_budget::ensure_context(body["_opsarkContext"].as_str().unwrap()).unwrap());
+            let rejected = json!({"decision":original_decision,"reason":"Need current evidence","summary":"Unfinished"});
+            let repaired = json!({"decision":repaired_decision,"reason":"No action","summary":"No action","steps":[]});
+            let payload = |value: &Value| if protocol == "responses" { completed(&value.to_string()) } else {
+                json!({"choices":[{"message":{"content":value.to_string()},"finish_reason":"stop"}]})
+            };
+            let (endpoint, provider) = server(vec![(200, payload(&rejected)), (200, payload(&repaired))]);
+            let error = tokio::runtime::Runtime::new().unwrap().block_on(post_model_request(
+                &endpoint, "offline-key", &body, "阶段联合决策", 5, None)).unwrap_err();
+            assert_eq!(error_code(&error), "MODEL_FORMAT_INVALID");
+            assert_eq!(provider.join().unwrap().len(), 2);
+        }
+    }
+}
 fn read_step() -> Value {
     json!({"kind":"observe","title":"Read directory","description":"Read current directory","action":{"type":"shell","command":"pwd"},"expected":"A directory path","validation":"","risk":"low"})
 }
@@ -675,7 +760,7 @@ fn focused_semantic_plan_repair_keeps_responses_schema_and_original_budget() {
 }
 #[test]
 fn compact_stage_repair_keeps_responses_and_uses_the_same_stage_consumer_and_budget() {
-    let stage = json!({"decision":"continue","reason":"Need current directory","summary":"Read current directory","steps":[wire_step(read_step())],"planUpdate":null,"reconciliation":null});
+    let stage = json!({"decision":"continue","reason":"Need current directory","summary":"Read current directory","steps":[wire_step(read_step())],"planUpdate":null,"reconciliation":null,"requirementReview":null,"blocking":null,"issueResolutions":null});
     let (endpoint, provider) = server(vec![
         (200, completed(&stage.to_string())),
         (200, completed(&stage.to_string())),
@@ -996,4 +1081,67 @@ fn deepseek_responses_maps_only_documented_efforts_and_preserves_non_thinking_de
         error_code(&explicit_provider_default),
         "MODEL_PARAMETER_UNSUPPORTED"
     );
+}
+
+#[test]
+fn automatic_budget_uses_declared_limit_in_both_wire_protocols() {
+    for protocol in ["chat_completions", "responses"] {
+        for official in [false, true] {
+            let mut body = with_context(request(protocol, "auto"), |context| {
+                context.as_object_mut().unwrap().remove("_requestParameters");
+            });
+            body.as_object_mut().unwrap().remove("max_tokens");
+            let preview = preview_model_request("https://example.invalid/v1", &body, "计划生成", official).unwrap();
+            let field = if protocol == "responses" { "max_output_tokens" } else { "max_completion_tokens" };
+            assert_eq!(preview["request"][field], 16000);
+            if official {
+                let body = with_context(body, |context| {
+                    context["_requestParameters"] = json!({"outputBudget":5000, "reasoning_effort":"stale-unsupported"});
+                });
+                let preview = preview_model_request("https://example.invalid/v1", &body, "计划生成", true).unwrap();
+                assert_eq!(preview["request"][field], 16000);
+                assert!(preview["request"].get("reasoning_effort").is_none());
+                assert!(preview["request"].get("reasoning").is_none());
+            }
+        }
+    }
+}
+
+#[test]
+fn recorded_shell_scope_placement_is_accepted_without_another_model_request_in_both_protocols() {
+    let fixtures: Value = serde_json::from_str(include_str!("fixtures/model-format-recovery.json")).unwrap();
+    let recorded = &fixtures.as_array().unwrap().iter().find(|f| f["name"] == "stage-misplaced-shell-execution-scope").unwrap()["response"];
+    let original: Value = serde_json::from_str(recorded["choices"][0]["message"]["content"].as_str().unwrap()).unwrap();
+    for protocol in ["chat_completions", "responses"] {
+        for policy in ["json_only", "require_schema"] {
+            let body = with_context(request(protocol, policy), |context| {
+                context["taskGoal"] = json!({"lifecycle":{"version":1,"revision":1}});
+                context["tools"] = json!([{"id":"files.get_structure","effect":"read","inputSchema":{
+                    "type":"object","properties":{"rootPath":{"type":"string"},"maxDepth":{"type":"integer"},
+                        "includeHidden":{"type":"boolean"},"excludeDirectories":{"type":"array","items":{"type":"string"}}},
+                    "required":["rootPath"],"additionalProperties":false}}]);
+            });
+            let mut value = original.clone();
+            if policy == "require_schema" {
+                for (index, step) in value["steps"].as_array_mut().unwrap().iter_mut().enumerate() {
+                    for field in ["executionScope", "validationScope", "runtimeClass", "sessionContextChange", "recovery", "retryBasis"] {
+                        if index == 0 && field == "executionScope" { continue; }
+                        if step.get(field).is_none() { step[field] = Value::Null; }
+                    }
+                }
+                value["planUpdate"] = json!(value["planUpdate"].to_string());
+                for field in ["reconciliation", "blocking", "issueResolutions"] { value[field] = Value::Null; }
+            }
+            let (endpoint, provider) = server(vec![(200, protocol_response(protocol, value))]);
+            let result = tokio::runtime::Runtime::new().unwrap().block_on(post_model_request(
+                &endpoint, "offline-key", &body, "阶段联合决策", 5, None)).unwrap();
+            let result: Value = serde_json::from_str(result["choices"][0]["message"]["content"].as_str().unwrap()).unwrap();
+            let mut expected = original.clone();
+            expected["steps"][0]["executionScope"] = expected["steps"][0]["action"].as_object_mut().unwrap().remove("executionScope").unwrap();
+            assert_eq!(result, expected, "{protocol}/{policy}: only the field location may change");
+            assert_eq!(provider.join().unwrap().len(), 1);
+            let (prepared, _) = crate::model_compatibility::prepare(&body, "阶段联合决策", false).unwrap();
+            assert_eq!(prepared["_opsarkSchemaCompilation"]["normalizationVersion"], "json-wrapper-and-shell-placement@3");
+        }
+    }
 }

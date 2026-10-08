@@ -1,14 +1,20 @@
+import { currentRequestCompleted, TaskEvidenceError } from "@/features/agent/taskDecisionResolution";
+import { activateRequirementReviewForRetry, applyTaskRequirementUpdate, appendLegacyTaskRequirement, mergeRequirementExecutionConstraints } from "@/features/agent/taskRequirements";
+import { archiveTasks, preserveContinuedLegacyTask, listTaskArchives, markTaskArchived, readTaskArchive } from "@/services/taskArchive";
+import type { TaskArchiveEntry } from "@/services/taskArchive";
+import type { ExecutionLedgerRecovery } from "@/features/agent/executionLedgerRecovery";
+import type { ExecutionTargetRef } from "@/types";
 import { buildOperationsCommand, parseOperationsOutput } from "@/features/tools/operationsInspection";
-import { modelIntegrationConfig } from "@/features/agent/modelIntegration";
+import { MODEL_PLAN_CONTRACT_REVISION, modelIntegrationConfig } from "@/features/agent/modelIntegration";
 import { directExecutionLedgerOwner } from "@/services/directExecutionLedger";
-import { ExecutionLedgerError, acknowledgeExecutionAttempt, runRecordedExecution, listExecutionLedger, cancelExecutionLedger, flushPendingReceipts, pendingExecutionReceipts, resolveExecutionOperation } from "@/services/executionLedger";
-import { readTaskProjection, executionReceiptSteps, readExecutionLedger, projectExecutionLedgerRecovery, buildReadOnlyReconciliation } from "@/features/agent/executionLedgerRecovery";
+import { ExecutionLedgerError, deriveExecutionAttemptReview, acknowledgeExecutionAttempt, runRecordedExecution, listExecutionLedger, cancelExecutionLedger, flushPendingReceipts, pendingExecutionReceipts, resolveExecutionOperation } from "@/services/executionLedger";
+import { readTaskProjection, isUntouchedRecoveryShell, executionRecordTitle, executionReceiptSteps, readExecutionLedger, projectExecutionLedgerRecovery, buildReadOnlyReconciliation } from "@/features/agent/executionLedgerRecovery";
 import { ToolExecutionError } from "@/features/tools/toolFailure";
 import { stableProtocolValue } from "@/services/planProtocolRepair";
 import { executionDigest, preparePlanForApproval } from "@/features/agent/planPreparation";
 import type { ExecutionIntentSnapshot, PreparedPlan } from "@/types";
 import { effectiveToolSemanticContract, prepareFinalToolArguments, resolveUniqueServer, resolveUniqueServerEndpoint } from "@/features/tools/toolPreparation";
-import { createModelRecoveryContext } from "@/services/modelRecovery";
+import { createModelRecoveryContext, isExplicitModelPlanningRetryable, isModelRecoveryScopeRejection } from "@/services/modelRecovery";
 import { assertToolStepBoundary, hasToolStepBoundaryConflict, stepOperationText, ToolStepBoundaryError } from "@/features/agent/stepAction";
 import { validateModelConfiguration } from "@/features/agent/modelCapabilities";
 import { defineStore } from "pinia";
@@ -19,13 +25,14 @@ import { useConnectionStore, isConnectionTransportFailure } from "@/features/con
 import { modelLogContext } from "@/features/agent/modelLogContext";
 import { requirementConversationContext, restoreConversationLinks } from "@/features/agent/conversationHistory";
 import { archiveToolEvidence } from "@/features/agent/evidenceArchive";
-import { workflowLifetime } from "@/features/agent/workflowLifetime";
+import { StaleWorkflowError, workflowLifetime } from "@/features/agent/workflowLifetime";
 import { restoreUserInputRequests } from "@/features/agent/restoreUserInputRequests";
 import { automaticContinuationStop, renewAutomaticPhaseBudget, workflowProgress } from "@/features/agent/workflowProgress";
 import { failureDependencyBlocker, holdFailureDependents } from "@/features/agent/failureDisposition";
 import { reconciliationBlocker, recordExecutionUncertainty, retryBlocker } from "@/features/agent/operationalRecovery";
+import { toolFailureFallback } from "@/features/agent/toolFallback";
 import { assertTaskPlanAuthorization, ExecutionPolicyError, executionPolicyBlocker, recoveryHistory, validateRecoveryReferences } from "@/features/agent/recoveryContract";
-import { backend, isTauri, ModelInvocationError, modelServiceError, modelServiceErrorMessage, PlanProtocolError } from "@/services/backend";
+import { backend, isTauri, ModelInvocationError, modelServiceError, modelServiceErrorMessage, PlanProtocolError, restoreLegacyPlanProtocolFailure } from "@/services/backend";
 import type { RuntimeConnection } from "@/services/backend";
 import {
   classifyStepResult,
@@ -45,6 +52,8 @@ import {
   normalizeCredentialStorageKey,
 } from "@/features/agent/serverCredentialGroup";
 import { applyPeriodicReviewAdjustment } from "@/features/agent/reviewCoordination";
+import { observationBoundary } from "@/features/agent/observationBoundary";
+import { commandExecutionScope, restoreCommandEvidenceScopes } from "@/features/agent/commandEvidenceScope";
 import {
   createToolOverrides,
   parseToolOverrides,
@@ -63,14 +72,13 @@ import { confirmedInputScope } from "@/features/agent/confirmedUserInputs";
 import { authenticationChannelFailure, gitAuthenticationRetryBlocker, repeatedAuthenticationInputBlocker } from "@/features/agent/authenticationRetry";
 import { activeProtocolRepair } from "@/features/agent/protocolReplan";
 import { refreshProtocolReplanApproval } from "@/features/agent/protocolReplanApproval";
-import { executionContextEvidence, modelContextStep } from "@/features/agent/executionContextEvidence";
+import { requirementExecutionContext } from "@/features/agent/requirementExecutionContext";
 import { planningSkills } from "@/features/skills/skillPlanning";
 import { retrieveTaskKnowledge, moveTaskKnowledge } from "@/features/knowledge/retrieval";
 import {
   buildAgentContext,
   extractKnownExecutionFacts,
   nextStagePolicyFingerprint,
-  trimEvidence,
 } from "@/features/agent/agentContext";
 import { normalizePermissionLevel, requiresStepApproval } from "@/features/agent/approvalPolicy";
 import { beginRequirementPlanning, transitionTask, canTransitionTask } from "@/features/agent/taskMachine";
@@ -107,7 +115,6 @@ import {
   resolveTaskProgression,
 } from "@/features/agent/taskProgression";
 import {
-  activeRoundSteps,
   archiveActivePhase,
   beginRequirementRound,
   capturePreviousRound,
@@ -236,6 +243,7 @@ const executionServerId = (task: Pick<OpsTask, "serverId" | "executionTargetServ
 let persistTimer: number | undefined;
 let credentialHydration: Promise<void> | undefined;
 const adjustingTaskIds = new Map<string, ReturnType<typeof workflowLifetime>>();
+const explicitModelRetries = new Map<string, ReturnType<typeof workflowLifetime>>();
 const managedAdjustmentSchedulers = new Map<string, { requested: boolean; current(): boolean }>();
 const recoveringAdjustmentTasks = new WeakMap<OpsTask, ReturnType<typeof workflowLifetime>>();
 const resumingTransportTaskIds = new Set<string>();
@@ -243,6 +251,12 @@ const resumingTransportTaskIds = new Set<string>();
 // handing off to the next stage; an old finally must not release a newer owner.
 const advancingTasks = new WeakMap<OpsTask, ReturnType<typeof workflowLifetime>>();
 const executingTaskSteps = new WeakMap<OpsTask, ReturnType<typeof workflowLifetime>>();
+interface ExecutionRecoveryCase { taskId: string; title: string; targets: ExecutionTargetRef[]; recovery: ExecutionLedgerRecovery }
+const taskRemovals = new WeakSet<OpsTask>();
+const ledgerScans = new WeakMap<object, Promise<void>>();
+const ledgerScanQueued = new WeakSet<object>();
+const archiveWrites = new WeakMap<object, Promise<void>>();
+const persistRevisions = new WeakMap<object, number>();
 const ledgerRefreshQueued = new WeakSet<OpsTask>();
 const ledgerDispatchRevisions = new WeakMap<OpsTask, number>();
 const submittingTaskInputs = new WeakMap<OpsTask, ReturnType<typeof workflowLifetime>>();
@@ -291,7 +305,7 @@ function hasWaitingStep(task: OpsTask) {
   return task.plan.some(step => step.status === "awaiting_input" || step.status === "awaiting_approval");
 }
 
-/** `adjust + []` is the model's explicit blocked/no_action result, not a replan request. */
+/** An accepted empty decision either delivers this request or records a blocker. */
 function isBlockedNoAction(task: OpsTask) {
   return task.status === "awaiting_continuation"
     && task.latestGoalReview?.decision.decision === "adjust"
@@ -304,7 +318,7 @@ function stopForBlockedNoAction(task: OpsTask) {
   task.autoAdjustmentSeconds = undefined;
   if (task.permission === "managed") {
     task.managedAdjustmentPhase = "manual_required";
-    task.managedStopReason = "no_action";
+    task.managedStopReason = currentRequestCompleted(task) ? "request_completed" : "no_action";
   }
   return true;
 }
@@ -446,7 +460,6 @@ const defaultModels: ModelProfile[] = [];
 const defaultAiGenerationSettings: AiGenerationSettings = {
   limitOutput: false,
   maxPlanSteps: 6,
-  maxOutputTokens: 5000,
   maxTextChars: 200,
   maxCommandChars: 4000,
 };
@@ -459,16 +472,23 @@ function normalizeAiGenerationSettings(settings: Partial<AiGenerationSettings>) 
   return {
     limitOutput: settings.limitOutput === true,
     maxPlanSteps: positiveInteger(settings.maxPlanSteps, defaultAiGenerationSettings.maxPlanSteps),
-    maxOutputTokens: positiveInteger(settings.maxOutputTokens, defaultAiGenerationSettings.maxOutputTokens, 256),
+    maxOutputTokens: settings.maxOutputTokens == null ? undefined : positiveInteger(settings.maxOutputTokens, 256, 256),
     maxTextChars: positiveInteger(settings.maxTextChars, defaultAiGenerationSettings.maxTextChars),
     maxCommandChars: positiveInteger(settings.maxCommandChars, defaultAiGenerationSettings.maxCommandChars),
   };
 }
 
 function initialAiGenerationSettings() {
-  return normalizeAiGenerationSettings(
-    readSaved<Partial<AiGenerationSettings>>("opsark.aiGenerationSettings", {}),
-  );
+  const saved = readSaved<Partial<AiGenerationSettings>>("opsark.aiGenerationSettings", {});
+  try {
+    if (localStorage.getItem("opsark.outputBudgetPolicy") !== "connection-limit-v1") {
+      // Old clients persisted the implicit 5000 default as though the user chose it.
+      if (saved.maxOutputTokens === 5000) delete saved.maxOutputTokens;
+      localStorage.setItem("opsark.aiGenerationSettings", JSON.stringify(saved));
+      localStorage.setItem("opsark.outputBudgetPolicy", "connection-limit-v1");
+    }
+  } catch { /* Storage can be unavailable; still use in-memory defaults. */ }
+  return normalizeAiGenerationSettings(saved);
 }
 
 function initialTools() {
@@ -647,6 +667,21 @@ function initialTasks(savedTasks: OpsTask[]) {
       .find((message) => message.role === "user" && message.kind === "message")?.content
       ?? task.rootGoal;
     task.currentRoundId ||= uid("round");
+    if (task.modelPlanningBlocker && (task.modelPlanningBlocker.error.code === "MODEL_FORMAT_INVALID" || isModelRecoveryScopeRejection(task.modelPlanningBlocker.error))
+      && ["planning_failed", "needs_adjustment", "awaiting_continuation"].includes(task.status)) {
+      task.pauseReason = modelServiceErrorMessage(task.modelPlanningBlocker.error);
+    }
+    if (task.status === "needs_adjustment" && task.managedStopReason === "workflow_error"
+      && !task.protocolRepair && !task.modelPlanningBlocker) {
+      const failure = restoreLegacyPlanProtocolFailure(task.pauseReason);
+      if (failure) {
+        task.protocolRepair = { roundId: task.currentRoundId, serverId: executionServerId(task),
+          repair: failure.repair, repairError: failure.repairError };
+        task.pauseReason = failure.userMessage;
+        task.managedAdjustmentPhase = "manual_required";
+        task.autoAdjustmentSeconds = undefined;
+      }
+    }
     const interrupted = task.plan.find(step => ["running", "validating"].includes(step.status));
     if (interrupted) {
       recordExecutionUncertainty(task, interrupted, "应用重启中断执行，需核对远端进程与实际结果。");
@@ -657,6 +692,18 @@ function initialTasks(savedTasks: OpsTask[]) {
       task.autoAdjustmentSeconds = undefined;
       task.currentExecutionId = undefined;
       task.pauseReason = "上次执行因应用重启中断。已保存目标和执行证据；先核对远端进程及实际结果，不会自动重放变更。";
+    } else if (["planning", "running", "validating"].includes(task.status) && !hasWaitingStep(task)) {
+      // Planning, overall-goal review and the gap between steps have no live
+      // owner after restart either. Preserve receipts and model uncertainty;
+      // restoration itself never restarts a request or dispatches an action.
+      const planning = task.status === "planning";
+      task.status = planning ? "planning_failed" : "needs_adjustment";
+      task.managedAdjustmentPhase = "manual_required";
+      task.managedStopReason = task.modelPlanningBlocker ? "model_generation_failed" : "workflow_error";
+      task.autoAdjustmentSeconds = undefined;
+      task.pauseReason = planning
+        ? "上次规划因应用重启中断，需求与已有记录已保留。请核对模型请求记录后重新生成；未自动续发模型请求或执行命令。"
+        : "上次阶段衔接或整体验收因应用重启中断，已有步骤与执行证据已保留。请核对记录后继续；未自动重放操作，也未将未完成验收记为成功。";
     }
     return task;
   });
@@ -797,6 +844,7 @@ export const useOpsStore = defineStore("ops", {
       persistenceWarning: taskCache.issues.join("\n"),
       taskCacheReadError: taskCache.issues.join("\n"),
       executionLedgerReadError: "",
+      executionRecoveryCases: [] as ExecutionRecoveryCase[],
     };
   },
 
@@ -948,7 +996,7 @@ export const useOpsStore = defineStore("ops", {
       let password = this.serverPasswords[serverId];
       if (!password) {
         try { password = await backend.loadCredential("server", serverId) ?? ""; }
-        catch { this.serverConnection(serverId).error = "系统凭据读取失败，请手动填写 SSH 密码"; }
+        catch { this.serverConnection(serverId).error = "加密凭据读取失败，请手动填写 SSH 密码"; }
       }
       if (!password) return false;
       return this.connectServer(serverId, password, false);
@@ -988,9 +1036,11 @@ export const useOpsStore = defineStore("ops", {
     persist(immediate = false) {
       if (persistTimer !== undefined) window.clearTimeout(persistTimer);
       const store = this;
-      const write = () => {
+      const revision = (persistRevisions.get(store) ?? 0) + 1;
+      persistRevisions.set(store, revision);
+      const write = (savedTasks = store.tasks, saveTaskCache = true) => {
         try {
-          if (!store.taskCacheReadError) localStorage.setItem("opsark.tasks", JSON.stringify(compactPersistedTasks(store.tasks)));
+          if (saveTaskCache && !store.taskCacheReadError) localStorage.setItem("opsark.tasks", JSON.stringify(compactPersistedTasks(savedTasks)));
           localStorage.setItem("opsark.logs", JSON.stringify(store.logs.slice(0, 300)));
           localStorage.setItem("opsark.developerLogs", JSON.stringify(store.developerLogs.slice(0, MAX_DEVELOPER_LOGS)));
           localStorage.setItem("opsark.servers", JSON.stringify(store.servers));
@@ -1004,7 +1054,7 @@ export const useOpsStore = defineStore("ops", {
           // 本地记录空间不足不能改变远程命令结果；降级保存精简快照并继续任务。
           store.persistenceWarning = `任务记录空间不足，已自动压缩历史：${String(error)}`;
           try {
-            if (!store.taskCacheReadError) localStorage.setItem("opsark.tasks", JSON.stringify(compactPersistedTasks(store.tasks, true)));
+            if (saveTaskCache && !store.taskCacheReadError) localStorage.setItem("opsark.tasks", JSON.stringify(compactPersistedTasks(savedTasks, true)));
             localStorage.setItem("opsark.logs", JSON.stringify(store.logs.slice(0, 80)));
             localStorage.setItem("opsark.developerLogs", JSON.stringify(compactDeveloperLogs(store.developerLogs)));
           } catch {
@@ -1013,14 +1063,30 @@ export const useOpsStore = defineStore("ops", {
         }
         persistTimer = undefined;
       };
-      if (immediate) write();
-      else persistTimer = window.setTimeout(write, 200);
+      const save = () => {
+        if (store.taskCacheReadError) { write(); return; }
+        const snapshots = JSON.parse(JSON.stringify(store.tasks)) as OpsTask[];
+        const failed = (error: unknown) => { write([], false); store.persistenceWarning = `任务归档保存失败，保留已有缓存：${String(error)}`; };
+        if (!isTauri()) {
+          try { void archiveTasks(snapshots); write(); } catch (error) { failed(error); }
+          return;
+        }
+        const pending = (archiveWrites.get(store) ?? Promise.resolve()).then(async () => {
+          await archiveTasks(snapshots);
+          if (persistRevisions.get(store) === revision) write(snapshots.filter(task => store.tasks.some(current => current.id === task.id)));
+        }).catch(failed);
+        archiveWrites.set(store, pending);
+        return pending;
+      };
+      if (immediate) return save();
+      else persistTimer = window.setTimeout(save, 200);
     },
 
     async recordStepExecution<T>(task: OpsTask, step: PlanStep, phase: string, executionId: string,
       isCurrent: () => boolean, execute: () => Promise<T>,
       options: { effect?: "read" | "change" | "interaction"; intent?: ExecutionIntentSnapshot; subkey?: string } = {}): Promise<T> {
       if (this.taskCacheReadError) throw new ExecutionLedgerError(this.taskCacheReadError, "prepare", false);
+      if (taskRemovals.has(task)) throw new ExecutionLedgerError("任务正在移除，未派发新操作。", "prepare", false);
       if (phase === "validation" && !options.intent && step.executionIntent) {
         const semantic = { ...step.executionIntent.semantic, effect: "read" as const, kind: "observe" as const,
           action: { type: "shell" as const, command: step.executionIntent.semantic.validator?.command ?? step.executionIntent.semantic.validation ?? step.validation },
@@ -1076,6 +1142,13 @@ export const useOpsStore = defineStore("ops", {
       }
     },
 
+    async markExecutionReviewed(step: PlanStep) {
+      const taskId = step.executionIntent?.semantic.taskId;
+      if (!taskId) return;
+      try { await this.persistExecutionAcknowledgements(taskId); }
+      catch { this.persistenceWarning = "复核结果已保留，台账确认尚未落盘；下次刷新重试保存，不重发远端操作。"; }
+    },
+
     async persistExecutionAcknowledgements(taskId: string, records?: Awaited<ReturnType<typeof listExecutionLedger>>) {
       const task = this.tasks.find(t => t.id === taskId);
       const parsed = records ? undefined : readExecutionLedger(await listExecutionLedger(this, taskId));
@@ -1089,8 +1162,12 @@ export const useOpsStore = defineStore("ops", {
         const attempt = operation.attempts[index];
         if (attempt.late || !attempt.outcome || !["succeeded", "failed", "not_dispatched"].includes(attempt.status)) continue;
         const reviewed = attempt.status === "succeeded" && verified.has(attempt.id);
-        if (applied.has(attempt.id) && (attempt.projectionAppliedAt === undefined || reviewed && attempt.reviewCompletedAt === undefined)) {
-          operation.attempts[index] = await acknowledgeExecutionAttempt(this, operation.operationId, attempt.id, reviewed);
+        const step = steps.find(item => item.executionLedgerAttempts?.some(ref =>
+          ref.operationId === operation.operationId && ref.attemptId === attempt.id));
+        const review = step ? deriveExecutionAttemptReview(operation, attempt, step) : undefined;
+        const newReview = review && !attempt.reviews?.some(item => item.reviewFingerprint === review.reviewFingerprint);
+        if (applied.has(attempt.id) && (attempt.projectionAppliedAt === undefined || reviewed && attempt.reviewCompletedAt === undefined || newReview)) {
+          operation.attempts[index] = await acknowledgeExecutionAttempt(this, operation.operationId, attempt.id, reviewed, newReview ? review : undefined);
         }
       }
       return operations;
@@ -1115,48 +1192,116 @@ export const useOpsStore = defineStore("ops", {
     },
 
     async restoreExecutionLedgerTasks() {
-      try {
-        const parsed = readExecutionLedger(await listExecutionLedger(this));
-        if (!parsed.compatible) { this.executionLedgerReadError = parsed.issues.join("；"); return; }
-        this.executionLedgerReadError = "";
-        const orphanIds = [...new Set(parsed.operations.filter(operation => !this.tasks.some(task => task.id === operation.taskId)
-          && (projectExecutionLedgerRecovery([operation]).items.length > 0
-            || !operation.taskId.startsWith("direct-") && operation.effect === "read"
-              && operation.attempts.some(attempt => ["succeeded", "failed"].includes(attempt.status))))
-          .map(operation => operation.taskId))];
-        for (const id of orphanIds) {
-          const records = parsed.operations.filter(operation => operation.taskId === id);
-          const historicalReadsOnly = records.every(record => record.effect === "read" && record.attempts.every(a => ["succeeded", "failed", "not_dispatched"].includes(a.status)));
-          const first = records[0], target = first.intent.semantic.targets.find(target => target.host);
-          const matches = this.servers.filter(server => target && server.host.toLowerCase() === target.host.toLowerCase()
-            && server.port === target.port && server.username === target.username);
-          const server = matches.length === 1 ? matches[0] : undefined;
-          const steps = new Map<string, PlanStep>();
-          for (const operation of records) {
-            const semantic = operation.intent.semantic;
-            if (steps.has(operation.stepId)) continue;
-            steps.set(operation.stepId, { id: operation.stepId, title: "待恢复的执行记录", description: semantic.expected,
-              action: semantic.action, command: semantic.action.type === "shell" ? semantic.action.command : "",
-              kind: semantic.kind, risk: semantic.risk, expected: semantic.expected, validation: semantic.validation ?? "",
-              validator: semantic.validator, runtimeClass: semantic.runtimeClass, status: "failed", executionIntent: operation.intent,
-              executionLedgerAttempts: records.filter(row => row.stepId === operation.stepId).flatMap(row => row.attempts.map(attempt => ({
-                operationId: row.operationId, attemptId: attempt.id, executionId: attempt.executionId, phase: row.phase }))) });
-          }
-          this.tasks.unshift({ id, serverId: server?.id ?? target?.serverId ?? "recovered-execution", modelId: "",
-            title: "执行记录恢复 · " + (server?.name ?? target?.host ?? id), status: "needs_adjustment", permission: "observe",
-            rootGoal: first.intent.semantic.expected, messages: [], plan: historicalReadsOnly ? [] : [...steps.values()], createdAt: new Date(first.createdAt).toISOString(),
-            updatedAt: now(), currentRoundId: first.roundId, workflowEpoch: first.workflowEpoch,
-            adjustmentCount: 0, adjustmentInProgress: false, managedAdjustmentPhase: "manual_required",
-            pauseReason: "任务展示缓存缺失，已从持久台账恢复执行事实。先只读核对，不能重发原变更。" });
-        }
-        await Promise.all(this.tasks.map(task => this.refreshExecutionLedger(task.id)));
-        if (orphanIds.length) this.persist(true);
-      } catch (error) { this.executionLedgerReadError = `执行台账读取失败，变更派发将阻止：${String(error)}`; }
+      const pending = ledgerScans.get(this);
+      if (pending) { ledgerScanQueued.add(this); return pending; }
+      const scan = (async () => {
+        do {
+          ledgerScanQueued.delete(this);
+          try {
+            let archives: TaskArchiveEntry[] = [], archiveError = "";
+            try { archives = await listTaskArchives(); }
+            catch (error) { archiveError = `任务归档暂不可读，已保留缓存：${String(error)}`; }
+            // Removal identity remains authoritative even if the execution ledger is unreadable.
+            const removedIds = new Set(archives.filter(entry => entry.disposition === "removed").map(entry => entry.taskId));
+            this.tasks = this.tasks.filter(task => !removedIds.has(task.id) || task.currentExecutionId || task.requirementProcessing
+              || ["planning", "running", "validating"].includes(task.status));
+            this.pendingUserInputs = this.pendingUserInputs.filter(row => !removedIds.has(row.taskId));
+            if (this.pendingSecret && removedIds.has(this.pendingSecret.taskId)) this.pendingSecret = null;
+            if (this.activeTaskId && !this.tasks.some(task => task.id === this.activeTaskId)) this.activeTaskId = null;
+            const parsed = readExecutionLedger(await listExecutionLedger(this));
+            if (!parsed.compatible) { this.executionLedgerReadError = [archiveError, ...parsed.issues].filter(Boolean).join("；"); return; }
+            if (!archiveError && !this.taskCacheReadError) {
+              for (const task of [...this.tasks]) {
+                const removed = archives.find(entry => entry.taskId === task.id)?.disposition === "removed";
+                const records = parsed.operations.filter(op => op.taskId === task.id);
+                if (!removed && !isUntouchedRecoveryShell(task, records)) {
+                  if (archives.find(entry => entry.taskId === task.id)?.disposition === "legacy_recovery") {
+                    await preserveContinuedLegacyTask(JSON.parse(JSON.stringify(task)));
+                  }
+                  continue;
+                }
+                if (task.currentExecutionId || task.requirementProcessing || ["planning", "running", "validating"].includes(task.status)) continue;
+                if (!removed) await markTaskArchived(JSON.parse(JSON.stringify(task)), "legacy_recovery");
+                // Never discard a shell that received user input while its backup was being saved.
+                if (!removed && !isUntouchedRecoveryShell(task, records)) {
+                  await preserveContinuedLegacyTask(JSON.parse(JSON.stringify(task)));
+                  continue;
+                }
+                this.tasks = this.tasks.filter(row => row !== task);
+                this.pendingUserInputs = this.pendingUserInputs.filter(row => row.taskId !== task.id);
+                if (this.pendingSecret?.taskId === task.id) this.pendingSecret = null;
+                if (this.activeTaskId === task.id) this.activeTaskId = null;
+              }
+            }
+            const cases: ExecutionRecoveryCase[] = [];
+            for (const taskId of new Set(parsed.operations.map(op => op.taskId))) {
+              if (this.tasks.some(task => task.id === taskId)) continue;
+              const records = parsed.operations.filter(op => op.taskId === taskId);
+              const owner = taskId.startsWith("direct-") ? directExecutionLedgerOwner : this;
+              const recovery = projectExecutionLedgerRecovery(records, { servers: this.servers,
+                storageFailures: pendingExecutionReceipts(owner, taskId).map(receipt => ({ kind: "storage_failed", operationId: receipt.operationId,
+                  attemptId: receipt.attemptId, summary: "远端结果已收到，但记录提交失败；重试只保存记录。", knownFacts: [], action: "retry_storage" })) });
+              const previous = this.executionRecoveryCases.find(item => item.taskId === taskId);
+              recovery.busyAttemptId = previous?.recovery.busyAttemptId;
+              recovery.error = previous?.recovery.error;
+              if (!recovery.items.length && !recovery.busyAttemptId && !recovery.error) continue;
+              const targets = records.flatMap(op => op.intent.semantic.targets).filter((target, index, all) =>
+                all.findIndex(row => JSON.stringify(row) === JSON.stringify(target)) === index);
+              const value = { taskId, targets, recovery, title: archives.find(entry => entry.taskId === taskId)?.title
+                ?? (taskId.startsWith("direct-") ? "直接操作记录" : "历史任务记录") };
+              cases.push(previous ? Object.assign(previous, value) : value);
+            }
+            this.executionRecoveryCases = cases;
+            this.executionLedgerReadError = archiveError;
+            await Promise.all(this.tasks.map(task => this.refreshExecutionLedger(task.id)));
+            if (!archiveError) this.persist(true);
+          } catch (error) { this.executionLedgerReadError = `执行记录读取失败：${String(error)}`; }
+        } while (ledgerScanQueued.has(this));
+      })();
+      ledgerScans.set(this, scan);
+      try { await scan; } finally { ledgerScans.delete(this); }
+    },
+
+    async loadExecutionHistory(taskId?: string) {
+      const parsed = readExecutionLedger(await listExecutionLedger(this, taskId));
+      if (!parsed.compatible) throw new Error(parsed.issues.join("；"));
+      let archives: TaskArchiveEntry[] = [], archiveIssue = "";
+      try { archives = await listTaskArchives(); }
+      catch (error) { archiveIssue = `任务归档暂不可读，以下仅展示可读的执行台账：${String(error)}`; }
+      if (archiveIssue && !parsed.operations.length) throw new Error(archiveIssue);
+      const ids = taskId ? [taskId] : [...new Set([...parsed.operations.map(op => op.taskId), ...archives.map(row => row.taskId)])]
+        .filter(id => !this.tasks.some(task => task.id === id));
+      return ids.map(id => {
+        const task = this.tasks.find(task => task.id === id), archive = archives.find(entry => entry.taskId === id);
+        const records = parsed.operations.filter(op => op.taskId === id);
+        return { ...(archiveIssue ? { archiveIssue } : {}), taskId: id, title: task?.title ?? archive?.title ?? (id.startsWith("direct-") ? "直接操作记录" : "历史任务记录"),
+          canOpen: !task && archive?.disposition === "active", removed: archive?.disposition === "removed",
+          receipts: records.flatMap(op => op.attempts.map(attempt => ({ operationId: op.operationId, attemptId: attempt.id,
+            title: executionRecordTitle(op, attempt.id, task), status: attempt.status, recordedAt: attempt.completedAt ?? attempt.startedAt,
+            expected: op.intent.semantic.expected, action: op.intent.semantic.action, targets: op.intent.semantic.targets,
+            late: attempt.late, evidenceRefs: attempt.outcome?.evidenceRefs ?? [] }))).sort((a, b) => b.recordedAt - a.recordedAt) };
+      });
+    },
+
+    async openArchivedTask(taskId: string) {
+      if (this.taskCacheReadError) throw new Error(this.taskCacheReadError);
+      const archive = await readTaskArchive(taskId);
+      if (!archive || archive.disposition !== "active" || !archive.snapshot) throw new Error("没有可恢复的原始任务快照；执行记录仍可查看。");
+      const parsed = readTaskProjection([archive.snapshot]);
+      if (!parsed.compatible) throw new Error(parsed.issues.join("；"));
+      let task = this.tasks.find(task => task.id === taskId);
+      if (!task) { task = initialTasks(parsed.tasks)[0]; this.tasks.unshift(task); }
+      this.selectTask(taskId);
+      await this.refreshExecutionLedger(taskId);
+      this.executionRecoveryCases = this.executionRecoveryCases.filter(row => row.taskId !== taskId);
+      this.persist(true);
+      return task;
     },
 
     async refreshExecutionLedger(taskId: string) {
       const task = this.tasks.find(item => item.id === taskId);
-      if (!task || executingTaskSteps.get(task)?.current()) return;
+      if (!task) { await this.restoreExecutionLedgerTasks(); return; }
+      if (executingTaskSteps.get(task)?.current()) return;
       if (task.executionLedgerLoading) { ledgerRefreshQueued.add(task); return; }
       task.executionLedgerLoading = true;
       const dispatchRevision = ledgerDispatchRevisions.get(task) ?? 0;
@@ -1176,9 +1321,10 @@ export const useOpsStore = defineStore("ops", {
         }
         if (!this.tasks.includes(task) || executingTaskSteps.get(task)?.current()) return;
         if ((ledgerDispatchRevisions.get(task) ?? 0) !== dispatchRevision) { ledgerRefreshQueued.add(task); return; }
+        if (parsed.compatible && restoreCommandEvidenceScopes(task, parsed.operations)) this.persist();
         const previousRecovery = task.executionLedgerRecovery;
         task.executionLedgerRecovery = { ...projectExecutionLedgerRecovery(parsed.operations, {
-          servers: this.servers,
+          servers: this.servers, task,
           appliedAttemptIds: executionReceiptSteps(task).flatMap(step => step.ledgerAppliedAttemptIds ?? []),
           verifiedAttemptIds: executionReceiptSteps(task).flatMap(step => step.ledgerVerifiedAttemptIds ?? []),
           issues: [...parsed.issues, ...(this.taskCacheReadError ? [this.taskCacheReadError] : [])],
@@ -1188,12 +1334,6 @@ export const useOpsStore = defineStore("ops", {
             attemptId: receipt.attemptId, summary: "远端结果已收到，但记录提交失败；重试只保存记录。",
             knownFacts: [receipt.remoteResultKnown ? "结果已知，禁止把保存失败当作远端执行失败。" : "派发结果仍不确定，保留原尝试。"], action: "retry_storage" as const }))],
         }), busyAttemptId: previousRecovery?.busyAttemptId, error: previousRecovery?.busyAttemptId ? previousRecovery.error : undefined };
-        if (task.title.startsWith("执行记录恢复 · ") && !task.executionLedgerRecovery.items.length
-          && task.executionLedgerRecovery.recordedReads?.length && task.status === "needs_adjustment"
-          && task.pauseReason?.startsWith("任务展示缓存缺失")) {
-          task.status = "awaiting_continuation";
-          task.pauseReason = "已恢复历史检查结果，可查看已有证据；这不代表当前任务目标已完成。";
-        }
         if (!parsed.compatible) task.executionLedgerError = { stage: "list", message: parsed.issues.join("；"), remoteResultKnown: false };
         else if (!pending.length && task.executionLedgerError && ["list", "result_commit"].includes(task.executionLedgerError.stage)) {
           const previousMessage = task.executionLedgerError.message;
@@ -1212,24 +1352,33 @@ export const useOpsStore = defineStore("ops", {
 
     async retryExecutionLedgerStorage(taskId: string, _attemptId?: string) {
       const task = this.tasks.find(item => item.id === taskId);
-      if (!task) return;
-      try { await flushPendingReceipts(taskId.startsWith("direct-") ? directExecutionLedgerOwner : this, taskId); task.executionLedgerError = undefined; }
-      catch (error) { if (task.executionLedgerRecovery) task.executionLedgerRecovery.error = String(error); }
+      const recovery = task?.executionLedgerRecovery ?? this.executionRecoveryCases.find(item => item.taskId === taskId)?.recovery;
+      if (!recovery || recovery.busyAttemptId) return;
+      let error: string | undefined;
+      recovery.busyAttemptId = _attemptId ?? "saving";
+      try { await flushPendingReceipts(taskId.startsWith("direct-") ? directExecutionLedgerOwner : this, taskId); if (task) task.executionLedgerError = undefined; }
+      catch (failure) { error = String(failure); }
+      recovery.busyAttemptId = undefined;
       await this.refreshExecutionLedger(taskId);
+      const current = task?.executionLedgerRecovery ?? this.executionRecoveryCases.find(item => item.taskId === taskId)?.recovery;
+      if (current) current.error = error;
       this.persist(true);
     },
 
     async reconcileExecutionAttempt(taskId: string, attemptId: string) {
       const task = this.tasks.find(item => item.id === taskId);
-      if (!task || task.executionLedgerRecovery?.busyAttemptId) return;
-      if (executingTaskSteps.get(task)?.current()) {
+      const recoveryCase = this.executionRecoveryCases.find(item => item.taskId === taskId);
+      if (task && taskRemovals.has(task)) return;
+      if (!task && !recoveryCase || (task?.executionLedgerRecovery ?? recoveryCase?.recovery)?.busyAttemptId) return;
+      if (task && executingTaskSteps.get(task)?.current()) {
         if (task.executionLedgerRecovery) task.executionLedgerRecovery.error = "当前步骤仍在执行或验收，请等待结果后核对。";
         return;
       }
-      const recovery = task.executionLedgerRecovery ??= projectExecutionLedgerRecovery([]);
-      const epoch = task.workflowEpoch, roundId = task.currentRoundId, plan = task.plan, incident = task.executionReconciliation;
-      const contextCurrent = () => this.tasks.includes(task) && task.workflowEpoch === epoch
-        && task.currentRoundId === roundId && task.plan === plan && !executingTaskSteps.get(task)?.current();
+      const recovery = task ? task.executionLedgerRecovery ??= projectExecutionLedgerRecovery([]) : recoveryCase!.recovery;
+      const epoch = task?.workflowEpoch, roundId = task?.currentRoundId, plan = task?.plan, incident = task?.executionReconciliation;
+      const contextCurrent = () => task ? this.tasks.includes(task) && task.workflowEpoch === epoch
+        && task.currentRoundId === roundId && task.plan === plan && !executingTaskSteps.get(task)?.current()
+        : this.executionRecoveryCases.includes(recoveryCase!) && !this.tasks.some(row => row.id === taskId);
       recovery.busyAttemptId = attemptId;
       recovery.error = undefined;
       try {
@@ -1238,10 +1387,10 @@ export const useOpsStore = defineStore("ops", {
         const operation = parsed.operations.find(row => row.attempts.some(attempt => attempt.id === attemptId));
         if (!operation) throw new Error("找不到原始执行尝试，不能自动恢复");
         if (!contextCurrent()) throw new Error("任务上下文已变化，原记录保留，停止本次核对");
-        const draft = buildReadOnlyReconciliation(operation, task, this.servers);
+        const draft = buildReadOnlyReconciliation(operation, { id: taskId }, this.servers);
         if (draft.attemptId !== attemptId) throw new Error("仅允许核对该操作最新的未决尝试");
         const readIds: string[] = [];
-        const originalStep = recoveryHistory(task).find(step => step.id === operation.stepId);
+        const originalStep = (task ? recoveryHistory(task) : []).find(step => step.id === operation.stepId);
         for (const read of draft.reads) {
           const stepId = `reconcile-${attemptId}-${read.role}`;
           const semantic = { ...operation.intent.semantic, taskId, stepId,
@@ -1257,7 +1406,7 @@ export const useOpsStore = defineStore("ops", {
           const generation = this.serverConnection(read.serverId).generation;
           const executionId = uid("reconcile-read");
           await runRecordedExecution({ owner: this,
-            task: { id: task.id, currentRoundId: roundId, workflowEpoch: epoch, planRevision: operation.planRevision },
+            task: { id: taskId, currentRoundId: roundId ?? operation.roundId, workflowEpoch: epoch ?? operation.workflowEpoch, planRevision: operation.planRevision },
             step: { id: stepId, executionIntent: intent }, phase: "validation", executionId,
             isCurrent: () => contextCurrent() && this.serverConnection(read.serverId).generation === generation,
             redact: text => redactExecutionOutput(text, { ...this.secretValues, password: connection.password }),
@@ -1275,19 +1424,20 @@ export const useOpsStore = defineStore("ops", {
         if (!contextCurrent()) throw new Error("任务上下文已变化，新的只读证据保留在原核对记录中");
         const resolved = await resolveExecutionOperation(this, operation.operationId, attemptId, proof);
         if (!contextCurrent()) return;
-        if (task.executionReconciliation === incident && incident?.stepId === operation.stepId && resolved.reconciliation) {
+        if (task && task.executionReconciliation === incident && incident?.stepId === operation.stepId && resolved.reconciliation) {
           incident.resolution = { incidentId: incident.id, status: "completed",
             evidenceIds: resolved.reconciliation.evidenceRefs, reason: "持久台账已核对新采集的同目标只读证据，当前状态满足原目标；原尝试保持原事实。" };
         }
-        task.executionLedgerError = undefined;
-        this.pushMessage(task, { role: "assistant", kind: "event", content: "只读证据已确认当前状态满足原目标，核对结果已落账。原尝试记录保留，不会重发原操作；后续变更仍需按当前计划授权。" });
+        if (task) task.executionLedgerError = undefined;
+        if (task) this.pushMessage(task, { role: "assistant", kind: "event", content: "只读证据已确认当前状态满足原目标，核对结果已落账。原尝试记录保留，不会重发原操作；后续变更仍需按当前计划授权。" });
       } catch (error) { recovery.error = String(error); }
       finally {
         const error = recovery.error;
         recovery.busyAttemptId = undefined;
-        if (task.executionLedgerRecovery) task.executionLedgerRecovery.busyAttemptId = undefined;
+        if (task?.executionLedgerRecovery) task.executionLedgerRecovery.busyAttemptId = undefined;
         await this.refreshExecutionLedger(taskId);
-        if (contextCurrent() && task.executionLedgerRecovery) task.executionLedgerRecovery.error = error;
+        const current = task?.executionLedgerRecovery ?? this.executionRecoveryCases.find(item => item.taskId === taskId)?.recovery;
+        if (contextCurrent() && current) current.error = error;
         this.persist(true);
       }
     },
@@ -1433,7 +1583,7 @@ export const useOpsStore = defineStore("ops", {
           .find((result) => result.status === "rejected");
         if (rejected?.status === "rejected") {
           // Partial reads must never be advertised as a complete hydration. In
-          // particular, an empty in-memory value after a failed keychain read
+          // particular, an empty in-memory value after a failed vault read
           // must not later be interpreted as an intentional deletion.
           this.credentialError = String(rejected.reason);
           this.credentialsHydrated = false;
@@ -2271,14 +2421,17 @@ export const useOpsStore = defineStore("ops", {
       void this.refreshExecutionLedger(taskId);
     },
 
-    deleteTask(taskId: string) {
+    async deleteTask(taskId: string) {
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task) return false;
       if (
-        task.currentExecutionId || task.requirementProcessing
-        || ["planning", "running", "validating"].includes(task.status)
+        task.currentExecutionId || task.requirementProcessing || task.adjustmentInProgress || taskRemovals.has(task)
+        || task.executionLedgerRecovery?.busyAttemptId || ["planning", "running", "validating"].includes(task.status)
       ) return false;
 
+      taskRemovals.add(task);
+      try { await markTaskArchived(JSON.parse(JSON.stringify(task)), "removed"); }
+      catch (error) { taskRemovals.delete(task); this.persistenceWarning = `任务移除标记保存失败，任务已保留：${String(error)}`; return false; }
       const wasActive = this.activeTaskId === taskId;
       this.tasks = this.tasks.filter((item) => item.id !== taskId);
       if (this.pendingSecret?.taskId === taskId) this.pendingSecret = null;
@@ -2289,11 +2442,13 @@ export const useOpsStore = defineStore("ops", {
       this.addLog({
         category: "task",
         level: "info",
-        title: "删除任务",
-        detail: `已删除任务“${task.title}”及其本地对话、计划和执行记录。`,
+        title: "移除任务",
+        detail: `已从任务列表移除“${task.title}”。历史快照和执行证据保留，未决操作仍可核对。`,
         serverId: task.serverId,
       });
       this.persist(true);
+      await this.restoreExecutionLedgerTasks();
+      taskRemovals.delete(task);
       return true;
     },
 
@@ -2390,6 +2545,7 @@ export const useOpsStore = defineStore("ops", {
       if (!task || task.serverId !== serverId) {
         task = this.createTask(serverId, permission, modelId);
       }
+      if (taskRemovals.has(task)) throw new Error("任务正在移除，请等待完成后创建新任务。");
       const requirementOwner = {};
       const requirementOwnerTasks = new Set<OpsTask>();
       const claimRequirementTask = (target: OpsTask) => {
@@ -2438,26 +2594,14 @@ export const useOpsStore = defineStore("ops", {
           }
         }
       };
+      task.requirementLifecycle ??= task.rootGoal ? taskRequirementSnapshot(task).lifecycle
+        : { version: 1, revision: 0, items: [], focus: { roundId: task.currentRoundId, requirementIds: [] } };
       const previousConstraints = task.executionConstraints;
+      const previousRequirementLifecycle = task.requirementLifecycle;
       const previousRoundSnapshot = capturePreviousRound(task);
       const contextWorkflowSnapshot = contextTask === task ? workflowSnapshot : captureWorkflowState(contextTask);
       const previousExecution = previousRequirement
-        ? {
-          requirement: previousRequirement.content,
-          status: contextTask.status,
-          summary: contextTask.summary,
-          executionConstraints: contextTask.executionConstraints,
-          steps: activeRoundSteps(contextTask).map(step => ({
-            stepId: step.id,
-            title: step.title,
-            command: step.command,
-            expected: step.expected,
-            status: step.status,
-            review: step.review,
-            result: modelContextStep(step).result,
-            ...executionContextEvidence(step, trimEvidence),
-          })),
-        }
+        ? requirementExecutionContext(contextTask, previousRequirement.content)
         : undefined;
       task.permission = permission;
       task.modelId = modelId;
@@ -2493,8 +2637,8 @@ export const useOpsStore = defineStore("ops", {
         const apiKey = this.modelApiKeys[modelId];
         if (!model) throw new Error("所选模型配置不存在，请重新选择模型");
         if (model.provider !== "Built-in" && !apiKey) {
-          const keychainDetail = this.credentialError ? ` 系统凭据读取错误：${this.credentialError}` : "";
-          throw new Error(`“${model.name}”的 API Key 未恢复，请前往“模型与设置”重新保存一次。${keychainDetail}`);
+          const credentialDetail = this.credentialError ? ` 加密凭据读取错误：${this.credentialError}` : "";
+          throw new Error(`“${model.name}”的 API Key 未恢复，请前往“模型与设置”重新保存一次。${credentialDetail}`);
         }
         const server = this.servers.find((item) => item.id === serverId);
         const contextMetrics = this.contextMetrics(serverId);
@@ -2557,7 +2701,9 @@ export const useOpsStore = defineStore("ops", {
             skillDirectory: this.enabledSkills,
             secretMetadata: this.secretMetadata,
             serverId,
-          }), _modelRecovery: modelRecovery });
+          }), requirementSubmission: { sourceMessageId: submittedMessage.id,
+            baseRevision: task.requirementLifecycle?.revision ?? 0, baseLifecycle: task.requirementLifecycle,
+            content, createdAt: submittedMessage.createdAt }, _modelRecovery: modelRecovery });
           const skillDefinitions = buildSkillContext(planningSkills(contextTask, this.enabledSkills));
           const developerRequest = {
             command: "process_ai_requirement",
@@ -2571,6 +2717,9 @@ export const useOpsStore = defineStore("ops", {
           try {
             processed = await backend.processRequirement(content, {
               ...modelIntegrationConfig(model),
+              assertCurrent: () => {
+                if (!ownsRequirementSubmission() || sourceTask.cancelRequested || sourceTask.workflowEpoch !== submissionEpoch) throw new StaleWorkflowError();
+              },
               apiKey: apiKey ?? "",
               endpoint: model.endpoint,
               model: model.model,
@@ -2743,7 +2892,10 @@ export const useOpsStore = defineStore("ops", {
           task.lastRequirementRelation = "new_goal";
           task.title = content;
           task.currentRoundId = uid("round");
-          this.pushMessage(task, { role: "user", kind: "message", content });
+          // Move the user's immutable submission identity with the new goal;
+          // requirementUpdate is bound to this message, not a synthesized copy.
+          task.messages.push({ ...submittedMessage, requirementRelation: "new_goal" });
+          task.updatedAt = now();
           await this.ensureTaskAgentSession(task.id, ownsRequirementSubmission);
           if (!ownsRequirementSubmission()
             || task.cancelRequested || sourceTask.workflowEpoch !== submissionEpoch) return;
@@ -2788,9 +2940,30 @@ export const useOpsStore = defineStore("ops", {
           task.currentInstruction = relation === "continue" ? task.currentInstruction || task.rootGoal : content;
           task.lastRequirementRelation = relation;
           task.currentRoundId ||= uid("round");
+    if (task.modelPlanningBlocker && (task.modelPlanningBlocker.error.code === "MODEL_FORMAT_INVALID" || isModelRecoveryScopeRejection(task.modelPlanningBlocker.error))
+      && ["planning_failed", "needs_adjustment", "awaiting_continuation"].includes(task.status)) {
+      task.pauseReason = modelServiceErrorMessage(task.modelPlanningBlocker.error);
+    }
           task.goalCancellation = undefined;
           task.title = task.title === "新任务" ? task.rootGoal : task.title;
         }
+        const requirementSource = { content, relation: (relation === "continue" ? "supplement" : relation) as "new_goal" | "replace_goal" | "supplement",
+          source: "user_message" as const, sourceMessageId: submittedMessage.id,
+          sourceRoundId: task.currentRoundId, createdAt: submittedMessage.createdAt };
+        if (processed.requirementUpdate) {
+          if (relation === "continue" && (processed.requirementUpdate.additions.length || processed.requirementUpdate.changes.length)) {
+            throw new Error("继续请求只能选择现有需求范围，不能新增、取消或修改要求；有范围变更时应按补充需求重新判断。");
+          }
+          if (task !== sourceTask) task.requirementLifecycle = { version: 1,
+            revision: processed.requirementUpdate.baseRevision, items: [],
+            focus: { roundId: task.currentRoundId, requirementIds: [] } };
+          task.requirementLifecycle = applyTaskRequirementUpdate(task, processed.requirementUpdate,
+            { source: requirementSource, roundId: task.currentRoundId });
+        } else if (relation !== "continue") {
+          task.requirementLifecycle = appendLegacyTaskRequirement(task, requirementSource, task.currentRoundId);
+        }
+        if (task.requirementLifecycle) task.requirementLifecycle.focus.roundId = task.currentRoundId;
+        task.currentRequestReview = undefined;
         task.plan = [];
         task.summary = undefined;
         task.pauseReason = undefined;
@@ -2812,18 +2985,12 @@ export const useOpsStore = defineStore("ops", {
         const selectedSkillIds = processed.selectedSkillIds ?? [];
         task.activeSkillIds = mergeTaskSkillIds(task.activeSkillIds, selectedSkillIds, relation);
         pinTaskSkills(task, this.skills);
-        task.executionConstraints = relation === "continue" && task === sourceTask && previousConstraints
-          ? previousConstraints
-          : processed.constraints ? {
-            ...processed.constraints,
-            userDirectives: [...new Set([...(task.executionConstraints?.userDirectives ?? []),
-            ...(processed.constraints.userDirectives ?? [])])],
-            prohibitedActions: [...new Set([...(task.executionConstraints?.prohibitedActions ?? []),
-            ...(processed.constraints.prohibitedActions ?? [])])],
-            requiredConditions: [...new Set([...(task.executionConstraints?.requiredConditions ?? []),
-            ...(processed.constraints.requiredConditions ?? [])])]
-          }
-            : task.executionConstraints;
+        task.executionConstraints = mergeRequirementExecutionConstraints({
+          previous: task === sourceTask ? previousConstraints : undefined,
+          classified: processed.constraints, relation,
+          previousLifecycle: task === sourceTask ? previousRequirementLifecycle : undefined,
+          nextLifecycle: task.requirementLifecycle,
+        });
         if (pendingProtocolError) throw pendingProtocolError;
         if (processed.planError) {
           const serviceError = modelServiceError(processed.planError);
@@ -2935,12 +3102,12 @@ export const useOpsStore = defineStore("ops", {
           };
           transitionTask(task, "needs_adjustment");
           task.pauseReason = error.userMessage;
-          task.managedAdjustmentPhase = undefined;
-          task.managedStopReason = undefined;
+          task.managedAdjustmentPhase = error.repair.businessReplanProgress ? "manual_required" : undefined;
+          task.managedStopReason = error.repair.businessReplanProgress ? "model_generation_failed" : undefined;
           task.autoAdjustmentSeconds = undefined;
           this.pushMessage(task, { role: "assistant", kind: "event", content: error.userMessage });
           this.persist();
-          await this.beginAdjustment(task.id, false, undefined, "system_initial");
+          if (!error.repair.businessReplanProgress) await this.beginAdjustment(task.id, false, undefined, "system_initial");
           return;
         }
         if (canTransitionTask(task.status, "planning_failed")) transitionTask(task, "planning_failed");
@@ -3029,12 +3196,54 @@ export const useOpsStore = defineStore("ops", {
 
     recordModelPlanningBlocker(task: OpsTask, error: ModelServiceError, conditionsFingerprint?: string) {
       task.modelPlanningBlocker = { error, conditionsFingerprint: conditionsFingerprint ?? this.modelPlanningConditions(task),
-        accountBalance: this.modelAccountBalance(task), recordedAt: now() };
+        accountBalance: this.modelAccountBalance(task), contractRevision: MODEL_PLAN_CONTRACT_REVISION, recordedAt: now() };
       task.autoAdjustmentSeconds = undefined;
       task.managedAdjustmentPhase = "manual_required";
       task.managedStopReason = "model_generation_failed";
       task.pauseReason = modelServiceErrorMessage(error);
       this.persist();
+    },
+
+    /** User-requested regeneration is separate from timers and execution replay. */
+    async retryModelPlanning(taskId: string) {
+      const task = this.tasks.find(item => item.id === taskId);
+      if (!task || explicitModelRetries.get(taskId)?.current() || task.requirementProcessing || task.adjustmentInProgress
+        || adjustingTaskIds.get(taskId)?.current() || executingTaskSteps.get(task)?.current()
+        || hasWaitingStep(task) || task.cancelRequested
+        || !["planning_failed", "needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)
+        || !isExplicitModelPlanningRetryable(task.modelPlanningBlocker?.error)) return;
+      if (task.status === "planning_failed") {
+        // An initial failure can predate classification. Require an explicit
+        // evidence-backed review of the original goal before accepting complete.
+        try {
+          const roundId = task.currentRoundId || uid("round");
+          const lifecycle = activateRequirementReviewForRetry({ ...task, currentRoundId: roundId });
+          task.currentRoundId = roundId;
+          task.requirementLifecycle = lifecycle;
+        } catch (error) {
+          task.pauseReason = error instanceof Error ? error.message : String(error);
+          task.managedStopReason = "workflow_error";
+          this.pushMessage(task, { role: "system", kind: "event", content: task.pauseReason });
+          this.persist();
+          return;
+        }
+      }
+      const lifetime = workflowLifetime(task);
+      explicitModelRetries.set(taskId, lifetime);
+      task.modelPlanningBlocker = undefined;
+      task.latestGoalReview = undefined;
+      task.autoAdjustmentSeconds = undefined;
+      this.pushMessage(task, { role: "system", kind: "event",
+        content: "已按你的请求重新生成方案；沿用当前目标、授权和执行证据，本次仍使用有限恢复预算。" });
+      this.persist();
+      try {
+        // Regeneration keeps the current requirement identity. Re-submitting
+        // the same text would classify it again and could create a new task.
+        if (task.status === "planning_failed") transitionTask(task, "needs_adjustment");
+        await this.requestAdjustment(taskId);
+      } finally {
+        if (explicitModelRetries.get(taskId) === lifetime) explicitModelRetries.delete(taskId);
+      }
     },
 
     /** Checking unchanged conditions is local and never probes the paid model endpoint. */
@@ -3052,7 +3261,14 @@ export const useOpsStore = defineStore("ops", {
         availableAtRefusal !== undefined && balance.available > availableAtRefusal
         || reservedAtRefusal !== undefined && balance.reserved < reservedAtRefusal
       );
-      if (blocker.conditionsFingerprint !== this.modelPlanningConditions(task) || improvedBalance) {
+      const updatedContract = blocker.error.code === "MODEL_FORMAT_INVALID"
+        && blocker.contractRevision !== MODEL_PLAN_CONTRACT_REVISION;
+      // Changing model settings cannot establish the outcome of an old request
+      // or repair its identity. Keep that uncertainty pinned to the task.
+      const unresolvedRequest = ["MODEL_DISPATCH_UNKNOWN", "MODEL_RESULT_UNAVAILABLE", "MODEL_REQUEST_CONFLICT",
+        "IDEMPOTENCY_KEY_CONFLICT", "REQUEST_ALREADY_ACCEPTED", "REQUEST_STATE_CONFLICT"].includes(blocker.error.code)
+        || blocker.error.code === "MODEL_RECOVERY_BUDGET_EXHAUSTED" && !isExplicitModelPlanningRetryable(blocker.error);
+      if (!unresolvedRequest && (updatedContract || blocker.conditionsFingerprint !== this.modelPlanningConditions(task) || improvedBalance)) {
         task.modelPlanningBlocker = undefined;
         task.autoAdjustmentSeconds = undefined;
         this.persist();
@@ -3393,6 +3609,8 @@ export const useOpsStore = defineStore("ops", {
       if (adjustingTaskIds.get(taskId)?.current()) return;
       const task = this.tasks.find((item) => item.id === taskId);
       if (!task || !["needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)) return;
+      if (task.cancelRequested || !automatic && protocolReplanSource === "manual"
+        && (task.requirementProcessing || executingTaskSteps.get(task)?.current())) return;
       if (automatic && stopForBlockedNoAction(task)) {
         this.persist();
         return;
@@ -3548,6 +3766,7 @@ export const useOpsStore = defineStore("ops", {
                 skills: activeSkills,
                 isCancelled: () => !lifetime.current(),
                 recoverProtocolFailures: true,
+                freshModelOperation: !automatic && protocolReplanSource === "manual",
               });
               if (goalReview.nextPlan.length) {
                 adjustment = {
@@ -3561,6 +3780,7 @@ export const useOpsStore = defineStore("ops", {
           }
           if (!lifetime.current()) return;
           if (!policyCurrent()) throw new Error("规划期间目标、授权或已确认输入发生变化，已丢弃旧上下文生成的方案，请重新生成");
+          if (goalReview && "taskDecision" in goalReview && goalReview.taskDecision) Object.assign(task, goalReview.taskDecision);
           if (goalReview?.reconciliationResolution && task.executionReconciliation) {
             task.executionReconciliation.resolution = goalReview.reconciliationResolution;
           }
@@ -3765,7 +3985,8 @@ export const useOpsStore = defineStore("ops", {
           const technicalDetail = error instanceof Error
             ? `${error.name}: ${error.message}${error.stack ? `\n${error.stack}` : ""}`
             : String(error);
-          const actionablePolicyReason = error instanceof ExecutionPolicyError
+          const localEvidenceError = error instanceof TaskEvidenceError;
+          const actionablePolicyReason = localEvidenceError || error instanceof ExecutionPolicyError
             || /(?:规划期间目标、授权或已确认输入发生变化|原协议事故保持原目标绑定)/.test(String(error));
           const reason = serviceError ? modelServiceErrorMessage(serviceError) : actionablePolicyReason
             ? String(error)
@@ -3791,7 +4012,7 @@ export const useOpsStore = defineStore("ops", {
           task.summary = undefined;
           if (task.permission === "managed") {
             task.managedAdjustmentPhase = "manual_required";
-            task.managedStopReason = "model_generation_failed";
+            task.managedStopReason = localEvidenceError ? "workflow_error" : "model_generation_failed";
           }
           this.addLog({
             category: "model",
@@ -3821,13 +4042,22 @@ export const useOpsStore = defineStore("ops", {
     async requestAdjustment(taskId: string, automatic = false, transportOnly = false) {
       if (adjustingTaskIds.get(taskId)?.current()) return;
       const task = this.tasks.find((item) => item.id === taskId);
+      if (task && taskRemovals.has(task)) return;
       if (!task || !["needs_adjustment", "awaiting_continuation", "failed"].includes(task.status)) return;
+      if (task.cancelRequested || !automatic && (task.requirementProcessing || task.adjustmentInProgress
+        || executingTaskSteps.get(task)?.current())) return;
       if (automatic && !transportOnly && stopForBlockedNoAction(task)) {
         this.persist();
         return;
       }
       if (hasWaitingStep(task)) return;
       if (task.protocolRepair && automatic) return;
+      if (!automatic && !transportOnly
+        && task.modelPlanningBlocker?.error.code === "MODEL_RECOVERY_BUDGET_EXHAUSTED"
+        && isExplicitModelPlanningRetryable(task.modelPlanningBlocker.error)) {
+        await this.retryModelPlanning(taskId);
+        return;
+      }
       if (!transportOnly && this.stopBlockedModelPlanning(task)) return;
       // A manual request is a new business proposal, not another field-local
       // repair attempt. Do not invent a fresh environment failure/incident.
@@ -4209,6 +4439,7 @@ export const useOpsStore = defineStore("ops", {
       automaticReason: AutomaticPlanApprovalReason = "managed",
     ) {
       const task = this.tasks.find((item) => item.id === taskId);
+      if (task && taskRemovals.has(task)) return;
       if (!task || task.status !== "awaiting_plan_approval"
         || (task.requirementProcessing && !automatic)) return;
       if (hasWaitingStep(task)) return;
@@ -4385,6 +4616,7 @@ export const useOpsStore = defineStore("ops", {
 
     async advanceTask(taskId: string) {
       const task = this.tasks.find((item) => item.id === taskId);
+      if (task && taskRemovals.has(task)) return;
       if (!task || task.status !== "running" || task.cancelRequested) return;
       if (hasWaitingStep(task) || executingTaskSteps.get(task)?.current()
         || submittingTaskInputs.get(task)?.current()) return;
@@ -4392,6 +4624,7 @@ export const useOpsStore = defineStore("ops", {
       if (this.pauseTaskForConnection(task)) return;
       const lifetime = claimTaskOperation(advancingTasks, task);
       if (!lifetime) return;
+      let outputRecoveryRecord: NonNullable<OpsTask["protocolRepairHistory"]>[number] | undefined;
       try {
         const targetServerId = executionServerId(task);
         const server = this.servers.find((item) => item.id === targetServerId);
@@ -4424,8 +4657,29 @@ export const useOpsStore = defineStore("ops", {
             generationSettings: this.aiGenerationSettings,
             skills: activeSkills,
             isCancelled: () => !lifetime.current(),
+            onCandidateRegeneration: error => {
+              if (error instanceof PlanProtocolError) {
+                outputRecoveryRecord = { roundId: task.currentRoundId, serverId: targetServerId,
+                  repair: JSON.parse(JSON.stringify(error.repair)), repairError: error.repairError,
+                  requestedAt: now(), status: "planning" };
+                task.protocolRepairHistory ??= [];
+                task.protocolRepairHistory.push(outputRecoveryRecord);
+                this.addDeveloperLog({ level: "error", operation: "workflow_progression",
+                  title: "后续候选未通过校验，正在切换恢复策略", summary: error.developerMessage,
+                  error: error.developerMessage, response: { repair: error.repair }, taskId, serverId: targetServerId });
+              }
+              this.addLog({ category: "model", level: "info", title: "系统从协议阻断自动转入业务重新规划",
+                detail: JSON.stringify({ triggerSource: "system_continuation", rejectedPlanExecuted: false, sharedOperationBudget: true }),
+                taskId, serverId: targetServerId });
+            },
           });
           if (!lifetime.current()) return;
+          if (outputRecoveryRecord) {
+            outputRecoveryRecord.status = "accepted";
+            outputRecoveryRecord.replacementStepIds = goalReview.nextPlan.map(step => step.id);
+            outputRecoveryRecord.outcome = goalReview.decision.summary;
+          }
+          if ("taskDecision" in goalReview && goalReview.taskDecision) Object.assign(task, goalReview.taskDecision);
           if (goalReview.reconciliationResolution && task.executionReconciliation) {
             task.executionReconciliation.resolution = goalReview.reconciliationResolution;
           }
@@ -4442,6 +4696,23 @@ export const useOpsStore = defineStore("ops", {
             taskId,
           });
           if (!goalReview.complete) {
+            if ("outputRegenerated" in goalReview && goalReview.outputRegenerated && goalReview.nextPlan.length) {
+              // Admit the accepted candidate once. Recovery must not send it
+              // back through another model operation or bypass step approval.
+              archiveActivePhase(task, "adjustment", now(), goalReview.decision.summary);
+              this.prepareTaskPlan(task, goalReview.nextPlan);
+              task.protocolRepair = undefined;
+              task.latestGoalReview = undefined;
+              task.pauseReason = undefined;
+              if (this.presentTaskUserInput(taskId)) return;
+              transitionTask(task, "awaiting_continuation");
+              transitionTask(task, "awaiting_plan_approval");
+              this.pushPlanProgressMessage(task, `后续方案已重新整理，包含 ${goalReview.nextPlan.length} 个执行步骤；系统将按现有授权继续，需要确认的步骤会在执行前单独提示。`);
+              this.persist();
+              lifetime.release();
+              await this.approvePlan(taskId, true, "protocol_replan");
+              return;
+            }
             if (goalReview.nextPlan?.length) {
               const previousPlan = task.plan;
               task.plan = [...previousPlan, ...goalReview.nextPlan];
@@ -4474,7 +4745,7 @@ export const useOpsStore = defineStore("ops", {
             this.pushMessage(task, {
               role: "assistant",
               kind: "event",
-              content: `当前计划阶段已完成，但整体目标尚未验收：${goalReview.decision.summary}`,
+              content: `${currentRequestCompleted(task) ? "本轮需求已完成；其他目标的状态分别保留：" : "当前计划阶段已完成，但整体目标尚未验收："}${goalReview.decision.summary}`,
             });
             this.persist();
             return;
@@ -4515,6 +4786,16 @@ export const useOpsStore = defineStore("ops", {
           return;
         }
 
+        if (observationBoundary(task, step, this.tools)) {
+          transitionTask(task, "needs_adjustment");
+          task.latestGoalReview = undefined;
+          task.pauseReason = "只读检查已有新结果，正在据此确认后续变更的前提并更新剩余计划。";
+          this.persist();
+          lifetime.release();
+          await this.beginAdjustment(taskId, true);
+          return;
+        }
+
         if (step.action?.type !== "tool") {
           step.progressMessage = "正在进行执行前安全检查…";
           const safety = await inspectPlanSafety(step.command, step.validation, false);
@@ -4548,8 +4829,15 @@ export const useOpsStore = defineStore("ops", {
         await this.runStep(taskId, step.id);
       } catch (error) {
         if (lifetime.current()) {
-          this.pauseWorkflowFailure(task, error, error instanceof PlanProtocolError);
-          if (error instanceof PlanProtocolError) {
+          if (outputRecoveryRecord) {
+            outputRecoveryRecord.status = "failed";
+            outputRecoveryRecord.outcome = error instanceof Error ? error.message : String(error);
+            this.addDeveloperLog({ level: "error", operation: "protocol_business_replan", title: "完整候选重生成未通过校验",
+              summary: outputRecoveryRecord.outcome, error: outputRecoveryRecord.outcome, taskId, serverId: executionServerId(task) });
+          }
+          const continueRecovery = error instanceof PlanProtocolError && !error.repair.businessReplanProgress;
+          this.pauseWorkflowFailure(task, error, continueRecovery);
+          if (continueRecovery) {
             // A rejected continuation proposal has not executed anything and
             // does not grant new authority. Ask for one fresh joint decision;
             // a second protocol rejection is bounded inside beginAdjustment.
@@ -4562,24 +4850,46 @@ export const useOpsStore = defineStore("ops", {
       }
     },
 
+    reprepareChangedStepApproval(task: OpsTask, step: PlanStep) {
+      // The click authorized the previously displayed intent only. Release
+      // its wait and prepare current facts locally so the next confirmation
+      // can authorize the new target without a paid model regeneration.
+      transitionStep(step, "pending");
+      step.approvalGrant = undefined;
+      step.safetyApprovalSnapshot = undefined;
+      step.approvedSafetySnapshot = undefined;
+      task.planApproval = undefined;
+      transitionTask(task, "needs_adjustment");
+      try {
+        this.prepareTaskPlan(task);
+        transitionTask(task, "awaiting_plan_approval");
+        task.pauseReason = "执行动作、目标或授权条件已更新，计划已重新准备。请核对当前内容后确认。";
+        this.pushMessage(task, { role: "system", kind: "event", content: task.pauseReason });
+        this.persist();
+      } catch (error) {
+        this.pauseWorkflowFailure(task, error);
+      }
+    },
+
     async approveStep(taskId: string, stepId: string) {
       const task = this.tasks.find((item) => item.id === taskId);
+      if (task && taskRemovals.has(task)) return;
       const step = task?.plan.find((item) => item.id === stepId);
       if (!task || !step || task.cancelRequested || task.requirementProcessing
         || task.status !== "awaiting_step_approval"
         || task.plan.find(item => !["completed", "failed", "skipped"].includes(item.status)) !== step
         || advancingTasks.get(task)?.current() || executingTaskSteps.get(task)?.current()) return;
       try { this.assertPreparedStep(task, step); }
-      catch (error) { this.pauseWorkflowFailure(task, error); return; }
+      catch { this.reprepareChangedStepApproval(task, step); return; }
       if (!step.executionIntent) {
         try { this.prepareTaskPlan(task); }
-        catch (error) { this.pauseWorkflowFailure(task, error); return; }
+        catch { this.reprepareChangedStepApproval(task, step); return; }
         requestStepApproval("observe", step, this.tools);
         this.persist();
         return;
       }
       const approval = acceptStepApproval(step, task.preparedPlan);
-      if (!approval) return;
+      if (!approval) { this.reprepareChangedStepApproval(task, step); return; }
       if (step.authenticationGate?.fingerprint === authenticationFingerprint(task, step)) step.authenticationGate.approved = true;
       transitionTask(task, approval.taskStatus);
       await this.runStep(taskId, stepId);
@@ -4649,6 +4959,7 @@ export const useOpsStore = defineStore("ops", {
 
     async runToolStep(taskId: string, stepId: string, call: ToolCall) {
       const task = this.tasks.find((item) => item.id === taskId);
+      if (task && taskRemovals.has(task)) return;
       const step = task?.plan.find((item) => item.id === stepId);
       if (!task || !step || task.status !== "running" || task.cancelRequested
         || !["pending", "awaiting_approval"].includes(step.status)
@@ -4712,6 +5023,15 @@ export const useOpsStore = defineStore("ops", {
           }
         }
         if (!await this.validateRecoveryDispatch(taskId, stepId, () => !lifetime.current())) return;
+        if (observationBoundary(task, step, this.tools)) {
+          transitionTask(task, "needs_adjustment");
+          task.latestGoalReview = undefined;
+          task.pauseReason = "只读检查已有新结果，正在据此确认后续变更的前提并更新剩余计划。";
+          this.persist();
+          lifetime.release();
+          await this.beginAdjustment(taskId, true);
+          return;
+        }
         // Revalidate after asynchronous policy checks and bind the approved action to dispatch.
         try { call = currentCall(); }
         catch (error) {
@@ -4810,6 +5130,7 @@ export const useOpsStore = defineStore("ops", {
         if (!lifetime.current()) return;
         transitionTask(task, lifecycle.taskStatus);
         if (step.status === "completed") await this.markExecutionVerified(step);
+        else await this.markExecutionReviewed(step);
         if (!lifetime.current()) return;
         if (step.status === "failed") {
           holdFailureDependents(step, task.plan.filter(item => item.status === "pending"));
@@ -4825,7 +5146,12 @@ export const useOpsStore = defineStore("ops", {
         });
         this.persist();
         if (!lifecycle.shouldAdvance) {
-          if (isTerminalTransportFailure(lifecycle.pauseReason) && step.result) {
+          if (toolFailureFallback(step) && executionServerId(task) === targetServerId
+            && this.serverConnection(targetServerId).generation === connectionGeneration
+            && step.executionIntent?.digest === frozenIntentDigest && stepMatchesExecutionIntent(step)) {
+            lifetime.release();
+            await this.routeAutomaticAdjustment(taskId);
+          } else if (isTerminalTransportFailure(lifecycle.pauseReason) && step.result) {
             step.result.facts.category = "terminal_transport";
             step.result.facts.commandCompleted = false;
             step.result.facts.terminalReleased = false;
@@ -4851,6 +5177,7 @@ export const useOpsStore = defineStore("ops", {
 
     async runStep(taskId: string, stepId: string) {
       const task = this.tasks.find((item) => item.id === taskId);
+      if (task && taskRemovals.has(task)) return;
       const step = task?.plan.find((item) => item.id === stepId);
       if (!task || !step || task.cancelRequested || task.status !== "running"
         || !["pending", "awaiting_approval"].includes(step.status)
@@ -4863,6 +5190,15 @@ export const useOpsStore = defineStore("ops", {
       if (!lifetime) return;
       try {
         if (!await this.validateRecoveryDispatch(taskId, stepId, () => !lifetime.current())) return;
+        if (observationBoundary(task, step, this.tools)) {
+          transitionTask(task, "needs_adjustment");
+          task.latestGoalReview = undefined;
+          task.pauseReason = "只读检查已有新结果，正在据此确认后续变更的前提并更新剩余计划。";
+          this.persist();
+          lifetime.release();
+          await this.beginAdjustment(taskId, true);
+          return;
+        }
         if (!step.executionIntent) {
           try { this.prepareTaskPlan(task); }
           catch (error) {
@@ -4875,6 +5211,7 @@ export const useOpsStore = defineStore("ops", {
           }
         }
         step.attemptContext = taskAttemptContext(task);
+        const failureScope = commandExecutionScope(step, task.id);
         const targetServerId = executionServerId(task);
         const connectionGeneration = this.serverConnection(targetServerId).generation;
         const assertConnection = () => {
@@ -5441,13 +5778,17 @@ export const useOpsStore = defineStore("ops", {
               validationPassed: monitorValidationPassed,
               evidenceId: uid("evidence-long-review"),
               collectedAt: now(),
+              scope: failureScope,
             });
+            recordExecutionUncertainty(task, step, "长任务复核已停止当前变更，需先核对进程状态及已经产生的副作用。");
             holdFailureDependents(step, task.plan.filter(item => item.status === "pending"));
             if (step.result && startupTransaction) {
               step.result.facts.shellStartupSnapshot = startupTransaction.backupPaths.join(",");
               step.result.facts.shellStartupRollback = startupRollbackSucceeded ? "success" : "failed";
             }
             if (monitoringModelError && this.pauseStepModelServiceFailure(task, step, monitoringModelError)) return;
+            await this.markExecutionReviewed(step);
+            if (!lifetime.current()) return;
             transitionTask(task, coordination.taskStatus);
             task.pauseReason = coordination.pauseReason;
             this.pushMessage(task, {
@@ -5467,6 +5808,7 @@ export const useOpsStore = defineStore("ops", {
               exitCode: result.exitCode,
               evidenceId: uid("evidence-main"),
               collectedAt: now(),
+              scope: failureScope,
             });
             if (authenticationChannelFailure(safeOutput)
               && (hasFixedPromptChannel || safeOutput.includes("PTY_AUTH_CHANNEL_UNAVAILABLE"))) {
@@ -5514,6 +5856,8 @@ export const useOpsStore = defineStore("ops", {
             if (reviewPipeline.cancelled || !lifetime.current()) return;
             reviewPipeline.audits.forEach((event) => this.addLog(event));
             const coordination = reviewPipeline.coordination;
+            await this.markExecutionReviewed(step);
+            if (!lifetime.current()) return;
             transitionTask(task, coordination.taskStatus);
             task.pauseReason = coordination.pauseReason;
             this.pushMessage(task, {
@@ -5763,6 +6107,7 @@ export const useOpsStore = defineStore("ops", {
           const coordination = reviewPipeline.coordination;
           transitionTask(task, coordination.taskStatus);
           if (step.status === "completed") await this.markExecutionVerified(step);
+          else await this.markExecutionReviewed(step);
           if (!lifetime.current()) return;
           task.pauseReason = coordination.pauseReason;
           this.pushMessage(task, {
@@ -5844,6 +6189,8 @@ export const useOpsStore = defineStore("ops", {
               if (reviewPipeline.cancelled || !lifetime.current()) return;
               reviewPipeline.audits.forEach((event) => this.addLog(event));
               const coordination = reviewPipeline.coordination;
+              await this.markExecutionReviewed(step);
+              if (!lifetime.current()) return;
               transitionTask(task, coordination.taskStatus);
               task.pauseReason = coordination.pauseReason;
               this.pushMessage(task, {
@@ -5899,6 +6246,7 @@ export const useOpsStore = defineStore("ops", {
     async provideUserInput(taskId: string, rawValues: Record<string, string>, expectedCallId?: string) {
       const request = this.pendingUserInputs.find((item) => item.taskId === taskId);
       const task = this.tasks.find((item) => item.id === taskId);
+      if (task && taskRemovals.has(task)) return;
       const step = task?.plan.find((item) => item.id === request?.stepId);
       if (!request || !task || !step || task.cancelRequested || task.requirementProcessing
         || task.status !== "awaiting_input" || step.status !== "awaiting_input"
@@ -6081,8 +6429,8 @@ export const useOpsStore = defineStore("ops", {
               const secretKey = field.key.toUpperCase();
               const valueId = secretValueId(targetServerId, secretKey);
               if (this.secretValues[valueId] !== raw) credentialChanged = true;
-              // Commit to the system keychain before advertising the metadata in
-              // memory/localStorage. A failed keychain write must leave the input
+              // Commit to the encrypted vault before advertising the metadata in
+              // memory/localStorage. A failed vault write must leave the input
               // card open instead of creating a phantom "saved" credential.
               const previous = this.secretValues[valueId];
               await backend.saveCredential("secret", valueId, raw);
@@ -6140,7 +6488,7 @@ export const useOpsStore = defineStore("ops", {
 
         // Persist metadata and non-sensitive companion inputs before advancing
         // the task. This closes the window where a refresh after submission left
-        // a keychain value with no visible row in Sensitive Information.
+        // a vault value with no visible row in Sensitive Information.
         this.persist(true);
         credentialWrite?.release();
 
@@ -6210,7 +6558,7 @@ export const useOpsStore = defineStore("ops", {
         this.credentialError = "";
         request.error = undefined;
         try {
-          // The keychain is the source of truth. Do not expose metadata or an
+          // The encrypted vault is the source of truth. Do not expose metadata or an
           // in-memory value until durable storage has accepted the credential.
           await backend.saveCredential("secret", valueId, value);
         } catch (error) {
@@ -6298,7 +6646,7 @@ export const useOpsStore = defineStore("ops", {
     async saveSecretSettings() {
       await this.hydrateCredentials();
       if (!this.credentialsHydrated) {
-        throw new Error(this.credentialError || "系统凭据尚未完整加载，已取消保存以避免误删钥匙串数据");
+        throw new Error(this.credentialError || "加密凭据尚未完整加载，已取消保存以避免误删已有凭据数据");
       }
       const invalidUsername = this.secretMetadata.find((secret) => secret.credentialRole === "username"
         && secret.credentialKind
@@ -6385,7 +6733,7 @@ export const useOpsStore = defineStore("ops", {
     async saveModelProfile(model: ModelProfile, apiKey: string) {
       if (model.source === "official" || this.models.some(item => item.id === model.id && item.source === "official")) throw new Error("官方连接由账号服务管理");
       validateModelConfiguration(model);
-      // Persist the credential first; a failed keychain write must not commit the draft.
+      // Persist the credential first; a failed vault write must not commit the draft.
       if (apiKey) await backend.saveCredential("model", model.id, apiKey);
       else await backend.deleteCredential("model", model.id);
       const saved = { ...model, hasApiKey: Boolean(apiKey) };

@@ -97,6 +97,7 @@ pub(crate) struct KnowledgeResponse {
 
 #[tauri::command]
 pub(crate) async fn knowledge_request(
+    app: tauri::AppHandle,
     endpoint: String,
     credential_id: String,
     operation: String,
@@ -119,9 +120,9 @@ pub(crate) async fn knowledge_request(
     if operation == "search" {
         validate_search_body(body.as_deref().ok_or("缺少检索正文")?)?;
     }
-    let key = crate::credential::load_credential("knowledge".into(), credential_id)?
+    let key = crate::credential::load_credential(app, "knowledge".into(), credential_id).await?
         .filter(|v| !v.is_empty())
-        .ok_or("知识 API Key 尚未保存到系统钥匙串")?;
+        .ok_or("知识 API Key 尚未保存到本地加密凭据库")?;
     let client = reqwest::Client::builder()
         .redirect(Policy::none())
         .no_proxy()

@@ -1,33 +1,21 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed } from "vue";
 import { ClipboardCheck, Database, LoaderCircle, ShieldAlert } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import type { ExecutionLedgerRecovery, ExecutionLedgerRecoveryAction, ExecutionLedgerRecoveryItem } from "@/features/agent/executionLedgerRecovery";
 
-import { backend } from "@/services/backend";
-const props = defineProps<{ recovery?: ExecutionLedgerRecovery; taskId?: string }>();
-const evidenceText = ref("");
-const visibleReadCount = ref(20);
-const evidenceError = ref("");
-const readingEvidence = ref(false);
-async function readEvidence(evidenceId: string) {
-  if (!props.taskId || readingEvidence.value) return;
-  readingEvidence.value = true; evidenceError.value = ""; evidenceText.value = "";
-  try {
-    const result = await backend.readTaskEvidence(props.taskId, evidenceId, 0, 8000);
-    evidenceText.value = JSON.stringify(result, null, 2);
-  } catch { evidenceError.value = english.value ? "Could not read saved evidence. No remote command was sent." : "暂时无法读取已保存证据，未发送远端命令。"; }
-  finally { readingEvidence.value = false; }
-}
+defineProps<{ recovery?: ExecutionLedgerRecovery; taskId?: string }>();
 const emit = defineEmits<{ action: [action: ExecutionLedgerRecoveryAction, item: ExecutionLedgerRecoveryItem] }>();
 const { locale } = useI18n();
 const english = computed(() => locale.value.startsWith("en"));
-const title = (kind: ExecutionLedgerRecoveryItem["kind"]) => ({
+const title = (item: ExecutionLedgerRecoveryItem) => ({
   uncertain: english.value ? "Execution result needs reconciliation" : "执行结果待核对",
-  recorded_result: english.value ? "Task result needs review" : "任务结果待确认",
+  recorded_result: item.origin === "direct"
+    ? (english.value ? "Operation result needs review" : "操作结果待核对")
+    : (english.value ? "Execution receipt needs review" : "执行回执待复核"),
   storage_failed: english.value ? "Record commit failed" : "记录提交失败",
   incompatible: english.value ? "Record cannot be read safely" : "记录版本待恢复",
-})[kind];
+})[item.kind];
 const actionTitle = (action: ExecutionLedgerRecoveryAction) => ({
   reconcile: english.value ? "Check current state" : "只读核对当前状态",
   verify: english.value ? "Check current state" : "只读核对当前状态",
@@ -37,14 +25,14 @@ const actionTitle = (action: ExecutionLedgerRecoveryAction) => ({
 </script>
 
 <template>
-  <section v-if="recovery && (recovery.items.length || recovery.recordedReads?.length)" class="execution-ledger-recovery" aria-live="polite">
+  <section v-if="recovery && (recovery.items.length || recovery.error)" class="execution-ledger-recovery" aria-live="polite">
     <article v-for="(item, index) in recovery.items" :key="`${item.operationId}:${item.attemptId ?? index}:${item.kind}`"
       class="ledger-recovery-item" :data-recovery-kind="item.kind">
       <div class="ledger-recovery-heading">
         <Database v-if="item.kind === 'storage_failed'" :size="16" />
         <ClipboardCheck v-else-if="item.kind === 'recorded_result'" :size="16" />
         <ShieldAlert v-else :size="16" />
-        <strong>{{ title(item.kind) }}</strong>
+        <strong>{{ title(item) }}</strong>
       </div>
       <p v-if="item.title"><strong>{{ item.title }}</strong></p>
       <p>{{ item.summary }}</p>
@@ -65,23 +53,6 @@ const actionTitle = (action: ExecutionLedgerRecoveryAction) => ({
         {{ actionTitle(item.action) }}
       </button>
     </article>
-    <details v-if="recovery.recordedReads?.length" class="recorded-read-evidence">
-      <summary>{{ english ? `Saved inspection results (${recovery.recordedReads.length})` : `已保存的检查结果（${recovery.recordedReads.length}）` }}</summary>
-      <p>{{ english ? 'Historical observations, not a new check or task acceptance.' : '以下为历史检查证据，采集时间不代表当前状态，也不代表任务目标已完成。' }}</p>
-      <ul>
-        <li v-for="receipt in recovery.recordedReads.slice(-visibleReadCount).reverse()" :key="receipt.attemptId">
-          <strong>{{ receipt.title }}</strong>
-          <span>{{ receipt.status === 'succeeded' ? (english ? 'Result saved' : '结果已保存') : (english ? 'Failed inspection recorded' : '检查失败已记录') }}</span>
-          <time v-if="receipt.recordedAt">{{ new Date(receipt.recordedAt).toLocaleString() }}</time>
-          <span v-if="receipt.late">{{ english ? 'Late result; not applied to current task' : '迟到结果，未推进当前任务' }}</span>
-          <button v-for="id in receipt.evidenceRefs" v-show="taskId" :key="id" type="button" class="button secondary"
-            :disabled="readingEvidence" @click="readEvidence(id)">{{ english ? 'View saved evidence' : '查看已保存证据' }}</button>
-        </li>
-      </ul>
-      <button v-if="recovery.recordedReads.length > visibleReadCount" type="button" class="button secondary" @click="visibleReadCount += 20">{{ english ? 'Show earlier results' : '显示更早的结果' }}</button>
-      <p v-if="evidenceError" role="alert">{{ evidenceError }}</p>
-      <pre v-if="evidenceText" class="saved-evidence-preview">{{ evidenceText }}</pre>
-    </details>
     <p v-if="recovery.error" class="ledger-recovery-error" role="alert">{{ recovery.error }}</p>
   </section>
 </template>
@@ -97,10 +68,4 @@ const actionTitle = (action: ExecutionLedgerRecoveryAction) => ({
 .ledger-attempt-details summary { cursor: pointer; }
 .ledger-attempt-details dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 10px; }
 .ledger-attempt-details dd { margin: 0; overflow-wrap: anywhere; }
-</style>
-
-<style scoped>
-.recorded-read-evidence { font-size: 12px; }
-.recorded-read-evidence li { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
-.saved-evidence-preview { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto; }
 </style>

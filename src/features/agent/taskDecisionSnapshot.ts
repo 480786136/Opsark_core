@@ -1,3 +1,4 @@
+import { resolvedTaskIssue, taskDecisionEvidenceIndex } from "./taskDecisionResolution";
 import { operationsPlanningContext, inspectionDecisionStep } from "./operationsPlanning";
 import { operationsObservation } from "@/features/tools/operationsObservation";
 import { compactReviewText, textFingerprint } from "@/features/agent/longRunningReviewOutput";
@@ -14,7 +15,7 @@ import {
   taskStepEvidenceKey,
   TASK_DECISION_RECENT_PHASE_LIMIT,
 } from "@/features/agent/taskHistoryCheckpoint";
-import { taskRequirementSnapshot } from "@/features/agent/taskGoal";
+import { modelTaskRequirementSnapshot } from "@/features/agent/taskGoal";
 import { modelLogContext } from "./modelLogContext";
 import { currentEvidenceSteps } from "@/features/agent/attemptState";
 import { decisionOutput, decisionOutputProjector, DECISION_EVIDENCE_INSTRUCTION } from "./decisionEvidence";
@@ -185,7 +186,7 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
   const selectedCurrentPlan = selectBoundedSteps(task.plan, CURRENT_PLAN_STEP_LIMIT);
   const selectedCurrentSteps = selectedCurrentPlan
     .filter(step => !incidentStep || taskStepEvidenceKey(step) !== taskStepEvidenceKey(incidentStep));
-  const requirements = taskRequirementSnapshot(task);
+  const requirements = modelTaskRequirementSnapshot(task);
   const rootGoal = requirements.rootGoal;
   const progression = workflowProgress(task);
   const allLedgerSteps = [
@@ -279,6 +280,7 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
     issueId?: string; stepId: string; verifiedByStepId: string; targetContext?: string; evidenceRef?: string;
   }[] = [];
   const issues = (checkpoint?.unresolvedIssues ?? []).filter(issue => {
+    if (resolvedTaskIssue(task, issue)) return false;
     const sourcePhase = [...(task.planHistory ?? []).flatMap(round => round.phases ?? []),
       ...(task.phaseHistory ?? [])].find(phase => phase.id === issue.sourcePhaseId);
     const matches = (sourcePhase?.plan ?? allLedgerSteps).filter(step => step.id === issue.stepId
@@ -347,6 +349,7 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
       } : undefined };
     }),
     unresolvedIssues: expandedIssues.map(issue => ({ ...issue, recoveryContract: undefined, countedAttemptKeys: undefined })),
+    resolvedHistoricalIssues: task.issueResolutions,
     resolvedByRecentEvidence: resolvedByRecentEvidence.length ? resolvedByRecentEvidence : undefined,
     totalUnresolvedIssues: issues.length,
     omittedUnresolvedDetails: issues.length - expandedIssues.length,
@@ -380,6 +383,10 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
     confirmedUserInputs,
     rootGoal,
     taskRequirements: requirements,
+    requirementEvidence: {
+      ...taskDecisionEvidenceIndex(task),
+      instruction: "satisfied 和 issueResolutions 只能引用 availableIds 中的成功验收证据。unknown/unmet 可引用 diagnosticIds 中的同目标诊断，失败不代表完成。untrustedDiagnosticIds 是缺少持久归属核实的失败记录，只能用于 unknown 并提出同目标只读检查，不能证明失败原因、完成、允许重试或解除执行阻断。所有引用仍需核对事实和采集时间；无可用证据可使用空 evidenceIds 并补充只读检查。",
+    },
     task: {
       title: compactReviewText(task.title, 180),
       status: task.status,

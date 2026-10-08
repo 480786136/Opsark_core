@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import { backend, ModelInvocationError, modelServiceError } from "./backend";
+import { backend, ModelInvocationError, modelServiceError, modelServiceErrorMessage } from "./backend";
 import type { ModelServiceError } from "@/types";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -13,9 +13,56 @@ beforeEach(() => Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {
 afterEach(() => { Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); vi.resetAllMocks(); });
 
 describe("local model contract failures", () => {
+  it.each(["MODEL_RECOVERY_SCOPE_REJECTED", "MODEL_FORMAT_INVALID"])("shows the policy reason for new and saved scope refusals: %s", async code => {
+    const modelError: ModelServiceError = { code, origin: "core", stage: "format_repair_scope", retryable: false,
+      httpStatus: 200, jsonPointer: "/steps/1/action/command", message: "untrusted private command or provider prose" };
+    vi.mocked(invoke).mockRejectedValueOnce(`OPSARK_MODEL_TRACE_V1:${JSON.stringify({ message: "old format failure", modelError })}`);
+    const error = await backend.decideNextStage("核对防火墙", runtime).catch(error => error);
+    expect(error).toBeInstanceOf(ModelInvocationError);
+    expect(error.modelError).toEqual(modelError);
+    expect(error.message).toContain("恢复方案未通过只读安全校验");
+    expect(error.message).toContain("第 2 个步骤的 Shell 命令");
+    expect(error.message).toContain("无法被当前规则确认只读");
+    expect(error.message).toContain("该方案未执行");
+    expect(error.message).not.toContain("格式修复失败");
+    expect(error.message).not.toContain("格式修复未成功");
+    expect(error.message).not.toContain("untrusted private");
+    expect(invoke).toHaveBeenCalledOnce();
+  });
+
+  it("recognizes a saved step-only scope diagnostic without guessing a command failure", () => {
+    const error = new ModelInvocationError("saved format failure", undefined, { code: "MODEL_FORMAT_INVALID", origin: "core",
+      stage: "format_repair_scope", jsonPointer: "/steps/1", message: "old text", retryable: false });
+    expect(error.message).toContain("第 2 个步骤未满足此轮只读取证限制");
+    expect(error.message).not.toContain("Shell 命令");
+  });
+
+  it("keeps unknown paths and provider prose out of the policy refusal message", () => {
+    const message = modelServiceErrorMessage({ code: "MODEL_RECOVERY_SCOPE_REJECTED", origin: "core",
+      stage: "format_repair_scope", jsonPointer: "/steps/0/private-secret", message: "private-secret", retryable: false });
+    expect(message).toContain("恢复方案未满足此轮只读取证限制");
+    expect(message).not.toContain("private-secret");
+  });
+
+  it("shows the scoped requirement field without exposing model content", () => {
+    const message = modelServiceErrorMessage({ code: "MODEL_FORMAT_INVALID", retryable: false,
+      message: "private model text", stage: "business_validation",
+      jsonPointer: "/requirementReview/focusOutcome", keyword: "enum" });
+    expect(message).toContain("/requirementReview/focusOutcome");
+    expect(message).not.toContain("private model text");
+  });
   const coreFailure = { code: "MODEL_SCHEMA_UNSUPPORTED", message: "unsupported schema keyword", retryable: false,
     origin: "core" as const, stage: "schema_compile", jsonPointer: "/properties/action", schemaPath: "/properties/action/allOf",
     keyword: "allOf", operation: "plan", contractVersion: "1" };
+
+  it("explains the rejected extra field without suggesting a larger output budget", () => {
+    const message = modelServiceErrorMessage({ code: "MODEL_FORMAT_INVALID", retryable: false,
+      message: "raw commands should stay private", stage: "business_validation",
+      jsonPointer: "/steps/0/action/timeoutSeconds", keyword: "additionalProperties" });
+    expect(message).toContain("/steps/0/action/timeoutSeconds不允许");
+    expect(message).not.toContain("输出预算");
+    expect(message).not.toContain("raw commands");
+  });
 
   it.each(["MODEL_SCHEMA_INVALID", "MODEL_SCHEMA_UNSUPPORTED"])("retains %s before HTTP dispatch without inventing a status or another model call", async (code) => {
     const modelError = { ...coreFailure, code };
@@ -40,7 +87,7 @@ describe("local model contract failures", () => {
     const error = await backend.reviewGoal("检查服务器", "{}", runtime).catch(error => error);
     expect(error).toBeInstanceOf(ModelInvocationError);
     expect(error.modelError).toEqual(modelError);
-    expect(error.message).toContain("同一条件下不会重复请求模型");
+    expect(error.message).toContain("已停止自动重试");
     expect(invoke).toHaveBeenCalledOnce();
   });
 
@@ -225,7 +272,7 @@ describe("provider credit failures", () => {
     const error = await backend.reviewStep("检查服务器", "{}", true, runtime).catch(error => error);
     expect(error).toBeInstanceOf(ModelInvocationError);
     expect(error.modelError?.code).toBe(code);
-    expect(error.message).toContain("同一条件下不会重复请求模型");
+    expect(error.message).toContain(code === "MODEL_FORMAT_INVALID" ? "已停止自动重试" : "同一条件下不会重复请求模型");
     expect(error.message).not.toContain("稍后重试");
     expect(invoke).toHaveBeenCalledOnce();
   });

@@ -4,6 +4,7 @@ import { runToolStepLifecycle } from "@/features/agent/toolStepLifecycle";
 import type { PlanStep } from "@/types";
 import type { ToolCall } from "@/features/tools/types";
 import { ExecutionLedgerError, type ExecutionLedgerStage } from "@/services/executionLedger";
+import { normalizeOperationsRequest } from "@/features/tools/operationsInspection";
 
 const call: ToolCall = {
   id: "call-1",
@@ -25,6 +26,22 @@ function step(): PlanStep {
 }
 
 describe("tool step lifecycle", () => {
+  it("preserves unsupported inspection evidence and requests replanning instead of advancing or retrying the tool", async () => {
+    const currentStep = step();
+    const diskCall = { id: "disk-call", toolId: "disk.inspect", arguments: normalizeOperationsRequest("disk.inspect", { path: "/" }) };
+    const execute = vi.fn().mockResolvedValue({ callId: diskCall.id, toolId: diskCall.toolId, success: true,
+      data: { request: diskCall.arguments, status: "unsupported", items: [], scannedEntries: 0, matchedEntries: 0,
+        skippedCount: 1, skipped: [{ path: "python3>=3.8 (actual 3.6.8)", reason: "unsupported" }],
+        coverageComplete: false, truncated: true, elapsedMs: 0, finishedAt: "now" } });
+    const result = await runToolStepLifecycle({ step: currentStep, call: diskCall, execute,
+      createEvidenceId: () => "unsupported-proof", now: () => "2026-09-30T00:00:00Z", isCancelled: () => false, onStart: vi.fn() });
+    expect(execute).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ cancelled: false, taskStatus: "needs_adjustment", shouldAdvance: false });
+    expect(currentStep.status).toBe("failed");
+    expect(currentStep.result).toMatchObject({ executionStatus: "success", facts: { inspectionStatus: "unsupported", evidenceComplete: false } });
+    expect(currentStep.review).toMatchObject({ decision: "adjust", acceptance: { status: "unknown" }, recoveryAction: { kind: "replan" } });
+    expect(currentStep.evidence?.[0].id).toBe("unsupported-proof");
+  });
   it("does not start a tool for an already cancelled task", async () => {
     const currentStep = step();
     const execute = vi.fn();

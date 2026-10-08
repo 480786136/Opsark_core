@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ExecutionIntentSnapshot } from "@/types";
+import type { ExecutionIntentSnapshot, PlanStep } from "@/types";
 import { executionDigest, canonicalExecutionJson } from "@/features/agent/planPreparation";
 import { backend } from "./backend";
 
@@ -18,12 +18,66 @@ export interface ExecutionAttemptRecord {
   status: Exclude<ExecutionState, "prepared">; bootId: string; cancelRequested: boolean;
   late: boolean; startedAt: number; completedAt?: number; outcome?: ExecutionOutcome;
   projectionAppliedAt?: number; reviewCompletedAt?: number;
+  reviews?: ExecutionAttemptReviewReceipt[];
+}
+/** A completed step review is not a claim that its acceptance conditions passed.
+ * Task follow-up transfers presentation ownership to the original task, never
+ * reconciles an uncertain remote effect or changes the recorded execution. */
+export interface ExecutionAttemptReviewInput {
+  version: 1; operationId: string; attemptId: string; intentDigest: string;
+  outcome: "proven" | "not_met" | "unknown";
+  disposition: "accepted" | "task_followup";
+  evidenceRefs: string[]; reviewFingerprint: string;
+}
+export interface ExecutionAttemptReviewReceipt extends ExecutionAttemptReviewInput { recordedAt: number }
+
+export function executionAttemptReviewMatches(operation: ExecutionOperationRecord, attempt: ExecutionAttemptRecord,
+  review: ExecutionAttemptReviewInput): boolean {
+  const refs = attempt.outcome?.evidenceRefs;
+  return review?.version === 1 && review.operationId === operation.operationId && review.attemptId === attempt.id
+    && review.intentDigest === operation.intentDigest && ["succeeded", "failed"].includes(attempt.status)
+    && ["proven", "not_met", "unknown"].includes(review.outcome)
+    && (review.disposition === "accepted" ? review.outcome === "proven" : review.disposition === "task_followup" && review.outcome !== "proven")
+    && typeof review.reviewFingerprint === "string" && /^sha256:[a-f0-9]{64}$/.test(review.reviewFingerprint)
+    && Array.isArray(review.evidenceRefs) && !!refs?.length && review.evidenceRefs.length === refs.length
+    && new Set(review.evidenceRefs).size === refs.length && review.evidenceRefs.every(ref => refs.includes(ref));
 }
 export interface ExecutionOperationRecord extends ExecutionOperationInput {
   state: ExecutionState; attempts: ExecutionAttemptRecord[]; cancelRequested: boolean;
   createdAt: number; updatedAt: number;
   reconciliation?: { version: 1; status: "completed"; reason: "current_state_verified"; attemptId: string; readOperationId: string; readOperationIds: string[];
     evidenceRefs: string[]; kind: "file_transfer" | "service"; resolvedAt: number };
+}
+/** Restore only an actual, attempt-bound step review; summaries and task status
+ * are intentionally insufficient. Historical steps with compacted-away reviews
+ * stay unreviewed rather than inventing a successful acceptance. */
+export function deriveExecutionAttemptReview(operation: ExecutionOperationRecord, attempt: ExecutionAttemptRecord,
+  step: PlanStep): ExecutionAttemptReviewInput | undefined {
+  const review = step.review, acceptance = review?.acceptance;
+  const latestReference = [...(step.executionLedgerAttempts ?? [])].reverse().find(ref => ref.phase === operation.phase);
+  if (!review || !acceptance || !step.result || typeof acceptance.reason !== "string" || !acceptance.reason.trim()
+    || !Array.isArray(acceptance.evidenceIds)
+    || operation.stepId !== step.id || step.executionIntent?.digest !== operation.intentDigest
+    || step.executionIntent.semantic.taskId !== operation.taskId
+    || attempt.operationId !== operation.operationId || attempt.late || attempt.cancelRequested || operation.cancelRequested
+    || !["succeeded", "failed"].includes(attempt.status) || !attempt.outcome?.evidenceRefs.length
+    || !step.ledgerAppliedAttemptIds?.includes(attempt.id)
+    || latestReference?.operationId !== operation.operationId || latestReference.attemptId !== attempt.id
+    || latestReference.executionId !== attempt.executionId) return undefined;
+  const availableEvidence = new Set([...(step.result.evidenceIds ?? []), ...(step.evidence ?? []).map(item => item.id)]);
+  if (acceptance.evidenceIds.some(id => !availableEvidence.has(id))) return undefined;
+  const accepted = acceptance.status === "proven" && step.status === "completed" && acceptance.evidenceIds.length > 0;
+  const followingUp = acceptance.status !== "proven" && step.status === "failed"
+    && (review.decision === "adjust" || review.decision === "continue" && review.recoveryAction?.kind === "continue_independent")
+    && typeof review.recoveryAction?.reason === "string" && !!review.recoveryAction.reason.trim()
+    && ["continue_independent", "repair", "retry", "replan", "request_input"].includes(review.recoveryAction.kind);
+  if (!accepted && !followingUp) return undefined;
+  const input: ExecutionAttemptReviewInput = { version: 1, operationId: operation.operationId, attemptId: attempt.id,
+    intentDigest: operation.intentDigest, outcome: acceptance.status, disposition: accepted ? "accepted" : "task_followup",
+    evidenceRefs: [...attempt.outcome.evidenceRefs],
+    reviewFingerprint: executionDigest({ version: "step-review@1", intentDigest: operation.intentDigest, review,
+      evidenceIds: [...availableEvidence].sort() }) };
+  return executionAttemptReviewMatches(operation, attempt, input) ? input : undefined;
 }
 export interface CompleteExecutionAttempt {
   operationId: string; attemptId: string; eventId: string; outcome: ExecutionOutcome; late?: boolean;
@@ -37,7 +91,7 @@ export interface ExecutionLedgerRepository {
   complete(receipt: CompleteExecutionAttempt): Promise<ExecutionAttemptRecord>;
   cancel(operationId: string, attemptId?: string): Promise<ExecutionOperationRecord>;
   list(taskId?: string): Promise<ExecutionOperationRecord[]>;
-  acknowledge(operationId: string, attemptId: string, reviewed: boolean): Promise<ExecutionAttemptRecord>;
+  acknowledge(operationId: string, attemptId: string, reviewed: boolean, review?: ExecutionAttemptReviewInput): Promise<ExecutionAttemptRecord>;
   resolve(operationId: string, attemptId: string, proof: ExecutionReconciliationProof): Promise<ExecutionOperationRecord>;
 }
 export type ExecutionLedgerStage = "prepare" | "begin" | "execution" | "result_commit" | "stale_result" | "list" | "cancel";
@@ -92,7 +146,7 @@ export function createNativeExecutionLedgerRepository(): ExecutionLedgerReposito
     complete: receipt => call("complete_execution_attempt", { ...receipt }),
     cancel: (operationId, attemptId) => call("request_execution_cancel", { operationId, attemptId }),
     list: taskId => call("list_execution_operations", { taskId }),
-    acknowledge: (operationId, attemptId, reviewed) => call("acknowledge_execution_attempt", { operationId, attemptId, reviewed }),
+    acknowledge: (operationId, attemptId, reviewed, review) => call("acknowledge_execution_attempt", { operationId, attemptId, reviewed, review }),
     resolve: (operationId, attemptId, proof) => call("resolve_execution_operation", { operationId, attemptId, proof }),
   };
 }
@@ -108,6 +162,7 @@ export function createMemoryExecutionLedgerRepository(): ExecutionLedgerReposito
         || input.intentDigest !== executionDigest({ version: "execution-intent@1", semantic: input.intent.semantic })
         || input.intent.digest !== input.intentDigest || input.intent.semantic.taskId !== input.taskId
         || input.intent.semantic.stepId !== input.stepId || input.intent.semantic.effect !== input.effect) fail("INTENT_INVALID");
+      if (credentialField(input.intent)) fail("SECRET_VALUE");
       const old = records.get(input.operationId);
       if (old) {
         const fields: (keyof ExecutionOperationInput)[] = ["version", "operationId", "taskId", "stepId", "roundId", "workflowEpoch",
@@ -154,13 +209,18 @@ export function createMemoryExecutionLedgerRepository(): ExecutionLedgerReposito
       operation.updatedAt = Date.now(); return copy(operation);
     },
     async list(taskId) { return copy([...records.values()].filter(value => !taskId || value.taskId === taskId)); },
-    async acknowledge(operationId, attemptId, reviewed) {
+    async acknowledge(operationId, attemptId, reviewed, review) {
       const operation = records.get(operationId) ?? fail("NOT_FOUND");
       const attempt = operation.attempts.find(a => a.id === attemptId) ?? fail("ATTEMPT_MISMATCH");
       if (!["succeeded", "failed", "not_dispatched"].includes(attempt.status) || !attempt.outcome || attempt.late
         || reviewed && attempt.status !== "succeeded") fail("ACKNOWLEDGEMENT_INVALID");
+      if (review && (attempt.cancelRequested || operation.cancelRequested
+        || !executionAttemptReviewMatches(operation, attempt, review))) fail("REVIEW_INVALID");
+      const previous = review && attempt.reviews?.find(item => item.reviewFingerprint === review.reviewFingerprint);
+      if (previous && canonicalExecutionJson({ ...previous, recordedAt: undefined }) !== canonicalExecutionJson(review)) fail("REVIEW_CONFLICT");
       attempt.projectionAppliedAt ??= Date.now();
       if (reviewed) attempt.reviewCompletedAt ??= Date.now();
+      if (review && !previous) (attempt.reviews ??= []).push({ ...copy(review), recordedAt: Date.now() });
       return copy(attempt);
     },
     async resolve(operationId, attemptId, proof) {
@@ -234,6 +294,23 @@ export function resetExecutionLedgerForTests() {
 /** Only the exact physical execution ID can reuse admission at a nested backend boundary. */
 export function isRecordedExecution(executionId: string): boolean { return activeExecutions.has(executionId); }
 
+// Field semantics, not coincidence with a saved password, determine whether
+// credentials entered a durable snapshot. Keep this list aligned with Rust.
+const CREDENTIAL_FIELDS = new Set(["password", "passwd", "passphrase", "apikey", "accesstoken", "refreshtoken",
+  "authorization", "privatekey", "clientsecret", "secret"]);
+const isCredentialField = (key: string) => CREDENTIAL_FIELDS.has(key.toLowerCase().replace(/[_-]/g, ""));
+function credentialField(value: unknown, path = ""): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  for (const [key, item] of Object.entries(value)) {
+    const location = `${path}/${key.replace(/~/g, "~0").replace(/\//g, "~1")}`;
+    if (!Array.isArray(value) && isCredentialField(key)
+      && item !== null && item !== undefined && item !== "" && item !== "[REDACTED]") return location;
+    const nested = credentialField(item, location);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
 /** Redact strings before serializing so quotes/newlines in a secret cannot defeat replacement. */
 export function redactExecutionValue(value: unknown, redact: (text: string) => string = value => value, seen = new WeakSet<object>()): unknown {
   if (typeof value === "string") return redact(value);
@@ -246,7 +323,7 @@ export function redactExecutionValue(value: unknown, redact: (text: string) => s
     if (value instanceof Error) return { name: value.name, message: redact(value.message) };
     if (Array.isArray(value)) return value.map(item => redactExecutionValue(item, redact, seen));
     return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined).map(([key, item]) => [key,
-      /^(password|passphrase|api[_-]?key|access[_-]?token|authorization|private[_-]?key|secret)$/i.test(key)
+      isCredentialField(key)
         ? "[REDACTED]" : redactExecutionValue(item, redact, seen)]));
   }
   return value ?? null;
@@ -268,6 +345,7 @@ export interface RecordedExecutionOptions<T> {
   isCurrent?: () => boolean; execute: () => Promise<T>;
   classifyResult?: (result: T) => ExecutionOutcomeStatus;
   classifyError?: (error: unknown) => "failed" | "unknown" | "not_dispatched";
+  /** Output/evidence redaction only. Never rewrites or gates approved intent. */
   redact?: (text: string) => string; evidenceWriter?: EvidenceWriter;
   onAttempt?: (operation: ExecutionOperationRecord, attempt: ExecutionAttemptRecord) => void;
   onCommitted?: (operationId: string, attemptId: string, outcome: ExecutionOutcome) => void;
@@ -312,8 +390,10 @@ export async function runRecordedExecution<T>(inputOptions: RecordedExecutionOpt
     throw new ExecutionLedgerError("执行快照摘要或效果与派发不一致，尚未发送命令", "prepare", false, operationId);
   }
   const resources = options.resourceKeys ?? executionResourceKeys(intent);
-  if (canonicalExecutionJson(redactExecutionValue(intent, options.redact)) !== canonicalExecutionJson(intent)) {
-    throw new ExecutionLedgerError("已批准的执行快照包含未替换的敏感值，请重新准备凭据引用；尚未发送命令", "prepare", false, operationId);
+  const credential = credentialField(intent);
+  if (credential) {
+    throw new ExecutionLedgerError(`执行快照字段 ${credential} 不能保存凭据值，请改用凭据引用；尚未发送命令`,
+      "prepare", false, operationId, undefined, undefined, new Error("EXECUTION_LEDGER_SECRET_VALUE"));
   }
   const input: ExecutionOperationInput = { version: 1, operationId, taskId: options.task.id, stepId: options.step.id,
     roundId: options.task.currentRoundId, workflowEpoch: options.task.workflowEpoch ?? 0,
@@ -423,6 +503,7 @@ export async function resolveExecutionOperation(owner: object, operationId: stri
 }
 
 /** Persist UI acknowledgement independently of the bounded task cache. Never unlocks remote effects. */
-export async function acknowledgeExecutionAttempt(owner: object, operationId: string, attemptId: string, reviewed: boolean) {
-  return scope(owner).repository.acknowledge(operationId, attemptId, reviewed);
+export async function acknowledgeExecutionAttempt(owner: object, operationId: string, attemptId: string, reviewed: boolean,
+  review?: ExecutionAttemptReviewInput) {
+  return scope(owner).repository.acknowledge(operationId, attemptId, reviewed, review);
 }

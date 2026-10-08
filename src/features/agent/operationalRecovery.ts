@@ -8,6 +8,7 @@ import { redactDecisionText } from "./decisionEvidence";
 import { isMutatingStepCommand } from "@/services/validation";
 import { gitAuthenticationRetryBlocker, gitAuthenticationFailure, repeatedAuthenticationInputBlocker } from "./authenticationRetry";
 import { gitAuthenticationOperation } from "./interactiveSshCredential";
+import { failedToolRetryBlocker, toolFallbackContext } from "./toolFallback";
 
 export class OperationalRecoveryError extends ExecutionPolicyError {}
 const pending = (step: PlanStep) => ["pending", "awaiting_approval"].includes(step.status);
@@ -75,6 +76,8 @@ export function retryBlocker(task: OpsTask, candidate: PlanStep): string | undef
   const authenticationBlocker = repeatedAuthenticationInputBlocker(task, candidate, ledger)
     ?? gitAuthenticationRetryBlocker(task, candidate, ledger);
   if (authenticationBlocker) return authenticationBlocker;
+  const failedTool = failedToolRetryBlocker(task, candidate, ledger);
+  if (failedTool) return failedTool;
   if (!changed(candidate)) return;
   const previous = [...ledger].reverse().find(step => step.id !== candidate.id && changed(step)
     && signature(step) === signature(candidate) && ["failed", "completed"].includes(step.status)
@@ -132,6 +135,12 @@ export function reconciliationBlocker(task: OpsTask, step: PlanStep) {
   return "原变更的执行结果尚未核对。请先只读检查原进程及实际产物/副作用，再决定是否重试；连接恢复不等于命令未执行。";
 }
 
+function reconciliationReads(task: OpsTask) {
+  const incident = task.executionReconciliation;
+  return incident ? recoveryHistory(task).filter(step => !incident.knownStepIds.includes(step.id)
+    && sameTarget(task, step) && !changed(step) && successful(step)) : [];
+}
+
 export function validateReconciliation(task: OpsTask, proposed?: NextStageDecision["reconciliation"]) {
   const incident = task.executionReconciliation;
   if (!proposed) return undefined;
@@ -139,8 +148,7 @@ export function validateReconciliation(task: OpsTask, proposed?: NextStageDecisi
     || incident.serverId !== (task.executionTargetServerId ?? task.serverId)
     || !["safe_to_retry", "completed", "still_running", "unknown"].includes(proposed.status)
     || !Array.isArray(proposed.evidenceIds)) throw new OperationalRecoveryError("核对结论不属于当前执行事故或目标，原变更仍禁止重放。");
-  const freshReads = recoveryHistory(task).filter(step => !incident.knownStepIds.includes(step.id)
-    && sameTarget(task, step) && !changed(step) && successful(step));
+  const freshReads = reconciliationReads(task);
   const ids = new Set(freshReads.flatMap(step => step.evidence?.map(item => item.id) ?? []));
   if (!proposed.evidenceIds.length || !proposed.evidenceIds.every(id => ids.has(id))) {
     throw new OperationalRecoveryError("执行核对必须引用事故发生后、同一服务器的真实只读证据，不能引用旧输出或猜测完成。");
@@ -183,6 +191,7 @@ export function operationalRecoveryContext(task: OpsTask) {
   });
   return {
     planFingerprint: currentPlanFingerprint(task),
+    toolFallback: toolFallbackContext(task, ledger),
     durableExecutionRecovery: task.executionLedgerRecovery?.items.map(item => ({
       operationId: item.operationId, attemptId: item.attemptId, stepId: item.stepId, kind: item.kind,
       summary: redactDecisionText(item.summary).slice(0, 800),
@@ -199,6 +208,9 @@ export function operationalRecoveryContext(task: OpsTask) {
     uncertainExecution: task.executionReconciliation ? {
       ...task.executionReconciliation, knownStepIds: undefined,
       command: redactDecisionText(task.executionReconciliation.command).slice(0, 1200),
+      availableEvidenceIds: reconciliationReads(task).flatMap(step => step.evidence?.map(item => item.id) ?? []),
+      nextAction: task.executionReconciliation.resolution ? "resolved" : "reconcile_before_change",
+      instruction: "核对结论必须在顶层 reconciliation 返回，不能只在 reason/summary 中描述。availableEvidenceIds 只表示引用可被校验，不代表证据已足够解除阻断；阅读原始证据，分别确认原进程状态和实际产物/副作用，不足时只补缺失的只读检查。进程检查应使用真实 PID/进程身份，命令全文匹配可能命中检查器自身，不能据此认定业务仍在运行。",
     } : undefined,
     retryPrerequisiteInstruction: "若本次计划先修复/检查再重试，可在 retryBasis 添加 afterStepIndex（本次 steps 内从 1 开始的前序步骤索引），evidenceIds 可空。执行器会绑定真实步骤 ID，并在该步骤实际成功验收后读取新证据；不是仅凭计划描述放行。",
     recentAttempts: ledger.filter(step => step.result).slice(-8).map(step => ({

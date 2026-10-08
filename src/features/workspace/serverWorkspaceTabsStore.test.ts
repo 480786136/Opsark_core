@@ -2,6 +2,7 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
+import { useAgentWorkspaceStore } from "@/features/agent/agentWorkspaceStore";
 import {
   LEGACY_STORAGE_KEY, LOCAL_WORKSPACE_ID, MAX_OPEN_SERVER_WINDOWS, STORAGE_KEY,
   useServerWorkspaceTabsStore,
@@ -48,6 +49,24 @@ describe("serverWorkspaceTabsStore", () => {
     expect(restored.activeTabId).toBe("a");
     expect(restored.activate("missing")).toBe(false);
     expect(restored.activeTabId).toBe("a");
+  });
+
+  it("retains an open conversation across reload and resets only its closed workspace", () => {
+    const tabs = restore();
+    tabs.open("a"); tabs.open("b");
+    const agents = useAgentWorkspaceStore();
+    agents.updateServer("a", { activeTaskId: "task-a", draft: "A draft", modelId: "model-a", automationEnabled: true });
+    agents.updateServer("b", { activeTaskId: "task-b", draft: "B draft" });
+    agents.persist(true);
+    const restored = restore();
+    restored.open("a");
+    const restoredAgents = useAgentWorkspaceStore();
+    expect(restoredAgents.ensureServer("a")).toMatchObject({ activeTaskId: "task-a", draft: "A draft" });
+    restored.close("a");
+    expect(restoredAgents.ensureServer("b")).toMatchObject({ activeTaskId: "task-b", draft: "B draft" });
+    restored.open("a");
+    expect(restoredAgents.ensureServer("a")).toMatchObject({ activeTaskId: "", draft: "", showTasks: false,
+      modelId: "model-a", automationEnabled: true });
   });
 
   it("selects the right neighbor, then the left, regardless of tab kind", () => {

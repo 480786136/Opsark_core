@@ -1,4 +1,5 @@
 import type { PlanStep, RiskLevel } from "@/types";
+import { isReadOnlyFirewallScript } from "@/services/recoveryRules";
 
 export type ChangeOperation =
   | "package_install"
@@ -18,7 +19,8 @@ export function classifyChangeOperations(command: string): ChangeOperation[] {
   if (/\bsystemctl\s+(?:disable|mask)\b/i.test(command)) operations.add("service_disable");
   else if (/\bsystemctl\s+(?:start|stop|restart|reload)\b/i.test(command)) operations.add("service_change");
   if (/\brm\s|\bdocker\s+rm\b|\bkubectl\s+delete\b/i.test(command)) operations.add("resource_delete");
-  if (/\b(?:iptables|nft|ufw|firewall-cmd)\b/i.test(command)) operations.add("network_policy_change");
+  if (/\b(?:iptables|nft|ufw)\b/i.test(command)
+    || (/\bfirewall-cmd\b/i.test(command) && !isReadOnlyFirewallScript(command))) operations.add("network_policy_change");
   if (/\bsed\s+-i\b|\btruncate\b|\btee\b|(?:^|[;\n])[^\n]*>\s*\/?[^&]/i.test(command)) operations.add("file_replace");
   return [...operations];
 }

@@ -237,7 +237,7 @@ describe("step review pipeline", () => {
     if (result.cancelled) throw new Error("review unexpectedly cancelled");
     expect(result.coordination.shouldAdvance).toBe(true);
     expect(validating.status).toBe("completed");
-    expect(remaining.status).toBe("skipped");
+    expect(remaining.status).toBe("pending");
   });
 
   it("does not apply an asynchronous review after cancellation", async () => {

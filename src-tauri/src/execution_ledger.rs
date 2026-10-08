@@ -85,6 +85,25 @@ pub(crate) struct Outcome {
     pub evidence_refs: Vec<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AttemptReviewInput {
+    pub version: u32,
+    pub operation_id: String,
+    pub attempt_id: String,
+    pub intent_digest: String,
+    pub outcome: String,
+    pub disposition: String,
+    pub evidence_refs: Vec<String>,
+    pub review_fingerprint: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AttemptReviewReceipt {
+    #[serde(flatten)]
+    pub review: AttemptReviewInput,
+    pub recorded_at: u64,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Attempt {
     pub version: u32,
@@ -105,6 +124,8 @@ pub(crate) struct Attempt {
     pub projection_applied_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_completed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviews: Vec<AttemptReviewReceipt>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -141,28 +162,27 @@ fn validate_id(id: &str) -> Result<(), String> {
     }
     Ok(())
 }
-fn contains_raw_secret(value: &Value) -> bool {
+// Matches the frontend's explicit credential fields; never searches arbitrary
+// IDs, paths, command text or public account names for password substrings.
+fn credential_field(value: &Value, path: &str) -> Option<String> {
     match value {
-        Value::Object(map) => map.iter().any(|(key, value)| {
-            let sensitive = matches!(
-                key.to_ascii_lowercase().as_str(),
-                "password"
-                    | "apikey"
-                    | "api_key"
-                    | "accesstoken"
-                    | "access_token"
-                    | "privatekey"
-                    | "private_key"
-            );
-            (sensitive
-                && !value.is_null()
-                && value.as_str() != Some("")
-                && value.as_str() != Some("[REDACTED]"))
-                || contains_raw_secret(value)
+        Value::Object(map) => map.iter().find_map(|(key, value)| {
+            let normalized = key.to_ascii_lowercase().replace(['_', '-'], "");
+            let sensitive = matches!(normalized.as_str(),
+                "password" | "passwd" | "passphrase" | "apikey" | "accesstoken"
+                | "refreshtoken" | "authorization" | "privatekey" | "clientsecret" | "secret");
+            let location = format!("{path}/{}", key.replace('~', "~0").replace('/', "~1"));
+            if sensitive && !value.is_null() && value.as_str() != Some("") && value.as_str() != Some("[REDACTED]") {
+                Some(location)
+            } else { credential_field(value, &location) }
         }),
-        Value::Array(values) => values.iter().any(contains_raw_secret),
-        _ => false,
+        Value::Array(values) => values.iter().enumerate()
+            .find_map(|(index, value)| credential_field(value, &format!("{path}/{index}"))),
+        _ => None,
     }
+}
+fn contains_raw_secret(value: &Value) -> bool {
+    credential_field(value, "").is_some()
 }
 fn validate_record(record: &PreparedOperation) -> Result<(), String> {
     if record.version != VERSION
@@ -264,10 +284,10 @@ fn validate_record(record: &PreparedOperation) -> Result<(), String> {
             "resource keys do not match frozen execution targets",
         ));
     }
-    if contains_raw_secret(&record.intent) {
+    if let Some(field) = credential_field(&record.intent, "") {
         return Err(error(
             "SECRET_VALUE",
-            "store credential references, never raw credentials",
+            &format!("credential field {field}: store credential references, never raw credentials"),
         ));
     }
     if serde_json::to_vec(record).map_err(storage)?.len() > 1_048_576 {
@@ -563,6 +583,7 @@ impl Ledger {
             outcome: None,
             projection_applied_at: None,
             review_completed_at: None,
+            reviews: Vec::new(),
         };
         tx.execute("INSERT INTO attempts(id,operation_id,record,status,boot_id) VALUES (?1,?2,?3,'dispatching',?4)", params![attempt.id, operation_id, json(&attempt)?, self.boot]).map_err(storage)?;
         tx.execute(
@@ -685,20 +706,53 @@ impl Ledger {
 
     /// Acknowledgement never changes outcomes, reconciliation or resource locks.
     pub(crate) fn acknowledge(&mut self, operation_id: &str, attempt_id: &str, reviewed: bool) -> Result<Attempt, String> {
+        self.acknowledge_with_review(operation_id, attempt_id, reviewed, None)
+    }
+
+    pub(crate) fn acknowledge_with_review(&mut self, operation_id: &str, attempt_id: &str, reviewed: bool,
+        review: Option<AttemptReviewInput>) -> Result<Attempt, String> {
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(storage)?;
         let operation = read_operation(&tx, operation_id)?.ok_or_else(|| error("NOT_FOUND", "operation not found"))?;
-        let mut attempt = operation.attempts.into_iter().find(|a| a.id == attempt_id)
+        let mut attempt = operation.attempts.iter().find(|a| a.id == attempt_id).cloned()
             .ok_or_else(|| error("ATTEMPT_MISMATCH", "attempt does not belong to operation"))?;
         if !matches!(attempt.status, Status::Succeeded | Status::Failed | Status::NotDispatched)
             || attempt.outcome.is_none() || attempt.late
             || reviewed && attempt.status != Status::Succeeded {
             return Err(error("ACKNOWLEDGEMENT_INVALID", "only an owned terminal receipt may be acknowledged"));
         }
+        if let Some(review) = &review {
+            let refs = &attempt.outcome.as_ref().expect("checked terminal receipt").evidence_refs;
+            let fingerprint = review.review_fingerprint.strip_prefix("sha256:").unwrap_or("");
+            let disposition_valid = match review.disposition.as_str() {
+                "accepted" => review.outcome == "proven",
+                "task_followup" => matches!(review.outcome.as_str(), "not_met" | "unknown"),
+                _ => false,
+            };
+            if review.version != 1 || review.operation_id != operation_id || review.attempt_id != attempt_id
+                || review.intent_digest != operation.record.intent_digest
+                || !matches!(attempt.status, Status::Succeeded | Status::Failed)
+                || operation.cancel_requested || attempt.cancel_requested || !disposition_valid
+                || fingerprint.len() != 64 || !fingerprint.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || refs.is_empty() || review.evidence_refs.len() != refs.len()
+                || review.evidence_refs.iter().collect::<std::collections::HashSet<_>>().len() != refs.len()
+                || review.evidence_refs.iter().any(|id| !refs.contains(id)) {
+                return Err(error("REVIEW_INVALID", "review must reference the exact owned terminal attempt, intent and evidence"));
+            }
+            if let Some(previous) = attempt.reviews.iter().find(|item| item.review.review_fingerprint == review.review_fingerprint) {
+                if previous.review != *review { return Err(error("REVIEW_CONFLICT", "a review fingerprint cannot replace a recorded decision")); }
+            } else {
+                attempt.reviews.push(AttemptReviewReceipt { review: review.clone(), recorded_at: now() });
+            }
+        }
         attempt.projection_applied_at.get_or_insert_with(now);
         if reviewed { attempt.review_completed_at.get_or_insert_with(now); }
         write_attempt(&tx, &attempt)?;
         tx.execute("INSERT OR IGNORE INTO events(id,operation_id,attempt_id,kind,payload,created_at) VALUES (?1,?2,?3,'receipt_acknowledged',?4,?5)",
             params![format!("ack:{attempt_id}:{reviewed}"), operation_id, attempt_id, json(&attempt)?, now()]).map_err(storage)?;
+        if let Some(review) = &review {
+            tx.execute("INSERT OR IGNORE INTO events(id,operation_id,attempt_id,kind,payload,created_at) VALUES (?1,?2,?3,'step_review_completed',?4,?5)",
+                params![format!("review:{attempt_id}:{}", review.review_fingerprint), operation_id, attempt_id, json(review)?, now()]).map_err(storage)?;
+        }
         tx.commit().map_err(storage)?;
         Ok(attempt)
     }
@@ -1563,10 +1617,11 @@ pub(crate) async fn list_execution_operations(
 #[tauri::command]
 pub(crate) async fn acknowledge_execution_attempt(
     app: tauri::AppHandle, frontend_session_id: String, operation_id: String, attempt_id: String, reviewed: bool,
+    review: Option<AttemptReviewInput>,
 ) -> Result<Attempt, String> {
     let root = app_root(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        with_frontend_session(&root, &frontend_session_id, false, |ledger, _| ledger.acknowledge(&operation_id, &attempt_id, reviewed))
+        with_frontend_session(&root, &frontend_session_id, false, |ledger, _| ledger.acknowledge_with_review(&operation_id, &attempt_id, reviewed, review))
     }).await.map_err(storage)?
 }
 #[tauri::command]
@@ -1699,6 +1754,67 @@ mod tests {
     }
 
     #[test]
+    fn negative_review_survives_restart_without_claiming_acceptance_or_reconciliation() {
+        let root = TestRoot::new();
+        let mut ledger = Ledger::open(&root.0, "boot").unwrap();
+        let prepared = record("op-review", Effect::Change);
+        ledger.prepare(prepared.clone()).unwrap();
+        begin(&mut ledger, "op-review", "attempt-review");
+        let outcome = archived_outcome(&root.0, "op-review", "attempt-review", Status::Succeeded, json!({"output":"listening on unexpected port"}));
+        ledger.complete(&root.0, "op-review", "attempt-review", "result-review", outcome.clone(), false).unwrap();
+        let review = AttemptReviewInput { version: 1, operation_id: "op-review".into(), attempt_id: "attempt-review".into(),
+            intent_digest: prepared.intent_digest, outcome: "not_met".into(), disposition: "task_followup".into(),
+            evidence_refs: outcome.evidence_refs.clone(), review_fingerprint: format!("sha256:{}", "a".repeat(64)) };
+        let saved = ledger.acknowledge_with_review("op-review", "attempt-review", false, Some(review.clone())).unwrap();
+        assert_eq!(ledger.acknowledge_with_review("op-review", "attempt-review", false, Some(review.clone())).unwrap(), saved);
+        let mut changed = review.clone(); changed.outcome = "unknown".into();
+        assert!(ledger.acknowledge_with_review("op-review", "attempt-review", false, Some(changed)).unwrap_err().contains("REVIEW_CONFLICT"));
+        drop(ledger);
+        let mut ledger = Ledger::open(&root.0, "next-boot").unwrap();
+        let operation = ledger.get("op-review").unwrap();
+        assert_eq!(operation.attempts[0], saved);
+        assert_eq!(operation.attempts[0].outcome, Some(outcome));
+        assert_eq!(operation.attempts[0].reviews[0].review.outcome, "not_met");
+        assert!(operation.attempts[0].review_completed_at.is_none());
+        assert!(operation.reconciliation.is_none());
+        ledger.cancel("op-review", Some("attempt-review")).unwrap();
+        assert!(ledger.acknowledge_with_review("op-review", "attempt-review", false, Some(review)).unwrap_err().contains("REVIEW_INVALID"));
+    }
+
+    #[test]
+    fn structured_reviews_reject_other_attempts_evidence_and_unknown_dispatch() {
+        let root = TestRoot::new();
+        let mut ledger = Ledger::open(&root.0, "boot").unwrap();
+        let prepared = record("op-review", Effect::Change);
+        ledger.prepare(prepared.clone()).unwrap();
+        begin(&mut ledger, "op-review", "attempt-review");
+        let outcome = archived_outcome(&root.0, "op-review", "attempt-review", Status::Succeeded, json!({"output":"ok"}));
+        let review = AttemptReviewInput { version: 1, operation_id: "op-review".into(), attempt_id: "attempt-review".into(),
+            intent_digest: prepared.intent_digest, outcome: "unknown".into(), disposition: "task_followup".into(),
+            evidence_refs: outcome.evidence_refs.clone(), review_fingerprint: format!("sha256:{}", "b".repeat(64)) };
+        drop(ledger);
+        let mut ledger = Ledger::open(&root.0, "next-boot").unwrap();
+        assert!(ledger.acknowledge_with_review("op-review", "attempt-review", false, Some(review.clone())).is_err());
+        ledger.complete(&root.0, "op-review", "attempt-review", "result-review", outcome, false).unwrap();
+        // The pre-restart receipt is late by design. Use a fresh owned attempt
+        // to exercise identity checks independently from that earlier guard.
+        let prepared = record("op-current-review", Effect::Change);
+        ledger.prepare(prepared.clone()).unwrap();
+        begin(&mut ledger, "op-current-review", "attempt-current-review");
+        let outcome = archived_outcome(&root.0, "op-current-review", "attempt-current-review", Status::Succeeded, json!({"output":"ok"}));
+        ledger.complete(&root.0, "op-current-review", "attempt-current-review", "result-current-review", outcome.clone(), false).unwrap();
+        let review = AttemptReviewInput { operation_id: "op-current-review".into(), attempt_id: "attempt-current-review".into(),
+            intent_digest: prepared.intent_digest, evidence_refs: outcome.evidence_refs, ..review };
+        let mut wrong_attempt = review.clone(); wrong_attempt.attempt_id = "other-attempt".into();
+        let mut wrong_evidence = review.clone(); wrong_evidence.evidence_refs = vec!["foreign-proof".into()];
+        let mut false_acceptance = review.clone(); false_acceptance.disposition = "accepted".into();
+        for invalid in [wrong_attempt, wrong_evidence, false_acceptance] {
+            assert!(ledger.acknowledge_with_review("op-current-review", "attempt-current-review", false, Some(invalid)).unwrap_err().contains("REVIEW_INVALID"));
+        }
+        assert!(ledger.get("op-current-review").unwrap().attempts[0].reviews.is_empty());
+    }
+
+    #[test]
     fn acknowledgement_cannot_accept_unknown_or_late_results() {
         let root = TestRoot::new();
         let mut ledger = Ledger::open(&root.0, "boot").unwrap();
@@ -1774,6 +1890,34 @@ mod tests {
             .unwrap_err()
             .starts_with("EXECUTION_LEDGER_SECRET_VALUE"));
         assert_eq!(ledger.list(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn credential_fields_are_explicit_and_rejection_does_not_lock_following_operations() {
+        let root = TestRoot::new();
+        let mut ledger = Ledger::open(&root.0, "boot").unwrap();
+        for field in ["password", "passwd", "passphrase", "apiKey", "api-key", "access_token",
+            "refreshToken", "authorization", "private_key", "clientSecret", "secret"] {
+            let mut rejected = record(&format!("rejected-{field}"), Effect::Change);
+            rejected.intent["semantic"]["action"] = json!({"type":"tool","toolId":"fixture",
+                "arguments":{"nested":[{field:"never-persist-this-credential"}]}});
+            let error = ledger.prepare(seal(rejected)).unwrap_err();
+            assert!(error.starts_with("EXECUTION_LEDGER_SECRET_VALUE"));
+            assert!(error.contains(&format!("/semantic/action/arguments/nested/0/{field}")));
+            assert!(!error.contains("never-persist-this-credential"));
+        }
+        assert!(ledger.list(None).unwrap().is_empty());
+        let mut valid = record("next-operation-1", Effect::Change);
+        valid.intent["semantic"]["action"] = json!({"type":"tool","toolId":"core.sftp.delete",
+            "arguments":{"path":"/opt/core-case","kind":"directory"}});
+        valid.intent["semantic"]["targets"][0]["username"] = json!("root");
+        valid.intent["semantic"]["targets"][0]["credentialRef"] = json!("keychain:server-1");
+        let sealed = seal(valid);
+        let saved = ledger.prepare(sealed.clone()).unwrap();
+        assert_eq!(saved.record.intent, sealed.intent);
+        assert_eq!(ledger.list(None).unwrap().len(), 1);
+        assert!(!contains_raw_secret(&json!({"password":null,"privateKey":"", "apiKey":"[REDACTED]"})));
+        assert!(contains_raw_secret(&json!({"output":{"refreshToken":"must redact"}})));
     }
 
     #[test]

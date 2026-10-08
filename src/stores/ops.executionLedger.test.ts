@@ -324,14 +324,35 @@ describe("J2 store dispatch and durable recovery", () => {
     const intent = JSON.stringify(task.plan[0].executionIntent), taskId = task.id;
     store.tasks = [];
     await store.restoreExecutionLedgerTasks();
-    const restored = store.tasks.find(item => item.id === taskId)!;
-    expect(restored).toMatchObject({ status: "awaiting_continuation", permission: "observe", serverId: server.id });
-    expect(restored.plan).toEqual([]);
+    expect(store.tasks).toHaveLength(0);
+    expect(store.executionRecoveryCases).toHaveLength(0);
     expect(JSON.stringify((await listExecutionLedger(store, taskId))[0].intent)).toBe(intent);
-    expect(restored.executionLedgerRecovery?.items).toEqual([]);
-    expect(restored.executionLedgerRecovery?.recordedReads).toHaveLength(1);
+    const history = await store.loadExecutionHistory(taskId);
+    expect(history[0].receipts).toHaveLength(1);
+    expect(history[0].receipts[0].title).toBe("命令检查");
     expect(backend.executeCommand).not.toHaveBeenCalled();
     expect(backend.reviewStep).not.toHaveBeenCalled();
+  });
+
+  it("does not surface successful direct deletes as orphan recovery cases, while retaining both history receipts", async () => {
+    const store = useOpsStore(), repository = createMemoryExecutionLedgerRepository();
+    configureExecutionLedger(store, repository, async () => "a".repeat(64));
+    configureExecutionLedger(directExecutionLedgerOwner, repository, async () => "a".repeat(64));
+    for (const [index, path] of ["/opt/core-case", "/root/core-case"].entries()) {
+      await runDirectExecution({ executionId: `direct-delete-${index}`, phase: "tool",
+        action: { type: "tool", toolId: "core.sftp.delete", arguments: { path, kind: "directory" } },
+        connections: [{ host: server.host, port: server.port, username: server.username, password: "fixture-only" }],
+        execute: async () => undefined });
+    }
+    const before = JSON.stringify(await listExecutionLedger(store));
+    await store.restoreExecutionLedgerTasks();
+    await store.restoreExecutionLedgerTasks();
+    expect(store.executionRecoveryCases).toEqual([]); expect(store.tasks).toEqual([]);
+    const history = await store.loadExecutionHistory();
+    expect(history).toHaveLength(1); expect(history[0].receipts).toHaveLength(2);
+    expect(history[0].receipts.every(receipt => receipt.status === "succeeded")).toBe(true);
+    expect(JSON.stringify(await listExecutionLedger(store))).toBe(before);
+    expect(backend.executeCommand).not.toHaveBeenCalled(); expect(backend.reviewStep).not.toHaveBeenCalled();
   });
 
   it("exposes direct-operation uncertainty after task-cache loss on the uniquely matching server", async () => {
@@ -344,12 +365,15 @@ describe("J2 store dispatch and durable recovery", () => {
       execute: async () => { throw new Error("SSH connection lost after dispatch"); },
     })).rejects.toThrow("无法确定远端结果");
     await store.restoreExecutionLedgerTasks();
-    expect(store.tasks).toHaveLength(1);
-    const restored = store.tasks[0];
-    expect(restored.id).toMatch(/^direct-/);
-    expect(restored.serverId).toBe(server.id);
-    expect(restored.plan[0].executionIntent?.semantic.targets[0].serverId).toBeUndefined();
-    expect(restored.executionLedgerRecovery?.items[0]).toMatchObject({ kind: "uncertain", action: "none" });
+    expect(store.tasks).toHaveLength(0);
+    const restored = store.executionRecoveryCases[0];
+    expect(restored.taskId).toMatch(/^direct-/);
+    expect(restored.targets[0].host).toBe(server.host);
+    expect(restored.recovery.items[0]).toMatchObject({ kind: "uncertain", action: "none" });
+    localStorage.setItem("opsark.taskArchive.v1", '{"version":99}');
+    await store.restoreExecutionLedgerTasks();
+    expect(store.executionRecoveryCases).toHaveLength(1);
+    expect(store.executionLedgerReadError).toContain("归档暂不可读");
     expect(backend.executeCommand).not.toHaveBeenCalled();
   });
 
@@ -403,4 +427,71 @@ describe("J2 store dispatch and durable recovery", () => {
     expect(task.executionLedgerRecovery?.items ?? []).toHaveLength(0);
     expect((await listExecutionLedger(store, task.id))[0].attempts[0].status).toBe("succeeded");
   });
+  it("reconciles an orphan under its original identity without replaying the change or creating a task", async () => {
+    const { store, task } = preparedTask(), repository = createMemoryExecutionLedgerRepository();
+    const semantic = { ...task.plan[0].executionIntent!.semantic, kind: "change" as const, effect: "change" as const,
+      action: { type: "shell" as const, command: "systemctl start app.service" }, runtimeClass: "persistent_service" as const,
+      validator: { type: "service" as const, command: "systemctl is-active app.service", validStates: ["healthy" as const] } };
+    task.plan[0].executionIntent = { version: "execution-intent@1", algorithm: "sha256", semantic,
+      digest: executionDigest({ version: "execution-intent@1", semantic }) };
+    configureExecutionLedger(store, repository, async () => "a".repeat(64));
+    await expect(store.recordStepExecution(task, task.plan[0], "command", "orphan-service", () => true,
+      async () => ({ success: false, error: { category: "network", dispatchState: "unknown" } }))).rejects.toThrow();
+    const original = (await listExecutionLedger(store, task.id))[0];
+    store.tasks = [];
+    await Promise.all([store.restoreExecutionLedgerTasks(), store.restoreExecutionLedgerTasks()]);
+    expect(store.executionRecoveryCases).toHaveLength(1);
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    vi.mocked(backend.executeCommand).mockResolvedValue({ success: true, simulated: true, exitCode: 0, output: "active" });
+    await Promise.all([store.reconcileExecutionAttempt(task.id, original.attempts[0].id),
+      store.reconcileExecutionAttempt(task.id, original.attempts[0].id)]);
+    expect(backend.executeCommand).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(backend.executeCommand).mock.calls[0][0]).toBe("systemctl is-active app.service");
+    const records = await listExecutionLedger(store, task.id);
+    expect(records.every(record => record.taskId === task.id)).toBe(true);
+    expect(records.find(record => record.operationId === original.operationId)?.reconciliation?.status).toBe("completed");
+    expect(store.executionRecoveryCases).toHaveLength(0); expect(store.tasks).toHaveLength(0);
+    expect(backend.reviewStep).not.toHaveBeenCalled();
+  });
+
+  it("backs up an untouched legacy shell before removing it, but preserves subsequent user work", async () => {
+    const { store, task } = preparedTask(), repository = createMemoryExecutionLedgerRepository();
+    configureExecutionLedger(store, repository, async () => "a".repeat(64));
+    await store.recordStepExecution(task, task.plan[0], "command", "legacy-read", () => true,
+      async () => ({ success: true, exitCode: 0, output: "READY" }));
+    const original = (await listExecutionLedger(store, task.id))[0];
+    Object.assign(task, { title: "执行记录恢复 · old server", modelId: "", permission: "observe", messages: [], plan: [],
+      rootGoal: original.intent.semantic.expected, status: "awaiting_continuation", createdAt: new Date(original.createdAt).toISOString(),
+      pauseReason: "已恢复历史检查结果，可查看已有证据；这不代表当前任务目标已完成。" });
+    const { readTaskArchive } = await import("@/services/taskArchive");
+    const snapshot = JSON.parse(JSON.stringify(task));
+    await store.restoreExecutionLedgerTasks();
+    expect(store.tasks).toHaveLength(0);
+    expect(await readTaskArchive(task.id)).toMatchObject({ disposition: "legacy_recovery", snapshot });
+    store.tasks = [snapshot];
+    store.pushMessage(store.tasks[0], { role: "user", kind: "message", content: "继续处理新需求" });
+    await store.restoreExecutionLedgerTasks();
+    expect(store.tasks).toHaveLength(1);
+    expect(store.tasks[0].messages[0].content).toBe("继续处理新需求");
+    expect((await readTaskArchive(task.id))?.disposition).toBe("active");
+    expect(backend.executeCommand).not.toHaveBeenCalled(); expect(backend.reviewStep).not.toHaveBeenCalled();
+  });
+
+  it("does not revive a task removed while a ledger scan is pending", async () => {
+    const { store, task } = preparedTask(), repository = createMemoryExecutionLedgerRepository();
+    configureExecutionLedger(store, repository, async () => "a".repeat(64));
+    await store.recordStepExecution(task, task.plan[0], "command", "race-read", () => true,
+      async () => ({ success: true, exitCode: 0, output: "READY" }));
+    const records = await listExecutionLedger(store, task.id), listing = deferred<typeof records>();
+    vi.spyOn(repository, "list").mockReturnValueOnce(listing.promise);
+    const scan = store.restoreExecutionLedgerTasks();
+    const removal = store.deleteTask(task.id);
+    await vi.waitFor(() => expect(store.tasks).toHaveLength(0));
+    listing.resolve(records);
+    await scan; expect(await removal).toBe(true);
+    await store.restoreExecutionLedgerTasks();
+    expect(store.tasks).toHaveLength(0); expect(store.executionRecoveryCases).toHaveLength(0);
+    expect((await store.loadExecutionHistory(task.id))[0]).toMatchObject({ removed: true, canOpen: false });
+  });
+
 });

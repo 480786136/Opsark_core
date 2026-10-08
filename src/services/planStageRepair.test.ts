@@ -97,7 +97,7 @@ describe("ordered mixed plans and standalone boundaries", () => {
 
   it("never deletes commands because completed fingerprints are present", async () => {
     const plan = [...readBatch, standalone, ...shellBatch];
-    vi.mocked(invoke).mockResolvedValueOnce(structuredClone(plan));
+    vi.mocked(invoke).mockResolvedValue(structuredClone(plan));
 
     await expect(backend.generatePlan(requirement, runtime({
       completedCommandFingerprints: ["all", "commands", "claimed", "complete"],
@@ -105,7 +105,11 @@ describe("ordered mixed plans and standalone boundaries", () => {
       repairError: expect.stringContaining("PLAN_STAGE_CONFLICT"),
       repair: { previousModelOutput: plan },
     });
-    expect(invoke).toHaveBeenCalledOnce();
+    expect(invoke).toHaveBeenCalledTimes(2);
+    const contexts = vi.mocked(invoke).mock.calls.map(([, payload]) => JSON.parse((payload as { context: string }).context));
+    expect(contexts.map(context => context._modelOutputRecovery.strategy)).toEqual(["initial", "regenerate"]);
+    expect(contexts[1]._modelRecovery).toEqual(contexts[0]._modelRecovery);
+    expect(contexts[1].completedCommandFingerprints).toEqual(["all", "commands", "claimed", "complete"]);
   });
 
   it.each([

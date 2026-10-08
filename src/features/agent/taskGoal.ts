@@ -14,6 +14,7 @@ import {
   refreshTaskHistoryCheckpoint,
 } from "@/features/agent/taskHistoryCheckpoint";
 import { carryForwardRecoveryBlockers } from "./recoveryContract";
+import { ensureTaskRequirementLifecycle, projectRequirementsContext } from "./taskRequirements";
 
 function cloneStep(step: PlanStep): PlanStep {
   return {
@@ -47,7 +48,7 @@ export function taskGoal(task: OpsTask) {
     || task.title;
 }
 
-export const TASK_REQUIREMENT_INSTRUCTION = "rootGoal 保留任务原始目标；requirements 按用户原文和先后顺序记录当前目标及补充要求，不代表已完成。验收必须同时核对本轮 currentInstruction 和仍有效的前序要求，不能仅因原始目标已有答案就忽略后续补充；用户明确收窄或修订的范围以较新要求为准，不自行扩张授权。continue 只恢复执行，不增加验收项；旁问和取消消息不作为业务要求。完成结论必须由对应真实 result/evidence 支持，历史记录仅在目标、范围和时效仍适用时复用。";
+export const TASK_REQUIREMENT_INSTRUCTION = "rootGoal 保留任务原始目标；requirements 按用户原文和先后顺序记录当前目标及补充要求，不代表已完成。验收必须同时核对本轮 currentInstruction 和仍有效的前序要求，不能仅因原始目标已有答案就忽略后续补充；用户明确收窄或修订的范围以较新要求为准，不自行扩张授权。continue 只恢复执行，不增加验收项；旁问和取消消息不作为业务要求。完成结论必须由对应真实 result/evidence 支持，历史记录仅在目标、范围和时效仍适用时复用。lifecycle.revision 大于 0 时，以 requirementContext 的本轮 focus、activeGoals 和 activeConstraints 为当前精确要求；历史已完成目标默认仅供参考，仍生效的约束不能随历史降级。完成本轮不等于整体完成，未完成或暂缓目标不得因未列入本轮而丢失。只有 overallOutcome=completed 才能 decision=complete；focusOutcome=completed 且 overallOutcome=pending 时，返回 decision=adjust、steps=[] 交付本轮结果，不自动启动其他目标。";
 
 function persistedRequirementSources(task: OpsTask): TaskRequirementSource[] {
   if (task.persistedRequirements?.version !== 1 || !Array.isArray(task.persistedRequirements.sources)) return [];
@@ -129,6 +130,7 @@ export function taskRequirementSnapshot(task: OpsTask) {
   const latest = requirements[requirements.length - 1];
   if (latest && !latest.sourceRoundId && ["new_goal", "replace_goal", "supplement"].includes(task.lastRequirementRelation ?? "")
     && latest.content.trim() === task.currentInstruction?.trim()) latest.sourceRoundId = task.currentRoundId;
+  const lifecycle = ensureTaskRequirementLifecycle(task, requirements);
   return {
     version: 1,
     rootGoal,
@@ -136,6 +138,8 @@ export function taskRequirementSnapshot(task: OpsTask) {
     relation: task.lastRequirementRelation,
     currentRoundId: task.currentRoundId,
     requirements,
+    lifecycle,
+    requirementContext: projectRequirementsContext(lifecycle),
     instruction: TASK_REQUIREMENT_INSTRUCTION,
   };
 }
@@ -143,9 +147,38 @@ export function taskRequirementSnapshot(task: OpsTask) {
 /** The outer model prompt must include supplements as well as the stable root goal. */
 export function taskAcceptanceRequirement(task: OpsTask) {
   const snapshot = taskRequirementSnapshot(task);
+  if (snapshot.lifecycle.revision > 0) {
+    const context = snapshot.requirementContext;
+    const sections: string[] = [];
+    if (context.focus.length) sections.push(`本轮要求：\n${context.focus.map(item => `[${item.id}] ${item.content}`).join("\n")}`);
+    const focusIds = new Set(context.focus.map(item => item.id));
+    const remaining = context.activeGoals.filter(item => !focusIds.has(item.id));
+    if (remaining.length) sections.push(`仍有效的未完成目标（不等于本轮必须执行）：\n${remaining.map(item => `[${item.id}] ${item.content}`).join("\n")}`);
+    if (context.activeConstraints.length) sections.push(`持续生效的约束：\n${context.activeConstraints.map(item => `[${item.id}] ${item.content}`).join("\n")}`);
+    if (context.deferred.length) sections.push(`暂缓要求（尚未完成）：\n${context.deferred.map(item => `[${item.id}] ${item.content}`).join("\n")}`);
+    if (context.historical.length) sections.push(`历史参考：${context.historical.map(item => `[${item.id}] ${item.status}: ${item.summary}`).join("；")}`
+      + (context.omittedHistoricalCount ? `；另有 ${context.omittedHistoricalCount} 条已归档参考未展开。` : ""));
+    if (sections.length) return sections.join("\n\n");
+  }
   if (snapshot.requirements.length === 1) return snapshot.requirements[0].content;
   return snapshot.requirements.map((item, index) =>
     `${index === 0 ? "整体目标" : `补充要求 ${index}`}：${item.content}`).join("\n");
+}
+
+/** Prompt projection: persisted originals stay local; resolved history is only bounded reference. */
+export function modelTaskRequirementSnapshot(task: OpsTask) {
+  const snapshot = taskRequirementSnapshot(task);
+  if (snapshot.lifecycle.revision === 0) return snapshot;
+  const { requirementContext: context, lifecycle, requirements: _originals, ...rest } = snapshot;
+  const relevantIds = new Set([
+    ...context.focus, ...context.activeGoals, ...context.activeConstraints, ...context.deferred,
+  ].map(item => item.id));
+  const relevant = lifecycle.items.filter(item => relevantIds.has(item.id));
+  const sources = relevant.map(item => item.source).filter((source, index, list) => list.findIndex(candidate =>
+    source.sourceMessageId ? candidate.sourceMessageId === source.sourceMessageId
+      : candidate.content === source.content && candidate.relation === source.relation) === index);
+  return { ...rest, requirements: sources,
+    lifecycle: { ...lifecycle, items: relevant }, requirementContext: context };
 }
 
 export function allTaskSteps(task: OpsTask) {

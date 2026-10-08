@@ -81,6 +81,7 @@ const dialog = ref<FileDialogState>();
 const dialogError = ref("");
 const operationError = ref("");
 const operationPending = ref(false);
+const deletingPath = ref("");
 const transferQueueOpen = ref(false);
 const uploadDragDepth = ref(0);
 const showOfflineCache = ref(false);
@@ -108,7 +109,7 @@ const directoryStateMessage = computed(() => {
   return t("files.directoryLastUpdated", { status: label, time: updated });
 });
 const showFiles = computed(() => hasSnapshot.value && (isLive.value || showOfflineCache.value));
-const draggingUpload = computed(() => isLive.value && uploadDragDepth.value > 0);
+const draggingUpload = computed(() => isLive.value && !operationPending.value && uploadDragDepth.value > 0);
 const sortedFiles = computed(() => sortRemoteFiles(fileState.value.files, sort.value));
 const selectedSet = computed(() => new Set(selection.value.selectedPaths));
 const serverTransferCount = computed(() => transferQueue.tasks.filter(({ serverId }) => serverId === props.serverId).length);
@@ -124,7 +125,7 @@ const fileTableStyle = computed(() => ({
 }));
 
 function beginPathEdit() {
-  if (!isLive.value) return;
+  if (!isLive.value || operationPending.value) return;
   pathDraft.value = currentPath.value;
   editingPath.value = true;
   void nextTick(() => pathInput.value?.select());
@@ -136,6 +137,7 @@ function cancelPathEdit() {
 }
 
 function submitPath() {
+  if (operationPending.value) return;
   const target = normalizeRemotePath(pathDraft.value.trim() || "/");
   editingPath.value = false;
   if (target !== currentPath.value) void loadDirectory(target);
@@ -188,12 +190,17 @@ async function loadDirectory(path: string) {
 }
 
 function openCurrentPathInTerminal() {
-  if (!isLive.value) return;
+  if (!isLive.value || operationPending.value) return;
   workspaceLinks.requestTerminalPath(props.serverId, currentPath.value);
 }
 
 function openDirectory(path: string) {
+  if (operationPending.value) return;
   void loadDirectory(path);
+}
+
+function refreshDirectory(path: string) {
+  if (!operationPending.value) void loadDirectory(path);
 }
 
 function toggleSort(key: FileSortKey) {
@@ -203,6 +210,7 @@ function toggleSort(key: FileSortKey) {
 }
 
 function selectEntry(entry: FileEntry, event: MouseEvent) {
+  if (operationPending.value) return;
   selection.value = updateFileSelection(
     selection.value,
     sortedFiles.value.map(({ path }) => path),
@@ -217,6 +225,7 @@ function focusSelectedRow(path: string) {
 }
 
 function handleListKeydown(event: KeyboardEvent) {
+  if (operationPending.value) return;
   const paths = sortedFiles.value.map(({ path }) => path);
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "a") {
     event.preventDefault();
@@ -238,6 +247,7 @@ function handleListKeydown(event: KeyboardEvent) {
 }
 
 function openContextMenu(entry: FileEntry, event: MouseEvent) {
+  if (operationPending.value) return;
   if (!selectedSet.value.has(entry.path)) {
     selection.value = { selectedPaths: [entry.path], anchorPath: entry.path };
   }
@@ -262,12 +272,13 @@ function goUp() {
 }
 
 function openEntry(entry: FileEntry) {
+  if (operationPending.value) return;
   if (entry.kind === "directory") openDirectory(entry.path);
   else if (isLive.value) emit("edit", entry);
 }
 
 function openDialog(type: FileAction, entry?: FileEntry, file?: File) {
-  if (!isLive.value || disposed) return;
+  if (!isLive.value || disposed || operationPending.value) return;
   dialogError.value = "";
   dialog.value = {
     type,
@@ -290,6 +301,7 @@ function translatedNameError(value: string) {
 }
 
 async function queueUpload(file: File, remoteName = file.name) {
+  if (deletingPath.value) return;
   if (!isLive.value || disposed) throw new Error(t("workspace.connectServer"));
   const serverId = props.serverId;
   const generation = store.serverConnection(serverId).generation;
@@ -298,6 +310,7 @@ async function queueUpload(file: File, remoteName = file.name) {
   const targetDirectory = currentPath.value;
   const remotePath = joinRemotePath(targetDirectory, remoteName);
   const data = new Uint8Array(await file.arrayBuffer());
+  if (deletingPath.value) return;
   if (disposed || serverId !== props.serverId || !isLive.value
     || generation !== store.serverConnection(serverId).generation) throw new Error(t("workspace.connectServer"));
   transferQueue.enqueueUpload(props.serverId, connection, remoteName, remotePath, data, () => {
@@ -315,8 +328,9 @@ async function queueUpload(file: File, remoteName = file.name) {
 
 async function submitDialog() {
   const state = dialog.value;
-  if (!state || !isLive.value || disposed) return;
+  if (!state || !isLive.value || disposed || operationPending.value) return;
   const serverId = props.serverId;
+  const generation = store.serverConnection(serverId).generation;
   dialogError.value = "";
   if (state.type === "create" || state.type === "rename" || state.type === "uploadRename") {
     dialogError.value = translatedNameError(state.value);
@@ -324,6 +338,9 @@ async function submitDialog() {
   }
 
   operationPending.value = true;
+  deletingPath.value = state.type === "delete" ? state.entry?.path ?? "" : "";
+  closeContextMenu();
+  uploadDragDepth.value = 0;
   try {
     const connection = store.getRuntimeConnection(props.serverId);
     if (!connection) throw new Error(t("workspace.connectServer"));
@@ -345,11 +362,14 @@ async function submitDialog() {
     } else if (state.type === "uploadRename" && state.file) {
       await queueUpload(state.file, state.value.trim());
     }
-    dialog.value = undefined;
+    if (!disposed && serverId === props.serverId && dialog.value === state) dialog.value = undefined;
   } catch (error) {
-    dialogError.value = String(error);
-    reportTransportFailure(error, serverId);
+    if (!disposed && serverId === props.serverId && generation === store.serverConnection(serverId).generation) {
+      if (dialog.value === state) dialogError.value = String(error);
+      reportTransportFailure(error, serverId);
+    }
   } finally {
+    deletingPath.value = "";
     operationPending.value = false;
   }
 }
@@ -364,7 +384,7 @@ function reportTransportFailure(error: unknown, serverId = props.serverId) {
 }
 
 function chooseUpload() {
-  if (isLive.value && !disposed) fileInput.value?.click();
+  if (isLive.value && !disposed && !operationPending.value) fileInput.value?.click();
 }
 
 async function handleUpload(event: Event) {
@@ -375,12 +395,13 @@ async function handleUpload(event: Event) {
 }
 
 async function uploadFiles(files: File[]) {
-  if (!isLive.value || !files.length) return;
+  if (!isLive.value || !files.length || operationPending.value) return;
   operationError.value = "";
   const existingNames = new Set(fileState.value.files.map(({ name }) => name));
   let conflictingFile: File | undefined;
   let oversized = false;
   for (const file of files) {
+    if (operationPending.value) return;
     if (file.size > 20 * 1024 * 1024) {
       oversized = true;
       continue;
@@ -405,13 +426,13 @@ function isFileDrag(event: DragEvent) {
 }
 
 function handleUploadDragEnter(event: DragEvent) {
-  if (!isLive.value || !isFileDrag(event)) return;
+  if (!isLive.value || operationPending.value || !isFileDrag(event)) return;
   uploadDragDepth.value += 1;
   if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
 }
 
 function handleUploadDragOver(event: DragEvent) {
-  if (!isLive.value || !isFileDrag(event)) return;
+  if (!isLive.value || operationPending.value || !isFileDrag(event)) return;
   if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
 }
 
@@ -422,7 +443,7 @@ function handleUploadDragLeave(event: DragEvent) {
 
 function handleUploadDrop(event: DragEvent) {
   uploadDragDepth.value = 0;
-  if (!isLive.value) return;
+  if (!isLive.value || operationPending.value) return;
   void uploadFiles([...(event.dataTransfer?.files ?? [])]);
 }
 
@@ -441,10 +462,11 @@ function localFileName(path: string) {
 }
 
 async function uploadNativePaths(paths: string[]) {
-  if (!isLive.value || disposed) return;
+  if (!isLive.value || disposed || operationPending.value) return;
   const files: File[] = [];
   operationError.value = "";
   for (const path of paths) {
+    if (operationPending.value) return;
     try {
       const data = await backend.readLocalFileForUpload(path);
       files.push(new File([data], localFileName(path)));
@@ -456,7 +478,7 @@ async function uploadNativePaths(paths: string[]) {
 }
 
 function handleNativeDragDrop({ payload: event }: TauriEvent<DragDropEvent>) {
-  if (!isLive.value) {
+  if (!isLive.value || operationPending.value) {
     uploadDragDepth.value = 0;
     return;
   }
@@ -470,7 +492,7 @@ function handleNativeDragDrop({ payload: event }: TauriEvent<DragDropEvent>) {
 }
 
 async function download(entry: FileEntry) {
-  if (!isLive.value || disposed) return;
+  if (!isLive.value || disposed || operationPending.value) return;
   operationError.value = "";
   try {
     const connection = store.getRuntimeConnection(props.serverId);
@@ -505,7 +527,7 @@ function dialogTitle(state: FileDialogState) {
 }
 
 function beginUploadRename() {
-  if (!dialog.value?.file) return;
+  if (!dialog.value?.file || operationPending.value) return;
   const file = dialog.value.file;
   const dotIndex = file.name.lastIndexOf(".");
   const suffix = dotIndex > 0 ? file.name.slice(dotIndex) : "";
@@ -535,9 +557,9 @@ watch([isLive, () => store.serverConnection(props.serverId).generation], ([live]
 }, { flush: "sync" });
 
 watch(
-  () => workspaceLinks.sftpPathRequests[props.serverId],
-  async (request) => {
-    if (!request) return;
+  [() => workspaceLinks.sftpPathRequests[props.serverId], operationPending],
+  async ([request, pending]) => {
+    if (!request || pending) return;
     const result = await loadDirectory(request.path);
     if (result?.ok) workspaceLinks.consumeSftpPath(props.serverId, request.id);
   },
@@ -572,6 +594,7 @@ onBeforeUnmount(() => {
   <section
     ref="filePanel"
     class="work-panel file-panel"
+    :aria-busy="operationPending"
     @dragenter.prevent="handleUploadDragEnter"
     @dragover.prevent="handleUploadDragOver"
     @dragleave.prevent="handleUploadDragLeave"
@@ -580,14 +603,14 @@ onBeforeUnmount(() => {
     <header class="panel-header">
       <div class="file-panel-title"><span class="eyebrow">SFTP</span><strong>{{ t("files.title") }}</strong></div>
       <div class="header-actions">
-        <button type="button" :title="t('files.upload')" :disabled="!isLive" @click="chooseUpload"><Upload :size="15" /></button>
-        <button type="button" :title="t('files.newFolder')" :disabled="!isLive" @click="openDialog('create')"><FolderPlus :size="15" /></button>
-        <button type="button" :title="t('files.openInTerminal')" :disabled="!isLive" @click="openCurrentPathInTerminal"><FolderInput :size="15" /></button>
-        <button type="button" :title="t('common.refresh')" :disabled="!isLive" @click="loadDirectory(currentPath)"><RefreshCw :class="{ spin: fileState.loading }" :size="15" /></button>
+        <button type="button" :title="t('files.upload')" :disabled="!isLive || operationPending" @click="chooseUpload"><Upload :size="15" /></button>
+        <button type="button" :title="t('files.newFolder')" :disabled="!isLive || operationPending" @click="openDialog('create')"><FolderPlus :size="15" /></button>
+        <button type="button" :title="t('files.openInTerminal')" :disabled="!isLive || operationPending" @click="openCurrentPathInTerminal"><FolderInput :size="15" /></button>
+        <button type="button" :title="t('common.refresh')" :disabled="!isLive || operationPending" @click="refreshDirectory(currentPath)"><RefreshCw :class="{ spin: fileState.loading }" :size="15" /></button>
         <button type="button" :title="t('files.transfers')" :class="{ active: transferQueueOpen }" @click="transferQueueOpen = !transferQueueOpen">
           <ArrowUpDown :size="15" /><i v-if="serverTransferCount">{{ serverTransferCount }}</i>
         </button>
-        <input ref="fileInput" class="hidden-file-input" type="file" multiple @change="handleUpload" />
+        <input ref="fileInput" class="hidden-file-input" type="file" multiple :disabled="operationPending" @change="handleUpload" />
       </div>
     </header>
     <div v-if="draggingUpload" class="file-upload-dropzone" role="status">
@@ -596,20 +619,24 @@ onBeforeUnmount(() => {
       <small>{{ currentPath }}</small>
     </div>
     <nav class="path-bar" :aria-label="t('files.title')">
-      <button type="button" :title="t('files.goUp')" :disabled="!isLive || currentPath === '/'" @click="goUp"><ChevronLeft :size="14" /></button>
+      <button type="button" :title="t('files.goUp')" :disabled="!isLive || operationPending || currentPath === '/'" @click="goUp"><ChevronLeft :size="14" /></button>
       <form v-if="editingPath" class="path-editor" @submit.prevent="submitPath">
-        <input ref="pathInput" v-model="pathDraft" :aria-label="t('files.path')" spellcheck="false" @keydown.esc.prevent="cancelPathEdit" @blur="submitPath" />
+        <input ref="pathInput" v-model="pathDraft" :disabled="operationPending" :aria-label="t('files.path')" spellcheck="false" @keydown.esc.prevent="cancelPathEdit" @blur="submitPath" />
       </form>
       <template v-for="(item, index) in editingPath ? [] : breadcrumbs" :key="item.path">
         <ChevronRight v-if="index" :size="12" />
-        <button type="button" :disabled="!isLive" :class="{ current: index === breadcrumbs.length - 1 }" :title="item.path" @click="openDirectory(item.path)">{{ item.label }}</button>
+        <button type="button" :disabled="!isLive || operationPending" :class="{ current: index === breadcrumbs.length - 1 }" :title="item.path" @click="openDirectory(item.path)">{{ item.label }}</button>
       </template>
-      <button v-if="!editingPath" type="button" class="path-empty-editor" :disabled="!isLive" :title="t('files.editPath')" :aria-label="t('files.editPath')" @click="beginPathEdit" />
+      <button v-if="!editingPath" type="button" class="path-empty-editor" :disabled="!isLive || operationPending" :title="t('files.editPath')" :aria-label="t('files.editPath')" @click="beginPathEdit" />
     </nav>
     <div v-if="!isLive || fileState.stale || fileState.loading" class="file-directory-state" role="status">
       <TriangleAlert :size="14" />
       <span>{{ directoryStateMessage }}</span>
       <button v-if="!isLive && hasSnapshot" type="button" @click="showOfflineCache = !showOfflineCache">{{ showOfflineCache ? t('files.hideOfflineCache') : t('files.showOfflineCache') }}</button>
+    </div>
+    <div v-if="deletingPath && !dialog" class="file-delete-progress" role="status">
+      <LoaderCircle class="spin" :size="15" aria-hidden="true" />
+      <span>{{ t("files.deleting") }} {{ deletingPath }}</span>
     </div>
     <div class="file-table-viewport" :style="fileTableStyle">
     <div class="file-table-head">
@@ -627,7 +654,7 @@ onBeforeUnmount(() => {
       <div v-if="fileState.loading" class="file-loading"><LoaderCircle class="spin" :size="17" />{{ t("files.loading") }}</div>
       <div v-else-if="!showFiles" class="file-empty"><Folder :size="22" /><span>{{ fileState.errorCode ? directoryErrorMessage : isLive ? t('files.loading') : t('workspace.connectServer') }}</span></div>
       <template v-else>
-        <button v-if="currentPath !== '/'" class="file-row file-parent-row" type="button" :disabled="!isLive" :title="t('files.goUp')" @dblclick="goUp">
+        <button v-if="currentPath !== '/'" class="file-row file-parent-row" type="button" :disabled="!isLive || operationPending" :title="t('files.goUp')" @dblclick="goUp">
           <span class="file-primary"><Folder :size="16" /><span class="file-name">..</span></span>
           <small>—</small><small>—</small>
         </button>
@@ -640,16 +667,17 @@ onBeforeUnmount(() => {
           :class="['file-row-wrap', { selected: selectedSet.has(file.path) }]"
           role="option"
           :aria-selected="selectedSet.has(file.path)"
+          :aria-disabled="operationPending"
           @click="selectEntry(file, $event)"
           @dblclick="openEntry(file)"
           @contextmenu.prevent="openContextMenu(file, $event)"
         >
-          <button class="file-row" type="button">
+          <button class="file-row" type="button" :disabled="operationPending">
             <span class="file-primary"><component :is="file.kind === 'directory' ? Folder : FileCode2" :size="16" /><span class="file-name">{{ file.name }}</span></span>
             <small>{{ file.size }}</small><small>{{ file.modified }}</small>
           </button>
           <div v-if="isLive" class="file-actions">
-            <button v-if="file.kind === 'file'" type="button" :title="t('files.download')" @click.stop="download(file)"><Download :size="12" /></button>
+            <button v-if="file.kind === 'file'" type="button" :disabled="operationPending" :title="t('files.download')" @click.stop="download(file)"><Download :size="12" /></button>
           </div>
         </div>
       </template>
@@ -658,7 +686,7 @@ onBeforeUnmount(() => {
     <div v-if="fileState.errorCode" class="file-directory-state" role="alert">
       <TriangleAlert :size="14" />
       <span>{{ directoryErrorMessage }}</span>
-      <button v-if="isLive" type="button" @click="loadDirectory(fileState.failedPath || currentPath)">{{ t("common.retry") }}</button>
+      <button v-if="isLive" type="button" :disabled="operationPending" @click="refreshDirectory(fileState.failedPath || currentPath)">{{ t("common.retry") }}</button>
     </div>
     <p v-if="operationError" class="file-operation-error">{{ operationError }}</p>
     <TransferQueuePanel v-if="transferQueueOpen" :server-id="serverId" @close="transferQueueOpen = false" />
@@ -670,38 +698,44 @@ onBeforeUnmount(() => {
     <Teleport to="body">
       <Transition name="context-menu">
         <div v-if="contextMenu" class="file-context-menu" :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }" @pointerdown.stop>
-          <button v-if="contextMenu.entry.kind === 'directory'" type="button" @click="openDirectory(contextMenu.entry.path); closeContextMenu()"><FolderOpen :size="13" />{{ t("files.open") }}</button>
-          <button v-else type="button" :disabled="!isLive" @click="download(contextMenu.entry); closeContextMenu()"><Download :size="13" />{{ t("files.download") }}</button>
-          <button v-if="contextMenu.entry.kind === 'file'" type="button" :disabled="!isLive" @click="openEntry(contextMenu.entry); closeContextMenu()"><FileCode2 :size="13" />{{ t("files.edit") }}</button>
+          <button v-if="contextMenu.entry.kind === 'directory'" type="button" :disabled="!isLive || operationPending" @click="openDirectory(contextMenu.entry.path); closeContextMenu()"><FolderOpen :size="13" />{{ t("files.open") }}</button>
+          <button v-else type="button" :disabled="!isLive || operationPending" @click="download(contextMenu.entry); closeContextMenu()"><Download :size="13" />{{ t("files.download") }}</button>
+          <button v-if="contextMenu.entry.kind === 'file'" type="button" :disabled="!isLive || operationPending" @click="openEntry(contextMenu.entry); closeContextMenu()"><FileCode2 :size="13" />{{ t("files.edit") }}</button>
           <button type="button" @click="copyPath(contextMenu.entry)"><Copy :size="13" />{{ t("files.copyPath") }}</button>
           <hr />
-          <button type="button" :disabled="!isLive" @click="openDialog('rename', contextMenu.entry); closeContextMenu()"><Pencil :size="13" />{{ t("files.rename") }}</button>
-          <button type="button" class="danger" :disabled="!isLive" @click="openDialog('delete', contextMenu.entry); closeContextMenu()"><Trash2 :size="13" />{{ t("files.remove") }}</button>
+          <button type="button" :disabled="!isLive || operationPending" @click="openDialog('rename', contextMenu.entry); closeContextMenu()"><Pencil :size="13" />{{ t("files.rename") }}</button>
+          <button type="button" class="danger" :disabled="!isLive || operationPending" @click="openDialog('delete', contextMenu.entry); closeContextMenu()"><Trash2 :size="13" />{{ t("files.remove") }}</button>
         </div>
       </Transition>
     </Teleport>
 
     <div v-if="dialog" class="file-dialog-backdrop" @click.self="closeDialog">
-      <form class="file-dialog" @submit.prevent="submitDialog">
-        <header><strong>{{ dialogTitle(dialog) }}</strong><button type="button" :title="t('common.close')" @click="closeDialog"><X :size="15" /></button></header>
+      <form class="file-dialog" :aria-busy="operationPending" @submit.prevent="submitDialog">
+        <header><strong>{{ dialogTitle(dialog) }}</strong><button type="button" :disabled="operationPending" :title="t('common.close')" @click="closeDialog"><X :size="15" /></button></header>
         <label v-if="dialog.type === 'create' || dialog.type === 'rename' || dialog.type === 'uploadRename'">
           {{ dialog.type === "create" ? t("files.newFolderName") : t("files.renameTo") }}
-          <input ref="nameInput" v-model="dialog.value" autocomplete="off" />
+          <input ref="nameInput" v-model="dialog.value" :disabled="operationPending" autocomplete="off" />
         </label>
         <p v-else>{{ dialog.type === "delete" ? t("files.deleteHint", { path: dialog.entry?.path }) : t("files.overwriteHint", { name: dialog.file?.name }) }}</p>
-        <span v-if="dialogError" class="file-dialog-error">{{ dialogError }}</span>
+        <span v-if="dialogError" class="file-dialog-error" role="alert">{{ dialogError }}</span>
         <footer v-if="dialog.type === 'overwrite'">
-          <button class="button secondary" type="button" @click="closeDialog">{{ t("files.skip") }}</button>
-          <button class="button secondary" type="button" @click="beginUploadRename">{{ t("files.renameUpload") }}</button>
+          <button class="button secondary" type="button" :disabled="operationPending" @click="closeDialog">{{ t("files.skip") }}</button>
+          <button class="button secondary" type="button" :disabled="operationPending" @click="beginUploadRename">{{ t("files.renameUpload") }}</button>
           <button class="button primary" type="submit" :disabled="operationPending || !isLive">{{ t("files.overwrite") }}</button>
         </footer>
         <footer v-else>
           <button class="button secondary" type="button" :disabled="operationPending" @click="closeDialog">{{ t("common.cancel") }}</button>
           <button class="button primary" type="submit" :disabled="operationPending || !isLive">
-            {{ dialog.type === "create" ? t("common.create") : dialog.type === "rename" ? t("common.save") : t("common.confirm") }}
+            <template v-if="deletingPath"><LoaderCircle class="spin" :size="14" aria-hidden="true" /><span role="status">{{ t("files.deleting") }}</span></template>
+            <template v-else>{{ dialog.type === "create" ? t("common.create") : dialog.type === "rename" ? t("common.save") : t("common.confirm") }}</template>
           </button>
         </footer>
       </form>
     </div>
   </section>
 </template>
+
+<style scoped>
+.file-delete-progress { display: flex; align-items: center; gap: 7px; padding: 9px; color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+.file-delete-progress svg { flex-shrink: 0; }
+</style>

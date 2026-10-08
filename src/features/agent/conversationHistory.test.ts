@@ -3,6 +3,7 @@ import {
   archivedConversationTimeline,
   conversationHistoryRounds,
   currentConversationTimeline,
+  requirementConversationContext,
   restoreConversationLinks,
 } from "./conversationHistory";
 import type { AuditEvent } from "@/types";
@@ -89,4 +90,27 @@ it("orders active-round phases before the continue message that archived them", 
   const timeline = currentConversationTimeline(active);
   expect(timeline.map(entry => entry.type === "message" ? entry.message.id : entry.phase.id))
     .toEqual(["original", "checkpoint", "old-phase", "continue", "new-progress", "question"]);
+});
+
+it("bounds model-facing historical prose while keeping the newest messages and local originals", () => {
+  const active = task("active", "2026-09-29T01:00:00Z");
+  active.messages = Array.from({ length: 30 }, (_, index) => ({ id: `history-${index}`, role: index % 2 ? "assistant" : "user",
+    kind: "message", content: `history-${index}: ${"完整过程文字".repeat(1000)} ending-${index}`, createdAt: active.createdAt }));
+  active.messages.push({ id: "event", role: "system", kind: "event", content: "not part of conversation", createdAt: active.createdAt });
+  const before = JSON.stringify(active);
+  const context = requirementConversationContext(active);
+  expect(context.length).toBeLessThanOrEqual(24);
+  expect(context.every(message => message.content.length <= 800)).toBe(true);
+  expect(context.reduce((total, message) => total + message.content.length, 0)).toBeLessThanOrEqual(6000);
+  expect(context.every(message => message.truncated && message.originalCharacters! > 800)).toBe(true);
+  expect(context[context.length - 1]?.content).toContain("history-29:");
+  expect(context[context.length - 1]?.content).toContain("ending-29");
+  expect(context.some(message => message.content.includes("history-0:"))).toBe(false);
+  expect(context[0].omittedEarlierMessages).toBe(30 - context.length);
+  expect(JSON.stringify(active)).toBe(before);
+});
+
+it("keeps short history exact without adding misleading truncation markers", () => {
+  const active = task("active", "2026-09-29T01:00:00Z");
+  expect(requirementConversationContext(active)).toEqual([{ role: "user", kind: "message", content: "active" }]);
 });

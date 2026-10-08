@@ -1,0 +1,127 @@
+[
+  {
+    "name": "plan-kind-tool",
+    "source": "sanitized response-only fixture from 2026-10-02 local task log",
+    "response": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "{\"steps\":[{\"kind\":\"tool\",\"title\":\"查询目标服务器连接资料\",\"description\":\"用户要求登录 192.0.2.10 这台虚拟机服务器检查状态并部署。先查询该地址是否已有纳管服务器记录或长期保存的 SSH 凭据组，作为后续连接依据。\",\"action\":{\"type\":\"tool\",\"toolId\":\"server.resolve_connection\",\"arguments\":{\"host\":\"192.0.2.10\",\"port\":22}},\"expected\":\"返回 192.0.2.10 是否存在可用连接资料及 credentialRef；不返回凭据真实值。\",\"validation\":\"\",\"risk\":\"low\"}]}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "completion_tokens": 132,
+        "prompt_cache_hit_tokens": 17408,
+        "prompt_cache_miss_tokens": 2401,
+        "prompt_tokens": 19809,
+        "prompt_tokens_details": {
+          "cached_tokens": 17408
+        },
+        "total_tokens": 19941
+      }
+    }
+  },
+  {
+    "name": "plan-missing-action-braces",
+    "source": "sanitized response-only fixture from 2026-10-02 local task log",
+    "response": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "{\"steps\":[{\"kind\":\"observe\",\"title\":\"检查服务器运行状态与基础环境\",\"description\":\"只读获取当前服务器的基础运行信息、Git 可用性和常用运行时环境情况，用于确认部署前置条件。\",\"action\":{\"type\":\"shell\",\"command\":\"set +e\\nprintf '%s\\\\n' '--- uname ---'\\nuname -a\\nprintf 'uname_rc=%d\\\\n' \\\"$?\\\"\\nprintf '%s\\\\n' '--- uptime ---'\\nuptime\\nprintf 'uptime_rc=%d\\\\n' \\\"$?\\\"\\nprintf '%s\\\\n' '--- memory ---'\\nfree -h\\nprintf 'free_rc=%d\\\\n' \\\"$?\\\"\\nprintf '%s\\\\n' '--- disk ---'\\ndf -h\\nprintf 'df_rc=%d\\\\n' \\\"$?\\\"\\nprintf '%s\\\\n' '--- git ---'\\ngit --version\\nprintf 'git_rc=%d\\\\n' \\\"$?\\\"\\nprintf '%s\\\\n' '--- runtimes ---'\\nfor c in node npm yarn pnpm python3 java go docker nginx; do if command -v \\\"$c\\\" >/dev/null 2>&1; then printf '%s: %s\\\\n' \\\"$c\\\" \\\"$(command -v \\\"$c\\\")\\\"; \\\"$c\\\" --version 2>&1 | head -n 1; else printf '%s: not-found\\\\n' \\\"$c\\\"; fi; done\",\"expected\":\"获得内核、负载、内存、磁盘、Git 版本以及本机是否存在 node/npm/python3/java/go/docker/nginx 等运行时的真实结果\",\"validation\":\"\",\"risk\":\"low\"},{\"kind\":\"observe\",\"title\":\"检查部署目标目录现状\",\"description\":\"只读检查计划用于存放项目源码的目录是否存在及其内容，避免覆盖已有数据。\",\"action\":{\"type\":\"shell\",\"command\":\"set +e\\nfor d in /opt /srv /home /root /var/www /data; do if [ -d \\\"$d\\\" ]; then printf '%s: exists\\\\n' \\\"$d\\\"; ls -la \\\"$d\\\" 2>&1 | head -n 20; else printf '%s: missing\\\\n' \\\"$d\\\"; fi; done\",\"expected\":\"获得常见部署父目录的存在性和当前内容，判断可用且不冲突的落盘位置\",\"validation\":\"\",\"risk\":\"low\"},{\"kind\":\"observe\",\"title\":\"获取仓库项目结构与构建声明\",\"description\":\"克隆前先判断目标地址可达性；由于项目结构未知，需要先读取仓库页面信息。此处使用只读方式探测远端仓库可达性。\",\"action\":{\"type\":\"shell\",\"command\":\"set +e\\nprintf '%s\\\\n' '--- git ls-remote ---'\\ngit ls-remote https://example.invalid/demo.git 2>&1 | head -n 20\\nprintf 'ls_remote_rc=%d\\\\n' \\\"${PIPESTATUS[0]}\\\"\",\"expected\":\"确认 gitee 仓库地址可达，并得到默认分支等真实引用信息；若失败输出真实错误原因\",\"validation\":\"\",\"risk\":\"low\"}]}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "completion_tokens": 692,
+        "prompt_cache_hit_tokens": 19712,
+        "prompt_cache_miss_tokens": 464,
+        "prompt_tokens": 20176,
+        "prompt_tokens_details": {
+          "cached_tokens": 19712
+        },
+        "total_tokens": 20868
+      }
+    }
+  },
+  {
+    "name": "stage-missing-action-brace",
+    "source": "sanitized response-only fixture from 2026-10-02 local task log",
+    "response": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "{\"decision\":\"adjust\",\"reason\":\"上一步 example-app-static.service 的验收证据自相矛盾：主命令显示 Active: active (running)、Main PID 12345，而同一返回的独立校验显示 activating，且 8080 监听进程 pid=68474 与 Main PID 12345 不一致，无法确认受管进程是否真正占用 192.0.2.10:8080。需要先做只读诊断（systemctl show/status、ss -lntp、进程信息、curl），依据真实状态判断是端口被旧进程占用还是服务未真正绑定，再决定修复动作。本阶段不重复已完成的仓库复用、依赖安装与构建（已有独立验收证据）。\",\"summary\":\"本轮已交付：goal-1 服务器状态检查已完成（uptime/负载、内存、磁盘、CentOS Stream 10）；goal-2 前半已完成——/opt/example 确认为目标仓库（origin 一致、HEAD 存在）、npm ci + vite build 成功、dist 产物独立校验通过。未完成：goal-2 部署落地（example-app-static.service 状态与 8080 监听归属存在冲突，尚未确认受管进程真实占用端口）、goal-3 可访问地址、goal-4 优化建议。下一阶段先只读诊断服务与端口真实状态，确认后再执行修复与验收。\",\"requirementReview\":{\"baseRevision\":8,\"roundId\":\"round-fixture\",\"focusOutcome\":\"pending\",\"overallOutcome\":\"pending\",\"items\":[{\"requirementId\":\"goal-1\",\"outcome\":\"satisfied\",\"evidenceIds\":[\"evidence-fixture\"],\"reason\":\"已有证据包含 uptime 与负载、内存、磁盘以及 CentOS Stream 10 (Coughlan) 发行版信息，满足服务器当前运行状态检查。\"},{\"requirementId\":\"goal-2\",\"outcome\":\"unmet\",\"evidenceIds\":[\"evidence-fixture\",\"evidence-fixture\",\"evidence-fixture\",\"evidence-fixture\",\"evidence-fixture\",\"evidence-fixture\",\"evidence-fixture\"],\"reason\":\"仓库身份与构建产物已验收通过，但部署未确认落地：example-app-static.service 的主命令自述 active(running)/Main PID 12345，与独立校验的 activating 及 8080 监听进程 pid=68474 冲突，受管进程是否真正占用 192.0.2.10:8080 尚无一致证据。\"},{\"requirementId\":\"goal-3\",\"outcome\":\"unknown\",\"evidenceIds\":[],\"reason\":\"尚未取得服务监听与 HTTP 可访问性的一致证据，无法确定可直接访问地址。\"},{\"requirementId\":\"goal-4\",\"outcome\":\"unknown\",\"evidenceIds\":[],\"reason\":\"最终运行状态未确认，缺少针对性优化建议所需的运行时证据。\"}]},\"steps\":[{\"kind\":\"observe\",\"title\":\"只读诊断 example-app-static.service 与 8080 监听真实状态\",\"description\":\"在独立 Shell 中只读采集：服务的 active/loaded 状态与 Main PID、8080 端口监听进程的 pid/命令行、该 pid 的启动时间与 cgroup 归属、本机 HTTP 响应码与首页内容。用于判定 68474 与 12345 的关系以及受管进程是否真正绑定 192.0.2.10:8080，本步骤不做任何变更。\",\"action\":{\"type\":\"shell\",\"command\":\"set -o pipefail\\nprintf '%s\\\\n' '-- unit state --'\\nsystemctl show example-app-static.service -p Id -p ActiveState -p SubState -p MainPID -p ExecMainStartTimestamp --no-pager\\nprintf '%s\\\\n' '-- 8080 listeners --'\\nss -lntp | grep -E ':8080\\\\b' || echo 'no listener on 8080'\\nprintf '%s\\\\n' '-- pid 68474 --'\\nif [ -r /proc/68474/cmdline ]; then tr '\\\\0' ' ' < /proc/68474/cmdline; echo; stat -c 'start=%z' /proc/68474; cat /proc/68474/cgroup; else echo 'pid 68474 已不存在'; fi\\nprintf '%s\\\\n' '-- pid 12345 --'\\nif [ -r /proc/12345/cmdline ]; then tr '\\\\0' ' ' < /proc/12345/cmdline; echo; stat -c 'start=%z' /proc/12345; cat /proc/12345/cgroup; else echo 'pid 12345 已不存在'; fi\\nprintf '%s\\\\n' '-- service cgroup pids --'\\nsystemctl status example-app-static.service --no-pager -l || true\\nprintf '%s\\\\n' '-- http --'\\ncurl -sS -o /dev/null -w 'local HTTP %{http_code}\\\\n' https://example.invalid/demo.git || echo 'local curl 失败'\\ncurl -sS https://example.invalid/demo.git | head -c 200 || true\",\"executionScope\":\"isolated_exec\",\"expected\":\"获得一致的只读事实：example-app-static.service 的真实 ActiveState/SubState 与 MainPID、8080 当前监听进程的 pid 与命令行、该 pid 对应的 systemd cgroup 归属、以及本机访问 8080 的 HTTP 状态码与首页片段。据此判定端口占用者是本服务还是残留旧进程。\",\"validation\":\"\",\"risk\":\"low\"}]}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "completion_tokens": 1266,
+        "prompt_cache_hit_tokens": 21504,
+        "prompt_cache_miss_tokens": 24140,
+        "prompt_tokens": 45644,
+        "prompt_tokens_details": {
+          "cached_tokens": 21504
+        },
+        "total_tokens": 46910
+      }
+    }
+  },
+  {
+    "name": "stage-repair-action-drift",
+    "source": "sanitized response-only fixture from 2026-10-02 local task log",
+    "response": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "{\"decision\":\"adjust\",\"reason\":\"上一轮 example-app-static.service 的验收证据自相矛盾（主命令显示 active(running)/Main PID 12345，独立校验显示 activating 且 8080 监听进程 pid=68474 与 Main PID 不一致），该步骤状态未确定，not proven。需先只读澄清 8080 真实占用与受管服务实际状态，再决定停止残留监听进程并按受管方式重启 example-app-static.service，随后才能继续外部可访问性验证（goal-3）。\",\"summary\":\"本轮交付：goal-1 服务器运行状态已完成；goal-2 中仓库来源与构建产物已验收通过（/opt/example 为 gitee.com/Kingzm/example-app.git，master HEAD=9ef9d09，vite build 生成 dist 且独立校验通过）。未完成：受管静态服务尚未得到一致性验收，先后端服务状态需澄清与修复，goal-3 可直接访问地址、goal-4 优化建议仍待完成。\",\"requirementReview\":{\"baseRevision\":8,\"roundId\":\"round-fixture\",\"focusOutcome\":\"pending\",\"overallOutcome\":\"pending\",\"items\":[{\"requirementId\":\"goal-1\",\"evidenceIds\":[\"evidence-fixture\"],\"outcome\":\"satisfied\",\"reason\":\"证据包含 uptime、负载、内存、磁盘及 CentOS Stream 10 发行版信息，满足服务器当前运行状态检查。\"},{\"requirementId\":\"goal-2\",\"evidenceIds\":[\"evidence-fixture\",\"evidence-fixture\",\"evidence-fixture\",\"evidence-fixture\",\"evidence-fixture\"],\"outcome\":\"unmet\",\"reason\":\"仓库来源与 HEAD 已确认，npm ci + vite build 成功且 dist 独立校验通过；但 host-static 部署落地尚未得到一致验收：example-app-static.service 启动步骤证据冲突（Main PID 12345 vs 监听 pid=68474，状态 active 与 activating 不一致）。\"},{\"requirementId\":\"goal-3\",\"evidenceIds\":[],\"outcome\":\"unknown\",\"reason\":\"尚无受管服务监听与 HTTP 可访问性的一致性证据，无法给出可信的直接访问地址。\"},{\"requirementId\":\"goal-4\",\"evidenceIds\":[],\"outcome\":\"unknown\",\"reason\":\"部署最终运行状态未确定，缺少针对性优化建议所需的运行时证据。\"}]},\"issueResolutions\":[{\"issueId\":\"119:5c70ef6a\",\"evidenceIds\":[\"evidence-fixture\"],\"reason\":\"历史 Docker 部署因 node:22-alpine 拉取超时失败，用户已改为 host-static；python3 3.12.12 已确认可用，该失败前提已被替代方案覆盖，不再作为当前阻断。\"}],\"steps\":[{\"kind\":\"observe\",\"title\":\"只读澄清 8080 真实占用与 example-app-static.service 实际状态\",\"description\":\"只读采集当前事实：example-app-static.service 的 is-active/is-enabled 精确值、8080 端口监听进程 PID 与命令行、以及该 PID 是否属于 example-app-static.service 的 MainPID。不停止、不重启任何进程，仅用于判定 pid 68474 与 Main PID 12345 的关系。\",\"action\":{\"type\":\"shell\",\"command\":\"set -o pipefail\\nprintf '%s\\\\n' '-- is-active --'\\nsystemctl is-active example-app-static.service\\nprintf '%s\\\\n' '-- is-enabled --'\\nsystemctl is-enabled example-app-static.service\\nprintf '%s\\\\n' '-- mainpid --'\\nsystemctl show -p MainPID -p ActiveState -p SubState example-app-static.service\\nprintf '%s\\\\n' '-- port 8080 --'\\nss -lntp 2>/dev/null | grep -E ':8080\\\\b' || echo 'no listener on 8080'\\nprintf '%s\\\\n' '-- python http.server processes --'\\nps -eo pid,ppid,lstart,args | grep -E 'http\\\\.server' | grep -v grep || echo 'no http.server process'\"},\"expected\":\"获得 8080 当前监听进程 PID 与 example-app-static.service 的 MainPID/ActiveState 真实值，明确两者是否一致（无 8080 监听也属有效观察）。\",\"validation\":\"\",\"risk\":\"low\"},{\"kind\":\"change\",\"title\":\"修复并受管重启 example-app-static.service 使监听归属一致\",\"description\":\"根据上一步真实结果修复：若 8080 被非本服务的残留 python3 http.server 进程占用，则先终止该残留进程（仅限已确认非 example-app-static.service MainPID 的 http.server 进程），再 systemctl restart example-app-static.service；若服务未真正绑定则直接 restart。随后立即输出 is-active 与监听归属，确保系统报告与实际监听一致。\",\"action\":{\"type\":\"shell\",\"command\":\"set -o pipefail\\nOLD_PID=$(ss -lntp 2>/dev/null | grep -E ':8080\\\\b' | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)\\nMAIN_PID=$(systemctl show -p MainPID --value example-app-static.service)\\nif [ -n \\\"$OLD_PID\\\" ] && [ \\\"$OLD_PID\\\" != \\\"$MAIN_PID\\\" ]; then\\n  echo \\\"stopping stale python3 http.server pid=$OLD_PID (service MainPID=$MAIN_PID)\\\"\\n  kill \\\"$OLD_PID\\\" || exit 1\\n  for i in $(seq 1 20); do\\n    if ! ss -lntp 2>/dev/null | grep -qE ':8080\\\\b'; then break; fi\\n    sleep 0.5\\n  done\\nfi\\nsystemctl restart example-app-static.service || exit 1\\nsleep 1\\nsystemctl --no-pager --full status example-app-static.service || true\\nprintf '%s\\\\n' '-- is-active --'\\nsystemctl is-active example-app-static.service\\nprintf '%s\\\\n' '-- mainpid --'\\nsystemctl show -p MainPID --value example-app-static.service\\nprintf '%s\\\\n' '-- port 8080 --'\\nss -lntp 2>/dev/null | grep -E ':8080\\\\b' || echo 'no listener on 8080'\",\"expected\":\"清除与受管服务无关的 8080 残留监听后，example-app-static.service 重启成功并处于 active(running)，其 MainPID 与 8080 监听进程 PID 一致。\",\"validation\":\"set -o pipefail\\nMAIN_PID=$(systemctl show -p MainPID --value example-app-static.service)\\nSTATE=$(systemctl is-active example-app-static.service)\\necho \\\"is-active=$STATE mainpid=$MAIN_PID\\\"\\ntest \\\"$STATE\\\" = active || exit 1\\nLISTEN_PID=$(ss -lntp 2>/dev/null | grep -E ':8080\\\\b' | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)\\necho \\\"listen_pid=$LISTEN_PID\\\"\\ntest -n \\\"$LISTEN_PID\\\" || exit 1\\ntest \\\"$LISTEN_PID\\\" = \\\"$MAIN_PID\\\" || exit 1\\necho 'listener owned by example-app-static.service'\",\"risk\":\"medium\",\"recovery\":{\"failedStepId\":\"ai-fixture\",\"targetContext\":\"[\\\"srv-fixture\\\",\\\"round-fixture\\\",\\\"agent-fixture\\\",2,0]\",\"purpose\":\"repair\"}}]}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "completion_tokens": 1740,
+        "prompt_cache_hit_tokens": 45568,
+        "prompt_cache_miss_tokens": 816,
+        "prompt_tokens": 46384,
+        "prompt_tokens_details": {
+          "cached_tokens": 45568
+        },
+        "total_tokens": 48124
+      }
+    }
+  },
+  {
+    "name": "stage-misplaced-shell-execution-scope",
+    "source": "sanitized response-only fixture from 2026-10-02 local task aiwtct, response 3; all identifiers mapped consistently",
+    "response": {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "{\"decision\":\"continue\",\"reason\":\"前置只读检查已确认 git 2.52.0 可用、/opt 存在可写、/opt/example 不存在，克隆前提成立；任务整体目标（拉取并部署并提供可访问地址）尚未完成，需要继续执行克隆与项目发现。\",\"summary\":\"本轮尚未完成：已完成环境确认，下一步按原计划克隆仓库并读取项目结构与构建部署声明，以确定技术栈、构建与运行方式后再规划部署与最终可访问地址验收。\",\"requirementReview\":{\"baseRevision\":1,\"roundId\":\"round-fixture-1\",\"focusOutcome\":\"pending\",\"overallOutcome\":\"pending\",\"items\":[{\"requirementId\":\"req-1\",\"outcome\":\"unknown\",\"evidenceIds\":[\"evidence-fixture-2\"],\"reason\":\"现有证据仅为环境前提确认（git 可用、/opt 可写、/opt/example 不存在），仓库尚未克隆，部署与可访问地址均未产生，目标未完成。\"}]},\"steps\":[{\"kind\":\"change\",\"title\":\"克隆 example-app 仓库到 /opt/example\",\"description\":\"在服务器 192.0.2.10 上以用户给定的原始 URL https://example.invalid/demo.git 克隆仓库到最终目录 /opt/example。命令再次检查目标目录是否存在，若已存在立即失败退出，不覆盖已有内容；前台运行，保留实时输出与真实退出码，URL 中不写入任何用户名或令牌。\",\"action\":{\"type\":\"shell\",\"command\":\"set -o pipefail\\nif [ -e /opt/example ]; then printf 'ERROR: /opt/example already exists, abort clone\\\\n' >&2; exit 1; fi\\ncd /opt || exit 1\\ngit clone -- https://example.invalid/demo.git /opt/example\",\"executionScope\":\"isolated_exec\"},\"expected\":\"git clone 成功退出（退出码 0），/opt/example 下出现仓库工作树内容\",\"validation\":\"test -d /opt/example/.git && git -C /opt/example rev-parse --is-inside-work-tree && git -C /opt/example remote get-url origin && git -C /opt/example rev-parse HEAD\",\"validationScope\":\"isolated_exec\",\"risk\":\"low\"},{\"kind\":\"observe\",\"title\":\"读取 example-app 项目结构与构建部署声明\",\"description\":\"只读获取 /opt/example 的目录结构（排除 .git、依赖目录与构建产物），用于确定项目技术栈、依赖声明、构建入口与部署方式；此步不执行安装或构建。\",\"action\":{\"type\":\"tool\",\"toolId\":\"files.get_structure\",\"arguments\":{\"rootPath\":\"/opt/example\",\"maxDepth\":4,\"includeHidden\":false,\"excludeDirectories\":[\".git\",\"node_modules\",\"dist\",\"build\",\"target\",\".venv\",\"vendor\"]}},\"expected\":\"获得 /opt/example 的目录树，据以定位 README、依赖声明文件、构建脚本与可能的部署配置\",\"validation\":\"\",\"risk\":\"low\"}],\"planUpdate\":{\"basePlanFingerprint\":\"2659:5be32854\",\"replaceStepIds\":[\"ai-step-fixture-3\",\"ai-step-fixture-4\"],\"reason\":\"克隆命令与命令指纹一致但补充了 executionScope（isolated_exec）以符合执行环境，克隆步骤本身必需；项目结构读取改为结构化 files.get_structure 工具以获得更可靠的只读证据。二者原本均为 pending，未执行，替换不丢弃已完成工作。\"}}"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "completion_tokens": 783,
+        "prompt_cache_hit_tokens": 3584,
+        "prompt_cache_miss_tokens": 21666,
+        "prompt_tokens": 25250,
+        "prompt_tokens_details": {
+          "cached_tokens": 3584
+        },
+        "total_tokens": 26033
+      }
+    }
+  }
+]

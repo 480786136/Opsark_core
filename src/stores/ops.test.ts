@@ -9,6 +9,7 @@ import {
   normalizeLongRunningCommandOutput,
   normalizePlanPreconditions,
 } from "@/services/backend";
+import invalidScope from "@/services/fixtures/next-stage-invalid-scope.json";
 import { useOpsStore } from "@/stores/ops";
 import { useConnectionStore } from "@/features/connection/connectionStore";
 import type { PlanStep } from "@/types";
@@ -328,6 +329,21 @@ describe("智能任务状态机", () => {
     expect(backend.reviewStep).toHaveBeenCalledOnce();
     expect(backend.executeCommand).toHaveBeenCalledOnce();
     expect(backend.decideNextStage).not.toHaveBeenCalled();
+  });
+
+  it("契约更新仅解除旧格式失败一次，不解除余额或其他请求阻断", () => {
+    const { store, task } = completedObservationTask();
+    const plan = JSON.parse(JSON.stringify(task.plan));
+    store.recordModelPlanningBlocker(task, { code: "MODEL_FORMAT_INVALID", message: "invalid", retryable: false });
+    expect(store.stopBlockedModelPlanning(task)).toBe(true);
+    task.modelPlanningBlocker!.contractRevision = "2026-10-02-field-repair-evidence-v6";
+    expect(store.stopBlockedModelPlanning(task)).toBe(false);
+    store.recordModelPlanningBlocker(task, { code: "MODEL_FORMAT_INVALID", message: "invalid again", retryable: false });
+    expect(store.stopBlockedModelPlanning(task)).toBe(true);
+    store.recordModelPlanningBlocker(task, quotaError().modelError!);
+    delete task.modelPlanningBlocker!.contractRevision;
+    expect(store.stopBlockedModelPlanning(task)).toBe(true);
+    expect(task.plan).toEqual(plan);
   });
 
   it("结构输出失败后相同条件不能反复规划，余额增加不解除，调整预算才解除", () => {
@@ -2087,6 +2103,30 @@ describe("智能任务状态机", () => {
     expect(legacy?.submittedSecretBindings).toEqual({});
   });
 
+  it("旧版结构化计划错误恢复到原任务，保留已完成计划和历史消息且不调用模型", () => {
+    const { task } = completedObservationTask();
+    task.status = "needs_adjustment";
+    task.managedStopReason = "workflow_error";
+    task.pauseReason = `后续流程暂不可用：ModelInvocationError: ${JSON.stringify(invalidScope)}。已完成步骤及其执行证据保持有效，可检查后继续。`;
+    task.messages.push({ id: "old-error-event", role: "system", kind: "event", content: task.pauseReason, createdAt: task.createdAt });
+    const original = JSON.parse(JSON.stringify(task));
+    localStorage.setItem("opsark.tasks", JSON.stringify([task]));
+    setActivePinia(createPinia());
+    const store = useOpsStore();
+    const restored = store.tasks.find(item => item.id === original.id)!;
+    expect(store.tasks).toHaveLength(1);
+    expect(restored.plan).toEqual(original.plan);
+    expect(restored.messages).toEqual(original.messages);
+    expect(restored.currentRoundId).toBe(original.currentRoundId);
+    expect(restored.protocolRepair?.repair.nextStageDecision).toEqual(invalidScope.nextStageDecision);
+    expect(restored.protocolRepair?.repair.previousModelOutput[0].action).toEqual(invalidScope.steps[0].action);
+    expect(restored.pauseReason).toContain("validationScope 不合法");
+    expect(restored.pauseReason).not.toContain("ModelInvocationError");
+    expect(restored.managedAdjustmentPhase).toBe("manual_required");
+    expect(backend.decideNextStage).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
   it("工具计划恢复时不向当前、缓存或嵌套历史步骤注入 Shell 验收器", () => {
     const task = JSON.parse(JSON.stringify(useOpsStore().createTask("srv-production-01", "safe", "model-deepseek")));
     const createdAt = "2026-09-26T05:59:00.000Z";
@@ -2555,6 +2595,32 @@ describe("智能任务状态机", () => {
     expect(backend.generatePlan).not.toHaveBeenCalled();
   });
 
+  it.each(["managed", "safe"])("unsupported 检查保留证据并按 %s 权限进入调整，不执行后续步骤", async permission => {
+    const store = useOpsStore();
+    const task = store.createTask("srv-production-01", permission, "model-deepseek");
+    store.serverPasswords[task.serverId] = "test-password";
+    task.status = "running";
+    task.plan = [{ ...structuredClone(plan[0]), id: "unsupported-disk", kind: "observe", command: "", validation: "",
+      action: { type: "tool", toolId: "disk.inspect", arguments: { path: "/", check: "capacity" } } },
+      { ...structuredClone(plan[0]), id: "remaining-step" }];
+    const execute = vi.spyOn(store, "executeToolCall").mockImplementation(async (_server, call) => ({
+      callId: call.id, toolId: call.toolId, success: true, data: { request: call.arguments, status: "unsupported", items: [],
+        scannedEntries: 0, matchedEntries: 0, skippedCount: 1, skipped: [{ path: "python3>=3.8", reason: "unsupported" }],
+        coverageComplete: false, truncated: true, elapsedMs: 0, finishedAt: "now" },
+    }));
+    const queue = vi.spyOn(store, "queueManagedAdjustment").mockResolvedValue();
+    const verify = vi.spyOn(store, "markExecutionVerified");
+    await store.runStep(task.id, "unsupported-disk");
+    expect(execute).toHaveBeenCalledOnce();
+    expect(task.plan[0].status).toBe("failed");
+    expect(task.plan[0].evidence?.[0].facts.inspectionStatus).toBe("unsupported");
+    expect(task.plan[0].review.acceptance.status).toBe("unknown");
+    expect(task.status).toBe("needs_adjustment");
+    expect(verify).not.toHaveBeenCalled();
+    expect(backend.decideNextStage).not.toHaveBeenCalled();
+    expect(queue).toHaveBeenCalledTimes(permission === "managed" ? 1 : 0);
+  });
+
   it("远程命令 30 秒进行模型复核但仍等待真实退出后才正式校验", async () => {
     vi.useFakeTimers();
     try {
@@ -2689,9 +2755,13 @@ describe("智能任务状态机", () => {
     }
   });
 
-  it.each(["observe", "safe"] as const)(
-    "%s 模式的长任务调整决定只暂停并等待用户生成方案",
-    async (permission) => {
+  it.each([
+    { permission: "observe", kind: "observe" },
+    { permission: "safe", kind: "observe" },
+    { permission: "safe", kind: "change" },
+  ] as const)(
+    "$permission 模式的 $kind 长任务调整保留失败归属并核对变更副作用",
+    async ({ permission, kind }) => {
       vi.useFakeTimers();
       try {
         const store = useOpsStore();
@@ -2701,8 +2771,10 @@ describe("智能任务状态机", () => {
         task.plan = [{
           ...structuredClone(plan[0]),
           id: `stalled-${permission}`,
+          kind,
           title: "检查构建环境",
-          command: "java -version; npm --version",
+          command: kind === "change" ? "docker pull node:22" : "java -version; npm --version",
+          risk: kind === "change" ? "medium" : "low",
           validation: "true",
         }];
         vi.mocked(backend.reviewStep).mockResolvedValueOnce({ decision: "adjust", source: "model",
@@ -2725,12 +2797,12 @@ describe("智能任务状态机", () => {
           });
         });
 
-        if (permission === "observe") {
+        if (permission === "observe" || kind === "change") {
           task.status = "awaiting_step_approval";
           store.prepareTaskPlan(task);
-          requestStepApproval("observe", task.plan[0], store.tools);
+          requestStepApproval(permission, task.plan[0], store.tools);
         }
-        const running = permission === "observe"
+        const running = permission === "observe" || kind === "change"
           ? store.approveStep(task.id, `stalled-${permission}`)
           : store.runStep(task.id, `stalled-${permission}`);
         await vi.advanceTimersByTimeAsync(60_000);
@@ -2740,6 +2812,11 @@ describe("智能任务状态机", () => {
         expect(task.status).toBe("needs_adjustment");
         expect(task.plan[0].status).toBe("failed");
         expect(task.plan[0].result?.facts.stoppedByPeriodicReview).toBe(true);
+        expect(task.plan[0].evidence?.find(evidence => evidence.source === "main")?.scope?.targetId).toBe(task.serverId);
+        if (kind === "change") {
+          expect(task.executionReconciliation).toMatchObject({ stepId: `stalled-${permission}`, serverId: task.serverId });
+          expect(task.executionReconciliation?.resolution).toBeUndefined();
+        } else expect(task.executionReconciliation).toBeUndefined();
         expect(backend.generatePlan).not.toHaveBeenCalled();
         expect(task.permission).toBe(permission);
       } finally {
@@ -3396,7 +3473,7 @@ describe("智能任务状态机", () => {
     expect(store.activeTask?.status).toBe("awaiting_plan_approval");
   });
 
-  it("删除任务会清理本地记录并回到新任务", () => {
+  it("移除任务保留归档并回到新任务", async () => {
     const store = useOpsStore();
     const retained = store.createTask("srv-production-01", "safe", "model-deepseek");
     retained.title = "保留任务";
@@ -3412,7 +3489,7 @@ describe("智能任务状态机", () => {
       unlockDescription: "提交后继续当前步骤",
     };
 
-    expect(store.deleteTask(removed.id)).toBe(true);
+    expect(await store.deleteTask(removed.id)).toBe(true);
 
     expect(store.tasks.map((item) => item.id)).toEqual([retained.id]);
     expect(store.activeTaskId).toBeNull();
@@ -3420,13 +3497,13 @@ describe("智能任务状态机", () => {
     expect(JSON.parse(localStorage.getItem("opsark.tasks") ?? "[]")).toHaveLength(1);
   });
 
-  it("正在规划或执行的任务必须先终止，不能直接删除", () => {
+  it("正在规划或执行的任务必须先终止，不能直接删除", async () => {
     const store = useOpsStore();
     const running = store.createTask("srv-production-01", "managed", "model-deepseek");
     running.status = "running";
     running.currentExecutionId = "exec-live";
 
-    expect(store.deleteTask(running.id)).toBe(false);
+    expect(await store.deleteTask(running.id)).toBe(false);
     expect(store.tasks.some((item) => item.id === running.id)).toBe(true);
     expect(store.activeTaskId).toBe(running.id);
   });
@@ -4563,6 +4640,7 @@ describe("智能任务状态机", () => {
       summary: "已保留当前证据，进入 blocked/no_action。",
       source: "model",
       steps: [],
+      blocking: { kind: "external", reason: "目标处于维护窗口，等待外部恢复", requirementIds: [] },
     });
 
     await store.advanceTask(task.id);
@@ -4677,6 +4755,7 @@ describe("智能任务状态机", () => {
       summary: "已保留失败证据，进入 blocked/no_action。",
       source: "model",
       steps: [],
+      blocking: { kind: "external", reason: "目标处于维护窗口，等待外部恢复", requirementIds: [] },
     });
 
     await store.requestAdjustment(task.id);
@@ -6083,7 +6162,7 @@ describe("智能任务状态机", () => {
     expect(task.status).toBe("needs_adjustment");
   });
 
-  it("运行时阻断有明确修复步骤时允许继续到环境修复审批", async () => {
+  it("运行时检查完成后根据真实结果更新环境修复方案再审批", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "safe", "model-deepseek");
     task.status = "running";
@@ -6116,13 +6195,19 @@ describe("智能任务状态机", () => {
       summary: "需要升级 Node.js。",
       source: "model",
     });
+    vi.mocked(backend.decideNextStage).mockResolvedValueOnce({
+      decision: "continue", reason: "只读检查已证明版本不兼容", summary: "升级到项目要求版本",
+      source: "model", steps: [{ ...task.plan[1], id: "confirmed-upgrade-node" }],
+    });
 
     await store.runStep(task.id, "node-compatibility-with-fix");
 
-    expect(task.plan[0].status).toBe("completed");
-    expect(task.plan[0].review?.decision).toBe("continue");
-    expect(task.plan[1].status).toBe("awaiting_approval");
-    expect(task.status).toBe("awaiting_step_approval");
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(task.phaseHistory?.at(-1)?.plan[0].status).toBe("completed");
+    expect(task.phaseHistory?.at(-1)?.plan[0].review?.decision).toBe("continue");
+    expect(task.plan).toHaveLength(1);
+    expect(task.plan[0].status).toBe("pending");
+    expect(task.status).toBe("awaiting_plan_approval");
   });
 
   it("直接 runStep 不再以失败前序的 recovery 关系拦截已生成步骤", async () => {
@@ -6292,6 +6377,9 @@ describe("智能任务状态机", () => {
 
     expect(backend.executeCommand).toHaveBeenCalledTimes(2);
     expect(task.plan[0]).toMatchObject({ status: "failed", result: { executionStatus: "failed" } });
+    const failureEvidence = task.plan[0].evidence?.find(evidence => evidence.source === "main");
+    expect(failureEvidence?.scope?.targetId).toBe(task.serverId);
+    expect(task.plan[0].result?.evidenceIds).toContain(failureEvidence?.id);
     expect(task.plan[1]).toMatchObject({ status: "completed" });
     expect(task.plan[1].recovery).toBeUndefined();
     expect(task.messages.every(message => !message.content.includes("缺少有效恢复关系"))).toBe(true);

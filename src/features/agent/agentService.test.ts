@@ -77,7 +77,7 @@ describe("agentService", () => {
     ];
     current.plan = [{ ...step("space", "df -h"), output: "根分区剩余 2.9G" }];
     const decide = vi.fn().mockResolvedValue({ decision: "adjust", reason: "磁盘剩余空间已回答，已完成", summary: "已完成",
-      source: "model", steps: [] });
+      source: "model", steps: [], blocking: { kind: "external", reason: "目标当前不可达，等待连接恢复", requirementIds: [] } });
     const result = await decideTaskNextStage({ task: current, model, apiKey: "fixture", tools: [], secretMetadata: [], generationSettings }, decide);
     expect(decide.mock.calls[0][0]).toContain(current.currentInstruction);
     const context = JSON.parse(decide.mock.calls[0][1].context);
@@ -187,13 +187,14 @@ describe("agentService", () => {
     expect(fallbackReview).not.toHaveBeenCalled();
   });
 
-  it("accepts adjust with no steps as a blocked/no-action decision", async () => {
+  it("accepts an explicit external blocker with no steps", async () => {
     const decide = vi.fn().mockResolvedValue({
       decision: "adjust",
-      reason: "缺少必要的用户决策",
+      reason: "外部服务器不可用",
       summary: "当前无法生成可执行步骤",
       source: "model",
       steps: [],
+      blocking: { kind: "external", reason: "外部服务器不可用", requirementIds: [] },
     });
     const fallbackReview = vi.fn();
 
@@ -223,6 +224,36 @@ describe("agentService", () => {
     expect(result.decision.summary).toContain("blocked/no_action");
     expect(decide).not.toHaveBeenCalled();
     expect(fallbackReview).not.toHaveBeenCalled();
+  });
+
+  it("corrects a phantom user wait once with concrete feedback and keeps the task unchanged", async () => {
+    const current = task();
+    const original = structuredClone(current);
+    const proposal = { decision: "adjust", reason: "等待用户", summary: "需要用户处理", source: "model", steps: [],
+      blocking: { kind: "user_input", reason: "等待选择端口", requirementIds: [] } };
+    const decide = vi.fn().mockResolvedValueOnce(proposal).mockResolvedValueOnce({ ...proposal,
+      reason: "远端不可达", summary: "连接恢复前没有可执行动作",
+      blocking: { kind: "external", reason: "远端不可达", requirementIds: [] } });
+    const result = await decideTaskNextStage({ task: current, model, apiKey: "fixture", tools: [],
+      secretMetadata: [], generationSettings, skills: [] }, decide);
+    expect(decide).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(decide.mock.calls[1][1].context).operationalRepair.reason).toContain("user.request_input");
+    expect(result.nextPlan).toEqual([]);
+    expect(result.decision.blocking?.kind).toBe("external");
+    expect(current).toEqual(original);
+  });
+
+  it("stops after one metadata correction and one fresh candidate without replacing execution evidence", async () => {
+    const current = task();
+    const original = structuredClone(current);
+    const decide = vi.fn().mockResolvedValue({ decision: "adjust", reason: "等待用户", summary: "需要用户处理",
+      source: "model", steps: [], blocking: { kind: "user_input", reason: "等待选择端口", requirementIds: [] } });
+    await expect(decideTaskNextStage({ task: current, model, apiKey: "fixture", tools: [], secretMetadata: [],
+      generationSettings, skills: [], recoverProtocolFailures: true }, decide)).rejects.toThrow("user.request_input");
+    expect(decide).toHaveBeenCalledTimes(3);
+    expect(JSON.parse(decide.mock.calls[2][1].context)._modelOutputRecovery.strategy).toBe("regenerate");
+    expect(JSON.parse(decide.mock.calls[2][1].context).operationalRepair).toBeUndefined();
+    expect(current).toEqual(original);
   });
 
   it("does not accept a rules fallback as the model's next-stage business decision", async () => {

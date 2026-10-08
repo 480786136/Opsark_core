@@ -1,5 +1,6 @@
 import type { ExecutionIntentSnapshot, ExecutionTargetRef, OpsTask, ServerProfile } from "@/types";
-import type { ExecutionOperationRecord } from "@/services/executionLedger";
+import { executionAttemptReviewMatches, type ExecutionAttemptRecord, type ExecutionAttemptReviewReceipt,
+  type ExecutionOperationRecord } from "@/services/executionLedger";
 import { executionIntentMatches } from "./planPreparation";
 
 const object = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -61,6 +62,11 @@ export function readExecutionLedger(value: unknown): { operations: ExecutionOper
         if (attempt.outcome !== undefined && (!object(attempt.outcome)
           || attempt.outcome.status !== attempt.status || !stringArray(attempt.outcome.evidenceRefs))) throw new Error();
         if (["succeeded", "failed", "not_dispatched"].includes(attempt.status as string) && !attempt.outcome) throw new Error();
+        if (attempt.reviews !== undefined && (!Array.isArray(attempt.reviews) || attempt.projectionAppliedAt === undefined
+          || attempt.reviews.some(review => !object(review) || !integer(review.recordedAt)
+            || !executionAttemptReviewMatches(row as unknown as ExecutionOperationRecord, attempt as unknown as ExecutionAttemptRecord,
+              review as unknown as ExecutionAttemptReviewReceipt))
+          || new Set(attempt.reviews.map(review => review.reviewFingerprint)).size !== attempt.reviews.length)) throw new Error();
         attemptIds.add(attempt.id);
       }
       if (row.reconciliation !== undefined) {
@@ -82,6 +88,7 @@ export function readExecutionLedger(value: unknown): { operations: ExecutionOper
 
 export type ExecutionLedgerRecoveryAction = "reconcile" | "verify" | "retry_storage" | "none";
 export interface ExecutionLedgerRecoveryItem {
+  origin?: "direct";
   kind: "uncertain" | "recorded_result" | "storage_failed" | "incompatible";
   operationId: string;
   attemptId?: string;
@@ -115,6 +122,17 @@ export function executionReceiptSteps(task: OpsTask) {
     ...(task.historyCheckpoint?.unresolvedIssues ?? []).flatMap(i => i.recoveryContract ? [i.recoveryContract.step] : [])];
 }
 
+/** Supplement only receipts whose exact output is no longer available in the task UI. */
+export function missingInspectionReceipts(task: OpsTask): RecordedReadReceipt[] {
+  const shown = new Set(executionReceiptSteps(task).flatMap(step => {
+    if (!step.output || step.output.includes("[持久化时已截断，完整实时输出不受影响]")) return [];
+    const attempt = step.executionLedgerAttempts?.filter(ref => ref.phase !== "validation").slice(-1)[0];
+    return attempt ? [JSON.stringify([attempt.operationId, attempt.attemptId])] : [];
+  }));
+  return (task.executionLedgerRecovery?.recordedReads ?? []).filter(receipt =>
+    !shown.has(JSON.stringify([receipt.operationId, receipt.attemptId])));
+}
+
 function supportsReconciliation(operation: ExecutionOperationRecord) {
   const semantic = operation.intent.semantic;
   return semantic.action.type === "tool" && semantic.action.toolId === "files.transfer_between_servers"
@@ -122,7 +140,39 @@ function supportsReconciliation(operation: ExecutionOperationRecord) {
       && isReadOnlyServiceValidator(semantic.validator?.command ?? semantic.validation ?? "");
 }
 
+/** Bind a display label to the exact historical attempt, never to a reused step ID. */
+export function executionRecordTitle(operation: ExecutionOperationRecord, attemptId: string, task?: OpsTask): string {
+  const step = task && executionReceiptSteps(task).find(step => step.executionLedgerAttempts?.some(
+    ref => ref.operationId === operation.operationId && ref.attemptId === attemptId));
+  if (step?.title?.trim()) return step.title.trim().slice(0, 80);
+  const action = operation.intent.semantic.action;
+  const names: Record<string, string> = { "disk.inspect": "磁盘检查", "files.find_large": "大文件检查", "services.inspect": "服务检查" };
+  if (action.type === "tool") {
+    const subject = action.arguments.service ?? action.arguments.path;
+    return (names[action.toolId] ?? action.toolId) + (typeof subject === "string" ? ` · ${subject.replace(/[\r\n\t]/g, " ").slice(0, 60)}` : "");
+  }
+  return operation.effect === "read" ? "命令检查" : "远端操作";
+}
+
+/** Old recovery projections are migratable only when the ledger proves their origin. */
+export function isUntouchedRecoveryShell(task: OpsTask, operations: readonly ExecutionOperationRecord[]): boolean {
+  if (!task.title.startsWith("执行记录恢复 · ") || task.modelId || task.messages.length || task.currentExecutionId
+    || task.requirementProcessing || task.permission !== "observe" || task.adjustmentCount !== 0
+    || task.planHistory?.length || task.phaseHistory?.length
+    || !["needs_adjustment", "awaiting_continuation"].includes(task.status)
+    || !["任务展示缓存缺失，已从持久台账恢复执行事实。先只读核对，不能重发原变更。",
+      "已恢复历史检查结果，可查看已有证据；这不代表当前任务目标已完成。"].includes(task.pauseReason ?? "")) return false;
+  const first = operations[0];
+  return Boolean(first && task.rootGoal === first.intent.semantic.expected
+    && task.createdAt === new Date(first.createdAt).toISOString()
+    && (!first.roundId || first.roundId === task.currentRoundId)
+    && operations.every(op => op.taskId === task.id && op.roundId === first.roundId && op.workflowEpoch === task.workflowEpoch)
+    && task.plan.every(step => step.title === "待恢复的执行记录" && step.status === "failed"
+      && operations.some(op => op.stepId === step.id && op.intentDigest === step.executionIntent?.digest)));
+}
+
 export function projectExecutionLedgerRecovery(operations: readonly ExecutionOperationRecord[], options: {
+  task?: OpsTask;
   appliedAttemptIds?: readonly string[];
   verifiedAttemptIds?: readonly string[];
   storageFailures?: readonly ExecutionLedgerRecoveryItem[];
@@ -142,14 +192,20 @@ export function projectExecutionLedgerRecovery(operations: readonly ExecutionOpe
     if (operation.effect === "read" && attempt.status === "succeeded" && verifiedReadOperations.has(operation.operationId)) continue;
     if (operation.reconciliation?.status === "completed" && operation.reconciliation.attemptId === attempt.id) continue;
     const acknowledged = applied.has(attempt.id) || attempt.projectionAppliedAt !== undefined;
-    const reviewed = !attempt.late && (verified.has(attempt.id) || attempt.reviewCompletedAt !== undefined);
+    // A failed/unknown acceptance already reviewed and owned by the task is not
+    // an unreviewed receipt. This is presentation ownership, not reconciliation.
+    // Cancellation, late responses and unknown dispatch always retain priority.
+    const reviewed = !attempt.late && !attempt.cancelRequested && !operation.cancelRequested
+      && (verified.has(attempt.id) || attempt.reviewCompletedAt !== undefined
+        || attempt.reviews?.some(review => executionAttemptReviewMatches(operation, attempt, review)) === true);
     const semantic = operation.intent.semantic;
-    const action = semantic.action;
-    const inspectionNames: Record<string, string> = { "disk.inspect": "磁盘检查", "files.find_large": "大文件检查", "services.inspect": "服务检查" };
-    const inspectionName = action.type === "tool" ? inspectionNames[action.toolId] : undefined;
-    const subject = action.type === "tool" ? action.arguments.service ?? action.arguments.path : undefined;
-    const title = inspectionName ? `${inspectionName}${typeof subject === "string" ? ` · ${subject.slice(0, 180)}` : ""}`
-      : semantic.expected?.trim().slice(0, 180) || (action.type === "tool" ? action.toolId : "远端操作");
+    const title = executionRecordTitle(operation, attempt.id, options.task);
+    const direct = semantic.policyVersion === "direct-user-action@1" && operation.taskId.startsWith("direct-")
+      && semantic.taskId === operation.taskId && semantic.stepId === operation.stepId;
+    // Direct user actions have no business-task review phase. A committed, on-time
+    // success belongs in history; do not fabricate review acknowledgements or alter facts.
+    if (direct && attempt.status === "succeeded" && attempt.outcome?.status === "succeeded"
+      && !attempt.late && !attempt.cancelRequested && !operation.cancelRequested) continue;
     if (operation.effect === "read" && ["succeeded", "failed"].includes(attempt.status) && attempt.outcome) {
       recordedReads.push({ operationId: operation.operationId, attemptId: attempt.id, stepId: operation.stepId,
         title, toolId: semantic.action.type === "tool" ? semantic.action.toolId : undefined,
@@ -163,8 +219,10 @@ export function projectExecutionLedgerRecovery(operations: readonly ExecutionOpe
       try { buildReadOnlyReconciliation(operation, { id: operation.taskId }, options.servers); }
       catch { supported = false; }
     }
-    const guidance = supported ? [] : ["此操作暂不支持自动核对；请在任务中查看已有证据并安排只读排查。"];
-    const base = { title, recordedAt: attempt.completedAt, operationId: operation.operationId, attemptId: attempt.id, stepId: operation.stepId,
+    const guidance = supported ? [] : [direct
+      ? "此操作暂不支持自动核对；可在执行记录中查看已有证据，并手动检查原目标。"
+      : "此操作暂不支持自动核对；请在任务中查看已有证据并安排只读排查。"];
+    const base = { ...(direct ? { origin: "direct" as const } : {}), title, recordedAt: attempt.completedAt, operationId: operation.operationId, attemptId: attempt.id, stepId: operation.stepId,
       cancelRequested: attempt.cancelRequested || operation.cancelRequested, late: attempt.late };
     if (["dispatching", "unknown"].includes(attempt.status)) {
       items.push({ ...base, kind: "uncertain", action: supported ? "reconcile" : "none",
@@ -172,10 +230,10 @@ export function projectExecutionLedgerRecovery(operations: readonly ExecutionOpe
         knownFacts: [...guidance, "已登记派发尝试；没有足够证据证明未执行。", ...(base.cancelRequested ? ["已请求取消，尚未确认远端停止。"] : [])] });
     } else if (attempt.status === "succeeded" && (!acknowledged || !reviewed)) {
       items.push({ ...base, kind: "recorded_result", action: supported ? "verify" : "none",
-        summary: operation.phase === "command" ? "主命令成功已记录，继续复核或只读验收，不重复执行主命令。" : "执行结果已记录，等待当前任务核验结果。",
-        knownFacts: [...guidance, "成功结果已保存；是否满足业务目标仍需结合任务证据确认。",
-          ...(attempt.late ? ["结果在原任务所有权结束后返回，保存在原尝试中。"] : [])] });
-    } else if (attempt.status === "failed" && !acknowledged) {
+        summary: direct ? "成功结果已保存，但存在取消或迟到标记，请检查原操作的最终状态。" : operation.phase === "command" ? "主命令成功已记录，继续复核或只读验收，不重复执行主命令。" : "执行结果已记录，等待当前任务核验结果。",
+        knownFacts: [...guidance, ...(direct ? [] : ["成功结果已保存；是否满足业务目标仍需结合任务证据确认。"]),
+          ...(attempt.late ? [direct ? "结果在取消或原执行上下文结束后返回，保存在原尝试中。" : "结果在原任务所有权结束后返回，保存在原尝试中。"] : [])] });
+    } else if (attempt.status === "failed" && (!acknowledged || attempt.late || base.cancelRequested)) {
       items.push({ ...base, kind: "recorded_result", action: supported ? "verify" : "none", summary: "已记录失败结果，先核对已发生的部分效果与后续处理。",
         knownFacts: [...guidance, "失败结果属于该次尝试；不能推定远端没有发生变更。"] });
     }

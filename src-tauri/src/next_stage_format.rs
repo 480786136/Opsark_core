@@ -1,10 +1,27 @@
 use serde_json::{json, Map, Value};
 
+/// A format correction preserves the decision, but must not invent work when a
+/// requirement-aware adjust legitimately reports a finished focus or a blocker.
+/// Requirement/evidence admission remains with the normal decision consumer.
+pub(crate) fn requires_nonempty_repair_steps(context: &Value, decision: &str) -> bool {
+    decision == "continue" || !crate::requirement_contract::requires_review(context)
+}
+
 /// A missing plan needs a focused proposal, not another copy of every Skill and
 /// historical phase. Authority and current evidence are never inferred from the
 /// rejected model prose; omitted history remains explicitly unavailable.
 pub(crate) fn repair_context(raw: &str) -> Option<Value> {
     let context: Value = serde_json::from_str(raw).ok()?;
+    // The service-level coordinator chooses field repair versus a full candidate.
+    // Old rejected-response history must not turn a fresh candidate request back
+    // into the legacy compact/missing-steps repair contract.
+    if context.get("_modelOutputRecovery").is_some() { return None; }
+    // Requirement-aware decisions can legitimately finish only the current
+    // request with no plan. The old compact repair hardcodes nonempty steps;
+    // use the complete contract and evidence context for these decisions.
+    if crate::requirement_contract::requires_review(&context) {
+        return None;
+    }
     let failure = &context["protocolReplan"];
     if failure["errorCode"] != "next_stage_response_invalid" {
         return None;
@@ -26,6 +43,7 @@ pub(crate) fn repair_context(raw: &str) -> Option<Value> {
         "_modelCapabilities",
         "_modelIntegration",
         "_modelRecovery",
+        "_modelOutputRecovery",
         "taskGoal",
         "server",
         "permission",

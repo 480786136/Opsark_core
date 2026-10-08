@@ -28,7 +28,65 @@ function task(steps: PlanStep[]): OpsTask {
     phaseHistory: steps.slice(0, -1).map(step => ({ id: step.id, roundId: "round", requirement: "分析磁盘", reason: "adjustment", plan: [step], createdAt: "now", completedAt: "now" })) };
 }
 
+function portInspection(text: string): PlanStep {
+  const step = inspection("final-ports");
+  const request = { check: "ports", timeoutSeconds: 15, logLines: 50, sinceMinutes: 30 };
+  const data = { request, status: "complete", coverageComplete: true, truncated: false,
+    scannedEntries: 0, matchedEntries: 1, skippedCount: 0, skipped: [],
+    items: [{ kind: "ports", subject: "server:listening", text, exitCode: 0 }],
+    elapsedMs: 15, finishedAt: "2026-10-03T03:40:31.310Z" };
+  step.action = { type: "tool", toolId: "services.inspect", arguments: request };
+  step.title = "复核 8087 已无监听进程";
+  step.expected = "8087 无监听才满足关闭要求";
+  step.output = JSON.stringify(data);
+  step.result!.observationStatus = "matched";
+  step.result!.warnings = [];
+  step.result!.facts = { toolId: "services.inspect", evidenceKind: "operations_inspection", inspectionStatus: "complete", evidenceComplete: true };
+  step.evidence![0].rawOutput = step.output;
+  step.evidence![0].archive = { evidenceId: "a".repeat(64), characters: step.output.length,
+    fingerprint: textFingerprint(step.output), capturedPartial: false };
+  return step;
+}
+
 describe("inspection progress and planning evidence", () => {
+  it("keeps the new 8087 listener in the single canonical decision body despite a misleading expected/title", () => {
+    const row = (port: number, pid: number) => `tcp LISTEN 0 511 0.0.0.0:${port} 0.0.0.0:* users:(("node",pid=${pid},fd=18))\n`;
+    const text = "Netid State Recv-Q Send-Q Local Address:Port Peer Address:PortProcess\n"
+      + Array.from({ length: 7 }, (_, i) => row(8090 + i, 84786 + i)).join("")
+      + row(8087, 370737) + Array.from({ length: 6 }, (_, i) => row(9090 + i, 1314 + i)).join("");
+    expect(text.indexOf("370737")).toBeGreaterThan(300);
+    const step = portInspection(text), before = JSON.stringify(step);
+    const snapshot = buildTaskDecisionSnapshot(task([step]), undefined, true);
+    const observation = snapshot.operationsEvidence!.observations[0];
+    expect(observation).toMatchObject({ coverageComplete: true, items: [{ text,
+      textProjection: { contentState: "complete", omittedCharacters: 0 } }] });
+    expect(JSON.stringify(snapshot).match(/370737/g)).toHaveLength(1);
+    expect(snapshot.currentPlan.steps[0].output?.contentRef).toBe("operationsEvidence.observations[0]");
+    expect(JSON.stringify(step)).toBe(before);
+  });
+
+  it("marks omitted table rows even when remote collection is complete and retains archive references", () => {
+    const step = portInspection("tcp LISTEN 0 511 0.0.0.0:8090 0.0.0.0:*\n".repeat(200));
+    const snapshot = buildTaskDecisionSnapshot(task([step]), undefined, true);
+    expect(snapshot.operationsEvidence!.observations[0]).toMatchObject({ coverageComplete: true, truncated: false,
+      items: [{ textProjection: { contentState: "excerpt", omittedCharacters: expect.any(Number) } }] });
+    expect(snapshot.currentPlan.steps[0].output?.references?.[0].readTool).toBe("evidence.read");
+    expect(snapshot.operationsEvidence!.instruction).toContain("不能因未看到某端口/进程就断言不存在");
+    expect(JSON.stringify(snapshot.operationsEvidence!.observations).length).toBeLessThan(OPERATIONS_SUMMARY_BUDGET);
+  });
+
+  it("redacts inspection text and shares the existing summary budget across several text items", () => {
+    const step = portInspection("curl --token sensitive-value\n" + "service-state ".repeat(600));
+    const data = JSON.parse(step.output!);
+    data.items.push(...Array.from({ length: 5 }, () => ({ ...data.items[0] })));
+    step.output = JSON.stringify(data);
+    const projection = operationsPlanningContext([step]);
+    expect(projection.context!.observations).toHaveLength(1);
+    expect(projection.context!.observations[0]).toMatchObject({ omittedItems: 3 });
+    expect(JSON.stringify(projection.context)).not.toContain("sensitive-value");
+    expect(JSON.stringify(projection.context!.observations).length).toBeLessThan(OPERATIONS_SUMMARY_BUDGET);
+  });
+
   it("does not count collection time or repeated capacity polling as new coverage", () => {
     expect(observationIdentity(inspection("first", "/srv", "directory", 1))).toBe(observationIdentity(inspection("second", "/srv", "directory", 9)));
     const current = task([1, 2, 3].map(i => inspection(String(i), "/", "capacity", i)));

@@ -73,6 +73,11 @@ export const useAgentWorkspaceStore = defineStore("agentWorkspaces", {
       Object.assign(this.ensureServer(serverId), patch);
       this.persist();
     },
+    resetConversation(serverId: string) {
+      // A new workspace visit starts with a blank conversation, retaining user preferences.
+      Object.assign(this.ensureServer(serverId), { activeTaskId: "", draft: "", showTasks: false });
+      this.persist(true);
+    },
     reconcileTasks(serverId: string, taskIds: string[]) {
       const workspace = this.ensureServer(serverId);
       if (workspace.activeTaskId && taskIds.includes(workspace.activeTaskId)) return;
@@ -86,10 +91,12 @@ export const useAgentWorkspaceStore = defineStore("agentWorkspaces", {
     persist(immediate = false) {
       if (persistTimer !== undefined) window.clearTimeout(persistTimer);
       const write = () => {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({
-          version: 1,
-          workspaces: this.workspaces,
-        } satisfies PersistedAgentWorkspaces));
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify({
+            version: 1,
+            workspaces: this.workspaces,
+          } satisfies PersistedAgentWorkspaces));
+        } catch { /* Conversation navigation remains usable when UI storage is unavailable. */ }
         persistTimer = undefined;
       };
       if (immediate) write();

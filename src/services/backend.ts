@@ -1,4 +1,6 @@
 import { modelIntegrationConfig } from "@/features/agent/modelIntegration";
+import { projectClassifiedRequirementContext } from "@/features/agent/requirementPlanningContext";
+import { mergeRequirementExecutionConstraints } from "@/features/agent/taskRequirements";
 import { parameterContext, validateRequestParameters } from "@/features/agent/modelParameters";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -29,7 +31,7 @@ import {
   parseRepairContext, protocolFieldValue, protocolRepairAuthority, protocolRepairScopeFingerprint, protocolRepairStopMessage, stableProtocolValue,
 } from "./planProtocolRepair";
 import type { PlanRepairDiagnostic, ProtocolRepairProgress } from "./planProtocolRepair";
-import { ensureModelRecoveryContext, recoveryFromContext } from "./modelRecovery";
+import { candidateRegenerationContext, ensureModelRecoveryContext, isModelRecoveryScopeRejection, isRecoverableModelOutput, outputStrategyFromContext, recoveryFromContext, withModelOutputStrategy } from "./modelRecovery";
 import type { ModelRecoveryContext } from "./modelRecovery";
 import { legacyModelOperationValue, modelOperationResult, ModelOperationBoundaryError } from "./modelOperationBoundary";
 import { cancelDirectExecution, directExecutionId, fileContentIdentity, runDirectExecution } from "./directExecutionLedger";
@@ -44,6 +46,8 @@ export interface RuntimeConnection {
 }
 
 export interface RuntimeModel extends ModelIntegration {
+  /** Local lifecycle guard; never serialized into the model request. */
+  assertCurrent?(): void;
   capabilities?: import("@/types").ModelCapabilities;
   requestParameters?: import("@/types").ModelRequestParameters;
   timeoutSeconds?: number;
@@ -137,7 +141,9 @@ const LOCAL_MODEL_ERROR_STAGES: Record<string, readonly string[]> = {
   MODEL_OUTPUT_REFUSED: ["response_status"],
   MODEL_TOOL_CALL_UNEXPECTED: ["response_status"],
   MODEL_CONTENT_FILTERED: ["response_status"],
-  MODEL_FORMAT_INVALID: ["json_parse", "wire_validation", "business_validation", "metadata_decode"],
+  MODEL_FORMAT_INVALID: ["json_parse", "wire_validation", "business_validation", "metadata_decode", "format_repair_scope"],
+  MODEL_RECOVERY_SCOPE_REJECTED: ["format_repair_scope"],
+  MODEL_OUTPUT_REPAIR_EXHAUSTED: ["output_recovery"],
   MODEL_OUTPUT_TRUNCATED: ["response_status"],
   MODEL_FINISH_UNSUPPORTED: ["response_status"],
   MODEL_CAPABILITY_INVALID: ["request"],
@@ -195,7 +201,7 @@ function parseModelServiceError(value: unknown): ModelServiceError | undefined {
   if (item.recoveryBudget && typeof item.recoveryBudget === "object" && !Array.isArray(item.recoveryBudget)) {
     const budget: NonNullable<ModelServiceError["recoveryBudget"]> = {};
     const rawBudget = item.recoveryBudget as Record<string, unknown>;
-    for (const key of ["generations", "transportAttempts", "elapsedMs", "accountedTokens", "knownUsageTokens", "unknownUsageAttempts", "maxGenerations", "maxTransportAttempts", "maxElapsedMs", "maxTotalTokens"] as const) {
+    for (const key of ["generations", "transportAttempts", "elapsedMs", "accountedTokens", "knownUsageTokens", "unknownUsageAttempts", "maxGenerations", "maxTransportAttempts", "maxElapsedMs", "maxTotalTokens", "fieldRepairs", "candidateRegenerations"] as const) {
       const number = rawBudget[key];
       if (typeof number === "number" && Number.isSafeInteger(number) && number >= 0) budget[key] = number;
     }
@@ -230,6 +236,23 @@ export function modelServiceError(error: unknown): ModelServiceError | undefined
 }
 
 export function modelServiceErrorMessage(error: ModelServiceError) {
+  if (isModelRecoveryScopeRejection(error)) {
+    const field = error.jsonPointer?.match(/^\/(?:steps|repair\/replacementSteps)\/(\d+)(?:\/(kind|executionScope|runtimeClass|validation|sessionContextChange|action(?:\/command|\/toolId)?))?$/);
+    const index = field ? Number(field[1]) : undefined;
+    const location = index !== undefined && Number.isSafeInteger(index) ? `第 ${index + 1} 个步骤` : "恢复方案";
+    const reasons: Record<string, string> = {
+      kind: "包含非观察步骤",
+      executionScope: "使用了此轮恢复不允许的执行作用域",
+      runtimeClass: "试图启动常驻服务",
+      validation: "包含此轮只读取证不允许的后置校验",
+      sessionContextChange: "试图修改执行会话",
+      "action/command": "的 Shell 命令包含变更，或无法被当前规则确认只读",
+      "action/toolId": "使用的工具未被当前目录声明为只读",
+      action: "的动作无法被当前规则确认只读",
+    };
+    const detail = field?.[2] && reasons[field[2]] ? `${location}${reasons[field[2]]}。` : `${location}未满足此轮只读取证限制。`;
+    return `恢复方案未通过只读安全校验。${detail}该方案未执行，已有目标、用户确认和执行证据已保留。已停止自动重试；后续方案需要使用当前规则可确认的只读检查，无需修改模型配置。`;
+  }
   if (MODEL_RECOVERY_ERROR_CODES.has(error.code)) {
     const summary = error.code === "MODEL_RESULT_UNAVAILABLE" ? "模型请求已有处理记录，但原始响应无法恢复。"
       : error.code === "MODEL_DISPATCH_UNKNOWN" ? "模型请求是否已经处理尚不确定，已停止自动重新发送。"
@@ -262,9 +285,19 @@ export function modelServiceErrorMessage(error: ModelServiceError) {
       : "模型服务请求失败，未获得可用结果。";
     return `${summary}已有目标、用户确认和执行证据已保留；本次操作已停止自动重试和重规划。`;
   }
+  if (error.code === "MODEL_FORMAT_INVALID") {
+    // Expose the field location, never the raw model response or provider message.
+    const field = error.jsonPointer && /^\/(?:steps|repair|decision|reason|summary|requirementReview|blocking|issueResolutions)(?:\/[A-Za-z0-9_-]+)*$/.test(error.jsonPointer)
+      ? error.jsonPointer.slice(0, 160) : undefined;
+    const detail = error.stage === "json_parse" ? "返回内容不是完整合法的 JSON。"
+      : field ? `字段 ${field}${error.keyword === "additionalProperties" ? "不允许出现在当前契约中" : "未通过契约校验"}。` : "返回字段未通过当前操作契约校验。";
+    return `模型响应格式修复未成功。${detail}被拒响应未用于推进任务，已有目标、用户确认和执行证据已保留。已停止自动重试；可点击“重新生成”发起一次有界重试，无需修改模型配置。`;
+  }
+  if (error.code === "MODEL_OUTPUT_REPAIR_EXHAUSTED") {
+    return "本轮局部修复机会已用完，当前操作未得到可用结果。已有目标、授权和执行证据已保留；可重新生成后续方案，执行结果未知的操作仍须先核对。";
+  }
   if (COMPATIBILITY_ERROR_CODES.has(error.code) || LOCAL_MODEL_ERROR_CODES.has(error.code)) {
     const summary = error.code === "MODEL_OUTPUT_TRUNCATED" ? "模型输出被截断，未得到完整可用结果。"
-      : error.code === "MODEL_FORMAT_INVALID" ? "模型响应格式不符合当前操作契约，格式修复未成功。"
       : error.code === "MODEL_FINISH_UNSUPPORTED" ? "模型响应未正常结束，不能作为可执行方案。"
       : error.code === "MODEL_RESPONSE_INVALID" ? "模型接口响应封装不符合所选 API 协议。"
       : error.code === "MODEL_OUTPUT_PENDING" ? "模型请求尚未完成，当前未启用后台结果续取。"
@@ -422,7 +455,7 @@ export interface PlanNormalizationRepair {
   progress?: ProtocolRepairProgress;
   /** Business proposals after the first rejection, separate from field repair. */
   businessReplanProgress?: { attemptCount: number; stopReason: "no_progress" | "budget_exhausted" };
-  nextStageDecision?: Pick<NextStageDecision, "decision" | "reason" | "summary" | "planUpdate" | "reconciliation">;
+  nextStageDecision?: Pick<NextStageDecision, "decision" | "reason" | "summary" | "planUpdate" | "reconciliation" | "requirementReview" | "blocking" | "issueResolutions">;
 }
 
 export class PlanProtocolError extends Error {
@@ -438,7 +471,9 @@ export class PlanProtocolError extends Error {
     }
     const safetyCode = this.repair.validationError.match(/\b(?:PIPELINE_STATUS_LOST|EMPTY_SUCCESS_FALLBACK|OBSERVE_COMMAND_MUTATION|ASKPASS_CREDENTIAL_SCRIPT)\b/)?.[0];
     const unavailableTool = this.repair.validationError.match(/当前规划上下文未开放工具[：\s]+([a-zA-Z0-9_.-]+)/)?.[1];
-    const reason = this.repair.validationError.includes("TOOL_IN_SHELL") ? "后续计划将工具调用嵌入了 Shell，须拆为独立步骤（TOOL_IN_SHELL）"
+    const invalidScope = this.repair.validationError.match(/(?:executionScope|validationScope|runtimeClass) 不合法/)?.[0];
+    const reason = invalidScope ? `后续计划的 ${invalidScope}，必须使用契约规定的枚举值`
+      : this.repair.validationError.includes("TOOL_IN_SHELL") ? "后续计划将工具调用嵌入了 Shell，须拆为独立步骤（TOOL_IN_SHELL）"
       : unavailableTool ? `后续计划调用了当前未开放的工具 ${unavailableTool}`
       : safetyCode ? `后续计划未通过安全检查（${safetyCode}${safetyCode === "PIPELINE_STATUS_LOST" ? "：管道可能掩盖主命令退出码" : ""}）`
       : isPlanModeConflictRepair(this.repair) ? "后续计划跨越了需要单独规划的交互或上下文边界"
@@ -452,6 +487,63 @@ export class PlanProtocolError extends Error {
     this.name = "PlanProtocolError";
     this.developerMessage = developerMessage;
   }
+}
+
+/** Decode audit proposals only. This does not admit or execute rejected steps. */
+/** Only output diagnostics may switch to another candidate; service/execution failures may not. */
+export function canRegenerateModelCandidate(error: unknown): boolean {
+  return error instanceof PlanProtocolError || isRecoverableModelOutput(modelServiceError(error));
+}
+
+export function modelCandidateDiagnostic(error: unknown): Record<string, unknown> {
+  if (error instanceof PlanProtocolError) return {
+    code: error.repair.diagnostic?.code ?? error.repair.errorCode,
+    fieldPath: error.repair.diagnostic?.fieldPath ?? error.repair.fieldPath,
+    expected: (error.repair.diagnostic?.expected ?? error.repair.validationError).slice(0, 1200),
+  };
+  const diagnostic = modelServiceError(error);
+  return { code: diagnostic?.code, stage: diagnostic?.stage, jsonPointer: diagnostic?.jsonPointer,
+    schemaPath: diagnostic?.schemaPath, keyword: diagnostic?.keyword };
+}
+
+export function exhaustedCandidateRecovery(error: unknown, stopReason: "no_progress" | "budget_exhausted" = "budget_exhausted"): unknown {
+  if (error instanceof PlanProtocolError) error.repair.businessReplanProgress = { attemptCount: 1, stopReason };
+  return error;
+}
+
+function rejectedProtocolSteps(value: unknown[]): PlanStep[] | undefined {
+  const steps: PlanStep[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+    const step = entry as Record<string, unknown>;
+    if (typeof step.id !== "string") return undefined;
+    const action = step.action as Record<string, unknown> | undefined;
+    if (action !== undefined && action !== null) {
+      if (typeof action !== "object" || Array.isArray(action)) return undefined;
+      if (action.type === "shell" && typeof action.command === "string") {
+        steps.push({ ...step, command: action.command } as unknown as PlanStep);
+      } else if (action.type === "tool" && typeof action.toolId === "string"
+        && action.arguments && typeof action.arguments === "object" && !Array.isArray(action.arguments)) {
+        steps.push({ ...step, command: "" } as unknown as PlanStep);
+      } else return undefined;
+    } else if (typeof step.command === "string") {
+      steps.push({ ...step } as unknown as PlanStep);
+    } else return undefined;
+  }
+  return steps;
+}
+
+/** Recover only the known legacy display wrapper; leave history and execution facts intact. */
+export function restoreLegacyPlanProtocolFailure(reason: string | undefined): PlanProtocolError | undefined {
+  const prefix = "后续流程暂不可用：ModelInvocationError: ";
+  const suffix = "。已完成步骤及其执行证据保持有效，可检查后继续。";
+  if (!reason?.startsWith(prefix) || !reason.endsWith(suffix)) return undefined;
+  const raw = reason.slice(prefix.length, -suffix.length);
+  try {
+    const envelope = JSON.parse(raw);
+    if (envelope?.kind !== "plan_protocol_failure" || envelope.rejectedPlanExecuted !== false) return undefined;
+    return rustProtocolFailure(envelope, "{}");
+  } catch { return undefined; }
 }
 
 /** Preserve rejected Rust output and its consumed budget across the Tauri boundary. */
@@ -486,8 +578,8 @@ function rustProtocolFailure(error: unknown, context: string): PlanProtocolError
     }
     if (envelope.kind === "plan_protocol_failure" && typeof envelope.validationError === "string"
       && Array.isArray(envelope.steps)) {
-      const steps = envelope.steps as PlanStep[];
-      if (steps.some(step => !step || typeof step.command !== "string" || typeof step.id !== "string")) return undefined;
+      const steps = rejectedProtocolSteps(envelope.steps);
+      if (!steps) return undefined;
       const repair = buildPlanNormalizationRepair(envelope.validationError, steps);
       repair.modelRecovery = recoveryFromContext(context);
       repair.businessReplanRequired = envelope.businessReplanRequired === true
@@ -510,8 +602,8 @@ function rustProtocolFailure(error: unknown, context: string): PlanProtocolError
     }
     const issue = readRecoveryProtocolError(envelope);
     if (!issue || !Array.isArray(envelope.steps) || !envelope.steps.length) return undefined;
-    const steps = envelope.steps as PlanStep[];
-    if (steps.some(step => !step || typeof step.command !== "string" || typeof step.id !== "string")) return undefined;
+    const steps = rejectedProtocolSteps(envelope.steps);
+    if (!steps) return undefined;
     const repair = buildPlanNormalizationRepair(new RecoveryProtocolError(issue), steps);
     repair.modelRecovery = recoveryFromContext(context);
     const decision = envelope.nextStageDecision as Record<string, unknown> | undefined;
@@ -639,18 +731,13 @@ function contextWithPlanRepair(context: string, repair: PlanNormalizationRepair)
 }
 
 /** Match the authority Rust used after classification, before creating repair feedback. */
-function classifiedPlanContext(context: string, result: RequirementProcessingResult, definitions: ModelSkillDefinition[]) {
-  const source = parseRepairContext(context);
-  const previous = protocolRepairAuthority(context).executionConstraints;
-  const continuing = result.relation === "continue" && previous;
-  const executionConstraints = continuing ? previous : result.constraints ? {
-    ...result.constraints,
-    ...(["continue", "supplement"].includes(result.relation ?? "") ? {
-      userDirectives: [...new Set([...(previous?.userDirectives ?? []), ...(result.constraints.userDirectives ?? [])])],
-      prohibitedActions: [...new Set([...(previous?.prohibitedActions ?? []), ...(result.constraints.prohibitedActions ?? [])])],
-      requiredConditions: [...new Set([...(previous?.requiredConditions ?? []), ...(result.constraints.requiredConditions ?? [])])],
-    } : {}),
-  } : previous;
+function classifiedPlanContext(context: string, result: RequirementProcessingResult, definitions: ModelSkillDefinition[], requirement: string) {
+  const projected = projectClassifiedRequirementContext(parseRepairContext(context), result, requirement);
+  const source = projected.context;
+  const previous = protocolRepairAuthority(context).executionConstraints
+    ?? parseRepairContext(context).previousExecution?.executionConstraints;
+  const executionConstraints = mergeRequirementExecutionConstraints({ previous, classified: result.constraints,
+    relation: result.relation, previousLifecycle: projected.previousLifecycle, nextLifecycle: projected.nextLifecycle });
   const selected = result.selectedSkillIds;
   const activeSkills = selected ? selected.flatMap(id => {
     const skill = definitions.find(item => item.id === id)
@@ -830,6 +917,7 @@ function mergeScopedProtocolRepairSteps(repair: PlanNormalizationRepair, respons
 /** One model attempt, one local merge, full validation; progress survives persistence. */
 async function executeProtocolRepair(repair: PlanNormalizationRepair, requirement: string, runtimeModel: RuntimeModel) {
   runtimeModel = { ...runtimeModel, context: ensureModelRecoveryContext(runtimeModel.context, repair.modelRecovery) };
+  runtimeModel.assertCurrent?.();
   const modelRecovery = recoveryFromContext(runtimeModel.context);
   repair = normalizePlanRepairStrategy(repair);
   repair.modelRecovery = modelRecovery;
@@ -888,12 +976,14 @@ async function executeProtocolRepair(repair: PlanNormalizationRepair, requiremen
     repair.modelRecovery = modelRecovery;
     if (isPlanModeConflictRepair(repair)) throw atomicPlanModeConflict(repair);
     beginProtocolRepair(repair, runtimeModel.context);
+    if (outputStrategyFromContext(runtimeModel.context) === "regenerate") throw new PlanProtocolError(repair, "完整候选重生成仍未通过校验，本轮输出恢复已结束");
     const response = await invoke<PlanStep[]>("generate_ai_plan", {
       apiKey: runtimeModel.apiKey, endpoint: runtimeModel.endpoint, model: runtimeModel.model,
       requirement: planProtocolRepairRequirement(repair),
-      context: parameterContext(compactProtocolRepairContext(runtimeModel.context, repair), runtimeModel.requestParameters, runtimeModel.capabilities, modelIntegrationConfig(runtimeModel)),
+      context: parameterContext(withModelOutputStrategy(compactProtocolRepairContext(runtimeModel.context, repair), "field_repair"), runtimeModel.requestParameters, runtimeModel.capabilities, modelIntegrationConfig(runtimeModel)),
       generationSettings: runtimeModel.generationSettings, timeoutSeconds: runtimeModel.timeoutSeconds,
     });
+    runtimeModel.assertCurrent?.();
     const merged = mergeScopedProtocolRepairSteps(repair, response);
     const fingerprint = planSemanticFingerprint(merged);
     if (repair.progress!.seenPlans.includes(fingerprint)) {
@@ -1345,25 +1435,53 @@ export const backend = {
       if (pendingRepair) {
         return legacyModelOperationValue("plan.repair", await executeProtocolRepair(pendingRepair, requirement, runtimeModel));
       }
-      let steps: PlanStep[];
-      try {
-        steps = await invoke<PlanStep[]>("generate_ai_plan", {
-          apiKey: runtimeModel.apiKey,
-          endpoint: runtimeModel.endpoint,
-          model: runtimeModel.model,
+      const original = { ...runtimeModel, context: withModelOutputStrategy(runtimeModel.context,
+        outputStrategyFromContext(runtimeModel.context) ?? "initial") };
+      const generate = async (runtime: RuntimeModel) => {
+        runtime.assertCurrent?.();
+        let steps: PlanStep[];
+        try {
+          steps = await invoke<PlanStep[]>("generate_ai_plan", {
+          apiKey: runtime.apiKey,
+          endpoint: runtime.endpoint,
+          model: runtime.model,
           requirement,
-          context: parameterContext(runtimeModel.context, runtimeModel.requestParameters, runtimeModel.capabilities, modelIntegrationConfig(runtimeModel)),
-          generationSettings: runtimeModel.generationSettings,
-          timeoutSeconds: runtimeModel.timeoutSeconds,
-        });
-      } catch (error) {
-        throw rustProtocolFailure(error, runtimeModel.context) ?? normalizeModelInvocationError(error);
-      }
+          context: parameterContext(runtime.context, runtime.requestParameters, runtime.capabilities, modelIntegrationConfig(runtime)),
+          generationSettings: runtime.generationSettings,
+          timeoutSeconds: runtime.timeoutSeconds,
+          });
+        } catch (error) {
+          runtime.assertCurrent?.();
+          const failure = rustProtocolFailure(error, runtime.context);
+          if (failure && !failure.repair.progress?.stopCode && outputStrategyFromContext(runtime.context) === "initial") {
+            return executeProtocolRepair(failure.repair, requirement, runtime);
+          }
+          throw failure ?? normalizeModelInvocationError(error);
+        }
+        runtime.assertCurrent?.();
+        modelOperationResult("plan.generate", steps);
+        try {
+          return legacyModelOperationValue("plan.generate", normalizePlanPreconditions(steps, requirement));
+        } catch (firstError) {
+          const repair = buildPlanNormalizationRepair(firstError, steps);
+          repair.modelRecovery = recoveryFromContext(runtime.context);
+          if (isPlanModeConflictRepair(repair)) throw atomicPlanModeConflict(repair);
+          if (outputStrategyFromContext(runtime.context) !== "initial") throw new PlanProtocolError(repair, String(firstError));
+          return legacyModelOperationValue("plan.repair", await executeProtocolRepair(repair, requirement, runtime));
+        }
+      };
       try {
-        return legacyModelOperationValue("plan.generate", normalizePlanPreconditions(steps, requirement));
-      } catch (firstError) {
-        const repair = buildPlanNormalizationRepair(firstError, steps);
-        return legacyModelOperationValue("plan.repair", await executeProtocolRepair(repair, requirement, runtimeModel));
+        return await generate(original);
+      } catch (error) {
+        original.assertCurrent?.();
+        const context = parseRepairContext(original.context);
+        if (outputStrategyFromContext(original.context) !== "initial" || context.workflowPhase === "protocol_repair"
+          || context.operationalRepair?.rejectedProposal?.responseMode === "metadata_fields" || !canRegenerateModelCandidate(error)) throw error;
+        try {
+          return await generate({ ...original, context: candidateRegenerationContext(original.context, modelCandidateDiagnostic(error)) });
+        } catch (failure) {
+          throw exhaustedCandidateRecovery(failure);
+        }
       }
     }
     if (isTauri()) return Promise.reject(new Error("未配置真实大模型连接，拒绝生成预制计划"));
@@ -1415,6 +1533,8 @@ export const backend = {
   ): Promise<RequirementProcessingResult> {
     if (isTauri()) {
       runtimeModel = runtimeWithModelRecovery(runtimeModel);
+      runtimeModel = { ...runtimeModel, context: withModelOutputStrategy(runtimeModel.context, "initial") };
+      runtimeModel.assertCurrent?.();
       let result: RequirementProcessingResult;
       try {
         result = await invoke<RequirementProcessingResult>("process_ai_requirement", {
@@ -1428,44 +1548,54 @@ export const backend = {
           timeoutSeconds: runtimeModel.timeoutSeconds,
         });
       } catch (error) {
+        runtimeModel.assertCurrent?.();
         throw normalizeModelInvocationError(error);
       }
+      runtimeModel.assertCurrent?.();
       const classified = modelOperationResult("requirement.classify", result);
       // Answers and context requests have no candidate action domain to normalize/repair.
       if (classified.classification.intent !== "execute") return legacyModelOperationValue("requirement.classify", result);
-      const planContext = classifiedPlanContext(runtimeModel.context, result, skillDefinitions);
-      if (result.planError) {
-        const invocationError = normalizeModelInvocationError(result.planError);
-        // Classification already succeeded. Preserve relation, constraints and
-        // selected Skills for the store's planError blocker path, without
-        // admitting a partial plan or starting another repair request.
-        if (modelServiceError(invocationError)) return legacyModelOperationValue("requirement.classify", { ...result, plan: [] });
-      }
-      const rustFailure = result.planError ? rustProtocolFailure(result.planError, planContext) : undefined;
-      if (rustFailure) {
-        rustFailure.processed = result;
-        rustFailure.developerTrace = result.developerTrace;
-        throw rustFailure;
-      }
-      try {
-        return legacyModelOperationValue("requirement.classify", { ...result, plan: normalizePlanPreconditions(result.plan, requirement) });
-      } catch (firstError) {
-        const repair = buildPlanNormalizationRepair(firstError, result.plan);
+      const planContext = classifiedPlanContext(runtimeModel.context, result, skillDefinitions, requirement);
+      let failure: unknown;
+      if (result.planError) failure = rustProtocolFailure(result.planError, planContext) ?? normalizeModelInvocationError(result.planError);
+      else {
         try {
-          const repaired = await backend.generatePlan(requirement, {
-            ...runtimeModel,
-            context: contextWithPlanRepair(planContext, repair),
-          });
-          return legacyModelOperationValue("requirement.classify", { ...result, plan: repaired });
-        } catch (repairError) {
-          const invocationError = normalizeModelInvocationError(repairError);
-          if (modelServiceError(invocationError) || invocationError instanceof ModelOperationBoundaryError) throw invocationError;
-          const error = repairError instanceof PlanProtocolError ? repairError
-            : new PlanProtocolError(repair, String(invocationError));
-          error.processed = result;
-          throw error;
+          return legacyModelOperationValue("requirement.classify", { ...result, plan: normalizePlanPreconditions(result.plan, requirement) });
+        } catch (error) {
+          failure = new PlanProtocolError(buildPlanNormalizationRepair(error, result.plan), String(error));
         }
       }
+      if (result.planError && modelServiceError(failure) && !canRegenerateModelCandidate(failure)) {
+        return legacyModelOperationValue("requirement.classify", { ...result, plan: [] });
+      }
+      // Classification is already authoritative. Repair only its unexecuted plan,
+      // with the classified constraints/Skills and the original operation budget.
+      if (failure instanceof PlanProtocolError && !failure.repair.progress?.stopCode) {
+        try {
+          const repaired = await executeProtocolRepair(failure.repair, requirement, { ...runtimeModel, context: planContext });
+          return legacyModelOperationValue("requirement.classify", { ...result, plan: repaired, planError: undefined });
+        } catch (error) { failure = error; }
+      }
+      runtimeModel.assertCurrent?.();
+      if (canRegenerateModelCandidate(failure)) {
+        try {
+          const plan = await backend.generatePlan(requirement, { ...runtimeModel,
+            context: candidateRegenerationContext(planContext, modelCandidateDiagnostic(failure)) });
+          return legacyModelOperationValue("requirement.classify", { ...result, plan, planError: undefined });
+        } catch (error) { failure = exhaustedCandidateRecovery(error); }
+      }
+      runtimeModel.assertCurrent?.();
+      if (failure instanceof PlanProtocolError) {
+        failure.processed = result;
+        failure.developerTrace ??= result.developerTrace;
+        throw failure;
+      }
+      const serviceError = modelServiceError(failure);
+      if (serviceError) {
+        return legacyModelOperationValue("requirement.classify", { ...result, plan: [],
+          planError: `${MODEL_TRACE_ERROR_PREFIX}${JSON.stringify({ message: failure instanceof Error ? failure.message : "计划生成失败", modelError: serviceError })}` });
+      }
+      throw failure;
     }
     return requireDesktopRuntime("Opsark Agent");
   },
@@ -1613,6 +1743,9 @@ export const backend = {
     };
     if (!isTauri() || !runtimeModel?.apiKey) return fallback;
     runtimeModel = runtimeWithModelRecovery(runtimeModel);
+    runtimeModel = { ...runtimeModel, context: withModelOutputStrategy(runtimeModel.context,
+      outputStrategyFromContext(runtimeModel.context) ?? "initial") };
+    runtimeModel.assertCurrent?.();
     try {
       const decision = await invoke<Omit<NextStageDecision, "source">>("decide_ai_next_stage", {
         apiKey: runtimeModel.apiKey,
@@ -1623,6 +1756,7 @@ export const backend = {
         generationSettings: runtimeModel.generationSettings,
         timeoutSeconds: runtimeModel.timeoutSeconds,
       });
+      runtimeModel.assertCurrent?.();
       const operation = modelOperationResult("stage.decide", { ...decision, source: "model" });
       if (!operation.proposal) return operation.decision;
       try {
@@ -1631,16 +1765,23 @@ export const backend = {
         const repair = buildPlanNormalizationRepair(error, decision.steps);
         repair.nextStageDecision = { decision: decision.decision, reason: decision.reason, summary: decision.summary,
           ...(decision.planUpdate ? { planUpdate: decision.planUpdate } : {}),
-          ...(decision.reconciliation ? { reconciliation: decision.reconciliation } : {}) };
+          ...(decision.reconciliation ? { reconciliation: decision.reconciliation } : {}),
+          ...(decision.requirementReview ? { requirementReview: decision.requirementReview } : {}),
+          ...(decision.blocking ? { blocking: decision.blocking } : {}),
+          ...(decision.issueResolutions ? { issueResolutions: decision.issueResolutions } : {}) };
+        repair.modelRecovery = recoveryFromContext(runtimeModel.context);
+        if (outputStrategyFromContext(runtimeModel.context) !== "initial") throw new PlanProtocolError(repair, String(error));
         // Preserve the joint decision. Only the invalid plan protocol is retried.
         const steps = await backend.generatePlan(requirement, { ...runtimeModel,
           context: contextWithPlanRepair(runtimeModel.context, repair) });
         return legacyModelOperationValue("stage.decide", { ...decision, steps, source: "model" });
       }
     } catch (error) {
+      runtimeModel.assertCurrent?.();
       if (error instanceof PlanProtocolError) throw error;
       const preserved = rustProtocolFailure(error, runtimeModel.context);
-      if (preserved?.repair.nextStageDecision && !preserved.repair.progress?.stopCode) {
+      if (preserved?.repair.nextStageDecision && !preserved.repair.progress?.stopCode
+        && outputStrategyFromContext(runtimeModel.context) === "initial") {
         const steps = await executeProtocolRepair(preserved.repair, requirement, runtimeModel);
         return legacyModelOperationValue("stage.decide", { ...preserved.repair.nextStageDecision, steps, source: "model" });
       }

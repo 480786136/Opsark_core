@@ -2783,6 +2783,7 @@ dependencies = [
  "keyring",
  "portable-pty",
  "reqwest 0.12.28",
+ "ring",
  "rusqlite",
  "ryu-js",
  "serde",
@@ -2792,6 +2793,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

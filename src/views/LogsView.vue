@@ -6,6 +6,7 @@ import { useOpsStore } from "@/stores/ops";
 import type { AuditEvent, TaskStatus } from "@/types";
 import { backend } from "@/services/backend";
 import DeveloperLogsPanel from "@/components/DeveloperLogsPanel.vue";
+import ExecutionDiagnostics from "@/components/ExecutionDiagnostics.vue";
 import ParameterSelect from "@/components/ParameterSelect.vue";
 import { isInternalPlanDiagnostic, localizeCoreText } from "@/features/preferences/coreText";
 
@@ -349,6 +350,7 @@ function commandContent(log: AuditEvent) {
     <DeveloperLogsPanel v-if="showDeveloperLogs && logMode === 'developer'" />
 
     <template v-else>
+      <ExecutionDiagnostics />
       <section class="log-filters">
       <label class="search-box"><Search :size="16" /><input v-model="query" :placeholder="t('logs.searchPlaceholder')" /></label>
       <ParameterSelect v-model="serverFilter" class="log-filter-select" size="small" :options="serverFilterOptions" :ariaLabel="t('logs.serverFilter')" />

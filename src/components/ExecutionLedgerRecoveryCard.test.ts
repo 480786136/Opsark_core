@@ -22,7 +22,8 @@ it("shows distinct recovery states, original attempt identities and bounded acti
   app.mount(host);
   try {
     expect(host.textContent).toContain("执行结果待核对");
-    expect(host.textContent).toContain("任务结果待确认");
+    expect(host.textContent).toContain("执行回执待复核");
+    expect(host.textContent).not.toContain("任务结果待确认");
     expect(host.textContent).toContain("记录提交失败");
     expect(host.textContent).toContain("不代表远端操作已停止");
     expect(host.textContent).toContain("attempt-original");
@@ -33,6 +34,7 @@ it("shows distinct recovery states, original attempt identities and bounded acti
     i18n.global.locale.value = "en";
     await nextTick();
     expect(host.textContent).toContain("Execution result needs reconciliation");
+    expect(host.textContent).toContain("Execution receipt needs review");
     expect(host.textContent).toContain("Retry saving record");
   } finally { app.unmount(); }
 });
@@ -58,24 +60,25 @@ it("does not add execution claims to old tasks with no ledger", () => {
   finally { app.unmount(); }
 });
 
-it("shows saved reads as collapsed history and reads local evidence without a verification action", async () => {
+it("keeps normal saved reads out of the recovery card", () => {
   const data: ExecutionLedgerRecovery = { version: "execution-ledger-recovery@1", items: [], recordedReads: [{
     operationId: "op-read", attemptId: "read-attempt", stepId: "read-step", title: "检查磁盘", status: "succeeded",
     late: false, recordedAt: 1000, evidenceRefs: ["saved-proof"],
   }] };
-  const read = vi.spyOn(backend, "readTaskEvidence").mockResolvedValue({ text: "saved disk result" });
+  const read = vi.spyOn(backend, "readTaskEvidence");
   const host = document.createElement("div");
   const app = createApp(ExecutionLedgerRecoveryCard, { recovery: data, taskId: "original-task" })
     .use(createI18n({ legacy: false, locale: "zh-CN", messages: { "zh-CN": {} } }));
   app.mount(host);
-  try {
-    expect(host.querySelector(".ledger-recovery-item")).toBeNull();
-    expect(host.querySelector<HTMLDetailsElement>("details")!.open).toBe(false);
-    expect(host.textContent).toContain("已保存的检查结果（1）");
-    expect(host.querySelector('[data-ledger-action="verify"]')).toBeNull();
-    host.querySelector<HTMLButtonElement>("button")!.click();
-    await nextTick(); await nextTick();
-    expect(read).toHaveBeenCalledWith("original-task", "saved-proof", 0, 8000);
-    expect(host.textContent).toContain("saved disk result");
-  } finally { app.unmount(); read.mockRestore(); }
+  try { expect(host.querySelector("section")).toBeNull(); expect(read).not.toHaveBeenCalled(); }
+  finally { app.unmount(); read.mockRestore(); }
+});
+
+it("describes a direct-operation anomaly without asking for a nonexistent task review", () => {
+  const data = recovery(); data.items = [{ ...data.items[1], origin: "direct" }];
+  const host = document.createElement("div");
+  const app = createApp(ExecutionLedgerRecoveryCard, { recovery: data }).use(createI18n({ legacy: false, locale: "zh-CN", messages: { "zh-CN": {} } }));
+  app.mount(host);
+  try { expect(host.textContent).toContain("操作结果待核对"); expect(host.textContent).not.toContain("任务结果待确认"); }
+  finally { app.unmount(); }
 });

@@ -97,6 +97,14 @@ fn selected_action_branch(branches: &[Value], instance: &Value) -> Option<usize>
     selected
 }
 
+// A nullable object has an unambiguous branch for an object instance. Do not
+// generalize this to overlapping unions or change whether validation succeeds.
+fn selected_nullable_object_branch(branches: &[Value], instance: &Value) -> Option<usize> {
+    if branches.len() != 2 || !instance.is_object() { return None; }
+    let index = branches.iter().position(|branch| branch.get("type").and_then(Value::as_str) == Some("object"))?;
+    (branches[1 - index] == serde_json::json!({"type":"null"})).then_some(index)
+}
+
 fn issue_for_error(schema: &Value, error: &jsonschema::ValidationError<'_>, depth: usize) -> ValidationIssue {
     let schema_path = error.schema_path().to_string();
     // Reuse the validator's existing branch errors. Re-validating a detached
@@ -104,7 +112,8 @@ fn issue_for_error(schema: &Value, error: &jsonschema::ValidationError<'_>, dept
     if depth < 16 {
         if let jsonschema::error::ValidationErrorKind::AnyOf { context } = error.kind() {
             if let Some(branches) = schema.pointer(&schema_path).and_then(Value::as_array) {
-                if let Some(index) = selected_action_branch(branches, error.instance().as_ref()) {
+                if let Some(index) = selected_action_branch(branches, error.instance().as_ref())
+                    .or_else(|| selected_nullable_object_branch(branches, error.instance().as_ref())) {
                     if let Some(nested) = context.get(index).and_then(|errors| errors.first()) {
                         return issue_for_error(schema, nested, depth + 1);
                     }

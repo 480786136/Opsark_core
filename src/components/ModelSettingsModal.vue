@@ -1,16 +1,20 @@
 <script setup lang="ts">
-import { nextTick, ref, watch } from "vue";
+import { computed, nextTick, ref, watch } from "vue";
 import { X } from "lucide-vue-next";
 import { useI18n } from "vue-i18n";
 import ModelManagementView from "@/views/ModelManagementView.vue";
 import { useOpsStore } from "@/stores/ops";
 import type { AiGenerationSettings } from "@/types";
 
-const props = defineProps<{ open: boolean }>();
+const props = defineProps<{ open: boolean; modelId?: string }>();
 const emit = defineEmits<{ close: []; saved: [] }>();
 const store = useOpsStore();
 const { t, locale } = useI18n();
 const limits = ref<AiGenerationSettings>({ ...store.aiGenerationSettings });
+const showLocalBudget = computed(() => props.modelId
+  ? store.models.find(model => model.id === props.modelId)?.source !== "official"
+  : store.models.some(model => model.source !== "official"));
+const outputBudget = ref<number | "">(limits.value.maxOutputTokens ?? "");
 const editing = ref(false);
 const panel = ref<HTMLElement>();
 const error = ref("");
@@ -20,14 +24,16 @@ watch(() => props.open, async open => {
   if (!open) { returnFocus?.focus(); return; }
   returnFocus = document.activeElement as HTMLElement;
   limits.value = { ...store.aiGenerationSettings };
+  outputBudget.value = limits.value.maxOutputTokens ?? "";
   editing.value = false; error.value = ""; saved.value = false;
   await nextTick(); panel.value?.focus();
 }, { immediate: true });
 watch(limits, () => { saved.value = false; }, { deep: true });
+watch(outputBudget, () => { saved.value = false; });
 function saveLimits() {
   error.value = "";
-  const value = limits.value;
-  if (!Number.isInteger(value.maxOutputTokens) || value.maxOutputTokens < 256 || value.maxOutputTokens > 1_000_000
+  const value = { ...limits.value, maxOutputTokens: outputBudget.value === "" ? undefined : Number(outputBudget.value) };
+  if (value.maxOutputTokens !== undefined && (!Number.isInteger(value.maxOutputTokens) || value.maxOutputTokens < 256 || value.maxOutputTokens > 1_000_000)
     || [value.maxPlanSteps, value.maxTextChars, value.maxCommandChars].some(n => !Number.isInteger(n) || n < 1)) {
     error.value = locale.value.startsWith("zh") ? "请输入有效整数：输出预算为 256–1000000，其余限制大于 0。" : "Use integers: output budget 256–1000000; other limits above zero.";
     return;
@@ -53,10 +59,10 @@ function keyboard(event: KeyboardEvent) {
       <section ref="panel" class="modal-card shared-model-settings" role="dialog" aria-modal="true" aria-labelledby="model-settings-title" tabindex="-1" :inert="editing || undefined">
         <header class="modal-title"><h2 id="model-settings-title">{{ t('settings.modalTitle') }}</h2><button class="icon-button" :aria-label="t('common.close')" @click="emit('close')"><X :size="18"/></button></header>
         <ModelManagementView embedded @editing="editing = $event" @saved="emit('saved')"/>
-        <form class="budget-settings" @submit.prevent="saveLimits">
-          <h3>{{ locale.startsWith('zh') ? '规划输出预算' : 'Planning output budget' }}</h3>
-          <label>{{ t('settings.compactOutputTokens') }}<input v-model.number="limits.maxOutputTokens" type="number" min="256" max="1000000" step="1" required/></label>
-          <p>{{ locale.startsWith('zh') ? '始终生效，不受下方精简开关影响。模型高级参数可覆盖此值，最终预算仍须符合该模型的接入上限。' : 'Always active, independent of compact limits. Model overrides take precedence and connection limits still apply.' }}</p>
+        <form v-if="showLocalBudget" class="budget-settings" @submit.prevent="saveLimits">
+          <h3>{{ locale.startsWith('zh') ? '自配模型规划输出预算' : 'Custom model planning output budget' }}</h3>
+          <label>{{ t('settings.compactOutputTokens') }}<input v-model.number="outputBudget" type="number" min="256" max="1000000" step="1" :placeholder="locale.startsWith('zh') ? '留空使用接入上限' : 'Empty: use connection limit'"/></label>
+          <p>{{ locale.startsWith('zh') ? '默认留空，使用接入声明的输出上限。仅影响自配模型，单个模型的预算可覆盖此值。官方模型由平台统一配置，无需设置参数。' : 'Leave empty to use the declared connection limit. Applies only to custom models; per-model budgets take precedence. Official models are configured by the platform.' }}</p>
           <label class="compact-toggle"><input v-model="limits.limitOutput" type="checkbox"/>{{ t('settings.enableCompactLimits') }}</label>
           <div v-if="limits.limitOutput" class="budget-grid">
             <label>{{ t('settings.compactMaxSteps') }}<input v-model.number="limits.maxPlanSteps" type="number" min="1" step="1" required/></label>

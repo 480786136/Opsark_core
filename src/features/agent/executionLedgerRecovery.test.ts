@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { ExecutionIntentSemantic, ExecutionIntentSnapshot, ServerProfile } from "@/types";
+import type { OpsTask, ExecutionIntentSemantic, ExecutionIntentSnapshot, ServerProfile } from "@/types";
 import type { ExecutionOperationRecord } from "@/services/executionLedger";
 import { executionDigest } from "./planPreparation";
 import { buildReadOnlyReconciliation, isReadOnlyServiceValidator, parseFileReconciliationObservation,
-  projectExecutionLedgerRecovery, readExecutionLedger, readTaskProjection } from "./executionLedgerRecovery";
+  missingInspectionReceipts, isUntouchedRecoveryShell, executionRecordTitle, projectExecutionLedgerRecovery, readExecutionLedger, readTaskProjection } from "./executionLedgerRecovery";
 
 function record(overrides: Partial<ExecutionOperationRecord> = {}, semantics: Partial<ExecutionIntentSemantic> = {}): ExecutionOperationRecord {
   const semantic: ExecutionIntentSemantic = { taskId: "task-a", stepId: "step-a", action: { type: "shell", command: "systemctl start app" },
@@ -122,6 +122,38 @@ describe("recovery projection", () => {
     expect(readExecutionLedger([operation]).compatible).toBe(true);
     expect(projectExecutionLedgerRecovery([operation]).items).toEqual([]);
   });
+  it("removes a task-owned negative review from duplicate pending cards without changing historical failure", () => {
+    const operation = record({ state: "succeeded" });
+    Object.assign(operation.attempts[0], { status: "succeeded", outcome: { status: "succeeded", evidenceRefs: ["proof"] }, projectionAppliedAt: 3 });
+    expect(projectExecutionLedgerRecovery([operation]).items).toHaveLength(1);
+    operation.attempts[0].reviews = [{ version: 1, operationId: operation.operationId, attemptId: "attempt-a", intentDigest: operation.intentDigest,
+      outcome: "not_met", disposition: "task_followup", evidenceRefs: ["proof"], reviewFingerprint: executionDigest("port mismatch review"), recordedAt: 4 }];
+    const restored = readExecutionLedger(JSON.parse(JSON.stringify([operation])));
+    expect(restored.compatible).toBe(true);
+    expect(projectExecutionLedgerRecovery(restored.operations).items).toEqual([]);
+    expect(restored.operations[0].attempts[0]).toMatchObject({ status: "succeeded", reviews: [{ outcome: "not_met" }] });
+    expect(restored.operations[0].reconciliation).toBeUndefined();
+    for (const changed of [
+      { ...operation.attempts[0], late: true },
+      { ...operation.attempts[0], cancelRequested: true },
+      { ...operation.attempts[0], status: "unknown" as const, outcome: { status: "unknown" as const, evidenceRefs: ["proof"] } },
+    ]) expect(projectExecutionLedgerRecovery([{ ...operation, attempts: [changed] }]).items).toHaveLength(1);
+    expect(projectExecutionLedgerRecovery([{ ...operation, cancelRequested: true }]).items).toHaveLength(1);
+    expect(projectExecutionLedgerRecovery([operation], { storageFailures: [{ kind: "storage_failed", operationId: "op-a", attemptId: "attempt-a",
+      action: "retry_storage", summary: "storage failed", knownFacts: [] }] }).items[0].kind).toBe("storage_failed");
+  });
+  it("does not apply a review from another attempt or evidence scope", () => {
+    const operation = record({ state: "succeeded" });
+    Object.assign(operation.attempts[0], { status: "succeeded", outcome: { status: "succeeded", evidenceRefs: ["proof"] }, projectionAppliedAt: 3 });
+    const review = { version: 1 as const, operationId: operation.operationId, attemptId: "attempt-a", intentDigest: operation.intentDigest,
+      outcome: "unknown" as const, disposition: "task_followup" as const, evidenceRefs: ["proof"], reviewFingerprint: executionDigest("review"), recordedAt: 4 };
+    for (const invalid of [{ ...review, attemptId: "old-attempt" }, { ...review, evidenceRefs: ["other-proof"] },
+      { ...review, disposition: "accepted" as const }, { ...review, intentDigest: executionDigest("other-intent") }]) {
+      operation.attempts[0].reviews = [invalid];
+      expect(readExecutionLedger([operation]).compatible).toBe(false);
+      expect(projectExecutionLedgerRecovery([operation]).items).toHaveLength(1);
+    }
+  });
   it("keeps unsupported uncertain changes visible without an unusable reconciliation button", () => {
     const operation = record({}, { runtimeClass: undefined, action: { type: "shell", command: "touch /srv/a" } });
     const recovery = projectExecutionLedgerRecovery([operation]);
@@ -181,4 +213,68 @@ describe("bounded read-only reconciliation", () => {
     expect(JSON.stringify(direct.intent)).toBe(before);
     expect(() => buildReadOnlyReconciliation(direct, { id: "task-a" }, [...servers, server("duplicate", "a.example")])).toThrow("原执行目标");
   });
+});
+
+it("uses an exact historical attempt title without changing intent or exposing expected as a heading", () => {
+  const operation = record({}, { expected: "返回软件状态、版本以及配置字段".repeat(40) });
+  const digest = operation.intentDigest;
+  const task = { plan: [{ id: operation.stepId, title: "后来计划的标题", executionLedgerAttempts: [{ operationId: "other", attemptId: "other" }] }] } as unknown as OpsTask;
+  expect(executionRecordTitle(operation, "attempt-a", task)).toBe("远端操作");
+  task.plan[0].executionLedgerAttempts = [{ operationId: operation.operationId, attemptId: "attempt-a", executionId: "exec-a", phase: "command" }];
+  expect(executionRecordTitle(operation, "attempt-a", task)).toBe("后来计划的标题");
+  expect(operation.intentDigest).toBe(digest);
+  expect(operation.intent.semantic.expected.length).toBeGreaterThan(400);
+});
+
+it("recognizes an untouched legacy shell whose missing round ID was initialized on restart", () => {
+  const operation = record();
+  const task = { id: operation.taskId, title: "执行记录恢复 · a.example", modelId: "", messages: [], plan: [], permission: "observe",
+    adjustmentCount: 0, status: "awaiting_continuation", rootGoal: operation.intent.semantic.expected,
+    createdAt: new Date(operation.createdAt).toISOString(), workflowEpoch: operation.workflowEpoch, currentRoundId: "generated-at-restart",
+    pauseReason: "已恢复历史检查结果，可查看已有证据；这不代表当前任务目标已完成。" } as unknown as OpsTask;
+  expect(isUntouchedRecoveryShell(task, [operation])).toBe(true);
+  expect(isUntouchedRecoveryShell(task, [{ ...operation, roundId: "later-user-round" }])).toBe(false);
+});
+
+describe("direct-operation recovery classification", () => {
+  function directRecord() {
+    return record({ taskId: "direct-endpoint", phase: "tool", state: "succeeded" }, {
+      taskId: "direct-endpoint", policyVersion: "direct-user-action@1", runtimeClass: undefined, validator: undefined,
+      action: { type: "tool", toolId: "core.sftp.delete", arguments: { path: "/opt/core-case" } },
+    });
+  }
+  it.each(["unknown", "dispatching", "failed"] as const)("keeps %s direct operations actionable", status => {
+    const row = directRecord(); row.state = status; row.attempts[0].status = status;
+    if (status === "failed") row.attempts[0].outcome = { status, evidenceRefs: ["proof"] };
+    const item = projectExecutionLedgerRecovery([row]).items[0];
+    expect(item).toMatchObject({ origin: "direct", kind: status === "failed" ? "recorded_result" : "uncertain" });
+    expect(item.knownFacts.join()).toContain("执行记录");
+    expect(item.knownFacts.join()).not.toContain("请在任务中");
+  });
+  it.each(["late", "cancelRequested", "operationCancel"])("retains success with a %s flag", flag => {
+    const row = directRecord();
+    Object.assign(row.attempts[0], { status: "succeeded", outcome: { status: "succeeded", evidenceRefs: ["proof"] } });
+    if (flag === "late") row.attempts[0].late = true;
+    else if (flag === "cancelRequested") row.attempts[0].cancelRequested = true;
+    else row.cancelRequested = true;
+    expect(projectExecutionLedgerRecovery([row]).items[0]).toMatchObject({ origin: "direct", kind: "recorded_result" });
+  });
+  it("does not bypass task review based on an ID prefix or hide a pending save", () => {
+    const row = directRecord();
+    Object.assign(row.attempts[0], { status: "succeeded", outcome: { status: "succeeded", evidenceRefs: ["proof"] } });
+    const storageFailure = { kind: "storage_failed" as const, operationId: row.operationId, attemptId: row.attempts[0].id,
+      action: "retry_storage" as const, summary: "保存失败", knownFacts: [] };
+    expect(projectExecutionLedgerRecovery([row], { storageFailures: [storageFailure] }).items).toEqual([storageFailure]);
+    row.intent.semantic.policyVersion = "core-execution-policy@1";
+    expect(projectExecutionLedgerRecovery([row]).items[0].kind).toBe("recorded_result");
+  });
+});
+
+it("only deduplicates the exact displayed attempt, preserving earlier and cache-truncated outputs", () => {
+  const receipts = ["older", "latest"].map(id => ({ operationId: "op", attemptId: id, stepId: "same-step", title: "检查", status: "succeeded", late: false, evidenceRefs: [id] }));
+  const task = { plan: [{ id: "same-step", output: "latest output", executionLedgerAttempts: receipts.map(receipt => ({ operationId: "op", attemptId: receipt.attemptId, executionId: receipt.attemptId, phase: "command" })) }],
+    executionLedgerRecovery: { version: "execution-ledger-recovery@1", items: [], recordedReads: receipts } } as unknown as OpsTask;
+  expect(missingInspectionReceipts(task).map(receipt => receipt.attemptId)).toEqual(["older"]);
+  task.plan[0].output = "partial output\n…[持久化时已截断，完整实时输出不受影响]";
+  expect(missingInspectionReceipts(task)).toEqual(receipts);
 });
