@@ -1,7 +1,11 @@
+import { invokeTaskModel } from "./taskModelRequests";
+import type { TaskModelRequest } from "./taskModelRequests";
+import type { TaskModelBudgetSnapshot } from "@/features/agent/taskModelBudget";
+import { parseTaskModelBudgetSnapshot, parseTaskBudgetAdmission } from "@/features/agent/taskModelBudget";
 import { modelIntegrationConfig } from "@/features/agent/modelIntegration";
 import { projectClassifiedRequirementContext } from "@/features/agent/requirementPlanningContext";
 import { mergeRequirementExecutionConstraints } from "@/features/agent/taskRequirements";
-import { parameterContext, validateRequestParameters } from "@/features/agent/modelParameters";
+import { planEvidenceContext, parameterContext, validateRequestParameters } from "@/features/agent/modelParameters";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { formatCredits } from "@/features/account/credits";
@@ -25,7 +29,7 @@ import {
 } from "@/features/agent/planSafety";
 import type { PlanStepSafetyAnalysis } from "@/features/agent/planSafety";
 import { isTerminalTransportFailure } from "@/features/agent/adjustmentIncident";
-import { readRecoveryProtocolError, RecoveryProtocolError } from "./recoveryRules";
+import { currentRecoveryRepairScope, readRecoveryProtocolError, RecoveryProtocolError } from "./recoveryRules";
 import {
   compactProtocolRepairContext, mergeProtocolRepairSteps, planSemanticFingerprint,
   parseRepairContext, protocolFieldValue, protocolRepairAuthority, protocolRepairScopeFingerprint, protocolRepairStopMessage, stableProtocolValue,
@@ -35,6 +39,10 @@ import { candidateRegenerationContext, ensureModelRecoveryContext, isModelRecove
 import type { ModelRecoveryContext } from "./modelRecovery";
 import { legacyModelOperationValue, modelOperationResult, ModelOperationBoundaryError } from "./modelOperationBoundary";
 import { cancelDirectExecution, directExecutionId, fileContentIdentity, runDirectExecution } from "./directExecutionLedger";
+import { isRecordedExecution } from "./executionLedger";
+import { privateCommandRedactor, type PrivateCommandAudit } from "./privateCommandAudit";
+import { isSshExecPayloadError, normalizeSshCommandInvokeError } from "./sshCommandTransport";
+import { candidateRejectionFromPlan, candidateRejectionMessage, parseCandidateRejection } from "./candidateRejection";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -46,6 +54,7 @@ export interface RuntimeConnection {
 }
 
 export interface RuntimeModel extends ModelIntegration {
+  requestLifecycleAdapter?: import("@/types").ModelProfile["requestLifecycleAdapter"];
   /** Local lifecycle guard; never serialized into the model request. */
   assertCurrent?(): void;
   capabilities?: import("@/types").ModelCapabilities;
@@ -58,6 +67,11 @@ export interface RuntimeModel extends ModelIntegration {
   context: string;
   generationSettings?: AiGenerationSettings;
 }
+
+export type ModelProbeConnection = Pick<RuntimeModel, "apiKey" | "endpoint" | "model" | "apiProtocol">;
+const probeConnection = (runtime: ModelProbeConnection): ModelProbeConnection => ({
+  apiKey: runtime.apiKey, endpoint: runtime.endpoint, model: runtime.model, apiProtocol: runtime.apiProtocol,
+});
 
 function runtimeWithModelRecovery(runtime: RuntimeModel): RuntimeModel {
   const pending = parseRepairContext(runtime.context).planGenerationRepair as PlanNormalizationRepair | undefined;
@@ -116,7 +130,18 @@ const COMPATIBILITY_ERROR_CODES = new Set(["MODEL_OUTPUT_TRUNCATED", "MODEL_FORM
   "MODEL_CAPABILITY_INVALID", "MODEL_PARAMETER_UNSUPPORTED", "MODEL_OUTPUT_BUDGET_INVALID",
   "PRESET_PARAMETER_UNSUPPORTED", "PRESET_THINKING_INCOMPATIBLE", "INVALID_MODEL_PARAMETERS", "OUTPUT_LIMIT",
   "PRESET_OUTPUT_LIMIT", "PRESET_MODEL_MISMATCH", "UNKNOWN_MODEL_PRESET", "UPSTREAM_SCHEMA_UNSUPPORTED", "INVALID_RESPONSE_FORMAT"]);
+const TASK_BUDGET_ERROR_CODES = new Set(["MODEL_TASK_BUDGET_DUPLICATE_ATTEMPT", "MODEL_TASK_BUDGET_EVIDENCE_CONFLICT",
+  "MODEL_TASK_BUDGET_EXHAUSTED", "MODEL_TASK_BUDGET_INVALID", "MODEL_TASK_BUDGET_POLICY_CHANGED",
+  "MODEL_TASK_BUDGET_REQUEST_ALREADY_RESERVED", "MODEL_TASK_BUDGET_STORAGE", "MODEL_TASK_BUDGET_UNINITIALIZED", "MODEL_TASK_BUDGET_UNREGISTERED"]);
+const REQUEST_LIFECYCLE_ERROR_CODES = new Set(["MODEL_ADAPTER_INVALID", "MODEL_ADAPTER_UNAVAILABLE", "MODEL_REQUEST_CANCELLED",
+  "MODEL_REQUEST_IDENTITY_CONFLICT", "MODEL_REQUEST_LEDGER_UNAVAILABLE", "MODEL_REQUEST_NOT_FOUND", "MODEL_REQUEST_REPLAY_BLOCKED",
+  "MODEL_REQUEST_STATE_CONFLICT", "MODEL_REQUEST_UNRESOLVED"]);
 const LOCAL_MODEL_ERROR_STAGES: Record<string, readonly string[]> = {
+  ...Object.fromEntries([...TASK_BUDGET_ERROR_CODES].map(code => [code, ["task_budget"]])),
+  ...Object.fromEntries([...REQUEST_LIFECYCLE_ERROR_CODES].map(code => [code, ["request_lifecycle"]])),
+  MODEL_RECOVERY_UNSUPPORTED: ["request_recovery"],
+  MODEL_ADAPTER_BUSY: ["request_recovery"],
+  MODEL_REQUEST_NOT_ACCEPTED: ["request_recovery"],
   MODEL_RESULT_UNAVAILABLE: ["request_status", "request_recovery"],
   MODEL_DISPATCH_UNKNOWN: ["request_status", "request_recovery", "transport"],
   MODEL_REQUEST_FAILED: ["request_recovery"],
@@ -135,12 +160,13 @@ const LOCAL_MODEL_ERROR_STAGES: Record<string, readonly string[]> = {
   MODEL_OUTPUT_ITEM_UNSUPPORTED: ["response_status"],
   MODEL_CAPABILITY_UNKNOWN: ["request"],
   MODEL_ENDPOINT_INVALID: ["request"],
-  MODEL_REQUEST_INVALID: ["request"],
+  MODEL_REQUEST_INVALID: ["request", "request_lifecycle"],
   MODEL_PROBE_CONTRACT_INVALID: ["request"],
   MODEL_PROTOCOL_UNSUPPORTED: ["request"],
   MODEL_OUTPUT_REFUSED: ["response_status"],
   MODEL_TOOL_CALL_UNEXPECTED: ["response_status"],
   MODEL_CONTENT_FILTERED: ["response_status"],
+  MODEL_REQUIREMENT_INVALID: ["requirement_contract"],
   MODEL_FORMAT_INVALID: ["json_parse", "wire_validation", "business_validation", "metadata_decode", "format_repair_scope"],
   MODEL_RECOVERY_SCOPE_REJECTED: ["format_repair_scope"],
   MODEL_OUTPUT_REPAIR_EXHAUSTED: ["output_recovery"],
@@ -176,6 +202,12 @@ function parseModelServiceError(value: unknown): ModelServiceError | undefined {
   if (raw.billing_mode === "direct" || raw.billing_mode === "reserved") details.billing_mode = raw.billing_mode;
   if (typeof raw.estimator === "string") details.estimator = raw.estimator.slice(0, 120);
   const diagnostic: Partial<ModelServiceError> = {};
+  const taskBudget = parseTaskModelBudgetSnapshot(item.taskBudget);
+  if (taskBudget) diagnostic.taskBudget = taskBudget;
+  if (item.origin === "core" && item.stage === "task_budget") {
+    const admission = parseTaskBudgetAdmission(item.taskBudgetAdmission);
+    if (admission) diagnostic.taskBudgetAdmission = admission;
+  }
   if (item.origin === "core" || item.origin === "provider" || item.origin === "upstream" || item.origin === "gateway") diagnostic.origin = item.origin;
   for (const key of ["stage", "jsonPointer", "schemaPath", "keyword", "operation", "contractVersion", "providerCode", "rawStatus", "incompleteReason"] as const) {
     if (typeof item[key] === "string") diagnostic[key] = item[key].slice(0, key === "jsonPointer" || key === "schemaPath" ? 2048 : 160);
@@ -201,7 +233,7 @@ function parseModelServiceError(value: unknown): ModelServiceError | undefined {
   if (item.recoveryBudget && typeof item.recoveryBudget === "object" && !Array.isArray(item.recoveryBudget)) {
     const budget: NonNullable<ModelServiceError["recoveryBudget"]> = {};
     const rawBudget = item.recoveryBudget as Record<string, unknown>;
-    for (const key of ["generations", "transportAttempts", "elapsedMs", "accountedTokens", "knownUsageTokens", "unknownUsageAttempts", "maxGenerations", "maxTransportAttempts", "maxElapsedMs", "maxTotalTokens", "fieldRepairs", "candidateRegenerations"] as const) {
+    for (const key of ["generations", "transportAttempts", "elapsedMs", "accountedTokens", "knownUsageTokens", "unknownUsageAttempts", "maxGenerations", "maxTransportAttempts", "maxElapsedMs", "maxTotalTokens", "fieldRepairs", "candidateRegenerations", "remainingWaitMs", "requiredWaitMs"] as const) {
       const number = rawBudget[key];
       if (typeof number === "number" && Number.isSafeInteger(number) && number >= 0) budget[key] = number;
     }
@@ -213,6 +245,8 @@ function parseModelServiceError(value: unknown): ModelServiceError | undefined {
     }
     if (Object.keys(budget).length) diagnostic.recoveryBudget = budget;
   }
+  const candidateRejection = parseCandidateRejection(item.candidateRejection);
+  if (candidateRejection) diagnostic.candidateRejection = candidateRejection;
   return { ...(httpStatus !== undefined ? { httpStatus } : {}), ...diagnostic,
     code: item.code, message: item.message.slice(0, 500), retryable: false,
     details: Object.keys(details).length ? details : undefined };
@@ -236,6 +270,45 @@ export function modelServiceError(error: unknown): ModelServiceError | undefined
 }
 
 export function modelServiceErrorMessage(error: ModelServiceError) {
+  return candidateRejectionMessage(error.candidateRejection) + baseModelServiceErrorMessage(error);
+}
+
+function modelOutputFailureSummary(error: ModelServiceError): string {
+  const budget = error.origin === "core" ? error.recoveryBudget : undefined;
+  const count = (value: number | undefined) => Number.isSafeInteger(value) && value! >= 0 ? value : undefined;
+  const fields = count(budget?.fieldRepairs), candidates = count(budget?.candidateRegenerations);
+  if (candidates !== undefined && candidates > 0) return "本轮完整候选重生成未得到可用结果。";
+  if (fields !== undefined && fields > 0) return "本轮字段修复未得到可用结果。";
+  // Legacy non-coordinated repairs may not have complete strategy counters.
+  // Zero counters alone cannot prove that no older generation was a repair.
+  if (fields === 0 && candidates === 0 && count(budget?.generations) === 1) {
+    const frozenArguments = error.jsonPointer && /^\/(?:steps|repair\/replacementSteps)\/\d+\/action\/arguments(?:\/|$)/.test(error.jsonPointer);
+    return frozenArguments ? "模型候选未通过校验，动作参数不属于字段修复范围，本轮未进行字段修复或候选重生成。"
+      : "模型候选未通过校验，本轮未进行字段修复或候选重生成。";
+  }
+  return error.code === "MODEL_OUTPUT_REPAIR_EXHAUSTED" ? "模型输出恢复已停止，当前操作未得到可用结果。"
+    : "模型响应未通过契约校验。";
+}
+
+function baseModelServiceErrorMessage(error: ModelServiceError) {
+  if (error.code === "MODEL_ADAPTER_BUSY") return "本地模型适配器队列已满，原请求已确认未受理。该次预留已释放，可在容量恢复后手动重试。";
+  if (error.code === "MODEL_REQUEST_NOT_ACCEPTED") return "原模型请求已确认未受理，该次预留已释放。请检查原请求记录后手动重试。";
+  if (error.code === "MODEL_RECOVERY_UNSUPPORTED") return "原模型连接不提供可信的结果查询接口，已保留原记录与未知用量，不能据此重新发送。";
+  if (TASK_BUDGET_ERROR_CODES.has(error.code)) {
+    return error.code === "MODEL_TASK_BUDGET_EXHAUSTED"
+      ? "任务或本轮 Token 额度不足，已在新模型请求发出前停止。已知消耗和未知请求的预留继续保留。"
+      : error.code === "MODEL_TASK_BUDGET_UNREGISTERED" || error.code === "MODEL_TASK_BUDGET_INVALID"
+        ? "任务预算尚未有效登记，请在 Token 额度中检查设置；旧任务需要明确登记从现在起可用的额度，历史消耗仍为未知。"
+        : error.code === "MODEL_TASK_BUDGET_POLICY_CHANGED" ? "已登记的任务或轮次额度与当前设置不一致，原额度和消耗已保留，不能通过重试重置。"
+          : "任务预算记录尚未完成核对，已停止新增模型调用；原请求的消耗与预留已保留。";
+  }
+  if (REQUEST_LIFECYCLE_ERROR_CODES.has(error.code)) {
+    return error.code === "MODEL_REQUEST_CANCELLED" ? "本次模型请求已请求取消，响应不会继续驱动执行。服务方是否停止以及最终用量仍以原请求记录为准。"
+      : error.code === "MODEL_REQUEST_UNRESOLVED" || error.code === "MODEL_REQUEST_REPLAY_BLOCKED"
+        ? "本任务存在尚未核对的模型请求，已停止重新发送。请查询原请求；无查询能力时保留未知状态。"
+        : error.code === "MODEL_ADAPTER_UNAVAILABLE" ? "原模型连接不提供可信的结果查询接口，已保留未知状态，不能据此重新发送。"
+          : "模型请求记录或身份尚未通过核对，已停止派发；原记录保留供查询。";
+  }
   if (isModelRecoveryScopeRejection(error)) {
     const field = error.jsonPointer?.match(/^\/(?:steps|repair\/replacementSteps)\/(\d+)(?:\/(kind|executionScope|runtimeClass|validation|sessionContextChange|action(?:\/command|\/toolId)?))?$/);
     const index = field ? Number(field[1]) : undefined;
@@ -254,6 +327,11 @@ export function modelServiceErrorMessage(error: ModelServiceError) {
     return `恢复方案未通过只读安全校验。${detail}该方案未执行，已有目标、用户确认和执行证据已保留。已停止自动重试；后续方案需要使用当前规则可确认的只读检查，无需修改模型配置。`;
   }
   if (MODEL_RECOVERY_ERROR_CODES.has(error.code)) {
+    const remaining = error.recoveryBudget?.remainingWaitMs, required = error.recoveryBudget?.requiredWaitMs;
+    if (error.code === "MODEL_RECOVERY_BUDGET_EXHAUSTED" && error.origin === "core" && error.stage === "recovery_budget"
+      && Number.isSafeInteger(remaining) && Number.isSafeInteger(required) && remaining! >= 0 && required! > remaining!) {
+      return `原操作剩余等待时间 ${remaining! / 1000} 秒，不足本次修复所需的 ${required! / 1000} 秒，已停止派发新的修复请求。已有目标、用户确认和执行证据已保留；原等待期限和额度没有增加。`;
+    }
     const summary = error.code === "MODEL_RESULT_UNAVAILABLE" ? "模型请求已有处理记录，但原始响应无法恢复。"
       : error.code === "MODEL_DISPATCH_UNKNOWN" ? "模型请求是否已经处理尚不确定，已停止自动重新发送。"
       : error.code === "MODEL_REQUEST_FAILED" ? "模型请求处理失败，已停止本次恢复。"
@@ -285,16 +363,22 @@ export function modelServiceErrorMessage(error: ModelServiceError) {
       : "模型服务请求失败，未获得可用结果。";
     return `${summary}已有目标、用户确认和执行证据已保留；本次操作已停止自动重试和重规划。`;
   }
+  if (error.code === "MODEL_REQUIREMENT_INVALID" && error.origin === "core" && error.stage === "requirement_contract") {
+    const field = error.jsonPointer?.match(/^\/(constraints(?:\/(?:changePolicy|environmentPolicy|failurePolicy|prohibitedActions|requiredConditions|userDirectives))?|intent|relation|answer|terminalContextLines|selectedSkillIds|requirementUpdate|steps)$/)?.[1];
+    const location = field ? `字段 ${field.replace(/\//g, ".")}` : "需求分类字段";
+    const reason = error.keyword === "enum" ? "取值不在允许枚举中" : error.keyword === "required" ? "缺失" : error.keyword === "type" ? "类型不符合契约" : "未通过本轮语义校验";
+    return `模型需求响应未通过校验。${location}${reason}。该响应未用于推进任务或执行候选，已有目标、授权和已知用量已保留。已停止自动重试；请核对响应契约后再明确重新规划。`;
+  }
   if (error.code === "MODEL_FORMAT_INVALID") {
     // Expose the field location, never the raw model response or provider message.
     const field = error.jsonPointer && /^\/(?:steps|repair|decision|reason|summary|requirementReview|blocking|issueResolutions)(?:\/[A-Za-z0-9_-]+)*$/.test(error.jsonPointer)
       ? error.jsonPointer.slice(0, 160) : undefined;
     const detail = error.stage === "json_parse" ? "返回内容不是完整合法的 JSON。"
       : field ? `字段 ${field}${error.keyword === "additionalProperties" ? "不允许出现在当前契约中" : "未通过契约校验"}。` : "返回字段未通过当前操作契约校验。";
-    return `模型响应格式修复未成功。${detail}被拒响应未用于推进任务，已有目标、用户确认和执行证据已保留。已停止自动重试；可点击“重新生成”发起一次有界重试，无需修改模型配置。`;
+    return `${modelOutputFailureSummary(error)}${detail}被拒响应未用于推进任务，已有目标、用户确认和执行证据已保留。已停止自动重试；可点击“重新生成”发起一次有界重试，无需修改模型配置。`;
   }
   if (error.code === "MODEL_OUTPUT_REPAIR_EXHAUSTED") {
-    return "本轮局部修复机会已用完，当前操作未得到可用结果。已有目标、授权和执行证据已保留；可重新生成后续方案，执行结果未知的操作仍须先核对。";
+    return `${modelOutputFailureSummary(error)}已有目标、授权和执行证据已保留；可重新生成后续方案，执行结果未知的操作仍须先核对。`;
   }
   if (COMPATIBILITY_ERROR_CODES.has(error.code) || LOCAL_MODEL_ERROR_CODES.has(error.code)) {
     const summary = error.code === "MODEL_OUTPUT_TRUNCATED" ? "模型输出被截断，未得到完整可用结果。"
@@ -434,11 +518,12 @@ function requireDesktopRuntime(operation: string): never {
 }
 
 export interface PlanNormalizationRepair {
+  candidateRejection?: import("@/types").CandidateRejectionDiagnostic;
   /** Carries the original model-operation budget across saved local repairs. */
   modelRecovery?: ModelRecoveryContext;
   /** A changed business action cannot be revived by legacy field revalidation. */
   businessReplanRequired?: boolean;
-  errorCode: "tool_schema_validation_failed" | "plan_normalization_failed" | "next_stage_response_invalid";
+  errorCode: "tool_schema_validation_failed" | "tool_evidence_capability_mismatch" | "plan_evidence_requirements_invalid" | "plan_normalization_failed" | "next_stage_response_invalid";
   repairStrategy?:
     | { type: "field_local" }
     | { type: "plan_protocol" }
@@ -463,9 +548,10 @@ export class PlanProtocolError extends Error {
   developerTrace?: ModelDeveloperTrace;
   get userMessage() {
     const progress = this.repair.businessReplanProgress;
-    const recovery = progress
+    const prior = candidateRejectionMessage(this.repair.candidateRejection);
+    const recovery = prior + (progress
       ? `已尝试 ${progress.attemptCount} 次后续方案重规划，${progress.stopReason === "no_progress" ? "方案重复无进展，已停止重复请求" : "已达到本轮重规划上限"}。`
-      : "";
+      : "");
     if (this.repair.errorCode === "next_stage_response_invalid") {
       return `${recovery}后续阶段响应格式不完整或不正确，未执行新的计划。已完成步骤及其证据保持有效，可重新生成后续方案。`;
     }
@@ -496,19 +582,47 @@ export function canRegenerateModelCandidate(error: unknown): boolean {
 }
 
 export function modelCandidateDiagnostic(error: unknown): Record<string, unknown> {
+  const rejection = safeCandidateRejection(error);
+  const cause = rejection ? { candidateRejection: rejection, ...(rejection.toolIds ? { rejectedToolIds: rejection.toolIds } : {}) } : {};
   if (error instanceof PlanProtocolError) return {
     code: error.repair.diagnostic?.code ?? error.repair.errorCode,
     fieldPath: error.repair.diagnostic?.fieldPath ?? error.repair.fieldPath,
     expected: (error.repair.diagnostic?.expected ?? error.repair.validationError).slice(0, 1200),
+    ...cause,
   };
   const diagnostic = modelServiceError(error);
   return { code: diagnostic?.code, stage: diagnostic?.stage, jsonPointer: diagnostic?.jsonPointer,
-    schemaPath: diagnostic?.schemaPath, keyword: diagnostic?.keyword };
+    schemaPath: diagnostic?.schemaPath, keyword: diagnostic?.keyword, ...cause };
 }
 
-export function exhaustedCandidateRecovery(error: unknown, stopReason: "no_progress" | "budget_exhausted" = "budget_exhausted"): unknown {
+function safeCandidateRejection(error: unknown) {
+  if (error instanceof PlanProtocolError) return candidateRejectionFromPlan(error.repair);
+  const service = modelServiceError(error);
+  if (service?.origin !== "core") return undefined;
+  const prior = parseCandidateRejection(service.candidateRejection);
+  if (prior) return prior;
+  return parseCandidateRejection({ version: 1, rejectedCandidateExecuted: false, code: service.code,
+    stepIndex: Number(service.jsonPointer?.match(/^\/steps\/(\d+)(?:\/|$)/)?.[1] ?? NaN) });
+}
+
+/** Keep the first rejection beside the later stop. Neither changes retryability,
+ * request identity, accounting, or the workflow/approval lifetime. */
+export function preserveCandidateRejection(error: unknown, rejected: unknown): unknown {
+  const rejection = safeCandidateRejection(rejected);
+  if (!rejection) return error;
+  if (error instanceof PlanProtocolError) {
+    error.repair.candidateRejection ??= rejection;
+    return error;
+  }
+  const service = modelServiceError(error);
+  if (!service) return error;
+  return new ModelInvocationError("计划修复已停止", error instanceof ModelInvocationError ? error.developerTrace : undefined,
+    { ...service, candidateRejection: service.candidateRejection ?? rejection });
+}
+
+export function exhaustedCandidateRecovery(error: unknown, stopReason: "no_progress" | "budget_exhausted" = "budget_exhausted", rejected?: unknown): unknown {
   if (error instanceof PlanProtocolError) error.repair.businessReplanProgress = { attemptCount: 1, stopReason };
-  return error;
+  return rejected === undefined ? error : preserveCandidateRejection(error, rejected);
 }
 
 function rejectedProtocolSteps(value: unknown[]): PlanStep[] | undefined {
@@ -673,6 +787,13 @@ function atomicPlanModeConflict(repair: PlanNormalizationRepair) {
 export function buildPlanNormalizationRepair(error: unknown, steps: PlanStep[]): PlanNormalizationRepair {
   const diagnostic = readRecoveryProtocolError(error);
   if (diagnostic) {
+    if (diagnostic.code === "TOOL_EVIDENCE_CAPABILITY_MISMATCH" || diagnostic.code === "PLAN_EVIDENCE_REQUIREMENTS_INVALID") return {
+      errorCode: diagnostic.code === "PLAN_EVIDENCE_REQUIREMENTS_INVALID" ? "plan_evidence_requirements_invalid" : "tool_evidence_capability_mismatch", repairStrategy: { type: "plan_protocol" },
+      diagnostic, fieldPath: diagnostic.fieldPath, expected: diagnostic.expected,
+      validationError: `${diagnostic.code} / ${diagnostic.fieldPath}：${diagnostic.expected}`,
+      previousModelOutput: steps,
+      instruction: `${diagnostic.expected}这是完整候选的证据声明或能力选择错误，不能局部补参或静默换工具；原候选未执行，保留原目标、约束、权限、请求归属及预算。`,
+    };
     const toolArgument = diagnostic.code === "TOOL_ARGUMENT_INVALID";
     return {
       errorCode: toolArgument ? "tool_schema_validation_failed" : "plan_normalization_failed",
@@ -731,7 +852,7 @@ function contextWithPlanRepair(context: string, repair: PlanNormalizationRepair)
 }
 
 /** Match the authority Rust used after classification, before creating repair feedback. */
-function classifiedPlanContext(context: string, result: RequirementProcessingResult, definitions: ModelSkillDefinition[], requirement: string) {
+export function classifiedPlanContext(context: string, result: RequirementProcessingResult, definitions: ModelSkillDefinition[], requirement: string) {
   const projected = projectClassifiedRequirementContext(parseRepairContext(context), result, requirement);
   const source = projected.context;
   const previous = protocolRepairAuthority(context).executionConstraints
@@ -754,16 +875,24 @@ export function assertPlanRepairScope(repair: PlanNormalizationRepair, repaired:
   }
   repair = normalizePlanRepairStrategy(repair);
   if (repair.errorCode !== "tool_schema_validation_failed") {
+    if (!repair.diagnostic || !currentRecoveryRepairScope(repair.diagnostic, repair.previousModelOutput[repair.diagnostic.stepIndex])) {
+      throw new Error("PROTOCOL_REPAIR_SCOPE_UNKNOWN：诊断字段与当前共享规则不一致，不允许扩大局部修复范围");
+    }
     const allowed = repair.diagnostic?.allowedRepairPaths ?? [];
     if (!allowed.length) throw new Error("PROTOCOL_REPAIR_SCOPE_UNKNOWN：没有可验证的局部修复字段，需补充权威上下文或进入业务调整");
     if (repair.previousModelOutput.length !== repaired.length) throw new Error("协议修复不得改变计划步骤数量");
-    const fields = ["kind", "title", "description", "action", "command", "risk", "expected", "validation", "executionScope",
-      "validationScope", "runtimeClass", "sessionContextChange", "recovery", "status"] as const;
+    const fields = ["kind", "title", "description", "action", "command", "risk", "expected", "evidenceRequirements", "validation", "executionScope",
+      "validationScope", "runtimeClass", "sessionContextChange", "recovery", "recoveryRuleVersion", "status"] as const;
     repair.previousModelOutput.forEach((previous, index) => {
       fields.forEach(field => {
         if (stableProtocolValue(protocolFieldValue(previous, field)) === stableProtocolValue(protocolFieldValue(repaired[index], field))) return;
         const shellRepair = allowed.includes(`steps[${index}].action.command`) && previous.action?.type === "shell" && repaired[index].action?.type === "shell";
-        if (shellRepair && (field === "command" || field === "action")) return;
+        if (shellRepair && field === "command") return;
+        if (shellRepair && field === "action") {
+          const { command: _oldCommand, ...oldAction } = previous.action as { type: "shell"; command: string };
+          const { command: _newCommand, ...newAction } = repaired[index].action as { type: "shell"; command: string };
+          if (stableProtocolValue(oldAction) === stableProtocolValue(newAction)) return;
+        }
         if (!allowed.includes(`steps[${index}].${field}`)) throw new Error(`协议修复不得改写 steps[${index}].${field}`);
         if (field === "command") {
           const beforeTool = previous.action?.type === "tool" ? previous.action.toolId : undefined;
@@ -782,8 +911,8 @@ export function assertPlanRepairScope(repair: PlanNormalizationRepair, repaired:
   if (precisePaths ? !precisePaths.length : !legacyField) {
     throw new Error("PROTOCOL_REPAIR_SCOPE_UNKNOWN：工具参数缺少可验证的局部修复字段");
   }
-  const immutable = ["kind", "title", "description", "risk", "expected", "validation", "executionScope",
-    "validationScope", "runtimeClass", "sessionContextChange", "recovery", "status"] as const;
+  const immutable = ["kind", "title", "description", "risk", "expected", "evidenceRequirements", "validation", "executionScope",
+    "validationScope", "runtimeClass", "sessionContextChange", "recovery", "recoveryRuleVersion", "status"] as const;
   const errorStep = repair.fieldPath?.match(/^steps\[(\d+)\]/)?.[1];
   repair.previousModelOutput.forEach((previous, index) => {
     const changed = immutable.find((field) => stableProtocolValue(protocolFieldValue(previous, field))
@@ -880,7 +1009,9 @@ function beginProtocolRepair(repair: PlanNormalizationRepair, context: string) {
     throw new PlanProtocolError(repair, "PROTOCOL_REPAIR_BUDGET_EXHAUSTED：同一事故达到协议修复上限");
   }
   let knownScope = repair.diagnostic
-    ? Boolean(repair.diagnostic.allowedRepairPaths.length)
+    ? repair.errorCode === "tool_schema_validation_failed"
+      ? Boolean(repair.diagnostic.allowedRepairPaths.length)
+      : currentRecoveryRepairScope(repair.diagnostic, repair.previousModelOutput[repair.diagnostic.stepIndex])
     : repair.errorCode === "tool_schema_validation_failed"
       && /^steps\[\d+\]\.action\.arguments\.fields\[key=[^\]]+\]\.(type|credential\.target)$/.test(repair.fieldPath ?? "");
   if (repair.diagnostic?.allowedRepairPaths.some(path => /\.recovery(?:\.|$)/.test(path))) {
@@ -977,7 +1108,8 @@ async function executeProtocolRepair(repair: PlanNormalizationRepair, requiremen
     if (isPlanModeConflictRepair(repair)) throw atomicPlanModeConflict(repair);
     beginProtocolRepair(repair, runtimeModel.context);
     if (outputStrategyFromContext(runtimeModel.context) === "regenerate") throw new PlanProtocolError(repair, "完整候选重生成仍未通过校验，本轮输出恢复已结束");
-    const response = await invoke<PlanStep[]>("generate_ai_plan", {
+    const response = await invokeTaskModel<PlanStep[]>("generate_ai_plan", {
+      _requestLifecycleAdapter: runtimeModel.requestLifecycleAdapter,
       apiKey: runtimeModel.apiKey, endpoint: runtimeModel.endpoint, model: runtimeModel.model,
       requirement: planProtocolRepairRequirement(repair),
       context: parameterContext(withModelOutputStrategy(compactProtocolRepairContext(runtimeModel.context, repair), "field_repair"), runtimeModel.requestParameters, runtimeModel.capabilities, modelIntegrationConfig(runtimeModel)),
@@ -1148,16 +1280,24 @@ export const backend = {
         targets: [{ role: "execution", host: input.connection.host, port: input.connection.port, username: input.connection.username,
           agentSession: { id: input.session.id, generation: input.session.generation, contextRevision: 0 } }],
         classifyResult: result => result.exitCode === undefined ? "unknown" : result.exitCode === 0 ? "succeeded" : "failed",
-        execute: () => invoke<AgentCommandResult>("execute_agent_terminal_command", {
-        ...input.connection,
-        sessionId: input.session.id,
-        generation: input.session.generation,
-        executionId: input.executionId,
-        command: input.command,
-        scope: input.scope,
-        approvedHighRisk: input.approvedHighRisk,
-        promptCredential: input.promptCredential,
-      }) });
+        execute: async () => {
+          try {
+            return await invoke<AgentCommandResult>("execute_agent_terminal_command", {
+              ...input.connection,
+              sessionId: input.session.id,
+              generation: input.session.generation,
+              executionId: input.executionId,
+              command: input.command,
+              scope: input.scope,
+              approvedHighRisk: input.approvedHighRisk,
+              promptCredential: input.promptCredential,
+            });
+          } catch (error) {
+            // This native entry owns both ordinary Agent exec and credential
+            // PTY exec. Classify before direct/Agent ledger receipt persistence.
+            throw normalizeSshCommandInvokeError(error);
+          }
+        } });
     } catch (error) {
       const transportError = error && typeof error === "object" && "originalError" in error ? error.originalError : error;
       if (isTerminalTransportFailure(transportError)) input.onSessionInvalidated?.();
@@ -1427,6 +1567,26 @@ export const backend = {
     return cancelDirectExecution(transferId, () => invoke<boolean>("cancel_sftp_transfer", { transferId }));
   },
 
+  async queryTaskModelBudget(taskId: string, roundId: string): Promise<TaskModelBudgetSnapshot | undefined> {
+    if (!isTauri()) return undefined;
+    return invoke("query_task_model_budget", { taskId, roundId });
+  },
+
+  async listTaskModelRequests(taskId: string): Promise<TaskModelRequest[]> {
+    if (!isTauri()) return [];
+    return invoke("list_task_model_requests", { taskId });
+  },
+
+  async cancelCurrentTaskModelRequests(taskId: string): Promise<void> {
+    if (!isTauri()) return;
+    await invoke("cancel_current_task_model_requests", { taskId });
+  },
+
+  async recoverTaskModelRequest(taskId: string, requestId: string, endpoint: string, apiKey: string, apiProtocol?: import("@/types").ModelApiProtocol, accountingOnly = false): Promise<TaskModelRequest> {
+    if (!isTauri()) return requireDesktopRuntime("查询原模型请求");
+    return invoke("recover_task_model_request", { taskId, requestId, endpoint, apiKey, apiProtocol, ...(accountingOnly ? { accountingOnly: true } : {}) });
+  },
+
   async generatePlan(requirement: string, runtimeModel?: RuntimeModel): Promise<PlanStep[]> {
     if (isTauri() && runtimeModel?.apiKey) {
       runtimeModel = runtimeWithModelRecovery(runtimeModel);
@@ -1441,12 +1601,13 @@ export const backend = {
         runtime.assertCurrent?.();
         let steps: PlanStep[];
         try {
-          steps = await invoke<PlanStep[]>("generate_ai_plan", {
+          steps = await invokeTaskModel<PlanStep[]>("generate_ai_plan", {
+          _requestLifecycleAdapter: runtime.requestLifecycleAdapter,
           apiKey: runtime.apiKey,
           endpoint: runtime.endpoint,
           model: runtime.model,
           requirement,
-          context: parameterContext(runtime.context, runtime.requestParameters, runtime.capabilities, modelIntegrationConfig(runtime)),
+          context: planEvidenceContext(parameterContext(runtime.context, runtime.requestParameters, runtime.capabilities, modelIntegrationConfig(runtime))),
           generationSettings: runtime.generationSettings,
           timeoutSeconds: runtime.timeoutSeconds,
           });
@@ -1480,7 +1641,7 @@ export const backend = {
         try {
           return await generate({ ...original, context: candidateRegenerationContext(original.context, modelCandidateDiagnostic(error)) });
         } catch (failure) {
-          throw exhaustedCandidateRecovery(failure);
+          throw exhaustedCandidateRecovery(failure, "budget_exhausted", error);
         }
       }
     }
@@ -1537,12 +1698,13 @@ export const backend = {
       runtimeModel.assertCurrent?.();
       let result: RequirementProcessingResult;
       try {
-        result = await invoke<RequirementProcessingResult>("process_ai_requirement", {
+        result = await invokeTaskModel<RequirementProcessingResult>("process_ai_requirement", {
+          _requestLifecycleAdapter: runtimeModel.requestLifecycleAdapter,
           apiKey: runtimeModel.apiKey,
           endpoint: runtimeModel.endpoint,
           model: runtimeModel.model,
           requirement,
-          context: parameterContext(runtimeModel.context, runtimeModel.requestParameters, runtimeModel.capabilities, modelIntegrationConfig(runtimeModel)),
+          context: planEvidenceContext(parameterContext(runtimeModel.context, runtimeModel.requestParameters, runtimeModel.capabilities, modelIntegrationConfig(runtimeModel))),
           skillDefinitions,
           generationSettings: runtimeModel.generationSettings,
           timeoutSeconds: runtimeModel.timeoutSeconds,
@@ -1578,11 +1740,12 @@ export const backend = {
       }
       runtimeModel.assertCurrent?.();
       if (canRegenerateModelCandidate(failure)) {
+        const rejected = failure;
         try {
           const plan = await backend.generatePlan(requirement, { ...runtimeModel,
             context: candidateRegenerationContext(planContext, modelCandidateDiagnostic(failure)) });
           return legacyModelOperationValue("requirement.classify", { ...result, plan, planError: undefined });
-        } catch (error) { failure = exhaustedCandidateRecovery(error); }
+        } catch (error) { failure = exhaustedCandidateRecovery(error, "budget_exhausted", rejected); }
       }
       runtimeModel.assertCurrent?.();
       if (failure instanceof PlanProtocolError) {
@@ -1605,7 +1768,10 @@ export const backend = {
     if (!runtimeModel.endpoint.trim()) return { available: false, reason: "未配置接口地址" };
     if (!runtimeModel.model.trim()) return { available: false, reason: "未配置模型名称" };
     if (!isTauri()) return { available: false, reason: "需要在 Opsark 桌面端验证真实模型连接" };
-    return legacyModelOperationValue("model.probe", await invoke("check_ai_model", {
+    runtimeModel.assertCurrent?.();
+    const result = await invokeTaskModel<ModelValidationResult>("check_ai_model", {
+      _requestLifecycleAdapter: runtimeModel.requestLifecycleAdapter,
+      context: "{}",
       requestParameters: validateRequestParameters(runtimeModel.requestParameters),
       capabilities: runtimeModel.capabilities,
       integration: modelIntegrationConfig(runtimeModel),
@@ -1614,7 +1780,26 @@ export const backend = {
       endpoint: runtimeModel.endpoint,
       model: runtimeModel.model,
       timeoutSeconds: runtimeModel.timeoutSeconds,
-    }));
+    });
+    // A late completion remains in the native ledger but cannot validate a
+    // replaced draft, cancelled test, or unmounted editor.
+    runtimeModel.assertCurrent?.();
+    return legacyModelOperationValue("model.probe", result);
+  },
+
+  async listModelProbeRequests(runtime: ModelProbeConnection): Promise<TaskModelRequest[]> {
+    if (!isTauri()) return [];
+    return invoke("list_model_probe_requests", probeConnection(runtime));
+  },
+
+  async cancelModelProbeRequests(runtime: ModelProbeConnection): Promise<TaskModelRequest[]> {
+    if (!isTauri()) return requireDesktopRuntime("取消模型测试");
+    return invoke("cancel_model_probe_requests", probeConnection(runtime));
+  },
+
+  async recoverModelProbeRequest(runtime: ModelProbeConnection, requestId: string): Promise<TaskModelRequest> {
+    if (!isTauri()) return requireDesktopRuntime("查询原模型测试");
+    return invoke("recover_model_probe_request", { ...probeConnection(runtime), requestId });
   },
 
   /** Offline preview uses the same native request builder without reading or forwarding a credential. */
@@ -1634,7 +1819,8 @@ export const backend = {
     const fallback = buildExecutionSummary(requirement, steps);
     if (isTauri() && runtimeModel?.apiKey) {
       try {
-        return legacyModelOperationValue("summary.generate", await invoke<string>("generate_ai_summary", {
+        return legacyModelOperationValue("summary.generate", await invokeTaskModel<string>("generate_ai_summary", {
+          _requestLifecycleAdapter: runtimeModel.requestLifecycleAdapter,
           apiKey: runtimeModel.apiKey,
           endpoint: runtimeModel.endpoint,
           model: runtimeModel.model,
@@ -1679,7 +1865,8 @@ export const backend = {
     };
     if (!isTauri() || !runtimeModel?.apiKey) return fallback;
     try {
-      const review = await invoke<Omit<StepReview, "source">>("review_ai_step", {
+      const review = await invokeTaskModel<Omit<StepReview, "source">>("review_ai_step", {
+        _requestLifecycleAdapter: runtimeModel.requestLifecycleAdapter,
         apiKey: runtimeModel.apiKey,
         endpoint: runtimeModel.endpoint,
         model: runtimeModel.model,
@@ -1712,7 +1899,8 @@ export const backend = {
     };
     if (!isTauri() || !runtimeModel?.apiKey) return fallback;
     try {
-      const review = await invoke<Omit<StepReview, "source">>("review_ai_step", {
+      const review = await invokeTaskModel<Omit<StepReview, "source">>("review_ai_step", {
+        _requestLifecycleAdapter: runtimeModel.requestLifecycleAdapter,
         apiKey: runtimeModel.apiKey,
         endpoint: runtimeModel.endpoint,
         model: runtimeModel.model,
@@ -1747,12 +1935,13 @@ export const backend = {
       outputStrategyFromContext(runtimeModel.context) ?? "initial") };
     runtimeModel.assertCurrent?.();
     try {
-      const decision = await invoke<Omit<NextStageDecision, "source">>("decide_ai_next_stage", {
+      const decision = await invokeTaskModel<Omit<NextStageDecision, "source">>("decide_ai_next_stage", {
+        _requestLifecycleAdapter: runtimeModel.requestLifecycleAdapter,
         apiKey: runtimeModel.apiKey,
         endpoint: runtimeModel.endpoint,
         model: runtimeModel.model,
         requirement,
-        context: parameterContext(runtimeModel.context, runtimeModel.requestParameters, runtimeModel.capabilities, modelIntegrationConfig(runtimeModel)),
+        context: planEvidenceContext(parameterContext(runtimeModel.context, runtimeModel.requestParameters, runtimeModel.capabilities, modelIntegrationConfig(runtimeModel))),
         generationSettings: runtimeModel.generationSettings,
         timeoutSeconds: runtimeModel.timeoutSeconds,
       });
@@ -1793,7 +1982,7 @@ export const backend = {
     command: string,
     connection?: RuntimeConnection,
     approvedHighRisk = false,
-    options?: { executionId: string; captureStreams?: boolean; onProgress?: (event: CommandOutputEvent) => void },
+    options?: { executionId: string; captureStreams?: boolean; onProgress?: (event: CommandOutputEvent) => void; privateCommandAudit?: PrivateCommandAudit },
   ): Promise<{
     output: string;
     stdout?: string;
@@ -1804,9 +1993,17 @@ export const backend = {
     exitCode?: number;
     emptyResult?: boolean;
   }> {
+    const privateAudit = options?.privateCommandAudit;
+    // A private command may only implement an already admitted tool operation.
+    // Never create a direct-action intent containing the expanded credentials.
+    if (privateAudit && (!options || !isRecordedExecution(options.executionId))) {
+      throw new Error("私密探针必须绑定已落账的工具执行，尚未发送命令");
+    }
+    const redactPrivate = privateAudit ? privateCommandRedactor(command, privateAudit) : undefined;
     if (isTauri() && connection?.password) {
       let unlisten: (() => void) | undefined;
-      if (options?.onProgress) {
+      // Secrets can span output chunks, so private probes never stream raw text.
+      if (options?.onProgress && !privateAudit) {
         unlisten = await listen<CommandOutputEvent>("command-output", (event) => {
           if (event.payload.executionId === options.executionId) options.onProgress?.(event.payload);
         });
@@ -1814,16 +2011,30 @@ export const backend = {
       try {
         const executionId = options?.executionId ?? directExecutionId();
         return await runDirectExecution({ executionId, connections: [connection], phase: "command",
-          action: { type: "shell", command },
+          action: { type: "shell", command: privateAudit?.displayCommand ?? command },
           classifyResult: (result: { success: boolean; exitCode?: number }) => result.exitCode === undefined
             ? (result.success ? "succeeded" : "unknown") : result.exitCode === 0 ? "succeeded" : "failed",
-          execute: () => invoke<{ stdout?: string; stderr?: string; stdoutTruncated?: boolean; output: string; success: boolean; simulated: boolean; exitCode?: number; emptyResult?: boolean }>("execute_ssh_command", {
-          ...connection,
-          command,
-          approvedHighRisk,
-          executionId,
-          ...(options?.captureStreams ? { separateOutput: true } : {}),
-        }) });
+          execute: async () => {
+            let result: { stdout?: string; stderr?: string; stdoutTruncated?: boolean; output: string; success: boolean; simulated: boolean; exitCode?: number; emptyResult?: boolean };
+            try {
+              result = await invoke<typeof result>("execute_ssh_command", {
+                ...connection, command, approvedHighRisk, executionId,
+                ...(options?.captureStreams ? { separateOutput: true } : {}),
+                ...(privateAudit ? { privateOutput: true } : {}),
+              });
+            } catch (error) {
+              // Only this native invoke rejection can attest to pre-dispatch
+              // rejection. Its fixed diagnostic contains no private material.
+              const normalized = normalizeSshCommandInvokeError(error);
+              if (isSshExecPayloadError(normalized)) throw normalized;
+              if (redactPrivate) throw new Error(redactPrivate(error instanceof Error ? error.message : String(error)));
+              throw error;
+            }
+            // Structured stdout remains private until the fixed adapter verifies
+            // actual connection identity and redacts its public observations.
+            return redactPrivate ? { ...result, output: redactPrivate(result.output),
+              ...(result.stderr === undefined ? {} : { stderr: redactPrivate(result.stderr) }) } : result;
+          } });
       } finally {
         unlisten?.();
       }

@@ -17,7 +17,7 @@ export function toolFailureFallback(step: PlanStep) {
     || tool.id === "server.resolve_connection" || tool.id === "evidence.read"
     || step.executionIntent && step.executionIntent.semantic.effect !== "read") return;
   const facts = step.result.facts;
-  const category = facts.evidenceKind === "operations_inspection" && facts.inspectionStatus === "unsupported"
+  const category = ["operations_inspection", "package_management", "file_metadata", "log_rotation", "database_inspection"].includes(String(facts.evidenceKind)) && facts.inspectionStatus === "unsupported"
     ? "unsupported" : String(facts.category ?? "");
   const attempts = Array.isArray(facts.attempts) ? facts.attempts.length : 0;
   if (step.result.executionStatus !== "failed"

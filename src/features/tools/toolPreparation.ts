@@ -96,9 +96,19 @@ export function bindPreparedToolTargets(action: ToolAction, context: PreparedToo
       };
     }
     const path = action.toolId === "files.transfer_between_servers" ? args.sourcePath
-      : ["files.read_content", "disk.inspect", "files.find_large"].includes(action.toolId) ? args.path : action.toolId === "files.get_structure" ? args.rootPath : undefined;
+      : ["files.read_content", "files.inspect", "files.inspect_manifest", "disk.inspect", "files.find_large"].includes(action.toolId) ? args.path : action.toolId === "files.get_structure" ? args.rootPath : undefined;
     if (typeof path === "string") source.path = path;
     targets.push(source);
+    if (action.toolId === "http.inspect_delivery" && args.backendObservation && typeof args.backendObservation === "object") {
+      const path = (args.backendObservation as Record<string, unknown>).path;
+      if (typeof path === "string") targets.push({ ...source, path });
+    }
+    if (action.toolId === "logs.inspect_rotation") {
+      const paths = [args.activePaths, args.archivePaths, args.configPaths].flatMap(value => Array.isArray(value) ? value : []);
+      for (const path of paths) {
+        if (typeof path === "string") targets.push({ ...source, path });
+      }
+    }
   }
   if (action.toolId === "files.transfer_between_servers") {
     if (!context.server) throw new ToolArgumentValidationError("文件传输缺少已绑定的源服务器");

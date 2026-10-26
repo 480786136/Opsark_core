@@ -1,4 +1,11 @@
 import { operationsOutputSchemas } from "./operationsContracts";
+import { fileDeletionOutputSchemas } from "./fileDeletionContracts";
+import { healthObservationOutputSchema } from "./healthObservation";
+import { logRotationOutputSchema } from "./logRotationInspection";
+import { databaseInspectionOutputSchema } from "./databaseInspectionContracts";
+import { fileManifestOutputSchema } from "./fileManifestContracts";
+import { httpDeliveryOutputSchema } from "./httpDeliveryContracts";
+import { nginxConfigOutputSchema } from "./nginxConfigContracts";
 import { fullSchemaPattern, schemaNonWhitespace } from "./toolSchemaPatterns";
 /** Compiled adapter contracts. Remote configuration cannot widen these outputs. */
 const text = { type: "string" };
@@ -12,6 +19,12 @@ const object = (properties: Record<string, unknown>, required = Object.keys(prop
 });
 const schemas: Record<string, Record<string, unknown>> = {
   ...operationsOutputSchemas,
+  "services.observe": healthObservationOutputSchema,
+  "logs.inspect_rotation": logRotationOutputSchema,
+  "database.inspect_postgres": databaseInspectionOutputSchema,
+  "files.inspect_manifest": fileManifestOutputSchema,
+  "http.inspect_delivery": httpDeliveryOutputSchema,
+  "nginx.inspect_configuration": nginxConfigOutputSchema,
   "context.expand": object({ skillId: nonempty }),
   "evidence.read": object({
     evidenceId: { type: "string", pattern: fullSchemaPattern("[a-f0-9]{64}") }, historical: { const: true },
@@ -56,7 +69,7 @@ const schemas: Record<string, Record<string, unknown>> = {
     sha256: { type: "string", pattern: fullSchemaPattern("[a-f0-9]{64}") }, targetServerId: nonempty,
   }),
 };
-export const toolOutputSchemas = Object.fromEntries(Object.entries(schemas).map(([id, schema]) =>
+export const toolOutputSchemas = Object.fromEntries(Object.entries({ ...schemas, ...fileDeletionOutputSchemas }).map(([id, schema]) =>
   [id, { $schema: "http://json-schema.org/draft-07/schema#", ...schema }])) as Record<string, Record<string, unknown>>;
 
 export const serverConnectPartialSchema = object({

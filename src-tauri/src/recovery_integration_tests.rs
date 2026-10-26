@@ -83,6 +83,28 @@ fn recovery_command_only_patch_succeeds_and_exports_rule_version() {
 }
 
 #[test]
+fn recovery_repair_rejects_widened_diagnostics_and_publishes_shared_capabilities() {
+    let original = diagnosis("cat <<'EOF'\nreadonly text\nEOF");
+    let mut issue = recovery_rules::metadata_issue(&serde_json::to_value(&original).unwrap(), 0).unwrap();
+    let error = recovery_rules::encode_issue(&issue);
+    let focused: Value = serde_json::from_str(&focused_plan_repair_context(
+        r#"{"permission":"safe","executionConstraints":{"changePolicy":"read_only"},"server":{"host":"host","port":22}}"#,
+        &error, &original).unwrap()).unwrap();
+    assert_eq!(focused["readOnlyPlanProtocol"], recovery_rules::read_only_plan_protocol());
+    assert_eq!(focused["permission"], "safe");
+    assert_eq!(focused["executionConstraints"]["changePolicy"], "read_only");
+    issue.allowed_repair_paths.push("steps[0].risk".into());
+    let mut candidate = diagnosis("uname -a");
+    candidate.risk = Some("low".into());
+    let mut steps = vec![original.clone()];
+    let rejection = apply_recovery_step_repair(&mut steps, AiPlanStepRepair {
+        step_index: 1, replacement_steps: vec![candidate],
+    }, &issue).unwrap_err();
+    assert!(rejection.contains("PROTOCOL_REPAIR_SCOPE_UNKNOWN"));
+    assert_eq!(steps[0].command, original.command);
+}
+
+#[test]
 fn recovery_patch_rejects_replanning_and_stops_identical_output() {
     let original = diagnosis("rm /tmp/diagnostic");
     let issue =

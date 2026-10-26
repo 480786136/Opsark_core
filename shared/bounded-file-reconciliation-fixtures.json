@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "accepted": [
+    {
+      "command": "set -eu\nf='/tmp/发布记录.txt'\nb='/tmp/发布记录.txt.bak'\nprintf '%s\\n' 'old' | cmp - \"$f\"\ntest ! -e \"$b\"\ncp -p -- \"$f\" \"$b\"\nprintf '%s\\n' 'new' >> \"$f\"",
+      "before": "old\n",
+      "after": "old\nnew\n",
+      "filePath": "/tmp/发布记录.txt",
+      "backupPath": "/tmp/发布记录.txt.bak",
+      "executionId": "exec-123",
+      "probe": "set -eu\ntest -f '/tmp/opsark-receipt-exec-123/done' && test ! -L '/tmp/opsark-receipt-exec-123/done'\ncat -- '/tmp/opsark-receipt-exec-123/done'\nprintf '%s\\n' CURRENT_BOOT\ncat /proc/sys/kernel/random/boot_id\nprintf '%s\\n' PROCESS_GROUPS\ngroups=$(ps -eo pgid=) || exit 125\ngroup=$(awk 'NR==5 {print}' '/tmp/opsark-receipt-exec-123/done') || exit 125\ncase \"$group\" in ''|*[!0-9]*) exit 125;; esac\nprintf '%s\\n' \"$groups\" | awk -v p=\"$group\" '$1 == p {found=1} END {print found ? p : 0}'\nprintf '%s\\n' FILE_DIGESTS\ntest -f '/tmp/发布记录.txt' && test ! -L '/tmp/发布记录.txt'\ntest -f '/tmp/发布记录.txt.bak' && test ! -L '/tmp/发布记录.txt.bak'\nsha256sum -- '/tmp/发布记录.txt' '/tmp/发布记录.txt.bak'\nsha256sum -- '/tmp/发布记录.txt' '/tmp/发布记录.txt.bak'\nprintf '%s\\n' END"
+    },
+    {
+      "command": "set -eu\nf='/tmp/发布记录.txt'\nb='/tmp/发布记录.txt.bak'\ncmp -s -- \"$f\" - <<'EOF'\nold\nEOF\ntest ! -e \"$b\"\ncp -p -- \"$f\" \"$b\"\nprintf '%s\\n' 'new' >> \"$f\"",
+      "before": "old\n",
+      "after": "old\nnew\n",
+      "filePath": "/tmp/发布记录.txt",
+      "backupPath": "/tmp/发布记录.txt.bak",
+      "executionId": "exec-123",
+      "probe": "set -eu\ntest -f '/tmp/opsark-receipt-exec-123/done' && test ! -L '/tmp/opsark-receipt-exec-123/done'\ncat -- '/tmp/opsark-receipt-exec-123/done'\nprintf '%s\\n' CURRENT_BOOT\ncat /proc/sys/kernel/random/boot_id\nprintf '%s\\n' PROCESS_GROUPS\ngroups=$(ps -eo pgid=) || exit 125\ngroup=$(awk 'NR==5 {print}' '/tmp/opsark-receipt-exec-123/done') || exit 125\ncase \"$group\" in ''|*[!0-9]*) exit 125;; esac\nprintf '%s\\n' \"$groups\" | awk -v p=\"$group\" '$1 == p {found=1} END {print found ? p : 0}'\nprintf '%s\\n' FILE_DIGESTS\ntest -f '/tmp/发布记录.txt' && test ! -L '/tmp/发布记录.txt'\ntest -f '/tmp/发布记录.txt.bak' && test ! -L '/tmp/发布记录.txt.bak'\nsha256sum -- '/tmp/发布记录.txt' '/tmp/发布记录.txt.bak'\nsha256sum -- '/tmp/发布记录.txt' '/tmp/发布记录.txt.bak'\nprintf '%s\\n' END"
+    }
+  ],
+  "rejected": [
+    "set -eu\nf='/tmp/发布记录.txt'\nb='/tmp/发布记录.txt.bak'\nprintf '%s\\n' 'old' | cmp - \"$f\"\ntest ! -e \"$b\"\ncp -p -- \"$f\" \"$b\"\nprintf '%s\\n' 'new' >> \"$f\"\ntouch /another",
+    "set -eu\nf='/tmp/发布记录.txt'\nb='/tmp/发布记录.txt.bak'\nprintf '%s\\n' 'old' | cmp - \"$f\"\ntest ! -e \"$b\"\ncp -p -- \"$f\" \"$b\"\nprintf '%s\\n' new>/another >> \"$f\"",
+    "set -eu\nf='/tmp/发布记录.txt'\nb='/tmp/发布记录.txt.bak'\nprintf '%s\\n' 'old' '|' cmp - \"$f\"\ntest ! -e \"$b\"\ncp -p -- \"$f\" \"$b\"\nprintf '%s\\n' 'new' >> \"$f\"",
+    "set -eu\nf='/tmp/发布记录.txt'\nb='/tmp/发布记录.txt.bak'\nprintf '%s\\n' 'old' | cmp - \"$f\"\ntest ! -e \"$b\"\ncp -p -- \"$f\" \"$b\"\nprintf '%s\\n' 'new' '>>' \"$f\"",
+    "set -eu\nf='/tmp/发布记录.txt'\nb='/tmp/发布记录.txt.bak'\nprintf '%s\\n' 'old' | cmp - \"$f\"\ntest -e \"$b\"\ncp -p -- \"$f\" \"$b\"\nprintf '%s\\n' 'new' >> \"$f\"",
+    "set -eu\nf='/tmp/发布记录.txt'\nb='/tmp/发布记录.txt'\nprintf '%s\\n' 'old' | cmp - \"$f\"\ntest ! -e \"$b\"\ncp -p -- \"$f\" \"$b\"\nprintf '%s\\n' 'new' >> \"$f\""
+  ]
+}

@@ -6,6 +6,7 @@ import { backend, type TerminalOutputEvent, type TerminalStatusEvent } from "@/s
 import { useOpsStore } from "@/stores/ops";
 import { i18n } from "@/features/preferences/i18n";
 import TerminalPanel from "./TerminalPanel.vue";
+import { getHostCapabilities, recordHostCapabilities } from "@/features/tools/hostCapabilities";
 
 const fake = vi.hoisted(() => ({
   input: undefined as ((data: string) => void) | undefined,
@@ -61,6 +62,23 @@ describe("TerminalPanel connection gating", () => {
     vi.spyOn(backend, "writeTerminal").mockResolvedValue(undefined);
   });
   afterEach(() => { app?.unmount(); app = undefined; host.remove(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  it("invalidates host capability facts only when PTY input is actually admitted", async () => {
+    await mount();
+    status({ terminalId, generation: 1, status: "connected", retryable: false });
+    const identity = { serverId: "server-a", host: "localhost", port: 22, username: "ops", connectionGeneration: 1 };
+    recordHostCapabilities(identity, { version: 1, observedAt: null,
+      facts: [{ name: "systemctl", supported: true }] }, { toolCallId: "probe" });
+    fake.input?.("x");
+    expect(getHostCapabilities(identity)).toBeUndefined();
+    expect(backend.writeTerminal).toHaveBeenCalledOnce();
+    recordHostCapabilities(identity, { version: 1, observedAt: null,
+      facts: [{ name: "systemctl", supported: true }] }, { toolCallId: "next-probe" });
+    ops.serverConnection("server-a").status = "suspect";
+    fake.input?.("y");
+    expect(getHostCapabilities(identity)).toBeDefined();
+    expect(backend.writeTerminal).toHaveBeenCalledOnce();
+  });
 
   it("blocks input immediately while offline and preserves the output buffer", async () => {
     await mount();

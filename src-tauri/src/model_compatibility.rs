@@ -97,21 +97,41 @@ pub(crate) fn action_schema(tools: &Value) -> Value {
     if let Some(tools) = tools.as_array() {
         for tool in tools {
             if tool["id"].is_string() && tool["inputSchema"].is_object() {
+                let mut tag = json!({"type":"string","enum":[tool["id"]]});
+                // Put result semantics at the discriminator actually being
+                // selected. Do not copy the whole directory or invent result
+                // fields from a plan title; this annotation grants no authority.
+                if let Some(description) = tool["outputDescription"].as_str().filter(|text| !text.trim().is_empty()) {
+                    let prefix = "返回能力：";
+                    let available = 160 - prefix.len();
+                    let truncated = description.len() > available;
+                    let suffix = if truncated { "…" } else { "" };
+                    let mut end = description.len().min(available - suffix.len());
+                    while !description.is_char_boundary(end) { end -= 1; }
+                    tag["description"] = json!(format!("{prefix}{}{suffix}", &description[..end]));
+                }
                 variants.push(object(json!({"type":{"type":"string","enum":["tool"]},
-                    "toolId":{"type":"string","enum":[tool["id"]]}, "arguments":tool["inputSchema"]}),json!({})));
+                    "toolId":tag, "arguments":tool["inputSchema"]}),json!({})));
             }
         }
     }
     json!({"anyOf":variants})
 }
-fn step(tools: &Value) -> Value {
-    object(
+fn step(tools: &Value, evidence_contract: bool) -> Value {
+    let mut schema = object(
         json!({"kind":{"type":"string","enum":["observe","change"]},
         "title":{"type":"string"},"description":{"type":"string"},"action":action_schema(tools),
         "expected":{"type":"string"},"validation":{"type":"string"},"risk":{"type":"string","enum":["low","medium","high"]}}),
         json!({"executionScope":nullable(json!({"type":"string","enum":crate::plan_contract::EXECUTION_SCOPES})),"validationScope":nullable(json!({"type":"string","enum":crate::plan_contract::VALIDATION_SCOPES})),
             "runtimeClass":nullable(json!({"type":"string","enum":crate::plan_contract::RUNTIME_CLASSES})),"sessionContextChange":metadata(),"recovery":metadata(),"retryBasis":metadata()}),
-    )
+    );
+    if evidence_contract {
+        schema["properties"]["evidenceRequirements"] = json!({"type":"array", "maxItems":1,
+            "items":{"type":"string","enum":["file_content"]},
+            "description":"本步骤需要的结果数据；正文工具填 [file_content]，其他步骤填 []。空数组不撤销 expected 中明确的正文要求；不证明内容完整、新鲜或已获授权。"});
+        schema["required"].as_array_mut().unwrap().push(json!("evidenceRequirements"));
+    }
+    schema
 }
 
 /// A separate contract per operation; a review must never receive the plan schema.
@@ -124,7 +144,7 @@ pub(crate) fn contract(name: &str, body: &Value) -> Option<Value> {
 pub(crate) fn full_contract(name: &str, body: &Value) -> Option<Value> {
     let context: Value =
         serde_json::from_str(body["_opsarkContext"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
-    let steps = json!({"type":"array","items":step(&context["tools"])});
+    let steps = json!({"type":"array","items":step(&context["tools"], context["_planEvidenceContract"]["version"] == 1)});
     let decision = json!({"type":"string","enum":["continue","adjust","complete"]});
     match name {
         "阶段联合决策" | "阶段格式修复（兼容模式）" => {
@@ -156,13 +176,18 @@ pub(crate) fn full_contract(name: &str, body: &Value) -> Option<Value> {
                 object(json!({"steps":steps}), json!({}))
             })
         }
-        "需求理解" => Some(object(
+        "需求理解" => {
+            let mut schema = object(
             json!({"intent":{"type":"string","enum":["answer","execute","terminal_context"]},
-            "answer":{"type":"string"},"selectedSkillIds":strings(),"constraints":nullable(object(json!({
-                "changePolicy":{"type":"string"},"environmentPolicy":{"type":"string"},"failurePolicy":{"type":"string"},
-                "prohibitedActions":strings(),"requiredConditions":strings(),"userDirectives":strings()}),json!({})))}),
+            "answer":{"type":"string"},"selectedSkillIds":strings(),"constraints":nullable(crate::classification_contract::schema())}),
             json!({"relation":nullable(json!({"type":"string"})),"terminalContextLines":nullable(json!({"type":"integer"})),"requirementUpdate":nullable(crate::requirement_contract::update())}),
-        )),
+            );
+            if body["_opsarkOperationContract"] == "requirement.plan@1" {
+                schema["properties"]["steps"] = steps;
+                schema["required"].as_array_mut().unwrap().push(json!("steps"));
+            }
+            Some(schema)
+        },
         "结果复核" => Some(object(
             json!({"decision":decision,"reason":{"type":"string"},"summary":{"type":"string"}}),
             json!({
@@ -189,6 +214,7 @@ fn contract_version(name: &str, schema: &Value) -> &'static str {
         "计划生成" => "plan.generate@1",
         "阶段联合决策" if schema["properties"].get("steps").is_none() => "stage.metadata-repair@2",
         "阶段联合决策" | "阶段格式修复（兼容模式）" => "stage.decide@2",
+        "需求理解" if schema["properties"].get("steps").is_some() => "requirement.plan@1",
         "需求理解" => "requirement.classify@1",
         "结果复核" => "result.review@1",
         "Skill 生成" => "skill.draft@1",
@@ -332,6 +358,9 @@ pub(crate) fn prepare(
     let mut body = body.clone();
     let raw = body["_opsarkContext"].as_str().unwrap_or("{}").to_owned();
     let mut context: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
+    if context.get("_planEvidenceContract").is_some_and(|marker| marker != &json!({"version":1})) {
+        return Err(error("PLAN_EVIDENCE_CONTRACT_UNSUPPORTED", "不支持的步骤证据契约版本，请求未发送"));
+    }
     // Official requests are configured by the platform, including old saved overrides.
     if gateway {
         context.as_object_mut().map(|c| c.remove("_requestParameters"));
@@ -481,6 +510,11 @@ pub(crate) fn prepare(
         budget
     });
     let schema = contract(name, &body);
+    if context["_planEvidenceContract"]["version"] == 1 && matches!(name, "计划生成" | "阶段联合决策" | "阶段格式修复（兼容模式）" | "模型业务测试" | "需求理解") {
+        if let Some(messages) = body["messages"].as_array_mut() {
+            messages.insert(0, json!({"role":"system","content":"若本轮响应含计划步骤，按已协商的证据契约扩展原字段清单与旧示例，每个步骤还必须有 evidenceRequirements 数组：需要文件正文时填 [\"file_content\"] 并选择目录中 providedEvidence 支持该类型的工具；其他步骤及 Shell 填 []。声明不构成验收证据，空数组不得掩盖正文需求。"}));
+        }
+    }
     if let Some(schema) = &schema {
         let use_schema = crate::model_protocol::schema_allowed(&integration, &caps);
         if !use_schema && !crate::model_protocol::json_allowed(&integration) {
@@ -525,6 +559,9 @@ pub(crate) fn prepare(
             }
         }
         body["_opsarkSchemaCompilation"]["contractVersion"] = json!(contract_version(name, schema));
+        if context["_planEvidenceContract"]["version"] == 1 {
+            body["_opsarkSchemaCompilation"]["evidenceContractVersion"] = json!("plan.evidence@1");
+        }
         body["_opsarkSchemaCompilation"]["normalizationVersion"] = json!(OUTPUT_NORMALIZATION_VERSION);
         body["_opsarkSchemaCompilation"]["capabilityVersion"] = caps["version"].clone();
         body["_opsarkSchemaCompilation"]["protocol"] = integration["apiProtocol"].clone();
@@ -727,6 +764,12 @@ pub(crate) fn normalize_response_with_wire(
         diagnostic.column = Some(error.column());
         diagnostic
     })?;
+    // Policy semantics are already known here; a bad policy must not buy an
+    // automatic reclassification/repair call or be normalized into authority.
+    if schema.pointer("/properties/intent").is_some() && schema.pointer("/properties/constraints").is_some()
+        && value["intent"] == "execute" {
+        if let Some(issue) = crate::classification_contract::invalid(&value["constraints"]) { return Err(issue); }
+    }
     normalize_shell_execution_scope(&mut value, schema);
     if let Some(wire) = wire {
         check_value(&value, wire, "wire_validation")?;
@@ -737,6 +780,22 @@ pub(crate) fn normalize_response_with_wire(
     check_value(&value, schema, "business_validation")?;
     payload["choices"][0]["message"]["content"] = json!(value.to_string());
     Ok(())
+}
+
+/// A rejected plan has no usable wire result. Its separate classification may
+/// still use the declared optional-null codec before full business validation.
+/// Only optional known fields are omitted; required/unknown fields stay intact.
+pub(crate) fn normalize_classification_projection(payload: &mut Value, schema: &Value) -> Result<(), OutputDiagnostic> {
+    if schema.pointer("/properties/steps").is_some() || schema.pointer("/properties/intent").is_none() {
+        return Err(OutputDiagnostic::new("MODEL_FORMAT_INVALID", "business_validation", "分类投影契约不合法"));
+    }
+    if let Some(text) = payload.pointer("/choices/0/message/content").and_then(Value::as_str) {
+        if let Ok(mut value) = serde_json::from_str::<Value>(crate::json_contract::normalize_json_wrapper(text)) {
+            omit_optional_nulls(&mut value, schema);
+            payload["choices"][0]["message"]["content"] = json!(value.to_string());
+        }
+    }
+    normalize_response_with_wire(payload, schema, None)
 }
 
 #[cfg(test)]

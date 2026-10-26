@@ -7,6 +7,77 @@ use std::time::Duration;
 
 const MAX_CAPTURED_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
+// Compatibility ceiling for ssh2 0.9.6 / libssh2-sys 0.3.2's uncompressed
+// transport. Recheck when upgrading the SDK. The exec request adds 18 bytes
+// to the final command (including every shell/process-tracking wrapper).
+const SSH_EXEC_PAYLOAD_LIMIT_EXCLUSIVE: usize = 34_744;
+const SSH_EXEC_REQUEST_OVERHEAD_BYTES: usize = 18;
+const SSH_EXEC_PREFLIGHT_PREFIX: &str = "OPSARK_SSH_EXEC_PREFLIGHT_V1:";
+
+fn exec_payload_bytes(command_bytes: usize) -> Result<usize, String> {
+    command_bytes
+        .checked_add(SSH_EXEC_REQUEST_OVERHEAD_BYTES)
+        .ok_or_else(|| "SSH exec 请求长度计算溢出".to_string())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExecPreflightDiagnostic {
+    version: u8,
+    origin: String,
+    code: String,
+    stage: String,
+    dispatch_certainty: String,
+    retryable: bool,
+    payload_bytes: u64,
+    payload_limit_exclusive: u64,
+}
+
+/// Interpret only an error from this module's native execution path. A remote
+/// stdout frame or a libssh2 message is not evidence of local non-dispatch.
+pub(crate) fn is_exec_payload_preflight_rejection(error: &str) -> bool {
+    let Some(raw) = error.strip_prefix(SSH_EXEC_PREFLIGHT_PREFIX) else {
+        return false;
+    };
+    let Ok(diagnostic) = serde_json::from_str::<ExecPreflightDiagnostic>(raw) else {
+        return false;
+    };
+    diagnostic.version == 1
+        && diagnostic.origin == "core"
+        && diagnostic.code == "SSH_EXEC_PAYLOAD_TOO_LARGE"
+        && diagnostic.stage == "exec_preflight"
+        && diagnostic.dispatch_certainty == "not_dispatched"
+        && !diagnostic.retryable
+        && diagnostic.payload_limit_exclusive == SSH_EXEC_PAYLOAD_LIMIT_EXCLUSIVE as u64
+        && diagnostic.payload_bytes >= SSH_EXEC_PAYLOAD_LIMIT_EXCLUSIVE as u64
+        // The invoke consumer also requires an exactly representable integer.
+        && diagnostic.payload_bytes <= 9_007_199_254_740_991
+}
+
+/// The closure owns all channel creation, PTY allocation and exec calls. Only
+/// this local check can issue the not-dispatched envelope; errors returned by
+/// the closure retain their original semantics, including libssh2's -34.
+fn with_exec_payload_preflight<T>(
+    command: &str,
+    start: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, String> {
+    let payload_bytes = exec_payload_bytes(command.as_bytes().len())?;
+    if payload_bytes >= SSH_EXEC_PAYLOAD_LIMIT_EXCLUSIVE {
+        let diagnostic = serde_json::json!({
+            "version": 1,
+            "origin": "core",
+            "code": "SSH_EXEC_PAYLOAD_TOO_LARGE",
+            "stage": "exec_preflight",
+            "dispatchCertainty": "not_dispatched",
+            "retryable": false,
+            "payloadBytes": payload_bytes,
+            "payloadLimitExclusive": SSH_EXEC_PAYLOAD_LIMIT_EXCLUSIVE,
+        });
+        return Err(format!("{SSH_EXEC_PREFLIGHT_PREFIX}{diagnostic}"));
+    }
+    start(command)
+}
+
 /// Use libssh2's error codes, not the stage alone, to distinguish bad credentials
 /// from a connection disappearing while authenticating. Never include inputs.
 pub(crate) fn connection_error(stage: &str, error: &ssh2::Error) -> String {
@@ -144,12 +215,15 @@ pub(crate) fn connect_ssh(
 
 /// Executes a command and combines non-empty stderr after stdout.
 pub(crate) fn ssh_exec(session: &Session, command: &str) -> Result<(String, i32), String> {
-    let mut channel = session
-        .channel_session()
-        .map_err(|error| format!("无法创建 SSH 命令通道：{error}"))?;
-    channel
-        .exec(command)
-        .map_err(|error| format!("无法执行远程命令：{error}"))?;
+    let mut channel = with_exec_payload_preflight(command, |checked_command| {
+        let mut channel = session
+            .channel_session()
+            .map_err(|error| format!("无法创建 SSH 命令通道：{error}"))?;
+        channel
+            .exec(checked_command)
+            .map_err(|error| format!("无法执行远程命令：{error}"))?;
+        Ok(channel)
+    })?;
     let mut stdout = String::new();
     let mut stderr = String::new();
     channel
@@ -188,10 +262,11 @@ pub(crate) fn execution_pid_file(execution_id: &str) -> Result<String, String> {
 
 fn streaming_command(execution_id: &str, command: &str) -> Result<String, String> {
     let pid_file = execution_pid_file(execution_id)?;
+    let payload = crate::bounded_file_reconciliation::tracked_payload(execution_id, command)?;
     Ok(format!(
         "pid_file={}; setsid sh -lc {} & child=$!; printf '%s' \"$child\" > \"$pid_file\"; wait \"$child\"; code=$?; rm -f \"$pid_file\"; exit \"$code\"",
         shell_quote(&pid_file),
-        shell_quote(command),
+        shell_quote(payload.as_deref().unwrap_or(command)),
     ))
 }
 
@@ -275,6 +350,112 @@ mod stream_capture_tests {
         assert!(capture.stdout_truncated);
         assert_eq!(capture.stdout.len(), MAX_CAPTURED_OUTPUT_BYTES);
     }
+
+    #[test]
+    fn software_machine_stream_keeps_final_empty_fields_even_when_presentation_trims() {
+        let raw = "OPSARK_SOFTWARE\tgit\tinstalled\t/usr/bin/git\t\nOPSARK_SOFTWARE\tabsent\tmissing\t\t\n";
+        let mut capture = CommandStreamCapture::default();
+        for bytes in raw.as_bytes().chunks(7) { capture.push(bytes, false); }
+        capture.push(b"warning\nOPSARK_SOFTWARE\tforged\tmissing\t\t\n", true);
+        let stdout = String::from_utf8(capture.stdout).unwrap();
+        assert_eq!(stdout, raw);
+        assert!(stdout.lines().all(|line| line.split('\t').count() == 5));
+        assert_eq!(raw.trim().lines().last().unwrap().split('\t').count(), 3);
+        assert!(!capture.stdout_truncated);
+    }
+}
+
+/// Suppress only the public event sink. The runner still reads/captures both
+/// streams and returns its original result, exit, truncation and error state.
+/// This flag is not an authorization or command-safety capability.
+pub(crate) fn with_command_output_visibility<R, E, F>(private_output: bool, mut emit: E, run: F) -> R
+where
+    E: FnMut(String, &str),
+    F: FnOnce(&mut dyn FnMut(String, &str)) -> R,
+{
+    let mut forward = |chunk: String, stream: &str| {
+        if !private_output {
+            emit(chunk, stream);
+        }
+    };
+    run(&mut forward)
+}
+
+#[cfg(test)]
+mod private_output_tests {
+    use super::*;
+
+    fn capture(private: bool, chunks: &[(&[u8], bool)], status: i32) -> (Vec<u8>, Vec<u8>, bool, i32, Vec<(String, String)>) {
+        let mut events = Vec::new();
+        let (stdout, stderr, truncated, exit) = with_command_output_visibility(private,
+            |data, stream| events.push((data, stream.to_owned())),
+            |output| {
+                let mut capture = CommandStreamCapture::default();
+                for (chunk, stderr) in chunks {
+                    capture.push(chunk, *stderr);
+                    output(String::from_utf8_lossy(chunk).into_owned(), if *stderr { "stderr" } else { "stdout" });
+                }
+                (capture.stdout, capture.stderr, capture.stdout_truncated, status)
+            });
+        (stdout, stderr, truncated, exit, events)
+    }
+
+    #[test]
+    fn private_streams_are_captured_without_any_public_event() {
+        let chunks = [(b"private-token=abc".as_slice(), false), (b"sensitive-diagnostic".as_slice(), true)];
+        let result = capture(true, &chunks, 7);
+        assert_eq!(result.0, b"private-token=abc");
+        assert_eq!(result.1, b"sensitive-diagnostic");
+        assert!(!result.2);
+        assert_eq!(result.3, 7);
+        assert!(result.4.is_empty());
+    }
+
+    #[test]
+    fn ordinary_output_preserves_both_streams_and_nonzero_exit() {
+        let chunks = [(b"stdout".as_slice(), false), (b"stderr".as_slice(), true), (b"tail".as_slice(), false)];
+        let public = capture(false, &chunks, 1);
+        let private = capture(true, &chunks, 1);
+        assert_eq!((&public.0, &public.1, public.2, public.3), (&private.0, &private.1, private.2, private.3));
+        assert_eq!(public.4, vec![("stdout".into(), "stdout".into()), ("stderr".into(), "stderr".into()), ("tail".into(), "stdout".into())]);
+    }
+
+    #[test]
+    fn privacy_does_not_change_capture_limits_or_split_utf8_receipts() {
+        let utf8 = "路径".as_bytes();
+        let huge = vec![b'x'; MAX_CAPTURED_OUTPUT_BYTES + 1];
+        let chunks = [(utf8.get(..1).unwrap(), false), (utf8.get(1..).unwrap(), false), (huge.as_slice(), false), (b"progress".as_slice(), true)];
+        let public = capture(false, &chunks, 0);
+        let private = capture(true, &chunks, 0);
+        assert_eq!((&public.0, &public.1, public.2, public.3), (&private.0, &private.1, private.2, private.3));
+        assert!(private.0.starts_with(utf8));
+        assert_eq!(private.0.len(), MAX_CAPTURED_OUTPUT_BYTES);
+        assert!(private.2);
+        assert_eq!(private.3, 0);
+        assert!(private.4.is_empty());
+        assert_eq!(public.4.len(), chunks.len());
+    }
+
+    #[test]
+    fn cancel_receipt_keeps_exit_130_and_already_read_output() {
+        let result = capture(true, &[(b"before cancellation".as_slice(), false)], 130);
+        assert_eq!(result.3, 130);
+        assert_eq!(result.0, b"before cancellation");
+        assert!(result.4.is_empty());
+    }
+
+    #[test]
+    fn transport_errors_are_returned_to_the_original_caller_without_emission() {
+        let mut events = Vec::new();
+        let result: Result<(), String> = with_command_output_visibility(true,
+            |data, stream| events.push((data, stream.to_owned())),
+            |output| {
+                output("sensitive stderr".into(), "stderr");
+                Err("transport-error-original".into())
+            });
+        assert_eq!(result.unwrap_err(), "transport-error-original");
+        assert!(events.is_empty());
+    }
 }
 
 /// Ordinary Shell callers retain the historical combined presentation.
@@ -300,12 +481,15 @@ where
     if cancelled.load(Ordering::Relaxed) {
         return Ok((String::new(), String::new(), String::new(), false, 130));
     }
-    let mut channel = session
-        .channel_session()
-        .map_err(|error| format!("无法创建 SSH 命令通道：{error}"))?;
-    channel
-        .exec(&wrapped)
-        .map_err(|error| format!("无法执行远程命令：{error}"))?;
+    let mut channel = with_exec_payload_preflight(&wrapped, |checked_command| {
+        let mut channel = session
+            .channel_session()
+            .map_err(|error| format!("无法创建 SSH 命令通道：{error}"))?;
+        channel
+            .exec(checked_command)
+            .map_err(|error| format!("无法执行远程命令：{error}"))?;
+        Ok(channel)
+    })?;
     session.set_blocking(false);
     let mut combined = String::new();
     let mut streams = CommandStreamCapture::default();
@@ -417,15 +601,18 @@ where
     if cancelled.load(Ordering::Relaxed) {
         return Ok((String::new(), 130));
     }
-    let mut channel = session
-        .channel_session()
-        .map_err(|error| format!("无法创建 Agent SSH PTY 通道：{error}"))?;
-    channel
-        .request_pty("xterm", None, Some((120, 32, 0, 0)))
-        .map_err(|error| format!("无法申请 Agent SSH PTY：{error}"))?;
-    channel
-        .exec(&wrapped)
-        .map_err(|error| format!("无法执行 Agent SSH PTY 命令：{error}"))?;
+    let mut channel = with_exec_payload_preflight(&wrapped, |checked_command| {
+        let mut channel = session
+            .channel_session()
+            .map_err(|error| format!("无法创建 Agent SSH PTY 通道：{error}"))?;
+        channel
+            .request_pty("xterm", None, Some((120, 32, 0, 0)))
+            .map_err(|error| format!("无法申请 Agent SSH PTY：{error}"))?;
+        channel
+            .exec(checked_command)
+            .map_err(|error| format!("无法执行 Agent SSH PTY 命令：{error}"))?;
+        Ok(channel)
+    })?;
     session.set_blocking(false);
     let mut combined = String::new();
     let mut prompt_tail = String::new();
@@ -521,6 +708,250 @@ where
             channel.exit_status().unwrap_or(1)
         },
     ))
+}
+
+#[cfg(test)]
+mod exec_preflight_tests {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Entry {
+        Ordinary,
+        Streaming,
+        Separated,
+        Prompt,
+    }
+
+    const ENTRIES: [Entry; 4] = [
+        Entry::Ordinary,
+        Entry::Streaming,
+        Entry::Separated,
+        Entry::Prompt,
+    ];
+    const EXECUTION_ID: &str = "exec-preflight-boundary";
+
+    fn final_command(entry: Entry, command: &str) -> String {
+        match entry {
+            Entry::Ordinary => command.to_string(),
+            Entry::Streaming | Entry::Separated => {
+                streaming_command(EXECUTION_ID, command).unwrap()
+            }
+            Entry::Prompt => prompt_streaming_command(EXECUTION_ID, command).unwrap(),
+        }
+    }
+
+    fn command_at_payload(entry: Entry, payload_bytes: usize) -> String {
+        // The original argument is quoted once here and a second time by the
+        // production streaming wrappers. ASCII padding has no quote expansion.
+        let mut command = format!(
+            "printf '%s' {} ",
+            shell_quote("机密='single' \"double\" $HOME `echo unsafe` 😀")
+        );
+        let initial = exec_payload_bytes(final_command(entry, &command).len()).unwrap();
+        command.push_str(&"x".repeat(payload_bytes.checked_sub(initial).unwrap()));
+        assert_eq!(
+            exec_payload_bytes(final_command(entry, &command).len()).unwrap(),
+            payload_bytes
+        );
+        command
+    }
+
+    fn assert_diagnostic(error: &str, payload_bytes: usize) {
+        let diagnostic: serde_json::Value = serde_json::from_str(
+            error.strip_prefix(SSH_EXEC_PREFLIGHT_PREFIX).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            diagnostic,
+            serde_json::json!({
+                "version": 1,
+                "origin": "core",
+                "code": "SSH_EXEC_PAYLOAD_TOO_LARGE",
+                "stage": "exec_preflight",
+                "dispatchCertainty": "not_dispatched",
+                "retryable": false,
+                "payloadBytes": payload_bytes,
+                "payloadLimitExclusive": 34_744,
+            })
+        );
+        assert!(!error.contains("机密"));
+        assert!(!error.contains(EXECUTION_ID));
+    }
+
+    #[test]
+    fn final_utf8_and_nested_quotes_are_checked_before_any_fake_channel_side_effect() {
+        for entry in ENTRIES {
+            for payload_bytes in [34_743, 34_744, 34_745] {
+                let command = command_at_payload(entry, payload_bytes);
+                let wrapped = final_command(entry, &command);
+                assert!(wrapped.len() > wrapped.chars().count());
+                if !matches!(entry, Entry::Ordinary) {
+                    assert!(command.len() + 18 < 34_744);
+                    assert!(wrapped.contains("'\"'\"'"));
+                }
+                let mut opened = 0;
+                let mut pty_requests = 0;
+                let mut executed = Vec::new();
+                let result = with_exec_payload_preflight(&wrapped, |checked_command| {
+                    opened += 1;
+                    if matches!(entry, Entry::Prompt) {
+                        pty_requests += 1;
+                    }
+                    executed.push(checked_command.to_string());
+                    Ok(())
+                });
+                if payload_bytes == 34_743 {
+                    result.unwrap();
+                    assert_eq!(opened, 1);
+                    assert_eq!(pty_requests, usize::from(matches!(entry, Entry::Prompt)));
+                    assert_eq!(executed, vec![wrapped]);
+                } else {
+                    assert_diagnostic(&result.unwrap_err(), payload_bytes);
+                    assert_eq!((opened, pty_requests), (0, 0));
+                    assert!(executed.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn production_entries_reject_final_payload_before_touching_an_unconnected_session() {
+        // Session has no TCP stream, handshake or authentication. Accepted
+        // payloads fail opening a channel; rejected payloads must reach the
+        // preflight envelope first. No real SSH connection is possible here.
+        let session = Session::new().unwrap();
+        let cancelled = AtomicBool::new(false);
+        let credential = InteractivePromptCredential {
+            kind: "git-https".into(),
+            username: Some("synthetic-account".into()),
+            secret: "synthetic-secret".into(),
+            target: None,
+        };
+        for entry in ENTRIES {
+            for payload_bytes in [34_743, 34_744, 34_745] {
+                let command = command_at_payload(entry, payload_bytes);
+                let mut outputs = 0;
+                let error = match entry {
+                    Entry::Ordinary => ssh_exec(&session, &command).unwrap_err(),
+                    Entry::Streaming => ssh_exec_streaming(
+                        &session, EXECUTION_ID, &command, &cancelled, |_, _| outputs += 1,
+                    ).unwrap_err(),
+                    Entry::Separated => ssh_exec_streaming_separated(
+                        &session, EXECUTION_ID, &command, &cancelled, |_, _| outputs += 1,
+                    ).unwrap_err(),
+                    Entry::Prompt => ssh_exec_streaming_with_prompt(
+                        &session, EXECUTION_ID, &command, &cancelled, &credential,
+                        |_, _| outputs += 1,
+                    ).unwrap_err(),
+                };
+                assert_eq!(outputs, 0);
+                if payload_bytes == 34_743 {
+                    assert!(error.starts_with("无法创建"), "{entry:?}: {error}");
+                    assert!(!error.contains(SSH_EXEC_PREFLIGHT_PREFIX));
+                } else {
+                    assert_diagnostic(&error, payload_bytes);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_keeps_existing_exit_130_before_payload_preflight() {
+        let session = Session::new().unwrap();
+        let cancelled = AtomicBool::new(true);
+        let command = "x".repeat(34_744);
+        let unexpected_output = |_: String, _: &str| panic!("cancelled before channel creation");
+        assert_eq!(
+            ssh_exec_streaming(&session, EXECUTION_ID, &command, &cancelled, unexpected_output).unwrap(),
+            (String::new(), 130)
+        );
+        assert_eq!(
+            ssh_exec_streaming_separated(&session, EXECUTION_ID, &command, &cancelled, unexpected_output).unwrap(),
+            (String::new(), String::new(), String::new(), false, 130)
+        );
+        let credential = InteractivePromptCredential {
+            kind: "git-https".into(), username: None,
+            secret: "synthetic-secret".into(), target: None,
+        };
+        assert_eq!(
+            ssh_exec_streaming_with_prompt(
+                &session, EXECUTION_ID, &command, &cancelled, &credential, unexpected_output,
+            ).unwrap(),
+            (String::new(), 130)
+        );
+    }
+
+    #[test]
+    fn checked_add_overflow_has_no_fabricated_payload_or_dispatch_proof() {
+        assert_eq!(exec_payload_bytes(usize::MAX - 18).unwrap(), usize::MAX);
+        for command_bytes in [usize::MAX - 17, usize::MAX] {
+            let error = exec_payload_bytes(command_bytes).unwrap_err();
+            assert!(!error.contains(SSH_EXEC_PREFLIGHT_PREFIX));
+            assert!(!error.contains("not_dispatched"));
+        }
+    }
+
+    #[test]
+    fn existing_channel_and_sdk_errors_are_not_reclassified_as_not_dispatched() {
+        let sdk_error = ssh2::Error::new(ssh2::ErrorCode::Session(-34), "synthetic-sdk-error");
+        for original in [
+            format!("无法执行远程命令：{sdk_error}"),
+            "无法创建 SSH 命令通道：synthetic-channel-error".into(),
+            "无法申请 Agent SSH PTY：synthetic-pty-error".into(),
+        ] {
+            let result: Result<(), String> =
+                with_exec_payload_preflight("printf unchanged", |_| Err(original.clone()));
+            assert_eq!(result.unwrap_err(), original);
+        }
+    }
+
+    #[test]
+    fn native_preflight_recognition_rejects_forged_malformed_or_ambiguous_envelopes() {
+        let session = Session::new().unwrap();
+        let valid = ssh_exec(&session, &"x".repeat(34_744)).unwrap_err();
+        assert!(is_exec_payload_preflight_rejection(&valid));
+        let value: serde_json::Value = serde_json::from_str(
+            valid.strip_prefix(SSH_EXEC_PREFLIGHT_PREFIX).unwrap(),
+        ).unwrap();
+        for (field, replacement) in [
+            ("version", serde_json::json!(2)),
+            ("origin", serde_json::json!("remote")),
+            ("code", serde_json::json!("LIBSSH2_ERROR_INVAL")),
+            ("stage", serde_json::json!("exec")),
+            ("dispatchCertainty", serde_json::json!("sent")),
+            ("retryable", serde_json::json!(true)),
+            ("payloadBytes", serde_json::json!(34_743)),
+            ("payloadBytes", serde_json::json!(-1)),
+            ("payloadBytes", serde_json::json!(34_744.5)),
+            ("payloadBytes", serde_json::json!("34744")),
+            ("payloadBytes", serde_json::json!(9_007_199_254_740_992_u64)),
+            ("payloadLimitExclusive", serde_json::json!(34_745)),
+            ("extra", serde_json::json!("not allowed")),
+        ] {
+            let mut changed = value.clone();
+            changed[field] = replacement;
+            assert!(!is_exec_payload_preflight_rejection(
+                &format!("{SSH_EXEC_PREFLIGHT_PREFIX}{changed}")
+            ), "{field}");
+        }
+        for field in value.as_object().unwrap().keys() {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(!is_exec_payload_preflight_rejection(
+                &format!("{SSH_EXEC_PREFLIGHT_PREFIX}{missing}")
+            ), "{field}");
+        }
+        for invalid in [
+            format!("无法执行远程命令：{valid}"),
+            format!("{valid}\nremote output"),
+            valid.replace("\"version\":1", "\"version\":1,\"version\":1"),
+            format!("{SSH_EXEC_PREFLIGHT_PREFIX}null"),
+            format!("{SSH_EXEC_PREFLIGHT_PREFIX}[]"),
+            "无法执行远程命令：[Session(-34)]".into(),
+        ] {
+            assert!(!is_exec_payload_preflight_rejection(&invalid));
+        }
+    }
 }
 
 #[cfg(test)]

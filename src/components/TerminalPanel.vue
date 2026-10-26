@@ -27,6 +27,7 @@ import {
   TERMINAL_THEME_ATTRIBUTE_FILTER,
 } from "@/features/preferences/terminalTheme";
 import { useOpsStore } from "@/stores/ops";
+import { invalidateHostCapabilities } from "@/features/tools/hostCapabilities";
 import type { TerminalPaneStatus } from "@/features/terminal/terminalSessionStore";
 import {
   buildTerminalChangeDirectoryCommand,
@@ -121,6 +122,8 @@ function writeTerminalInput(data: string, confirmed = false) {
     terminal.write("\r\n".repeat(Math.max(1, terminal.rows)));
   }
   const currentLifecycle = lifecycle;
+  // PTY input may operate an interactive program; do not infer read-only intent from text.
+  invalidateHostCapabilities(props.serverId);
   void backend.writeTerminal(terminalId, data).catch((error) => {
     if (currentLifecycle === lifecycle && !disposed) reportTerminalFailure(error);
   });

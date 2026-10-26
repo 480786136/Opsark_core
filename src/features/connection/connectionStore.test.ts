@@ -3,6 +3,7 @@ import { createPinia, setActivePinia } from "pinia";
 import { computed } from "vue";
 import type { RuntimeConnection } from "@/services/backend";
 import { connectionErrorMessage, isConnectionTransportFailure, useConnectionStore } from "./connectionStore";
+import { getHostCapabilities, hostCapabilityEpoch, recordHostCapabilities } from "@/features/tools/hostCapabilities";
 
 const { checkSshConnection } = vi.hoisted(() => ({ checkSshConnection: vi.fn() }));
 vi.mock("@/services/backend", () => ({ backend: { checkSshConnection } }));
@@ -44,6 +45,25 @@ describe("server connection coordinator", () => {
     vi.clearAllTimers();
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it("invalidates observed host capabilities on suspect state, reconnect and disconnect", async () => {
+    const store = useConnectionStore();
+    await store.connect("server", credentials);
+    const identity = () => ({ serverId: "server", host: credentials.host, port: credentials.port,
+      username: credentials.username, connectionGeneration: store.state("server").generation });
+    const observe = () => recordHostCapabilities(identity(), { version: 1, observedAt: null,
+      facts: [{ name: "jq", supported: false }] }, { toolCallId: "native-probe", epoch: hostCapabilityEpoch("server") });
+    observe(); expect(getHostCapabilities(identity())).toBeDefined();
+    checkSshConnection.mockRejectedValueOnce(networkError());
+    await store.checkHealth("server");
+    expect(getHostCapabilities(identity())).toBeUndefined();
+    await store.connect("server", credentials); observe();
+    const old = identity();
+    await store.connect("server", { ...credentials, username: "another" });
+    expect(getHostCapabilities(old)).toBeUndefined();
+    observe(); store.disconnect("server");
+    expect(getHostCapabilities(identity())).toBeUndefined();
   });
 
   it("returns a reactive state proxy on the very first read", async () => {

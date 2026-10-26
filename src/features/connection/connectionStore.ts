@@ -1,6 +1,7 @@
 import { defineStore } from "pinia";
 import { reactive } from "vue";
 import { backend, type RuntimeConnection } from "@/services/backend";
+import { invalidateHostCapabilities } from "@/features/tools/hostCapabilities";
 
 export type ServerConnectionStatus = "idle" | "connecting" | "connected" | "suspect"
   | "reconnecting" | "manual" | "auth_failed" | "disconnected";
@@ -90,6 +91,7 @@ export const useConnectionStore = defineStore("server-connections", () => {
   }
 
   function manual(serverId: string, reason: string) {
+    invalidateHostCapabilities(serverId);
     const current = state(serverId);
     const run = runtime(serverId);
     current.status = isAuthenticationFailure(reason) ? "auth_failed" : "manual";
@@ -117,6 +119,7 @@ export const useConnectionStore = defineStore("server-connections", () => {
   }
 
   function scheduleRecovery(serverId: string, reason: string) {
+    invalidateHostCapabilities(serverId);
     const current = state(serverId);
     const run = runtime(serverId);
     if (isAuthenticationFailure(reason) || /SSH_INVALID_CONFIG/.test(reason)) {
@@ -172,6 +175,7 @@ export const useConnectionStore = defineStore("server-connections", () => {
     }
     const timeoutMs = Math.floor(Math.min(CONNECTION_POLICY.connectTimeoutMs, budget));
     const deadline = now + timeoutMs;
+    invalidateHostCapabilities(serverId);
     const generation = ++current.generation;
     const intent = run.intent;
     current.status = automatic ? "reconnecting" : "connecting";
@@ -216,6 +220,7 @@ export const useConnectionStore = defineStore("server-connections", () => {
     // old results immediately, but serialize the latest request behind bounded
     // in-flight work. Intermediate queued requests must never win afterward.
     const outstanding = run.pending;
+    invalidateHostCapabilities(serverId);
     const intent = ++run.intent;
     current.generation += 1;
     run.credentials = { ...credentials };
@@ -274,6 +279,7 @@ export const useConnectionStore = defineStore("server-connections", () => {
       } catch (error) {
         if (!isCurrent()) return false;
         run.failedProbes += 1;
+        invalidateHostCapabilities(serverId);
         run.connectedSince = undefined;
         current.error = connectionErrorMessage(error);
         if (isAuthenticationFailure(String(error)) || run.failedProbes >= 2) {
@@ -293,6 +299,7 @@ export const useConnectionStore = defineStore("server-connections", () => {
   function reportFailure(serverId: string, reason: string) {
     const current = state(serverId);
     if (!["connected", "suspect"].includes(current.status)) return;
+    invalidateHostCapabilities(serverId);
     const run = runtime(serverId);
     run.connectedSince = undefined;
     run.failureVersion += 1;
@@ -341,6 +348,7 @@ export const useConnectionStore = defineStore("server-connections", () => {
   }
 
   function disconnect(serverId: string) {
+    invalidateHostCapabilities(serverId);
     const current = state(serverId);
     const run = runtime(serverId);
     current.generation += 1;

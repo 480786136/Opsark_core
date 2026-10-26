@@ -20,7 +20,7 @@ import { useAccountStore } from "@/features/account/accountStore";
 import { useOfficialCatalogStore } from "@/features/account/officialCatalogStore";
 import { formatCredits } from "@/features/account/credits";
 import { useSkillAutoSyncStore } from "@/features/skills/skillAutoSync";
-const { confirmationMessage, confirmAction, resolveConfirmation } = useActionConfirmation();
+const { confirmationMessage, confirmationId, confirmAction, resolveConfirmation } = useActionConfirmation();
 
 const store = useOpsStore();
 const account = useAccountStore();
@@ -188,9 +188,13 @@ function saveSkill() {
 
 async function removeSkill() {
   const skill = selectedSkill.value;
-  if (!skill || skill.builtIn || !await confirmAction(t("skills.removeConfirm", { name: skill.name }))) return;
-  store.removeSkill(skill.id);
-  delete savedFingerprints.value[skill.id];
+  if (!skill || skill.builtIn) return;
+  const targetId = skill.id;
+  if (!await confirmAction(t("skills.removeConfirm", { name: skill.name }))) return;
+  if (store.skills.find(item => item.id === targetId) !== skill || skill.builtIn) return;
+  store.removeSkill(targetId);
+  delete savedFingerprints.value[targetId];
+  if (selectedSkillId.value !== targetId) return;
   query.value = "";
   selectedSkillId.value = store.skills.find(item => !item.builtIn)?.id ?? "";
 }
@@ -281,7 +285,7 @@ function closePreview() {
 </script>
 
 <template>
-  <ConfirmActionDialog :message="confirmationMessage" :title="t('skills.removeTitle')" :confirm-label="t('skills.removeConfirmAction')" @result="resolveConfirmation" />
+  <ConfirmActionDialog :message="confirmationMessage" :request-id="confirmationId" :title="t('skills.removeTitle')" :confirm-label="t('skills.removeConfirmAction')" @result="resolveConfirmation" />
   <section class="settings-card skill-management-card">
     <div v-if="!standalone" class="settings-title">
       <Sparkles :size="18" />

@@ -15,6 +15,22 @@ fn rules() -> &'static Value {
 pub fn version() -> u64 {
     rules()["version"].as_u64().expect("rule version")
 }
+
+/// Shared prompt boundary, not an executable allowlist or a safety bypass.
+pub fn read_only_plan_protocol() -> Value {
+    let shell = &rules()["shell"];
+    json!({
+        "ruleVersion": version(),
+        "unsupportedShellOperators": shell["unsupportedShellOperators"],
+        "opaqueInterpreters": shell["opaqueInterpreters"],
+        "interpreterQueryOptions": shell["safeInterpreterOptions"],
+        "interpreterReadOnlyOptions": shell["interpreterReadOnlyOptions"],
+        "safeWriteTargets": shell["safeWriteTargets"],
+        "maxNestedDepth": shell["maxNestedDepth"],
+        "requiresFullValidation": true,
+        "localRepair": rules()["localRepairPolicy"],
+    })
+}
 fn contains(list: &Value, text: &str) -> bool {
     list.as_array()
         .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(text)))
@@ -62,6 +78,17 @@ fn issue(code: &str, step: &Value, index: usize, matched: Option<String>) -> Rec
             .collect(),
         rule_version: version(),
     }
+}
+
+/// Diagnostics cannot widen the current shared field-repair policy.
+pub fn current_repair_scope(diagnostic: &RecoveryProtocolIssue, step: &Value) -> bool {
+    metadata_issue(step, diagnostic.step_index).is_some_and(|actual| {
+        !actual.allowed_repair_paths.is_empty()
+            && diagnostic.rule_version == actual.rule_version
+            && diagnostic.code == actual.code
+            && diagnostic.field_path == actual.field_path
+            && diagnostic.allowed_repair_paths == actual.allowed_repair_paths
+    })
 }
 
 pub fn metadata_issue(step: &Value, index: usize) -> Option<RecoveryProtocolIssue> {
@@ -790,12 +817,30 @@ mod tests {
                     format!("steps[3].{}", case["field"].as_str().unwrap())
                 );
                 assert_eq!(found.rule_version, version());
-                if found.code == "OBSERVE_COMMAND_MUTATION" {
-                    assert_eq!(found.allowed_repair_paths, vec!["steps[3].command"]);
+                if ["OBSERVE_COMMAND_MUTATION", "RECOVERY_DIAGNOSE_MUTATION"].contains(&found.code.as_str()) {
+                    assert_eq!(found.allowed_repair_paths, vec![format!("steps[3].{}", case["field"].as_str().unwrap())]);
                 } else {
                     assert!(found.allowed_repair_paths.is_empty());
                 }
             }
         }
+    }
+
+    #[test]
+    fn shared_repair_scope_cases() {
+        let step = json!({"id":"next","kind":"observe","command":"mktemp -d","action":{"type":"shell","command":"mktemp -d"}});
+        let original = serde_json::to_value(metadata_issue(&step, 2).unwrap()).unwrap();
+        let cases: Value = serde_json::from_str(include_str!("../../shared/recovery-repair-scope-cases.json")).unwrap();
+        for case in cases.as_array().unwrap() {
+            let mut patched = original.clone();
+            for (key, value) in case["patch"].as_object().unwrap() { patched[key] = value.clone(); }
+            let diagnostic = serde_json::from_value(patched).unwrap();
+            assert_eq!(current_repair_scope(&diagnostic, &step), case["allowed"].as_bool().unwrap(), "{}", case["name"]);
+        }
+        let contract = read_only_plan_protocol();
+        assert_eq!(contract["unsupportedShellOperators"], rules()["shell"]["unsupportedShellOperators"]);
+        assert_eq!(contract["opaqueInterpreters"], rules()["shell"]["opaqueInterpreters"]);
+        assert_eq!(contract["localRepair"], rules()["localRepairPolicy"]);
+        assert_eq!(contract["requiresFullValidation"], true);
     }
 }

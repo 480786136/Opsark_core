@@ -1,13 +1,148 @@
 use super::*;
 
+fn static_acceptance_fixture() -> (Value, Value, String) {
+    let source = "将 /srv/releases/site.tar.gz 发布到 http://site.example/，保留旧网站且不影响其他站点".to_string();
+    let context = json!({"requirementSubmission":{"baseRevision":0,"sourceMessageId":"static-source",
+        "content":source,"acceptanceContractVersion":1}});
+    let delta = json!({"baseRevision":0,"sourceMessageId":"static-source","changes":[],
+        "additions":[
+            {"id":"publish","kind":"goal","content":"发布静态站点","sourceQuote":source,"supersedes":[]},
+            {"id":"preserve","kind":"constraint","content":"保留旧网站且不影响其他站点",
+                "sourceQuote":"保留旧网站且不影响其他站点","supersedes":[]}],
+        "focusIds":["publish","preserve"],"acceptanceCoverage":[
+            {"requirementId":"publish","strategy":"static_site","sourceQuote":source,"reason":"交付指定压缩包到网站入口",
+                "staticSite":{"artifactPath":"/srv/releases/site.tar.gz","entryUrl":"http://site.example/",
+                    "preserveExisting":true,"preserveOtherSites":true}},
+            {"requirementId":"preserve","strategy":"general_review","sourceQuote":"保留旧网站且不影响其他站点",
+                "reason":"保护约束持续生效，并由站点条件核对备份与对照资源"}]});
+    (context, delta, source)
+}
+
+#[test]
+fn new_submissions_require_exact_acceptance_coverage_but_legacy_remains_readable() {
+    let (context, delta, source) = static_acceptance_fixture();
+    let valid = |context: &Value, delta: &Value| requirement_contract::validate_update(
+        "execute", Some("new_goal"), Some(delta), &context.to_string(), &source);
+    assert!(valid(&context, &delta).is_none());
+    let mut missing = delta.clone();
+    missing.as_object_mut().unwrap().remove("acceptanceCoverage");
+    assert!(valid(&context, &missing).unwrap().contains("acceptanceCoverage"));
+    let mut legacy = context.clone();
+    legacy["requirementSubmission"].as_object_mut().unwrap().remove("acceptanceContractVersion");
+    assert!(valid(&legacy, &missing).is_none());
+    let mut future = context.clone();
+    future["requirementSubmission"]["acceptanceContractVersion"] = json!(2);
+    assert!(valid(&future, &delta).unwrap().contains("版本不支持"));
+    for invalid in [json!([]), json!([delta["acceptanceCoverage"][0]]),
+        json!([delta["acceptanceCoverage"][0], delta["acceptanceCoverage"][0]]),
+        json!([delta["acceptanceCoverage"][0], {"requirementId":"unknown","strategy":"general_review",
+            "sourceQuote":"保留旧网站","reason":"不能引用未知要求"}])] {
+        let mut changed = delta.clone();
+        changed["acceptanceCoverage"] = invalid;
+        assert!(valid(&context, &changed).is_some());
+    }
+}
+
+#[test]
+fn acceptance_contract_rejects_invented_sources_and_strategy_shape_changes() {
+    let (context, delta, source) = static_acceptance_fixture();
+    for (pointer, value) in [
+        ("/acceptanceCoverage/0/sourceQuote", json!("非用户原文")),
+        ("/acceptanceCoverage/0/reason", json!(" ")),
+        ("/acceptanceCoverage/0/staticSite/artifactPath", json!("/other/current.tar.gz")),
+        ("/acceptanceCoverage/0/staticSite/entryUrl", json!("http://attacker.example/")),
+        ("/acceptanceCoverage/0/strategy", json!("general_review")),
+        ("/acceptanceCoverage/0/strategy", json!("unknown")),
+        ("/acceptanceCoverage/0/staticSite", Value::Null),
+        ("/additions/0/kind", json!("constraint")),
+    ] {
+        let mut invalid = delta.clone();
+        *invalid.pointer_mut(pointer).unwrap() = value;
+        assert!(requirement_contract::validate_update("execute", Some("new_goal"),
+            Some(&invalid), &context.to_string(), &source).is_some(), "{pointer}");
+    }
+    let mut pending = delta;
+    pending["acceptanceCoverage"][0]["staticSite"]["artifactPath"] = Value::Null;
+    pending["acceptanceCoverage"][0]["staticSite"]["entryUrl"] = Value::Null;
+    assert!(requirement_contract::validate_update("execute", Some("new_goal"),
+        Some(&pending), &context.to_string(), &source).is_none());
+}
+
+#[test]
+fn acceptance_contract_rejects_unsafe_parameter_shapes_even_when_user_supplied() {
+    for (field, invalid) in [("artifactPath", "/"), ("artifactPath", "/srv/../etc/archive.tar"),
+        ("artifactPath", "/srv//archive.tar"), ("artifactPath", "/srv/\\archive.tar"),
+        ("entryUrl", "file:///srv/site"), ("entryUrl", "https://user:password@site.example/"),
+        ("entryUrl", "https://site.example/#fragment")] {
+        let (mut context, mut delta, source) = static_acceptance_fixture();
+        let source = format!("{source}，补充参数 {invalid}");
+        context["requirementSubmission"]["content"] = json!(source);
+        delta["acceptanceCoverage"][0]["staticSite"][field] = json!(invalid);
+        assert!(requirement_contract::validate_update("execute", Some("new_goal"), Some(&delta),
+            &context.to_string(), &source).is_some(), "{field}={invalid}");
+    }
+}
+
+#[test]
+fn acceptance_contract_survives_actual_planning_projection_and_continue() {
+    let (context, delta, source) = static_acceptance_fixture();
+    let projected = project(&context, "new_goal", &delta, &source, &Value::Null);
+    let state = &projected["taskGoal"]["lifecycle"];
+    assert_eq!(state["items"][0]["acceptance"]["staticSite"], delta["acceptanceCoverage"][0]["staticSite"]);
+    assert_eq!(state["items"][1]["acceptance"]["strategy"], "general_review");
+    assert!(state["items"][0]["acceptance"].get("requirementId").is_none());
+    let next_context = json!({"requirementSubmission":{"baseRevision":1,"sourceMessageId":"continue-source",
+        "content":"继续","acceptanceContractVersion":1,"baseLifecycle":state}});
+    let mut next_delta = json!({"baseRevision":1,"sourceMessageId":"continue-source","additions":[],"changes":[],
+        "focusIds":["publish","preserve"],"acceptanceCoverage":[]});
+    let continued = project(&next_context, "continue", &next_delta, "继续", &Value::Null);
+    assert_eq!(continued["taskGoal"]["lifecycle"]["items"][0]["acceptance"], state["items"][0]["acceptance"]);
+    next_delta["acceptanceCoverage"] = json!([{"requirementId":"publish","strategy":"general_review",
+        "sourceQuote":"继续","reason":"不能用继续重写历史验收契约"}]);
+    assert!(requirement_contract::validate_update("execute", Some("continue"), Some(&next_delta),
+        &next_context.to_string(), "继续").is_some());
+}
+
+#[test]
+fn acceptance_contract_round_trips_in_both_model_protocols_and_strict_modes() {
+    let (context, delta, source) = static_acceptance_fixture();
+    let value = json!({"intent":"execute","relation":"new_goal","answer":"","terminalContextLines":0,
+        "selectedSkillIds":[],"constraints":{"changePolicy":"requested_changes_only","environmentPolicy":"preserve",
+            "failurePolicy":"strict","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},
+        "requirementUpdate":delta});
+    for protocol in ["chat_completions", "responses"] {
+        for strict in [false, true] {
+            let decoded = normalized("需求理解", protocol, strict, &value);
+            assert_eq!(decoded["requirementUpdate"]["acceptanceCoverage"], delta["acceptanceCoverage"], "{protocol}/{strict}");
+            assert!(requirement_contract::validate_update("execute", Some("new_goal"), decoded.get("requirementUpdate"),
+                &context.to_string(), &source).is_none());
+        }
+    }
+    assert!(requirement_contract::update_rule().contains(requirement_contract::ACCEPTANCE_RULE));
+}
+
 fn normalized(operation: &str, protocol: &str, strict: bool, value: &Value) -> Value {
     let schema = model_compatibility::contract(operation, &json!({})).unwrap();
     let compiled = model_schema::compile(&schema).unwrap();
+    let mut wire_value = value.clone();
+    if strict {
+        // Strict wire schemas encode optional fields as required nullable ones.
+        // Supply the provider's null placeholders, then verify normalization
+        // removes them without changing legacy domain responses.
+        if let Some(delta) = wire_value.get_mut("requirementUpdate").and_then(Value::as_object_mut) {
+            let coverage = delta.entry("acceptanceCoverage").or_insert(Value::Null);
+            if let Some(items) = coverage.as_array_mut() {
+                for item in items {
+                    item.as_object_mut().unwrap().entry("staticSite").or_insert(Value::Null);
+                }
+            }
+        }
+    }
     let mut payload = if protocol == "responses" {
         json!({"status":"completed","output":[{"type":"message","role":"assistant","status":"completed",
-            "content":[{"type":"output_text","text":value.to_string()}]}]})
+            "content":[{"type":"output_text","text":wire_value.to_string()}]}]})
     } else {
-        json!({"choices":[{"message":{"role":"assistant","content":value.to_string()},"finish_reason":"stop"}]})
+        json!({"choices":[{"message":{"role":"assistant","content":wire_value.to_string()},"finish_reason":"stop"}]})
     };
     model_protocol::normalize_response(&mut payload, protocol).unwrap();
     model_compatibility::normalize_response_with_wire(
@@ -509,4 +644,103 @@ fn continuation_preserves_current_instruction_and_policy_but_cannot_change_oblig
         Some(&classified)
     )
     .is_err());
+}
+
+fn mixed_focus_fixture() -> (Value, Value, String) {
+    let (mut context, _, mut constraints, _) = projection_fixture();
+    let current = "检查8081状态，禁止修改配置".to_string();
+    context["requirementSubmission"]["content"] = json!(current);
+    constraints["changePolicy"] = json!("read_only");
+    constraints["prohibitedActions"] = json!(["禁止删除"]);
+    constraints["requiredConditions"] = json!(["禁止修改配置"]);
+    let decision = json!({"intent":"execute","relation":"supplement","answer":"",
+        "constraints":constraints,"terminalContextLines":0,"selectedSkillIds":[],
+        "requirementUpdate":{"baseRevision":5,"sourceMessageId":"message-new",
+            "additions":[
+                {"id":"inspect-8081","kind":"goal","content":"检查8081状态","sourceQuote":"检查8081状态","supersedes":[]},
+                {"id":"no-config-write","kind":"constraint","content":"禁止修改配置","sourceQuote":"禁止修改配置","supersedes":[]}],
+            "changes":[],"focusIds":["inspect-8081"]}});
+    (context, decision, current)
+}
+
+#[test]
+fn mixed_goals_and_constraints_share_prompt_schema_and_focus_validation() {
+    assert_eq!(requirement_contract::update()["properties"]["focusIds"]["description"], requirement_contract::FOCUS_RULE);
+    assert!(requirement_contract::update_rule().contains(requirement_contract::FOCUS_RULE));
+    for (focus, missing) in [(json!(["inspect-8081"]), "no-config-write"), (json!(["no-config-write"]), "inspect-8081")] {
+        let (context, mut decision, current) = mixed_focus_fixture();
+        decision["requirementUpdate"]["focusIds"] = focus;
+        let error = requirement_contract::validate_update("execute", Some("supplement"),
+            decision.get("requirementUpdate"), &context.to_string(), &current).unwrap();
+        assert!(error.contains("requirementUpdate.focusIds"));
+        assert!(error.contains(&format!("[\"{missing}\"]")));
+        assert!(!error.contains("PRIVATE_UNCOMPRESSED_HISTORY"));
+    }
+    let (context, mut decision, current) = mixed_focus_fixture();
+    decision["requirementUpdate"]["focusIds"] = json!(["inspect-8081", "no-config-write"]);
+    for protocol in ["chat_completions", "responses"] {
+        for strict in [false, true] {
+            let wire = normalized("需求理解", protocol, strict, &decision);
+            assert!(requirement_contract::validate_update("execute", Some("supplement"),
+                wire.get("requirementUpdate"), &context.to_string(), &current).is_none());
+        }
+    }
+    let projected = project(&context, "supplement", &decision["requirementUpdate"], &current, &decision["constraints"]);
+    let active = projected["taskGoal"]["requirementContext"]["activeConstraints"].as_array().unwrap();
+    assert!(active.iter().any(|item| item["id"] == "internal-only" && item["source"]["sourceMessageId"] == "message-original"));
+    assert!(active.iter().any(|item| item["id"] == "no-config-write" && item["source"]["sourceMessageId"] == "message-new"));
+    assert_eq!(projected["executionConstraints"]["prohibitedActions"], json!(["禁止删除"]));
+}
+
+#[test]
+fn focused_repair_is_small_and_cannot_change_authority_sources_or_classification() {
+    let (context, decision, current) = mixed_focus_fixture();
+    let repair = requirement_contract::focus_repair(&decision, &context.to_string(), &current).unwrap();
+    assert_eq!(repair["missingIds"], json!(["no-config-write"]));
+    assert_eq!(repair["originalDecision"], decision);
+    assert!(!repair.to_string().contains("PRIVATE_UNCOMPRESSED_HISTORY"));
+    assert!(repair.to_string().len() < context.to_string().len());
+    let mut fixed = decision.clone();
+    fixed["requirementUpdate"]["focusIds"] = json!(["inspect-8081", "no-config-write"]);
+    assert!(requirement_contract::validate_focus_repair(&repair, &fixed).is_none());
+    assert!(requirement_contract::validate_update("execute", Some("supplement"),
+        fixed.get("requirementUpdate"), &context.to_string(), &current).is_none());
+    for (path, replacement) in [
+        ("/constraints/changePolicy", json!("allow_necessary_changes")),
+        ("/constraints/prohibitedActions", json!([])),
+        ("/requirementUpdate/additions/1/sourceQuote", json!("任意写入")),
+        ("/requirementUpdate/changes", json!([{"id":"internal-only","status":"cancelled"}])),
+        ("/requirementUpdate/sourceMessageId", json!("different-message")),
+        ("/relation", json!("replace_goal")),
+        ("/intent", json!("answer")),
+        ("/requirementUpdate/focusIds", json!(["no-config-write"])),
+        ("/requirementUpdate/focusIds", json!(["inspect-8081", "no-config-write", "internal-only"])),
+        ("/requirementUpdate/focusIds", json!(["inspect-8081", "no-config-write", "no-config-write"])),
+    ] {
+        let mut tampered = fixed.clone();
+        *tampered.pointer_mut(path).unwrap() = replacement;
+        assert!(requirement_contract::validate_focus_repair(&repair, &tampered).is_some(), "{path}");
+    }
+    assert!(requirement_contract::validate_focus_repair(&repair, &json!({})).is_some());
+    assert_eq!(context["requirementSubmission"]["baseLifecycle"]["revision"], 5);
+}
+
+#[test]
+fn focus_repair_does_not_mask_other_contract_errors_or_side_question_boundaries() {
+    let (context, decision, current) = mixed_focus_fixture();
+    for (path, replacement) in [
+        ("/requirementUpdate/baseRevision", json!(4)),
+        ("/requirementUpdate/sourceMessageId", json!("wrong-message")),
+        ("/requirementUpdate/additions/1/sourceQuote", json!("非用户原文")),
+        ("/requirementUpdate/focusIds", json!(["unknown"])),
+        ("/relation", json!("continue")),
+        ("/intent", json!("answer")),
+        ("/intent", json!("terminal_context")),
+    ] {
+        let mut invalid = decision.clone();
+        *invalid.pointer_mut(path).unwrap() = replacement;
+        assert!(requirement_contract::focus_repair(&invalid, &context.to_string(), &current).is_none(), "{path}");
+        assert!(requirement_contract::validate_update(invalid["intent"].as_str().unwrap(), invalid["relation"].as_str(),
+            invalid.get("requirementUpdate"), &context.to_string(), &current).is_some(), "{path}");
+    }
 }

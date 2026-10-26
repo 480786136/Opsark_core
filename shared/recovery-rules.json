@@ -1,6 +1,12 @@
 {
   "version": 1,
   "recoveryFields": ["failedStepId", "targetContext", "purpose"],
+  "localRepairPolicy": {
+    "scope": "rejected_fields",
+    "immutableFields": ["kind", "risk", "expected", "validation", "executionScope", "validationScope", "runtimeClass", "sessionContextChange", "recovery", "recoveryRuleVersion"],
+    "instruction": "只修改允许字段；保留原目标、权限、主机、风险和验收。Shell 改成工具、替换工具或需要新增动作时，进入现有有界业务重规划并重新校验审批，不是局部字段修复。",
+    "readOnlyInstruction": "observe 不支持 heredoc/here-string 或任意解释器程序，即使模型宣称只读或使用 -B。不能仅将 heredoc 改为 python -c 等价重发。可在不改变验收和目标的前提下使用已验证能力的普通只读命令、内存捕获和管道，保留真实退出码；涉及重定向、嵌套调用和后台进程仍须完整安全检查。需要结构化查询时，业务重规划优先选择当前 context.tools 明确提供的固定只读工具，不能猜测工具、参数或伪造覆盖完整性。"
+  },
   "purposeRules": {
     "diagnose": { "kind": "observe", "readonly": true },
     "repair": { "kind": "change", "readonly": false },

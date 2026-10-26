@@ -1,4 +1,5 @@
 import { stepHasResolvedIssue } from "./taskDecisionResolution";
+import { deletionAuthorizedStep } from "./confirmedFileDeletion";
 import type { OpsTask, PlanStep } from "@/types";
 import { isMutatingStepCommand } from "@/services/validation";
 import { supplementalRecoveryAcceptance, validationHasAcceptanceCheck } from "./planSafety";
@@ -8,6 +9,10 @@ const mutating = (step: PlanStep) => step.kind === "change" || isMutatingStepCom
 export class ExecutionPolicyError extends Error {}
 
 export function executionPolicyBlocker(task: OpsTask, step: PlanStep) {
+  if (step.action?.type === "tool" && step.action.toolId === "files.delete_confirmed"
+    && !deletionAuthorizedStep(task, step)) return "精确文件删除缺少当前任务、需求版本和候选清单的有效确认。";
+  if (task.executionConstraints?.changePolicy === "confirm_changes" && mutating(step)
+    && !deletionAuthorizedStep(task, step)) return "此需求要求先预览再确认；只能执行已确认清单对应的专用变更，不能扩大为任意Shell授权。";
   return task.executionConstraints?.changePolicy === "read_only" && mutating(step)
     ? `只读授权不允许执行变更步骤「${step.title}」；恢复关系和风险审批不扩大授权范围。` : undefined;
 }

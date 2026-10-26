@@ -4,7 +4,7 @@ import { executionDigest, executionIntentMatches } from "./planPreparation";
 import { operationsInputSchemas } from "@/features/tools/operationsContracts";
 
 export function isRemoteToolObservation(toolId: string) {
-  return ["files.get_structure", "files.read_content", "software.check"].includes(toolId)
+  return ["files.get_structure", "files.read_content", "software.check", "services.observe", "logs.inspect_rotation", "database.inspect_postgres", "files.inspect_manifest", "http.inspect_delivery"].includes(toolId)
     || Object.prototype.hasOwnProperty.call(operationsInputSchemas, toolId);
 }
 

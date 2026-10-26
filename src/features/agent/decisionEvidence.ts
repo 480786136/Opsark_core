@@ -1,12 +1,27 @@
 import type { ExecutionEvidence } from "@/types";
 import { compactReviewText, textFingerprint } from "./longRunningReviewOutput";
 import { compactReviewOutput } from "./reviewPayload";
+import { redactExecutionOutput } from "./secretTool";
 
 export const SHORT_DECISION_OUTPUT_LIMIT = 2_048;
 export const DECISION_OUTPUT_BUDGET = 12_000;
 
+/** References only reuse byte-identical text present in this request. They do
+ * not establish evidence freshness, a new observation, or new authority. */
+export const SAME_REQUEST_TEXT_REFERENCE_INSTRUCTION = "terminalReferenceRef 指向本次请求 terminalContext.content 中完全相同的原文；来源、行数和 hasMore 仍以 terminalContext 为准。引用不代表新增证据，也不代表完整采集或当前状态。";
+
+export function duplicateTerminalReference(reference: string | undefined, content: string | undefined) {
+  if (!reference || reference !== content) return false;
+  // The reference and its explicit interpretation must save actual serialized
+  // UTF-8 bytes; short inputs remain unchanged, with no cosmetic compression.
+  const encoder = new TextEncoder();
+  return encoder.encode(JSON.stringify({ terminalReference: reference })).length
+    > encoder.encode(JSON.stringify({ terminalReferenceRef: "terminalContext.content",
+      contextReferenceInstruction: SAME_REQUEST_TEXT_REFERENCE_INSTRUCTION })).length;
+}
+
 export function redactDecisionText(value: string) {
-  return value
+  return redactExecutionOutput(value, {})
     .replace(/((?:--?)(?:password|passwd|pwd|token|access[_-]?token|api[_-]?key|secret|credential)(?:=|\s+))(?:("[^"]*")|('[^']*')|([^\s]+))/giu, "$1••••••••")
     .replace(/([?&](?:password|passwd|pwd|token|access[_-]?token|api[_-]?key|secret|credential)=)[^&#\s]+/giu, "$1••••••••")
     .replace(/([a-z][a-z0-9+.-]*:\/\/[^\s/'"`:@]+:)[^@\s/'"`]+@/giu, "$1••••••••@");
@@ -36,6 +51,8 @@ export function decisionOutput(
     }
   }
   const references = evidence.filter(item => item.archive
+    && (!item.archive.sourceEvidenceId || item.archive.sourceEvidenceId === item.id)
+    && (!item.scope?.targetId || !item.archive.serverId || item.scope.targetId === item.archive.serverId)
     && item.archive.fingerprint === textFingerprint(item.rawOutput)).map(item => ({
     source: item.source, sourceEvidenceId: item.id, ...item.archive,
     readTool: allowArchive ? "evidence.read" : undefined,
@@ -54,10 +71,16 @@ export function decisionOutput(
 }
 
 /** One output budget shared by current steps, recent phases and history. */
-export function decisionOutputProjector(allowArchive: boolean, budget = DECISION_OUTPUT_BUDGET) {
+export function decisionOutputProjector(allowArchive: boolean, budget = DECISION_OUTPUT_BUDGET, preferComplete = false) {
   let remaining = budget;
   return (value: string | undefined, evidence: ExecutionEvidence[] = [], limit = SHORT_DECISION_OUTPUT_LIMIT) => {
-    const result = decisionOutput(value, evidence, Math.min(limit, remaining), allowArchive);
+    // Reallocate the existing budget, never increase it. Fixed per-location
+    // excerpts can hide a medium body's middle even with ample space left.
+    // A zero limit remains an explicit metadata-only projection.
+    const length = value ? redactDecisionText(value).length : 0;
+    const allocation = preferComplete && limit > 0 && length <= 6_000 && length <= remaining
+      ? Math.max(limit, length) : limit;
+    const result = decisionOutput(value, evidence, Math.min(allocation, remaining), allowArchive);
     remaining = Math.max(0, remaining - (result?.content?.length ?? 0));
     return result;
   };

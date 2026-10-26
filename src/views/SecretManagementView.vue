@@ -39,9 +39,13 @@ const dialog = ref<HTMLDialogElement>();
 const editing = ref<SecretMetadata>();
 const editorServer = ref("");
 const editorError = ref("");
-const { confirmationMessage, confirmAction, resolveConfirmation } = useActionConfirmation();
+const { confirmationMessage, confirmationId, confirmAction, resolveConfirmation } = useActionConfirmation();
+const deletePending = ref(false);
+let editorRevision = 0;
 let returnFocus: HTMLElement | null = null;
 async function openEditor(secret?: SecretMetadata) {
+  editorRevision += 1;
+  saveState.value = "idle";
   returnFocus = document.activeElement as HTMLElement;
   editorServer.value = serverId.value;
   editing.value = secret;
@@ -57,6 +61,8 @@ function closeEditor() {
   dialog.value?.close();
 }
 function clearEditor() {
+  if (dialog.value?.open) return;
+  editorRevision += 1;
   newValue.value = ""; editing.value = undefined;
   returnFocus?.focus();
 }
@@ -86,16 +92,35 @@ async function submitEditor() {
   }
 }
 async function deleteEntry() {
-  if (!editing.value || saveState.value === "saving") return;
-  const message = editing.value.credentialGroupId
+  if (!editing.value || saveState.value === "saving" || deletePending.value) return;
+  const secret = editing.value;
+  const target = { key: secret.key, serverId: editorServer.value, groupId: secret.credentialGroupId };
+  const revision = editorRevision;
+  const members = store.secretMetadata.filter(item => item.serverId === target.serverId
+    && (target.groupId ? item.credentialGroupId === target.groupId : item === secret))
+    .map(item => ({ item, key: item.key }));
+  const currentEditor = () => editorRevision === revision;
+  const message = target.groupId
     ? t("settings.deleteCredentialGroupConfirm")
     : t("settings.deleteSecretConfirm");
-  if (!await confirmAction(message)) return;
-  saveState.value = "saving";
+  deletePending.value = true;
   try {
-    await store.removeSecretMetadata(editing.value.key, editorServer.value);
-    saveState.value = "saved"; closeEditor();
-  } catch { saveState.value = "error"; editorError.value = t("settings.secretDeleteFailed"); }
+    if (!await confirmAction(message)) return;
+    // Capture identity before awaiting, and reject a changed/replaced target.
+    // Closing an editor must never turn this into a delete of the next editor.
+    const current = store.secretMetadata.filter(item => item.serverId === target.serverId
+      && (target.groupId ? item.credentialGroupId === target.groupId : item.key === target.key));
+    if (secret.key !== target.key || secret.serverId !== target.serverId
+      || secret.credentialGroupId !== target.groupId || current.length !== members.length
+      || members.some(member => !current.includes(member.item) || member.item.key !== member.key)) {
+      throw new Error(t("settings.secretDeleteFailed"));
+    }
+    if (currentEditor()) saveState.value = "saving";
+    await store.removeSecretMetadata(target.key, target.serverId);
+    if (currentEditor()) { saveState.value = "saved"; closeEditor(); }
+  } catch {
+    if (currentEditor()) { saveState.value = "error"; editorError.value = t("settings.secretDeleteFailed"); }
+  } finally { deletePending.value = false; }
 }
 
 function credentialGroupHint(secret: SecretMetadata) {
@@ -175,6 +200,7 @@ onMounted(() => void store.hydrateCredentials());
     </Teleport>
     <ConfirmActionDialog
       :message="confirmationMessage"
+      :request-id="confirmationId"
       :title="t('settings.confirmDelete')"
       :confirm-label="t('settings.confirmDelete')"
       @result="resolveConfirmation"

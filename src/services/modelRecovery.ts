@@ -1,4 +1,5 @@
 import type { ModelServiceError } from "@/types";
+import { parseTaskModelBudgetSnapshot, type TaskModelBudgetSnapshot } from "@/features/agent/taskModelBudget";
 
 /** Core-owned identity shared by one model operation and all of its automatic repairs. */
 export interface ModelRecoveryContext {
@@ -22,14 +23,44 @@ export function isModelRecoveryScopeRejection(error: ModelServiceError | undefin
 
 /** Only a user action may start a new operation after these bounded failures.
  * Unknown dispatch/results, billing and authentication keep their own gates. */
-export function isExplicitModelPlanningRetryable(error: ModelServiceError | undefined): boolean {
+export function isExplicitModelPlanningRetryable(error: ModelServiceError | undefined,
+  snapshot?: TaskModelBudgetSnapshot): boolean {
   return error?.code === "MODEL_FORMAT_INVALID"
+    || error?.code === "MODEL_REQUIREMENT_INVALID" && error.origin === "core" && error.stage === "requirement_contract"
     || isModelRecoveryScopeRejection(error)
     || error?.code === "MODEL_OUTPUT_REPAIR_EXHAUSTED" && error.origin === "core" && error.stage === "output_recovery"
       && error.recoveryBudget?.recoveryBlocked === false
     || error?.code === "MODEL_RECOVERY_BUDGET_EXHAUSTED"
       && error.origin === "core" && error.stage === "recovery_budget"
-      && error.recoveryBudget?.recoveryBlocked === false;
+      && error.recoveryBudget?.recoveryBlocked === false
+    || taskBudgetReservationReleased(error, snapshot);
+}
+
+/** Only the caller's fresh native ledger result may reopen an explicit retry.
+ * A lower conservative reservation is not a new allowance or proof that the
+ * next full wire request fits: native reserve() must still authorize dispatch. */
+function taskBudgetReservationReleased(error: ModelServiceError | undefined,
+  snapshot: TaskModelBudgetSnapshot | undefined): boolean {
+  if (error?.code !== "MODEL_TASK_BUDGET_EXHAUSTED" || error.origin !== "core" || error.stage !== "task_budget") return false;
+  const previous = parseTaskModelBudgetSnapshot(error.taskBudget);
+  const current = parseTaskModelBudgetSnapshot(snapshot);
+  if (!previous || !current || !current.taskId || !current.roundId
+    || current.taskId !== previous.taskId || current.roundId !== previous.roundId) return false;
+  return (["task", "round"] as const).every(scope => {
+    const before = previous[scope], after = current[scope];
+    return after.maxTotalTokens === before.maxTotalTokens
+      && before.accountedTokens >= before.knownUsageTokens + before.estimatedReservedTokens
+      && after.accountedTokens >= after.knownUsageTokens + after.estimatedReservedTokens
+      && after.knownUsageTokens >= before.knownUsageTokens
+      && after.unknownUsageAttempts <= before.unknownUsageAttempts
+      && after.accountedTokens <= before.accountedTokens
+      && after.estimatedReservedTokens <= before.estimatedReservedTokens
+      // An earlier round may settle late and release this task's shared cap;
+      // the current round's existing accounting then legitimately stays equal.
+      && (scope !== "task" || after.accountedTokens < before.accountedTokens
+        && after.estimatedReservedTokens < before.estimatedReservedTokens)
+      && after.accountedTokens < after.maxTotalTokens;
+  });
 }
 
 function parseContext(context: string): Record<string, unknown> {
@@ -78,10 +109,10 @@ export function candidateRegenerationContext(context: string, diagnostic: Record
   delete original.protocolRepairBudget;
   return JSON.stringify({ ...original, _modelOutputRecovery: { strategy: "regenerate" },
     outputRecovery: { diagnostic, rejectedCandidateExecuted: false,
-      instruction: "上一候选未通过校验且未执行。依据原始目标、约束、授权、已确认输入及真实执行证据，重新生成当前操作的完整候选，仅处理剩余工作。不要沿用本轮字段补丁输出形式，不重复已完成动作；执行结果未知的动作先核对。保留必要字段与验收，缩短描述和摘要，不得通过空方案或宣称完成掩盖错误。新候选仍须通过全部校验与正常审批。" } });
+      instruction: "上一候选未通过校验且未执行。依据原始目标、约束、授权、已确认输入及真实执行证据，重新生成当前操作的完整候选，仅处理剩余工作。重新核对被拒工具的outputSchema与所需证据；只返回路径、大小、摘要或候选的工具不能取得正文或配置值，需要正文时从当前目录选择真正返回content的读取工具，不要只补参数却保留错误能力。不要沿用本轮字段补丁输出形式，不重复已完成动作；执行结果未知的动作先核对。保留必要字段与验收，缩短描述和摘要，不得通过空方案或宣称完成掩盖错误。新候选仍须通过全部校验与正常审批。" } });
 }
 
-/** Never mutate a reusable RuntimeModel or attach a permanent budget to a task. */
+/** Keep this per-operation identity separate from the persistent task/round budget. */
 export function ensureModelRecoveryContext(context: string, recovery?: ModelRecoveryContext): string {
   const parsed = parseContext(context);
   // Rust validates and freezes the context. Do not replace an invalid supplied

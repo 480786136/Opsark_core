@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import cases from "../../shared/recovery-cases.json";
 import metadataCases from "../../shared/recovery-metadata-cases.json";
 import firewallCases from "../../shared/firewall-query-cases.json";
-import { commandMutation, isReadOnlyFirewallScript, recoveryMetadataIssue, RecoveryProtocolError, readRecoveryProtocolError, RECOVERY_RULE_VERSION } from "./recoveryRules";
+import scopeCases from "../../shared/recovery-repair-scope-cases.json";
+import rules from "../../shared/recovery-rules.json";
+import { commandMutation, currentRecoveryRepairScope, isReadOnlyFirewallScript, readOnlyPlanProtocol, recoveryMetadataIssue, RecoveryProtocolError, readRecoveryProtocolError, RECOVERY_RULE_VERSION } from "./recoveryRules";
 
 describe("shared Rust/TS recovery policy", () => {
   for (const testCase of firewallCases) {
@@ -18,7 +20,8 @@ describe("shared Rust/TS recovery policy", () => {
       const issue = recoveryMetadataIssue(testCase.step, 3);
       expect(issue?.code ?? null).toBe(testCase.code);
       if (issue) expect(issue).toMatchObject({ fieldPath: `steps[3].${testCase.field}`,
-        allowedRepairPaths: testCase.code === "OBSERVE_COMMAND_MUTATION" ? ["steps[3].command"] : [], ruleVersion: RECOVERY_RULE_VERSION });
+        allowedRepairPaths: ["OBSERVE_COMMAND_MUTATION", "RECOVERY_DIAGNOSE_MUTATION"].includes(testCase.code ?? "")
+          ? [`steps[3].${testCase.field}`] : [], ruleVersion: RECOVERY_RULE_VERSION });
     });
   }
   for (const testCase of cases) {
@@ -40,5 +43,24 @@ describe("shared Rust/TS recovery policy", () => {
     const step = { id: "next", kind: "observe", command: "true", recovery: { failedStepId: "old", targetContext: "original", purpose: "repair" } };
     expect(recoveryMetadataIssue(step)).toMatchObject({ code: "RECOVERY_KIND_MISMATCH", allowedRepairPaths: [] });
     expect(recoveryMetadataIssue({ ...step, recoveryRuleVersion: 999 })).toMatchObject({ code: "RECOVERY_RULE_VERSION_MISMATCH", allowedRepairPaths: [] });
+  });
+
+  it.each(scopeCases)("verifies local authority: $name", testCase => {
+    const step = { id: "next", kind: "observe", command: "mktemp -d", action: { type: "shell", command: "mktemp -d" } };
+    const diagnostic = { ...recoveryMetadataIssue(step, 2)!, ...testCase.patch };
+    expect(currentRecoveryRepairScope(diagnostic, step)).toBe(testCase.allowed);
+  });
+
+  it("rejects a no-longer-failing proposal and publishes rules rather than invented capabilities", () => {
+    const step = { kind: "observe", command: "mktemp -d" };
+    expect(currentRecoveryRepairScope(recoveryMetadataIssue(step)!, { ...step, command: "uname -a" })).toBe(false);
+    expect(readOnlyPlanProtocol()).toMatchObject({ ruleVersion: RECOVERY_RULE_VERSION,
+      unsupportedShellOperators: rules.shell.unsupportedShellOperators, opaqueInterpreters: rules.shell.opaqueInterpreters,
+      safeWriteTargets: rules.shell.safeWriteTargets, maxNestedDepth: rules.shell.maxNestedDepth,
+      requiresFullValidation: true, localRepair: rules.localRepairPolicy });
+    for (const command of ["cat <<'EOF'\nreadonly text\nEOF", "python3 -B -c 'print(1)'",
+      "printf '%s' \"$(touch /tmp/x)\"", "uname -a >/tmp/x", "bash -c 'rm /tmp/x' &"]) {
+      expect(commandMutation(command)).toBeDefined();
+    }
   });
 });

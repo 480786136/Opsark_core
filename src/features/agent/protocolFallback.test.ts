@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { decideTaskNextStage } from "./agentService";
-import { backend, buildPlanNormalizationRepair, ModelInvocationError, PlanProtocolError } from "@/services/backend";
+import { backend, buildPlanNormalizationRepair, canRegenerateModelCandidate, ModelInvocationError, modelServiceError, PlanProtocolError } from "@/services/backend";
 import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 import type { ModelProfile, NextStageDecision, OpsTask, PlanStep } from "@/types";
 import missingSteps from "@/services/fixtures/next-stage-missing-steps.json";
@@ -181,7 +181,11 @@ describe("bounded protocol recovery", () => {
     const input = { ...fixture(), recoverProtocolFailures: true };
     const saved = structuredClone(input.task);
     const decide = vi.fn().mockRejectedValue(error);
-    await expect(decideTaskNextStage(input, decide)).rejects.toBe(error);
+    const stopped = await decideTaskNextStage(input, decide).catch(error => error);
+    expect(stopped).toBeInstanceOf(ModelInvocationError);
+    expect(modelServiceError(stopped)).toMatchObject({ ...error.modelError,
+      candidateRejection: { version: 1, code: "PLAN_CANDIDATE_REJECTED", rejectedCandidateExecuted: false } });
+    expect(canRegenerateModelCandidate(stopped)).toBe(false);
     expect(decide).toHaveBeenCalledOnce();
     expect(input.task).toEqual(saved);
   });

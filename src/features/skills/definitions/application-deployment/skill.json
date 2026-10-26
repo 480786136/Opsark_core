@@ -4,7 +4,7 @@
   "name": "应用部署与上线验收",
   "category": "deployment",
   "description": "将已有项目部署、启动或上线，并完成端到端验收。",
-  "version": 8,
+  "version": 9,
   "enabled": true,
   "builtIn": true,
   "matchRules": [
@@ -15,7 +15,7 @@
     "配置 Web 服务",
     "regex:(?:部署|上线|发布|运行|启动).*(?:项目|应用|网站|服务)|(?:项目|应用|网站|服务).*(?:部署|上线|发布)"
   ],
-  "updatedAt": "2026-09-23T00:00:00.000Z",
+  "updatedAt": "2026-10-12T00:00:00.000Z",
   "instructions": "instructions.md",
   "planningContract": {
     "evidenceAdapters": [
@@ -66,6 +66,6 @@
         "instructions": "stages/prepare.md"
       }
     ],
-    "sourceFingerprint": "fnv1a:2055:d1c2b7eb"
+    "sourceFingerprint": "fnv1a:2194:ad8aa6b9"
   }
 }

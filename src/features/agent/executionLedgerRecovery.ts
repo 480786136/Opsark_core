@@ -2,11 +2,28 @@ import type { ExecutionIntentSnapshot, ExecutionTargetRef, OpsTask, ServerProfil
 import { executionAttemptReviewMatches, type ExecutionAttemptRecord, type ExecutionAttemptReviewReceipt,
   type ExecutionOperationRecord } from "@/services/executionLedger";
 import { executionIntentMatches } from "./planPreparation";
+import { boundedFileAppendContract, boundedFileAppendProbe } from "./boundedFileReconciliation";
+import { taskTerminalEvidenceValid } from "./taskTerminalEvidence";
+import { observationRuntimeRecordValid } from "./observationRuntime";
 
 const object = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === "object" && !Array.isArray(value));
 const text = (value: unknown): value is string => typeof value === "string" && value.trim().length > 0;
 const integer = (value: unknown) => Number.isSafeInteger(value) && Number(value) >= 0;
 const stringArray = (value: unknown): value is string[] => Array.isArray(value) && value.every(text);
+
+function pendingRequirementsValid(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!Array.isArray(value)) return false;
+  const ids = new Set<string>();
+  for (const pending of value) {
+    if (!object(pending) || !text(pending.id) || ids.has(pending.id) || !text(pending.content)
+      || !integer(pending.baseRevision) || typeof pending.state !== "string" || !["pending", "failed"].includes(pending.state)
+      || !text(pending.receivedAt) || pending.sourceMessageId !== undefined && typeof pending.sourceMessageId !== "string"
+      || pending.error !== undefined && typeof pending.error !== "string") return false;
+    ids.add(pending.id);
+  }
+  return true;
+}
 
 /** Projection parsing never prepares steps, acquires approval, or changes historical facts. */
 export function readTaskProjection(value: unknown): { tasks: OpsTask[]; issues: string[]; compatible: boolean } {
@@ -23,6 +40,12 @@ export function readTaskProjection(value: unknown): { tasks: OpsTask[]; issues: 
   rows.forEach((row, index) => {
     if (!object(row) || !text(row.id) || !text(row.serverId) || !text(row.status)
       || !Array.isArray(row.plan) || !Array.isArray(row.messages) || ids.has(row.id)
+      || !pendingRequirementsValid(row.pendingRequirements)
+      || row.automaticReconciliationAttempts !== undefined && !stringArray(row.automaticReconciliationAttempts)
+      || row.terminalEvidence !== undefined && !taskTerminalEvidenceValid(row.terminalEvidence, row.id)
+      || row.observationWindows !== undefined && (!Array.isArray(row.observationWindows)
+        || !row.observationWindows.every(window => observationRuntimeRecordValid(window, row.id as string))
+        || new Set(row.observationWindows.map(window => window.binding.executionId)).size !== row.observationWindows.length)
       || !row.plan.every(step => object(step) && text(step.id) && text(step.status))) {
       issues.push(`第 ${index + 1} 条任务缓存无法安全读取，原始记录未修改。`);
       return;
@@ -74,7 +97,7 @@ export function readExecutionLedger(value: unknown): { operations: ExecutionOper
         if (!object(resolution) || resolution.version !== 1 || resolution.status !== "completed"
           || resolution.reason !== "current_state_verified" || !text(resolution.attemptId)
           || !row.attempts.some(attempt => object(attempt) && attempt.id === resolution.attemptId)
-          || !["file_transfer", "service"].includes(String(resolution.kind)) || !integer(resolution.resolvedAt)
+          || !["file_transfer", "service", "bounded_file_append"].includes(String(resolution.kind)) || !integer(resolution.resolvedAt)
           || !stringArray(resolution.evidenceRefs) || !resolution.evidenceRefs.length
           || !stringArray(resolution.readOperationIds) || !resolution.readOperationIds.length
           || resolution.readOperationId !== resolution.readOperationIds[0]) throw new Error();
@@ -136,6 +159,7 @@ export function missingInspectionReceipts(task: OpsTask): RecordedReadReceipt[] 
 function supportsReconciliation(operation: ExecutionOperationRecord) {
   const semantic = operation.intent.semantic;
   return semantic.action.type === "tool" && semantic.action.toolId === "files.transfer_between_servers"
+    || Boolean(boundedFileAppendContract(semantic))
     || semantic.action.type === "shell" && semantic.runtimeClass === "persistent_service"
       && isReadOnlyServiceValidator(semantic.validator?.command ?? semantic.validation ?? "");
 }
@@ -146,7 +170,8 @@ export function executionRecordTitle(operation: ExecutionOperationRecord, attemp
     ref => ref.operationId === operation.operationId && ref.attemptId === attemptId));
   if (step?.title?.trim()) return step.title.trim().slice(0, 80);
   const action = operation.intent.semantic.action;
-  const names: Record<string, string> = { "disk.inspect": "磁盘检查", "files.find_large": "大文件检查", "services.inspect": "服务检查" };
+  const names: Record<string, string> = { "disk.inspect": "磁盘检查", "files.find_large": "大文件检查", "files.inspect": "文件身份与摘要检查", "services.inspect": "服务检查",
+    "services.observe": "服务健康窗口观察", "package.inspect": "部署包只读检查" };
   if (action.type === "tool") {
     const subject = action.arguments.service ?? action.arguments.path;
     return (names[action.toolId] ?? action.toolId) + (typeof subject === "string" ? ` · ${subject.replace(/[\r\n\t]/g, " ").slice(0, 60)}` : "");
@@ -248,10 +273,10 @@ export interface ReconciliationRead {
   serverId: string;
   target: ExecutionTargetRef;
   command: string;
-  format: "file-fingerprint@1" | "service-readiness@1";
+  format: "file-fingerprint@1" | "service-readiness@1" | "bounded-file-append@1";
 }
 export interface ReadOnlyReconciliation {
-  kind: "file_transfer" | "service";
+  kind: "file_transfer" | "service" | "bounded_file_append";
   operationId: string;
   attemptId: string;
   reads: ReconciliationRead[];
@@ -280,6 +305,12 @@ export function buildReadOnlyReconciliation(operation: ExecutionOperationRecord,
     return { ...target, serverId: matches[0].id };
   };
   const base = { operationId: operation.operationId, attemptId: attempt.id };
+  const append = boundedFileAppendContract(semantic);
+  if (append) {
+    const target = bind(semantic.targets.find(item => item.role === "execution"));
+    return { ...base, kind: "bounded_file_append", reads: [{ role: "execution", target, serverId: target.serverId,
+      command: boundedFileAppendProbe(append, attempt.executionId), format: "bounded-file-append@1" }] };
+  }
   if (semantic.action.type === "tool" && semantic.action.toolId === "files.transfer_between_servers") {
     const source = bind(semantic.targets.find(target => target.role === "source")), target = bind(semantic.targets.find(target => target.role === "target"));
     const reads = [source, target].map(endpoint => {

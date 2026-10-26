@@ -4,6 +4,7 @@ import { AlertTriangle, Check, Copy, RefreshCw, RotateCcw, Search } from "lucide
 import { useI18n } from "vue-i18n";
 import { backend } from "@/services/backend";
 import type { ModelTransportEvent } from "@/types";
+import { parseTaskBudgetAdmission, parseOutputBudgetAdjustment } from "@/features/agent/taskModelBudget";
 import ParameterSelect from "@/components/ParameterSelect.vue";
 
 const { locale } = useI18n();
@@ -27,7 +28,7 @@ const errorMessage = ref("");
 const copiedId = ref("");
 const PAGE_SIZE = 100;
 const QUERY_DEBOUNCE_MS = 250;
-const TRANSPORT_EVENTS = ["request_sent", "response_received", "request_failed", "response_failed", "compatibility_attempt", "unknown"] as const;
+const TRANSPORT_EVENTS = ["request_sent", "response_received", "request_failed", "response_failed", "task_budget_rejected", "compatibility_attempt", "unknown"] as const;
 let reloadTimer: number | undefined;
 let requestVersion = 0;
 let reloadQueued = false;
@@ -62,6 +63,14 @@ function normalizeTransportEvent(value: unknown): ModelTransportEvent | undefine
     event: record.event as ModelTransportEvent["event"],
     timestampMs: record.timestampMs,
   };
+  if (event.event === "task_budget_rejected") {
+    event.taskBudgetAdmission = parseTaskBudgetAdmission(record.taskBudgetAdmission);
+    if (record.dispatchCertainty === "not_dispatched") event.dispatchCertainty = "not_dispatched";
+    if (typeof record.diagnosticCode === "string" && ["MODEL_TASK_BUDGET_EXHAUSTED", "MODEL_TASK_BUDGET_DUPLICATE_ATTEMPT",
+      "MODEL_TASK_BUDGET_REQUEST_ALREADY_RESERVED", "MODEL_TASK_BUDGET_EVIDENCE_CONFLICT", "MODEL_TASK_BUDGET_STORAGE",
+      "MODEL_TASK_BUDGET_INVALID", "MODEL_TASK_BUDGET_UNREGISTERED"].includes(record.diagnosticCode)) event.diagnosticCode = record.diagnosticCode;
+  }
+  if (event.event === "request_sent") event.outputBudgetAdjustment = parseOutputBudgetAdjustment(record.outputBudgetAdjustment);
   if (event.event === "compatibility_attempt") {
     event.capabilityVersion = optionalString(record, "capabilityVersion");
     const protocol = optionalString(record, "apiProtocol");
@@ -297,7 +306,7 @@ function resetFilters() {
 }
 
 function eventLevel(event: ModelTransportEvent) {
-  if (event.event === "request_failed" || event.event === "response_failed") return "error";
+  if (event.event === "request_failed" || event.event === "response_failed" || event.event === "task_budget_rejected") return "error";
   if (event.event === "response_received") return event.status !== undefined && event.status >= 400 ? "error" : "success";
   return "info";
 }
@@ -309,10 +318,21 @@ function eventTitle(event: ModelTransportEvent) {
   if (event.event === "response_received") return `${requestName} · ${locale.value.startsWith("zh") ? "收到响应" : "response received"}${event.status !== undefined ? ` HTTP ${event.status}` : ""}`;
   if (event.event === "request_failed") return `${requestName} · ${locale.value.startsWith("zh") ? "请求传输失败" : "request transport failed"}`;
   if (event.event === "response_failed") return `${requestName} · ${locale.value.startsWith("zh") ? "响应读取失败" : "response read failed"}`;
+  if (event.event === "task_budget_rejected") return `${requestName} · ${locale.value.startsWith("zh")
+    ? event.diagnosticCode === "MODEL_TASK_BUDGET_EXHAUSTED" ? "预算不足，未派发" : "预算准入拒绝，未派发"
+    : event.diagnosticCode === "MODEL_TASK_BUDGET_EXHAUSTED" ? "budget insufficient; not dispatched" : "budget admission rejected; not dispatched"}`;
   return `${requestName} · ${locale.value.startsWith("zh") ? "未知传输事件" : "unknown transport event"}`;
 }
 
 function eventSummary(event: ModelTransportEvent) {
+  if (event.event === "task_budget_rejected" && event.taskBudgetAdmission) {
+    const admission = event.taskBudgetAdmission;
+    const available = [admission.scopes.task?.availableTokens, admission.scopes.round?.availableTokens]
+      .filter((value): value is number => value !== undefined);
+    return locale.value.startsWith("zh")
+      ? `本次预计预留 ${admission.requiredReservedTokens ?? "未知"} Token；可用 ${available.length ? Math.min(...available) : "未知"} Token。预留估计不是实际计费。`
+      : `Estimated reservation ${admission.requiredReservedTokens ?? "unknown"} tokens; available ${available.length ? Math.min(...available) : "unknown"}. Reservation is not actual usage.`;
+  }
   if (event.event === "compatibility_attempt") return [event.apiProtocol, event.effectiveOutputMode,
     event.effectiveOutputTokens !== undefined ? `${event.effectiveOutputTokens} Token` : "",
     event.schemaDowngraded ? (locale.value.startsWith("zh") ? "上游不支持 Schema，已降级" : "Schema unsupported; downgraded") : "",
@@ -321,6 +341,12 @@ function eventSummary(event: ModelTransportEvent) {
     event.capabilityVersion,
   ].filter(Boolean).join(" · ");
   const parts: string[] = [event.event];
+  if (event.outputBudgetAdjustment) {
+    const adjusted = event.outputBudgetAdjustment;
+    parts.push(locale.value.startsWith("zh")
+      ? `预算内输出上限 ${adjusted.originalOutputTokenLimit ?? "未知"} → ${adjusted.effectiveOutputTokenLimit ?? "未知"} Token；实际用量仍按回执结算`
+      : `Budget-fitted output ceiling ${adjusted.originalOutputTokenLimit ?? "unknown"} → ${adjusted.effectiveOutputTokenLimit ?? "unknown"} tokens; actual usage settles from receipt`);
+  }
   if (event.attempt !== undefined) parts.push(`attempt ${event.attempt}`);
   if (event.status !== undefined) parts.push(`HTTP ${event.status}`);
   if (event.durationMs !== undefined) parts.push(`${event.durationMs} ms`);

@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "nginx-delivery",
+  "name": "Nginx安装、站点与代理交付",
+  "category": "deployment",
+  "description": "依据真实交接安装并启动Nginx、部署静态网站或配置反向代理，核对备份、站点范围、资源及实际后端请求。",
+  "version": 1,
+  "enabled": true,
+  "builtIn": true,
+  "matchRules": ["Nginx", "nginx", "反向代理", "静态网站", "regex:(?:网站|页面|后端).*(?:转发|代理)|(?:转发|代理).*(?:网站|页面|后端)"],
+  "updatedAt": "2026-10-12T00:00:00.000Z",
+  "instructions": "instructions.md"
+}

@@ -14,6 +14,7 @@ import { validateShellStartupTransaction } from "@/features/agent/shellStartupCo
 import { semanticRiskForCommand, validateAuthorizedChangeOperations } from "@/features/agent/changeOperation";
 import { validateRecoveryMetadata } from "./recoveryContract";
 import { assertToolStepBoundary } from "./stepAction";
+import { assertPlanEvidenceRequirements, assertToolEvidenceCapability } from "@/features/tools/toolEvidenceCapability";
 
 export function normalizeSecretPlaceholders(value: string) {
   return value.replace(/\\+\$\{secret\.([A-Z0-9_]+)\}/g, "\${secret.$1}");
@@ -82,8 +83,12 @@ export function normalizePlanPreconditions(
       }
     }
   });
+  normalized.forEach((step, index) => {
+    if (["pending", "awaiting_approval", "awaiting_input"].includes(step.status)) assertPlanEvidenceRequirements(step, index);
+  });
   for (const { index, toolId } of pendingToolCalls) {
     const definition = toolById.get(toolId);
+    if (definition) assertToolEvidenceCapability(normalized[index]!, definition, index);
     if (definition?.effect === "change" && normalized[index].kind !== "change") throw new Error(`工具 ${toolId} 会变更状态，kind 必须为 change`);
     if (definition?.effect === "change" && normalized[index].risk === "low") normalized[index].risk = "medium";
     if ((definition?.effect === "read" || definition?.planMode === "read_batch") && normalized[index].kind !== "observe") {

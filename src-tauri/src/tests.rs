@@ -1944,6 +1944,87 @@ fn parses_answer_and_execute_requirement_intents() {
 }
 
 #[test]
+fn confirm_changes_classification_preserves_conditional_authority_through_plan_context() {
+    let constraints = json!({"changePolicy":"confirm_changes","environmentPolicy":"preserve","failurePolicy":"strict",
+        "prohibitedActions":["不能删除新出现的文件"],"requiredConditions":["先展示候选，再由我确认"],
+        "userDirectives":["仅清理归档目录里的普通文件"]});
+    let decision: AiRequirementDecision = serde_json::from_value(json!({"intent":"execute","relation":"new_goal",
+        "answer":"","constraints":constraints,"terminalContextLines":0,"selectedSkillIds":[]})).unwrap();
+    assert_eq!(classification_contract_error(&decision, None), None);
+    assert!(execute_constraints_match_contract(&decision.constraints));
+    let normalized = normalize_execution_constraints(Some(serde_json::from_value(decision.constraints).unwrap()));
+    assert_eq!(normalized.change_policy, "confirm_changes");
+    assert_eq!(normalized.required_conditions, vec!["先展示候选，再由我确认"]);
+    let enriched = context_with_selected_skills(
+        r#"{"permission":"managed","tools":[{"id":"files.preview_deletion"},{"id":"files.confirm_deletion"},{"id":"files.delete_confirmed"}],"executionConstraints":{"changePolicy":"read_only"}}"#,
+        &[], &[], Some(&normalized)).unwrap();
+    let plan: Value = serde_json::from_str(&enriched).unwrap();
+    assert_eq!(plan["executionConstraints"], constraints);
+    assert_eq!(plan["permission"], "managed");
+    assert!(plan.get("fileDeletionAuthorizations").is_none(), "classification must not fabricate confirmation grants");
+    assert_eq!(plan["tools"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn confirm_changes_requires_a_valid_execute_contract_not_a_generic_approval_alias() {
+    let valid = json!({"changePolicy":"confirm_changes","environmentPolicy":"preserve","failurePolicy":"strict",
+        "prohibitedActions":[],"requiredConditions":["确认后只删除原清单"],"userDirectives":[]});
+    for policy in [json!("confirmed"), json!("confirm_changes\n"), json!("unspecified"), json!(true), Value::Null] {
+        let mut constraints = valid.clone(); constraints["changePolicy"] = policy;
+        assert!(!execute_constraints_match_contract(&constraints));
+        let decision: AiRequirementDecision = serde_json::from_value(json!({"intent":"execute","relation":"new_goal",
+            "answer":"","constraints":constraints,"terminalContextLines":0,"selectedSkillIds":[]})).unwrap();
+        assert!(classification_contract_error(&decision, None).is_some());
+    }
+    for field in ["environmentPolicy", "failurePolicy", "prohibitedActions", "requiredConditions", "userDirectives"] {
+        let mut incomplete = valid.clone(); incomplete.as_object_mut().unwrap().remove(field);
+        assert!(!execute_constraints_match_contract(&incomplete), "missing {field} must not become unrestricted authority");
+    }
+    let answer: AiRequirementDecision = serde_json::from_value(json!({"intent":"answer","relation":"side_question",
+        "answer":"已确认","constraints":valid,"terminalContextLines":0,"selectedSkillIds":[]})).unwrap();
+    assert!(classification_contract_error(&answer, None).is_some(), "answer prose cannot issue an execution confirmation");
+}
+
+#[test]
+fn confirm_changes_requirement_projection_keeps_confirmation_condition_and_revision() {
+    let requirement = "列出归档目录候选文件，确认后再删除";
+    let base = json!({"version":1,"revision":0,"items":[],"focus":{"requirementIds":[]}});
+    let context = json!({"permission":"managed","taskGoal":{"lifecycle":base},
+        "requirementSubmission":{"baseRevision":0,"sourceMessageId":"message-confirm","content":requirement,
+            "baseLifecycle":base}});
+    let update = json!({"baseRevision":0,"sourceMessageId":"message-confirm","additions":[
+        {"id":"cleanup","kind":"goal","content":"列出归档目录候选文件","sourceQuote":"列出归档目录候选文件","supersedes":[]},
+        {"id":"confirm-first","kind":"constraint","content":"确认后再删除","sourceQuote":"确认后再删除","supersedes":[]}],
+        "changes":[],"focusIds":["cleanup","confirm-first"]});
+    let constraints = json!({"changePolicy":"confirm_changes","environmentPolicy":"preserve","failurePolicy":"strict",
+        "prohibitedActions":[],"requiredConditions":["确认后再删除"],"userDirectives":[]});
+    let projected: Value = serde_json::from_str(&requirement_contract::project_classified_context(
+        &context.to_string(), Some("new_goal"), Some(&update), requirement, Some(&constraints)).unwrap()).unwrap();
+    assert_eq!(projected["executionConstraints"], constraints);
+    assert_eq!(projected["taskGoal"]["lifecycle"]["revision"], 1);
+    assert_eq!(projected["taskGoal"]["requirementContext"]["activeConstraints"][0]["id"], "confirm-first");
+    assert_eq!(projected["taskGoal"]["lifecycle"]["items"][1]["status"], "active");
+    assert!(projected.get("fileDeletionAuthorizations").is_none());
+    assert!(!projected.to_string().contains("baseLifecycle"));
+    assert_eq!(context["requirementSubmission"]["baseLifecycle"]["revision"], 0);
+}
+
+#[test]
+fn confirm_changes_continuation_cannot_promote_existing_scope_to_immediate_changes() {
+    let constraints = json!({"changePolicy":"confirm_changes","environmentPolicy":"preserve","failurePolicy":"strict",
+        "prohibitedActions":["不得添加其他目录"],"requiredConditions":["确认后仅删除原清单"],"userDirectives":[]});
+    let context = json!({"permission":"managed","executionConstraints":constraints,
+        "taskGoal":{"rootGoal":"先预览文件，由我确认后删除","currentInstruction":"先预览文件"}});
+    let mut overbroad = constraints.clone();
+    overbroad["changePolicy"] = json!("allow_necessary_changes");
+    overbroad["requiredConditions"] = json!([]);
+    let projected: Value = serde_json::from_str(&requirement_contract::project_classified_context(
+        &context.to_string(), Some("continue"), None, "继续", Some(&overbroad)).unwrap()).unwrap();
+    assert_eq!(projected["executionConstraints"], constraints);
+    assert!(projected.get("fileDeletionAuthorizations").is_none());
+}
+
+#[test]
 fn serializes_model_failure_with_complete_developer_trace() {
     let mut trace = ModelDeveloperTrace::default();
     record_model_attempt(
@@ -2008,6 +2089,7 @@ fn omits_absent_optional_plan_fields_from_the_frontend_payload() {
         command: "test -d /opt/ruoyi".into(),
         risk: "low".into(),
         expected: "得到目录状态".into(),
+        evidence_requirements: None,
         validation: String::new(),
         recovery: None,
         recovery_rule_version: None,

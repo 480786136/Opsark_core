@@ -7,7 +7,7 @@ import type { OpsTask, PlanStep, SecretMetadata } from "@/types";
 const command = 'mysql --protocol=TCP -h db.internal -P 3306 -u "${secret.DB_USER}" -p"${secret.DB_PASSWORD}" -e "SHOW DATABASES;"';
 const step: PlanStep = { id: "s", title: "查询", description: "只读", command, validation: "", kind: "observe", risk: "low", expected: "结果", status: "pending" };
 function fixture() {
-  const task: OpsTask = { id: "t", serverId: "srv", title: "检查", status: "running", modelId: "m", permission: "managed", plan: [step], messages: [], createdAt: "now", updatedAt: "now" };
+  const task: OpsTask = { id: "t", serverId: "srv", title: "检查", status: "running", modelId: "m", permission: "managed", plan: [step], messages: [], createdAt: "now", updatedAt: "now", agentSessionId: "session", agentSessionGeneration: 1 };
   const metadata: SecretMetadata[] = ["username", "secret"].map((role, i) => ({
     key: i ? "DB_PASSWORD" : "DB_USER", description: "凭据", scope: "server", serverId: "srv",
     credentialGroupId: "g", credentialKind: "database", credentialRole: role as "username" | "secret", credentialTarget: "db.internal:3306",

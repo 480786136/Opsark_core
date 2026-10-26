@@ -5,5 +5,7 @@
   "project-build",
   "database-inspection-operations",
   "application-deployment",
-  "file-transfer-integrity"
+  "file-transfer-integrity",
+  "log-rotation",
+  "nginx-delivery"
 ]

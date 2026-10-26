@@ -1,6 +1,6 @@
 use crate::command_guard::risk_for;
 use crate::ssh::{
-    connect_ssh, execution_pid_file, shell_quote, ssh_exec, ssh_exec_streaming,
+    connect_ssh, execution_pid_file, is_exec_payload_preflight_rejection, shell_quote, ssh_exec, ssh_exec_streaming,
     ssh_exec_streaming_with_prompt, InteractivePromptCredential,
 };
 use serde::{Deserialize, Serialize};
@@ -297,6 +297,34 @@ impl AgentTerminalManager {
         Ok(session.generation)
     }
 
+    fn finish_failed_execution(
+        &self,
+        session_id: &str,
+        generation: u64,
+        execution_id: &str,
+        error: &str,
+    ) -> Result<Option<u64>, String> {
+        if !is_exec_payload_preflight_rejection(error) {
+            return self
+                .recover_after_transport_failure(session_id, execution_id)
+                .map(Some);
+        }
+        // No channel was opened. Release only the still-current command; a
+        // late result must not clear a replacement execution or its generation.
+        let mut sessions = self.sessions.lock().map_err(|_| "Agent 会话状态锁异常")?;
+        if let Some(session) = sessions.get_mut(session_id) {
+            if session.generation == generation
+                && session.state == "busy"
+                && session.active.as_ref()
+                    .is_some_and(|active| active.execution_id == execution_id)
+            {
+                session.active = None;
+                session.state = "ready".into();
+            }
+        }
+        Ok(None)
+    }
+
     fn validate_active_execution(
         &self,
         session_id: &str,
@@ -563,16 +591,18 @@ pub(crate) async fn execute_agent_terminal_command(
             value
         }
         Ok(Err(error)) => {
-            let next_generation =
-                manager.recover_after_transport_failure(&session_id, &execution_id)?;
-            emit_agent_event(
-                &app,
-                &session_id,
-                next_generation,
-                Some(&execution_id),
-                "AgentSession transport recovered; generation changed",
-                "error",
-            );
+            if let Some(next_generation) = manager.finish_failed_execution(
+                &session_id, generation, &execution_id, &error,
+            )? {
+                emit_agent_event(
+                    &app,
+                    &session_id,
+                    next_generation,
+                    Some(&execution_id),
+                    "AgentSession transport recovered; generation changed",
+                    "error",
+                );
+            }
             return Err(error);
         }
         Err(error) => {
@@ -746,6 +776,133 @@ pub(crate) fn close_agent_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn active_test_manager() -> AgentTerminalManager {
+        let manager = AgentTerminalManager::default();
+        manager.next_generation.store(7, Ordering::Relaxed);
+        manager.sessions.lock().unwrap().insert("session-test".into(), AgentSessionState {
+            task_id: "task-test".into(),
+            generation: 7,
+            state: "busy".into(),
+            target: AgentTarget {
+                server_id: "server-test".into(), host: "unused.invalid".into(),
+                port: 22, username: "synthetic-account".into(),
+            },
+            context: AgentSessionContext {
+                cwd: Some("/opt/current-app".into()),
+                environment: HashMap::from([("APP_MODE".into(), "test".into())]),
+                source_files: vec!["/opt/current-app/env.sh".into()],
+                shell: "bash".into(), revision: 9,
+            },
+            active: Some(ActiveExecution {
+                execution_id: "exec-current".into(),
+                cancel: Arc::new(AtomicBool::new(false)),
+            }),
+            created_at: "synthetic-created-at".into(),
+        });
+        manager
+    }
+
+    fn native_preflight_error(with_prompt: bool) -> String {
+        // Exercise the real SSH entry points with no TCP stream. The final
+        // scoped command fails locally before opening a channel or PTY.
+        let session = ssh2::Session::new().unwrap();
+        let cancel = AtomicBool::new(false);
+        let raw = format!("printf '%s' {}", shell_quote(&"路径'".repeat(8_000)));
+        let scoped = command_for_scope("agent_session", &raw, &AgentSessionContext::default()).unwrap();
+        let no_output = |_: String, _: &str| panic!("preflight must not emit remote output");
+        if with_prompt {
+            let credential = InteractivePromptCredential {
+                kind: "git-https".into(), username: None,
+                secret: "synthetic-secret".into(), target: None,
+            };
+            ssh_exec_streaming_with_prompt(
+                &session, "exec-current", &scoped, &cancel, &credential, no_output,
+            ).unwrap_err()
+        } else {
+            ssh_exec_streaming(&session, "exec-current", &scoped, &cancel, no_output).unwrap_err()
+        }
+    }
+
+    #[test]
+    fn native_preflight_releases_only_current_command_without_transport_recovery() {
+        for with_prompt in [false, true] {
+            let manager = active_test_manager();
+            let before = manager.sessions.lock().unwrap()["session-test"].clone();
+            let error = native_preflight_error(with_prompt);
+            assert!(is_exec_payload_preflight_rejection(&error));
+            let recovered_generation = manager.finish_failed_execution(
+                "session-test", 7, "exec-current", &error,
+            ).unwrap();
+            assert_eq!(recovered_generation, None);
+            let after = manager.sessions.lock().unwrap()["session-test"].clone();
+            assert_eq!(after.generation, before.generation);
+            assert_eq!(manager.next_generation.load(Ordering::Relaxed), 7);
+            assert_eq!(after.context, before.context);
+            assert_eq!(after.task_id, before.task_id);
+            assert_eq!(after.created_at, before.created_at);
+            assert_eq!(after.state, "ready");
+            assert!(after.active.is_none());
+            assert!(!before.active.unwrap().cancel.load(Ordering::Relaxed));
+        }
+    }
+
+    #[test]
+    fn late_preflight_rejection_cannot_clear_a_new_generation_or_execution() {
+        let error = native_preflight_error(false);
+        for (generation, execution_id) in [(6, "exec-current"), (7, "exec-retired")] {
+            let manager = active_test_manager();
+            let before = manager.sessions.lock().unwrap()["session-test"].clone();
+            before.active.as_ref().unwrap().cancel.store(true, Ordering::Relaxed);
+            assert_eq!(manager.finish_failed_execution(
+                "session-test", generation, execution_id, &error,
+            ).unwrap(), None);
+            let after = manager.sessions.lock().unwrap()["session-test"].clone();
+            assert_eq!(after.generation, 7);
+            assert_eq!(manager.next_generation.load(Ordering::Relaxed), 7);
+            assert_eq!(after.context, before.context);
+            assert_eq!(after.state, "busy");
+            let active = after.active.unwrap();
+            assert_eq!(active.execution_id, "exec-current");
+            assert!(active.cancel.load(Ordering::Relaxed));
+        }
+        let manager = active_test_manager();
+        manager.sessions.lock().unwrap().remove("session-test");
+        assert_eq!(manager.finish_failed_execution("session-test", 7, "exec-current", &error).unwrap(), None);
+        assert!(manager.sessions.lock().unwrap().is_empty());
+        for terminal_state in ["closed", "cancelled"] {
+            let manager = active_test_manager();
+            manager.sessions.lock().unwrap().get_mut("session-test").unwrap().state = terminal_state.into();
+            assert_eq!(manager.finish_failed_execution("session-test", 7, "exec-current", &error).unwrap(), None);
+            let after = manager.sessions.lock().unwrap()["session-test"].clone();
+            assert_eq!(after.state, terminal_state);
+            assert_eq!(after.generation, 7);
+            assert!(after.active.is_some());
+        }
+    }
+
+    #[test]
+    fn real_transport_and_untrusted_errors_keep_existing_generation_recovery() {
+        let valid = native_preflight_error(false);
+        for error in [
+            "无法执行远程命令：[Session(-34)] Unable to send channel request".to_string(),
+            "SSH 网络连接失败：synthetic disconnect".to_string(),
+            format!("无法执行 Agent SSH PTY 命令：{valid}"),
+            valid.replace("\"version\":1", "\"version\":2"),
+        ] {
+            let manager = active_test_manager();
+            let context = manager.sessions.lock().unwrap()["session-test"].context.clone();
+            assert_eq!(manager.finish_failed_execution(
+                "session-test", 7, "exec-current", &error,
+            ).unwrap(), Some(8));
+            let after = manager.sessions.lock().unwrap()["session-test"].clone();
+            assert_eq!(after.generation, 8);
+            assert_eq!(manager.next_generation.load(Ordering::Relaxed), 8);
+            assert_eq!(after.context, context);
+            assert_eq!(after.state, "ready");
+            assert!(after.active.is_none());
+        }
+    }
 
     #[test]
     fn replays_only_structured_non_secret_context() {

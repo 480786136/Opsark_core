@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExecutionIntentSnapshot, ExecutionIntentSemantic, PlanStep } from "@/types";
 import { executionDigest } from "@/features/agent/planPreparation";
+import { getHostCapabilities, hostCapabilityEpoch, invalidateHostCapabilities, recordHostCapabilities } from "@/features/tools/hostCapabilities";
 import {
   cancelExecutionLedger, configureExecutionLedger, createMemoryExecutionLedgerRepository,
   ExecutionLedgerError, flushPendingReceipts, listExecutionLedger, pendingExecutionReceipts,
@@ -29,6 +30,53 @@ function deferred<T>() { let resolve!: (value: T) => void; const promise = new P
 
 describe("durable execution coordination", () => {
   beforeEach(resetExecutionLedgerForTests);
+
+  it("S02 invalidates all mutation endpoints after durable admission and rejects an earlier in-flight capability read", async () => {
+    const { owner, store } = setup();
+    const identities = ["server", "target-server", "unrelated-server"].map(serverId => ({ serverId, host: "host.test", port: 22, username: "deploy", connectionGeneration: 1 }));
+    const facts = { version: 1 as const, observedAt: null, facts: [{ name: "jq" as const, supported: false }] };
+    for (const identity of identities) recordHostCapabilities(identity, facts, { toolCallId: `before-${identity.serverId}` });
+    const epochs = identities.map(identity => hostCapabilityEpoch(identity.serverId));
+    const frozen = intent();
+    frozen.semantic.action = { type: "tool", toolId: "files.transfer_between_servers", arguments: { sourcePath: "/srv/source", targetPath: "/srv/target" } };
+    frozen.semantic.targets = [
+      { ...frozen.semantic.targets[0], role: "source", path: "/srv/source" },
+      { ...frozen.semantic.targets[0], role: "target", serverId: "target-server", host: "target.test", path: "/srv/target" },
+      { ...frozen.semantic.targets[0], role: "lookup" },
+    ];
+    frozen.digest = executionDigest({ version: "execution-intent@1", semantic: frozen.semantic });
+    const execute = vi.fn(async () => {
+      expect((await store.list())[0].state).toBe("dispatching");
+      expect(getHostCapabilities(identities[0])).toBeUndefined();
+      expect(getHostCapabilities(identities[1])).toBeUndefined();
+      expect(getHostCapabilities(identities[2])).toBeDefined();
+      expect(hostCapabilityEpoch("server")).toBe(epochs[0] + 1);
+      expect(hostCapabilityEpoch("target-server")).toBe(epochs[1] + 1);
+      expect(recordHostCapabilities(identities[0], facts, { toolCallId: "late-old-read", epoch: epochs[0] })).toBeUndefined();
+      throw new Error("connection lost during mutation");
+    });
+    await expect(runRecordedExecution({ ...options(owner, execute), intent: frozen, phase: "tool" })).rejects.toThrow();
+    expect(execute).toHaveBeenCalledOnce();
+    expect(getHostCapabilities(identities[0])).toBeUndefined();
+    expect((await store.list())[0].state).toBe("unknown");
+    for (const identity of identities) invalidateHostCapabilities(identity.serverId);
+  });
+
+  it("S02 inspection and a rejected mutation admission preserve the existing capability facts", async () => {
+    const { owner, store } = setup();
+    const identity = { serverId: "server", host: "EXAMPLE.com", port: 22, username: "deploy", connectionGeneration: 1 };
+    recordHostCapabilities(identity, { version: 1, observedAt: null, facts: [{ name: "jq", supported: false }] }, { toolCallId: "native-read" });
+    const epoch = hostCapabilityEpoch("server");
+    await runRecordedExecution(options(owner, async () => "read-only", "read"));
+    expect(getHostCapabilities(identity)?.source.toolCallId).toBe("native-read");
+    const dispatch = vi.fn(async () => "must not run");
+    vi.spyOn(store, "begin").mockRejectedValueOnce(new Error("EXECUTION_LEDGER_RESOURCE_BUSY"));
+    await expect(runRecordedExecution(options(owner, dispatch, "change", "other-step", "other-execution"))).rejects.toThrow();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(getHostCapabilities(identity)?.source.toolCallId).toBe("native-read");
+    expect(hostCapabilityEpoch("server")).toBe(epoch);
+    invalidateHostCapabilities("server");
+  });
 
   it.each(["not_met", "unknown"] as const)("records a %s task-owned review separately from successful acceptance", async outcome => {
     const { owner, store } = setup();

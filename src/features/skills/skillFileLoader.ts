@@ -21,7 +21,8 @@ export function loadSkillDefinition(id: string, files: Record<string, string> = 
       || path.split("/").some(part => !part || part === "." || part === "..")) throw new Error(`Invalid Skill resource: ${id}`);
     const text = files[`./definitions/${id}/${path}`];
     if (typeof text !== "string" || !text.trim()) throw new Error(`Missing Skill resource: ${id}/${path}`);
-    return text;
+    // Git checkout line endings must not change bundled instructions or catalog identity.
+    return text.replace(/\r\n/g, "\n");
   };
   const manifest: unknown = JSON.parse(files[`./definitions/${id}/skill.json`] ?? "null");
   if (!object(manifest) || manifest.schemaVersion !== 1 || manifest.id !== id

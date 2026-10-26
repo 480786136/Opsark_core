@@ -13,6 +13,7 @@ mod credential;
 mod credential_vault;
 mod evidence_store;
 mod execution_ledger;
+mod bounded_file_reconciliation;
 mod task_archive;
 mod file_tree;
 mod json_contract;
@@ -24,12 +25,19 @@ mod scoped_model_repair;
 mod model_schema;
 mod plan_contract;
 mod model_budget;
+mod task_model_budget;
+mod model_request_lifecycle;
+mod model_probe;
 mod model_request_status;
 mod schema_validation;
 mod next_stage_format;
 mod requirement_contract;
+mod requirement_planning;
+mod classification_contract;
 #[cfg(test)]
 mod requirement_contract_tests;
+#[cfg(test)]
+mod requirement_planning_tests;
 mod knowledge;
 mod metrics;
 mod model;
@@ -128,6 +136,17 @@ impl StepAction {
     fn command(&self) -> &str { match self { Self::Shell { command } => command, _ => "" } }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PlanEvidenceKind { FileContent }
+
+fn deserialize_evidence_requirements<'de, D: serde::Deserializer<'de>>(deserializer: D)
+    -> Result<Option<Vec<PlanEvidenceKind>>, D::Error> {
+    let kinds = Vec::<PlanEvidenceKind>::deserialize(deserializer)?;
+    if kinds.len() > 1 { return Err(serde::de::Error::custom("evidenceRequirements 不允许重复类型")); }
+    Ok(Some(kinds))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PlanStep {
@@ -139,6 +158,8 @@ struct PlanStep {
     command: String,
     risk: String,
     expected: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_evidence_requirements")]
+    evidence_requirements: Option<Vec<PlanEvidenceKind>>,
     validation: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery: Option<Value>,
@@ -202,7 +223,7 @@ const PLAN_STEP_OUTPUT_CONTRACT: &str = r#"输出必须是只包含 steps 数组
 recovery 是可选的历史关联元数据，包含 failedStepId（上下文中既有失败 ID）、targetContext（该失败的原始目标上下文）和 purpose（只能选 diagnose、repair 或 verify）。只有当某步确实针对特定失败进行诊断、修复或复验时才提供；普通只读诊断无需为了通过 Core 门禁而附加 recovery。diagnose 必须 observe 且只读，repair 必须 change。历史失败的命令、expected、退出码和输出是不可改写的执行事实，不是后续计划必须逐字复制的验收方法。你可以依据用户目标、当前证据和授权调整后续步骤、剩余计划及验收方法；verify 应说明新证据如何证明目标，不能仅靠修复命令成功宣告目标已验收。Core 不会根据 recovery 关系裁决业务是否完成；不得编造关联 ID/上下文，recovery 关系本身不授权变更，仍须通过安全、授权和真实执行证据检查。
 observe 表示只读查询或诊断：主命令输出和退出状态就是观察证据，validation 必须为空字符串，不得生成第二条重复查询。change 表示会改变目标状态：validation 必须是非空、独立、只读的后置条件。command 和 validation 可以包含换行，但必须按标准 JSON 规则转义。
 diagnose 的 command 必须真正无副作用，禁止 mktemp、写入/删除临时文件和刷新包缓存。不要生成“mktemp→输出落盘→rm”诊断链，修复时需整体移除创建、写入和清理；不能只删 rm，也不能改为 repair 绕过授权。需要截断输出时使用 set -o pipefail，或 out=$(只读命令 2>&1); rc=$?; printf '%s\n' "$out"; exit "$rc"，保留真实退出码。允许 /dev/null 和文件描述符输出；dnf/yum 查询必须使用 --cacheonly/-C，避免刷新缓存。
-工具步骤的 action.type 必须为 tool，action.toolId 必须来自 context.tools 当前目录，action.arguments 必须是符合该工具 inputSchema 的参数对象；不得输出顶层 command 或 opsark-tool 字符串。工具 validation 必须为空字符串，由结构化结果提供验收；standalone 工具必须独立规划。
+工具步骤的 action.type 必须为 tool，action.toolId 必须来自 context.tools 当前目录，action.arguments 必须是符合该工具 inputSchema 的参数对象；不得输出顶层 command 或 opsark-tool 字符串。工具 validation 必须为空字符串，由结构化结果提供验收；standalone 工具必须独立规划。按实际返回能力选择工具：路径、大小、身份、SHA-256及删除候选均不是文本正文，不能用来解析配置当前值；需要正文时选当前目录真正返回content的工具。只修正参数不会修正错误的证据能力。
 同一计划可按顺序包含 Shell、变更及 read_batch 只读工具，例如克隆成功并验收后读取已知最终路径。read_batch 是只读批次能力，不是整个计划的限制；这些工具仍必须 kind=observe。程序串行执行并逐步审批，前置失败停止后续步骤，不把混合计划当作并行批次。参数必须已知，未知路径或配置取决于前项输出时先取得结果再规划，不能猜测。standalone 工具仍必须单独规划，等待输入或上下文变化后续接。context.expand 只补充说明，不证明业务完成。
 Shell 反斜杠在 JSON 字符串内必须写成双反斜杠，例如 Shell 的 \( 必须输出为 \\( 的 JSON 文本。
 输出前逐个检查必填字段，必须保证整个 JSON 对象完整闭合，不得截断任何字段。"#;
@@ -226,10 +247,10 @@ Shell observe 的 validation 为空字符串，Shell change 的 validation 必�
 planMode=read_batch 的 observe 工具允许和 Shell、变更在同一计划中按顺序执行，不能并行跨越依赖；前置执行及验收成功后再执行后续步骤，失败立即停止。参数依赖未知输出时另行规划，不预设结果。standalone 工具仍是唯一待执行步骤。planMode、completionMode、executionMode 是工具目录元数据，由编排器读取，禁止复制到 steps 的对象字段中；步骤只能使用输出协议声明的字段。
 工具调用只允许结构化 action，不支持 opsark-tool 命令字符串；禁止在 Shell 或 validation 中嵌入工具调用。
 command 和 validation 中的换行及反斜杠必须按标准 JSON 规则转义。返回前必须同时自检决策分支、所有计划字段和完整 JSON 结构。"#;
-const REQUIREMENT_CLASSIFICATION_CONTRACT: &str = r#"本阶段只做需求分类、任务关系判断、终端上下文判断、执行约束提取和 Skill 选择，禁止输出 steps、command、validation 或执行计划。context.taskGoal.rootGoal 保留任务原始目标供追溯；lifecycle.revision>0 时以当前有效要求和约束为准，已完成历史只作参考。currentInstruction 是上一轮指令。必须判断本次输入与整体目标的关系：new_goal=独立的新执行目标；continue=继续/重试原目标；supplement=为原目标补充条件；side_question=临时咨询且不改变原目标；replace_goal=用户明确放弃原目标并替换；cancel_goal=明确取消原目标。不得仅因用户提出另一个问题就隐式覆盖原目标；新执行目标使用 new_goal，只有明确“改为/不要原目标/替换为”才用 replace_goal。必须先判断回答或计划是否依赖用户之前的终端输入/输出：如依赖且 terminalContext.content 未提供或范围不够，返回 terminal_context，terminalContextLines 必须大于当前 includedLines，且不超过 totalLines 和 400；不依赖则不得请求终端内容。对 execute，constraints.changePolicy 是本轮权威的只读/变更边界：查询现状、列表、检查和定位故障必须为 read_only；用户明确要求安装、修改、构建、部署、传输或其他环境变更时为 requested_changes_only；只有用户明确允许为达成目标执行必要的附加变更时才为 allow_necessary_changes。execute 不得返回 unspecified。environmentPolicy、failurePolicy、prohibitedActions、requiredConditions 和 userDirectives 只能来自用户明确表达，不得猜测或自行增加。context.skillDirectory 中的名称、description 和 selectionHints 用于语义选择；category 只用于管理和导航，不得触发 Skill。只选择直接适用于整体目标、本轮显式子目标或已有证据证明必需阶段的 Skill，允许复合需求选择多个 Skill；不得因为目录中存在相近领域或关键词局部相似而强行匹配。零匹配是正常且合法的结果，此时 selectedSkillIds=[]，后续使用通用流程。selectedSkillIds 是本轮完整集合，continue/supplement 也必须移除不再适用或上轮误选的 Skill，程序不会自动并集。以下示例只说明各分支的合法格式，实际分类、关系和约束必须依据用户输入，不得照抄示例作默认决策。
+const REQUIREMENT_CLASSIFICATION_CONTRACT: &str = r#"本阶段只做需求分类、任务关系判断、终端上下文判断、执行约束提取和 Skill 选择，禁止输出 steps、command、validation 或执行计划。context.taskGoal.rootGoal 保留任务原始目标供追溯；lifecycle.revision>0 时以当前有效要求和约束为准，已完成历史只作参考。currentInstruction 是上一轮指令。必须判断本次输入与整体目标的关系：new_goal=独立的新执行目标；continue=继续/重试原目标；supplement=为原目标补充条件；side_question=临时咨询且不改变原目标；replace_goal=用户明确放弃原目标并替换；cancel_goal=明确取消原目标。不得仅因用户提出另一个问题就隐式覆盖原目标；新执行目标使用 new_goal，只有明确“改为/不要原目标/替换为”才用 replace_goal。必须先判断回答或计划是否依赖用户之前的终端输入/输出：如依赖且 terminalContext.content 未提供或范围不够，返回 terminal_context，terminalContextLines 必须大于当前 includedLines，且不超过 totalLines 和 400；不依赖则不得请求终端内容。对 execute，constraints.changePolicy 是本轮权威的只读/变更边界：仅查询现状、列表、检查和定位故障且不请求后续变更时为 read_only；用户要求先预览或列出候选、明确确认后再变更时必须为 confirm_changes，不能将条件变更误判为永久只读或立即授权；用户明确要求安装、修改、构建、部署、传输或其他环境变更时为 requested_changes_only；只有用户明确允许为达成目标执行必要的附加变更时才为 allow_necessary_changes。execute 不得返回 unspecified。environmentPolicy、failurePolicy、prohibitedActions、requiredConditions 和 userDirectives 只能来自用户明确表达，不得猜测或自行增加。context.skillDirectory 中的名称、description 和 selectionHints 用于语义选择；category 只用于管理和导航，不得触发 Skill。只选择直接适用于整体目标、本轮显式子目标或已有证据证明必需阶段的 Skill，允许复合需求选择多个 Skill；不得因为目录中存在相近领域或关键词局部相似而强行匹配。零匹配是正常且合法的结果，此时 selectedSkillIds=[]，后续使用通用流程。selectedSkillIds 是本轮完整集合，continue/supplement 也必须移除不再适用或上轮误选的 Skill，程序不会自动并集。以下示例只说明各分支的合法格式，实际分类、关系和约束必须依据用户输入，不得照抄示例作默认决策。
 咨询类 intent 为 answer，relation 只能选 side_question 或 cancel_goal；answer 非空，其余字段按本分支协议输出。示例：
 {"intent":"answer","relation":"side_question","answer":"uptime 用于读取系统运行时间和负载。","constraints":null,"terminalContextLines":0,"selectedSkillIds":[]}
-执行类 intent 为 execute，relation 只能选 new_goal、continue、supplement 或 replace_goal；answer 为空。constraints.changePolicy 只能选 read_only、requested_changes_only 或 allow_necessary_changes；environmentPolicy 只能选 unspecified、preserve、allow_isolated_changes 或 allow_host_changes；failurePolicy 只能选 unspecified、strict 或 best_effort。三个约束数组只记录用户明确要求；selectedSkillIds 只包含当前目录中实际匹配的 Skill。首次只读查询且无额外明确约束、无匹配 Skill 时的示例：
+执行类 intent 为 execute，relation 只能选 new_goal、continue、supplement 或 replace_goal；answer 为空。三个策略字段仅使用上方分类约束共享契约给出的枚举，禁止空字符串。三个约束数组只记录用户明确要求；selectedSkillIds 只包含当前目录中实际匹配的 Skill。首次只读查询且无额外明确约束、无匹配 Skill 时的示例：
 {"intent":"execute","relation":"new_goal","answer":"","constraints":{"changePolicy":"read_only","environmentPolicy":"unspecified","failurePolicy":"unspecified","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},"terminalContextLines":0,"selectedSkillIds":[]}
 需要更多终端内容时 intent 为 terminal_context，relation 为 null；terminalContextLines 按前述 includedLines、totalLines 和 400 行上限选择，以下 80 仅说明字段类型，不是默认请求行数。示例：
 {"intent":"terminal_context","relation":null,"answer":"","constraints":null,"terminalContextLines":80,"selectedSkillIds":[]}
@@ -308,7 +329,7 @@ fn is_scoped_protocol_repair(context: &str) -> bool {
     })
 }
 const GENERAL_REQUIREMENT_SYSTEM: &str = r#"你是通用运维需求分类、任务关系判断与 Skill 编排器，本阶段不生成计划。先将用户本次输入和 context.taskGoal.rootGoal 比较，区分继续、补充、旁问、独立新目标、明确替换或取消；不得让‘继续部署’、‘重试’取代整体目标，也不得让临时问题破坏原任务。判断用户是仅需要不依赖当前环境的知识性回答，还是需要读取或改变真实目标环境。需要当前状态、真实数据或任何环境变更时必须返回 execute。
-执行意图已明确但目标有歧义、缺少必要用户决定或授权时，仍返回 execute，由后续规划通过 user.request_input 询问并等待；本阶段不得用 answer 代替执行前澄清，也不得增加契约外分类字段或猜测替代目标。用户回答已有待决问题通常是 supplement；‘继续、托管、批准’不替代未回答的具体问题，也不自动扩大授权。对 execute 必须用 constraints.changePolicy 明确表达本轮只读或变更边界，不得返回 unspecified；依据当前任务中用户已经明确的操作提取边界，复用仍然有效的授权，任务中尚无变更授权时为 read_only。
+执行意图已明确但目标有歧义、缺少必要用户决定或授权时，仍返回 execute，由后续规划通过 user.request_input 询问并等待；本阶段不得用 answer 代替执行前澄清，也不得增加契约外分类字段或猜测替代目标。用户回答已有待决问题通常是 supplement；‘继续、托管、批准’不替代未回答的具体问题，也不自动扩大授权。对 execute 必须用 constraints.changePolicy 明确表达本轮只读或变更边界，不得返回 unspecified；依据当前任务中用户已经明确的操作提取边界，复用仍然有效的授权，任务中仅允许查询时为 read_only；明确要求确认后变更时为 confirm_changes，只有对应精确候选确认才能执行专用变更，普通表单回答不扩大权限。
 从系统提供的 Skill 目录中依据名称、适用场景和选择提示进行语义选择，允许复合需求选择零个、一个或多个 Skill；没有直接适用 Skill 时必须返回空数组并使用通用流程，不得选择最相近的 Skill 凑数，也不得编造目录外 Skill。environmentPolicy、failurePolicy 和其他结构化约束只能来自用户明确表达，不得猜测或自行增加。"#;
 const GENERAL_SUMMARY_SYSTEM: &str = "你是通用运维结果总结器。仅根据当前轮用户目标和当前轮脱敏的真实执行证据总结，不得用旧轮证据回答新的状态问题。结构化 result、evidence.facts 和 evidence.scope 优先于预期文本和旧总结。证据只能证明自己的 scope/persistence：agent_session 成功不证明用户已打开 Shell 或新 Shell 自动加载，显式 source 成功不证明启动文件会自动加载。有效的“未发现”、“非健康”或“警告”是观察结果，不等于命令执行失败。若存在关键失败且无后续证据证明目标已达成，必须明确说明任务未完成、最终阻断、已确认结果和尚未满足的目标。不得虚构、输出命令或泄露敏感信息。使用一至三段中文纯文本。";
 const GENERAL_REVIEW_SYSTEM: &str = r#"你是运维执行复核员。根据用户目标、trigger、executionConstraints、当前步骤或 baseSnapshot 的结构化结果、关键错误和剩余步骤，判断 continue、adjust 或 complete。priorVerifiedFacts 只用于避免重复，不能代替当前状态证据。不得把失败改写为成功，不得虚构证据、命令或授权。证据作用域必须与 expected 一致。存在授权内的确定恢复路径且必要用户决定已明确时 continue；已阻断、证据不足或作用域不匹配时 adjust；只有目标被真实且作用域匹配的证据充分证明时 complete。安全拦截、审批、执行结果和程序门禁不可被覆盖。
@@ -338,6 +359,8 @@ struct AiPlanStep {
     command: String,
     #[serde(default)]
     expected: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_evidence_requirements")]
+    evidence_requirements: Option<Vec<PlanEvidenceKind>>,
     #[serde(default)]
     validation: String,
     #[serde(default)]
@@ -369,6 +392,8 @@ struct AiPlanStepWire {
     description: String,
     #[serde(default)]
     expected: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_evidence_requirements")]
+    evidence_requirements: Option<Vec<PlanEvidenceKind>>,
     #[serde(default)]
     validation: String,
     #[serde(default)]
@@ -396,6 +421,7 @@ impl<'de> Deserialize<'de> for AiPlanStep {
             title: wire.title,
             description: wire.description,
             expected: wire.expected,
+            evidence_requirements: wire.evidence_requirements,
             validation: wire.validation,
             risk: wire.risk,
             execution_scope: wire.execution_scope,
@@ -484,7 +510,7 @@ impl Default for AiGenerationSettings {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AiRequirementDecision {
     intent: String,
@@ -773,25 +799,15 @@ fn normalize_execution_constraints(
     ExecutionConstraints {
         change_policy: normalize_policy(
             constraints.change_policy,
-            &[
-                "unspecified",
-                "read_only",
-                "requested_changes_only",
-                "allow_necessary_changes",
-            ],
+            classification_contract::CHANGE_POLICIES,
         ),
         environment_policy: normalize_policy(
             constraints.environment_policy,
-            &[
-                "unspecified",
-                "preserve",
-                "allow_isolated_changes",
-                "allow_host_changes",
-            ],
+            classification_contract::ENVIRONMENT_POLICIES,
         ),
         failure_policy: normalize_policy(
             constraints.failure_policy,
-            &["unspecified", "strict", "best_effort"],
+            classification_contract::FAILURE_POLICIES,
         ),
         prohibited_actions: normalize_items(constraints.prohibited_actions),
         required_conditions: normalize_items(constraints.required_conditions),
@@ -833,7 +849,9 @@ fn classification_contract_error(
                 if !decision.answer.trim().is_empty() {
                     "执行类响应的 answer 必须为空字符串".to_string()
                 } else if !execute_constraints_match_contract(&decision.constraints) {
-                    "执行类响应的 constraints 必须包含合法字段且 changePolicy 不得为 unspecified".to_string()
+                    classification_contract::invalid(&decision.constraints)
+                        .map(|issue| format!("执行类响应字段 {} 未通过约束契约校验（{}）", issue.json_pointer.unwrap_or_default(), issue.keyword.unwrap_or_default()))
+                        .unwrap_or_else(|| "执行类响应的约束未通过校验".into())
                 } else if decision.terminal_context_lines != 0 {
                     "执行类响应的 terminalContextLines 必须为 0".to_string()
                 } else {
@@ -855,19 +873,7 @@ fn classification_contract_error(
 }
 
 fn execute_constraints_match_contract(value: &Value) -> bool {
-    let Ok(constraints) = serde_json::from_value::<ExecutionConstraints>(value.clone()) else {
-        return false;
-    };
-    matches!(
-        constraints.change_policy.as_str(),
-        "read_only" | "requested_changes_only" | "allow_necessary_changes"
-    ) && matches!(
-        constraints.environment_policy.as_str(),
-        "unspecified" | "preserve" | "allow_isolated_changes" | "allow_host_changes"
-    ) && matches!(
-        constraints.failure_policy.as_str(),
-        "unspecified" | "strict" | "best_effort"
-    )
+    classification_contract::invalid(value).is_none()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -934,6 +940,10 @@ fn unix_seconds() -> u64 {
 fn model_tool_id(step: &AiPlanStep) -> Option<&str> { step.action.as_ref().and_then(StepAction::tool_id) }
 
 fn validate_step_action(step: &AiPlanStep) -> Result<(), String> {
+    if step.evidence_requirements.as_ref().is_some_and(|kinds| kinds.len() > 1
+        || (!kinds.is_empty() && model_tool_id(step).is_none())) {
+        return Err("evidenceRequirements 的 file_content 仅支持具有正文输出契约的工具，且不得重复".into());
+    }
     let action = step.action.as_ref().ok_or("缺少结构化 action；旧工具命令字符串已停用")?;
     match action {
         StepAction::Shell { command } => {
@@ -1119,6 +1129,7 @@ fn convert_ai_plan_steps(raw_steps: Vec<AiPlanStep>) -> Result<Vec<PlanStep>, St
                 command,
                 risk: risk.into(),
                 expected,
+                evidence_requirements: item.evidence_requirements,
                 validation,
                 recovery_rule_version: item.recovery.as_ref().map(|_| recovery_rules::version()),
                 recovery: item.recovery,
@@ -1637,6 +1648,11 @@ fn focused_plan_repair_context(
         .ok_or_else(|| "局部计划修复上下文必须是 JSON 对象".to_string())?;
     let mut focused = Map::new();
     focused.insert("workflowPhase".into(), json!("focused_plan_repair"));
+    if recovery_rules::decode_issue(error).is_some_and(|issue|
+        ["OBSERVE_COMMAND_MUTATION", "RECOVERY_DIAGNOSE_MUTATION"].contains(&issue.code.as_str()))
+    {
+        focused.insert("readOnlyPlanProtocol".into(), recovery_rules::read_only_plan_protocol());
+    }
     focused.insert(
         "repairPolicy".into(),
         json!({
@@ -1799,6 +1815,9 @@ fn apply_recovery_step_repair(
     }
     let original = steps.get(issue.step_index).ok_or_else(|| rejection("PROTOCOL_REPAIR_SCOPE_VIOLATION", "原始步骤不存在"))?;
     let mut old = serde_json::to_value(original).unwrap();
+    if !recovery_rules::current_repair_scope(issue, &old) {
+        return Err(rejection("PROTOCOL_REPAIR_SCOPE_UNKNOWN", "诊断字段与当前共享规则不一致，不允许扩大局部修复范围"));
+    }
     let mut new = serde_json::to_value(&repair.replacement_steps[0]).unwrap();
     for path in &issue.allowed_repair_paths {
         let prefix = format!("steps[{}].", issue.step_index);
@@ -2723,6 +2742,7 @@ async fn execute_ssh_command(
     approved_high_risk: bool,
     execution_id: String,
     separate_output: Option<bool>,
+    private_output: Option<bool>,
 ) -> Result<CommandResult, String> {
     if let Some(rejection) = command_safety_rejection(&command) {
         return Ok(rejection);
@@ -2748,12 +2768,10 @@ async fn execute_ssh_command(
     let id = execution_id.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         let session = connect_ssh(&host, port, &username, &password)?;
-        ssh::ssh_exec_streaming_separated(
-            &session,
-            &id,
-            &command,
-            cancel_flag.as_ref(),
+        ssh::with_command_output_visibility(
+            private_output.unwrap_or(false),
             |chunk, stream| emit_command_output(&app_handle, &id, chunk, stream),
+            |on_output| ssh::ssh_exec_streaming_separated(&session, &id, &command, cancel_flag.as_ref(), on_output),
         )
         .map(|(output, stdout, stderr, truncated, status)| (command, output, stdout, stderr, truncated, status))
     })
@@ -3326,30 +3344,56 @@ async fn process_ai_requirement(
     generation_settings: Option<AiGenerationSettings>,
     timeout_seconds: Option<u64>,
 ) -> Result<RequirementProcessingResult, String> {
+    let developer_log_path = developer_model_log_path(&app);
+    process_requirement_with_log(api_key, endpoint, model, requirement, context,
+        skill_definitions, generation_settings, timeout_seconds, developer_log_path.as_deref(),
+        requirement_planning::enabled(std::env::var("OPSARK_REQUIREMENT_JOINT_PLANNING").ok().as_deref())).await
+}
+
+async fn process_requirement_with_log(
+    api_key: String,
+    endpoint: String,
+    model: String,
+    requirement: String,
+    context: String,
+    skill_definitions: Vec<ModelSkillDefinition>,
+    generation_settings: Option<AiGenerationSettings>,
+    timeout_seconds: Option<u64>,
+    developer_log_path: Option<&Path>,
+    joint_planning: bool,
+) -> Result<RequirementProcessingResult, String> {
     let context = model_budget::ensure_context(&context)?;
     let timeout_seconds = normalize_model_timeout(timeout_seconds);
+    if joint_planning && requirement_planning::eligible(&context, &requirement, &skill_definitions) {
+        return requirement_planning::process(&api_key, &endpoint, &model, &requirement, &context,
+            &skill_definitions, generation_settings.unwrap_or_default(), timeout_seconds, developer_log_path).await;
+    }
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
-    let system = format!("{}\n{}", GENERAL_REQUIREMENT_SYSTEM, requirement_contract::UPDATE_RULE);
+    let system = format!("{}\n{}", GENERAL_REQUIREMENT_SYSTEM, requirement_contract::update_rule());
     let mut last_error = "模型未返回需求理解结果".to_string();
+    let mut focus_repair = None;
     let mut valid_decision = None;
     let mut developer_trace = ModelDeveloperTrace::default();
-    let developer_log_path = developer_model_log_path(&app);
     let classification_context = requirement_classification_context(&context)
         .map_err(|error| traced_model_error(error, &developer_trace))?;
     for attempt in 0..STRUCTURED_OUTPUT_ATTEMPTS {
         let correction = if attempt == 0 {
             String::new()
+        } else if focus_repair.is_some() {
+            format!("\n\n上次分类错误：{last_error}。仅修正指定字段；保留原对象其他字段，不得重新分类或扩大授权。")
         } else {
             format!(
                 "\n\n上次输出未通过需求分类结构校验：{last_error}。请丢弃上次输出，严格按分类契约重新返回完整对象，不得输出 steps 或计划字段。"
             )
         };
+        let prompt_context = focus_repair.as_ref().map(|repair: &Value| repair.to_string())
+            .unwrap_or_else(|| classification_context.clone());
         let body = json!({
             "_opsarkContext": classification_context,
             "model": model,
             "messages": [
-                {"role": "system", "content": format!("{system}\n{SECRET_PLACEHOLDER_RULE}\n{REQUIREMENT_CLASSIFICATION_CONTRACT}\n{REQUIREMENT_RELATION_RULE}\n{STRICT_JSON_OUTPUT_RULE}")},
-                {"role": "user", "content": format!("服务器上下文：\n{classification_context}\n\n用户输入：\n{requirement}\n\n严格按系统消息中的分类契约返回。{correction}")}
+                {"role": "system", "content": format!("{system}\n{SECRET_PLACEHOLDER_RULE}\n{}\n{REQUIREMENT_CLASSIFICATION_CONTRACT}\n{REQUIREMENT_RELATION_RULE}\n{STRICT_JSON_OUTPUT_RULE}", classification_contract::rule())},
+                {"role": "user", "content": format!("分类上下文：\n{prompt_context}\n\n用户输入：\n{requirement}\n\n严格按系统消息中的分类契约返回。{correction}")}
             ],
             "thinking": {"type": "disabled"},
             "response_format": {"type": "json_object"},
@@ -3363,7 +3407,7 @@ async fn process_ai_requirement(
             &body,
             "需求理解",
             timeout_seconds,
-            developer_log_path.as_deref(),
+            developer_log_path,
         )
         .await
         {
@@ -3418,11 +3462,18 @@ async fn process_ai_requirement(
                 .find(|id| !available_skill_ids.contains(id.as_str()))
                 .map(|id| format!("selectedSkillIds 包含未启用或不存在的 Skill：{id}"))
         };
-        let contract_error = classification_contract_error(&decision, skill_selection_error)
+        let classification_error = classification_contract_error(&decision, skill_selection_error);
+        let decision_value = serde_json::to_value(&decision)
+            .map_err(|error| traced_model_error(format!("需求分类序列化失败：{error}"), &developer_trace))?;
+        let contract_error = classification_error.clone()
             .or_else(|| requirement_contract::validate_update(&decision.intent, decision.relation.as_deref(),
-                decision.requirement_update.as_ref(), &context, &requirement));
+                decision.requirement_update.as_ref(), &context, &requirement))
+            .or_else(|| focus_repair.as_ref().and_then(|repair| requirement_contract::validate_focus_repair(repair, &decision_value)));
         if let Some(error) = contract_error {
             last_error = error;
+            if focus_repair.is_none() && classification_error.is_none() {
+                focus_repair = requirement_contract::focus_repair(&decision_value, &context, &requirement);
+            }
             record_model_attempt(
                 &mut developer_trace,
                 "requirement_classification",
@@ -3513,7 +3564,7 @@ async fn process_ai_requirement(
         generation_settings,
         timeout_seconds,
         &mut developer_trace,
-        developer_log_path.as_deref(),
+        developer_log_path,
     )
     .await;
     let (plan, plan_error) = match plan_result {
@@ -3657,6 +3708,7 @@ async fn check_ai_model(
     integration: Option<Value>,
     mode: Option<String>,
     timeout_seconds: Option<u64>,
+    context: Option<String>,
 ) -> Result<ModelCheckResult, String> {
     let timeout_seconds = normalize_model_timeout(timeout_seconds);
     let explicit_probe = mode.as_deref();
@@ -3665,8 +3717,11 @@ async fn check_ai_model(
         let structured = explicit_probe != Some("parameters") && (capabilities.is_some() || integration.is_some() || explicit_probe.is_some());
         let business = explicit_probe == Some("business");
         let probe_mode = if business {"business"} else if structured {"structured"} else {"parameters"};
-        let (body, operation) = model::probe_body(&model, probe_mode, request_parameters, capabilities, integration)?;
-        let payload = post_model_request(&format!("{}/chat/completions", endpoint.trim_end_matches('/')), &api_key, &body, operation, timeout_seconds, None).await?;
+        let protocol=integration.as_ref().and_then(|value|value["apiProtocol"].as_str().or_else(||value["capabilitiesV2"]["preferredProtocol"].as_str()));
+        let (url,probe)=model_probe::scope(&endpoint,&model,&api_key,protocol)?;
+        let (mut body, operation) = model::probe_body(&model, probe_mode, request_parameters, capabilities, integration)?;
+        model_probe::bind_context(&mut body,context.as_deref(),&probe)?;
+        let payload = post_model_request(&url, &api_key, &body, operation, timeout_seconds, None).await?;
         let content = message_content(&payload, "模型测试没有返回文本")?;
         if business {
             let value:Value=serde_json::from_str(content).map_err(|_| "模型业务测试结果不是 JSON".to_string())?;
@@ -3887,11 +3942,100 @@ async fn review_ai_step(
     ))
 }
 
+#[tauri::command]
+fn register_task_model_budget(registration: task_model_budget::TaskBudgetRegistration) -> Result<Value, String> {
+    task_model_budget::register(registration)
+}
+
+#[tauri::command]
+fn query_task_model_budget(task_id: String, round_id: String) -> Result<Value, String> {
+    task_model_budget::query(&task_id, &round_id)
+}
+
+#[tauri::command]
+fn list_task_model_requests(task_id: String) -> Result<Value, String> {
+    model_request_lifecycle::list_requests(&task_id).map(public_model_request_records)
+}
+
+#[tauri::command]
+fn list_model_probe_requests(endpoint:String,model:String,api_key:String,api_protocol:Option<String>) -> Result<Value,String> {
+    let (_,scope)=model_probe::scope(&endpoint,&model,&api_key,api_protocol.as_deref())?;
+    model_request_lifecycle::list_probe_requests(&scope).map(public_model_request_records)
+}
+
+#[tauri::command]
+fn cancel_model_probe_requests(endpoint:String,model:String,api_key:String,api_protocol:Option<String>) -> Result<Value,String> {
+    let (_,scope)=model_probe::scope(&endpoint,&model,&api_key,api_protocol.as_deref())?;
+    model_request_lifecycle::cancel_probe_requests(&scope).map(public_model_request_records)
+}
+
+#[tauri::command]
+async fn recover_model_probe_request(endpoint:String,model:String,api_key:String,api_protocol:Option<String>,request_id:String) -> Result<Value,String> {
+    let (url,scope)=model_probe::scope(&endpoint,&model,&api_key,api_protocol.as_deref())?;
+    model::recover_persisted_model_probe(&scope,&request_id,&url,&api_key).await.map(public_model_request_records)
+}
+
+fn public_model_request_records(mut value: Value) -> Value {
+    fn strip(record: &mut Value) {
+        if let Some(object) = record.as_object_mut() {
+            object.retain(|key, _| matches!(key.as_str(), "requestId" | "operationId" | "taskId" | "roundId" | "state" | "phase" | "cancelRequested" | "late" | "httpStatus" | "usage" | "createdAtMs" | "updatedAtMs"));
+        }
+    }
+    if let Some(records) = value.as_array_mut() { records.iter_mut().for_each(strip); }
+    else { strip(&mut value); }
+    value
+}
+
+#[cfg(test)]
+mod model_accounting_command_tests {
+    use super::*;
+    #[test]
+    fn request_projection_keeps_status_without_provider_body_or_credential_fingerprint() {
+        let raw = json!({"requestId":"original","taskId":"task","state":"unknown","cancelRequested":true,
+            "response":{"private":"not-for-ui"},"credentialDigest":"private-hash","endpoint":"https://provider.invalid/v1",
+            "events":[{"response":"private"}],"usage":{"total_tokens":19}});
+        for value in [raw.clone(),json!([raw])] {
+            let result = public_model_request_records(value);
+            let text = result.to_string();
+            assert!(text.contains("original"));
+            assert!(text.contains("cancelRequested"));
+            assert!(!text.contains("private"));
+            assert!(!text.contains("endpoint"));
+        }
+    }
+    #[test]
+    fn original_request_lookup_uses_the_same_endpoint_normalization_as_model_calls() {
+        assert_eq!(model_protocol::endpoint("http://127.0.0.1:18765/v1", "chat_completions").unwrap(),
+            "http://127.0.0.1:18765/v1/chat/completions");
+        assert_eq!(model_protocol::endpoint("http://127.0.0.1:18765/v1/chat/completions", "chat_completions").unwrap(),
+            "http://127.0.0.1:18765/v1/chat/completions");
+    }
+}
+
+#[tauri::command]
+fn cancel_current_task_model_requests(task_id: String) -> Result<Value, String> {
+    model_request_lifecycle::cancel_current_task_requests(&task_id).map(public_model_request_records)
+}
+
+#[tauri::command]
+fn cancel_task_model_request(task_id: String, request_id: String) -> Result<Value, String> {
+    model_request_lifecycle::request_cancel(&task_id, Some(&request_id)).map(public_model_request_records)
+}
+
+#[tauri::command]
+async fn recover_task_model_request(task_id: String, request_id: String, endpoint: String, api_key: String, api_protocol: Option<String>, accounting_only: Option<bool>) -> Result<Value, String> {
+    let url = model_protocol::endpoint(&endpoint, api_protocol.as_deref().unwrap_or("chat_completions"))?;
+    model::lookup_persisted_model_request(&task_id, &request_id, &url, &api_key, accounting_only.unwrap_or(false)).await.map(public_model_request_records)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     model_budget::initialize_runtime();
     tauri::Builder::default()
         .setup(|app| {
+            let local_data = app.path().app_local_data_dir()?;
+            task_model_budget::initialize(&local_data).map_err(std::io::Error::other)?;
+            model_request_lifecycle::initialize(&local_data).map_err(std::io::Error::other)?;
             app.manage(credential::CredentialVaultState::new(app.path().app_local_data_dir()?));
             Ok(())
         })
@@ -3904,6 +4048,15 @@ pub fn run() {
             account::account_request,
             cloud::cloud_request,
             official_content::official_content_request,
+            register_task_model_budget,
+            query_task_model_budget,
+            list_task_model_requests,
+            list_model_probe_requests,
+            cancel_model_probe_requests,
+            recover_model_probe_request,
+            cancel_task_model_request,
+            cancel_current_task_model_requests,
+            recover_task_model_request,
             execution_permissions::configure_task_execution,
             local_terminal::open_local_terminal,
             local_terminal::write_local_terminal,
@@ -3973,3 +4126,9 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running Opsark");
 }
+
+#[cfg(test)]
+mod structured_evidence_tests;
+
+#[cfg(test)]
+mod requirement_contract_stage29_tests;

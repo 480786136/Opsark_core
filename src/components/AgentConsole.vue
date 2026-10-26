@@ -54,11 +54,16 @@ import {
   currentConversationTimeline,
 } from "@/features/agent/conversationHistory";
 import { modelServiceErrorMessage, restoreLegacyPlanProtocolFailure } from "@/services/backend";
-import { isExplicitModelPlanningRetryable, isModelRecoveryScopeRejection } from "@/services/modelRecovery";
+import { reconciledModelStopMessage } from "@/services/taskModelRequests";
+import { parseCandidateRejection } from "@/services/candidateRejection";
+import { isModelRecoveryScopeRejection } from "@/services/modelRecovery";
 import { localizeCoreText } from "@/features/preferences/coreText";
 import { useAccountStore } from "@/features/account/accountStore";
 import { useOfficialCatalogStore } from "@/features/account/officialCatalogStore";
 import { formatCredits } from "@/features/account/credits";
+import TaskModelAccounting from "./TaskModelAccounting.vue";
+import TaskExecutionTiming from "./TaskExecutionTiming.vue";
+import { createTaskModelBudget } from "@/features/agent/taskModelBudget";
 
 const props = defineProps<{ serverId: string; active?: boolean }>();
 const showDevelopmentFeatures = import.meta.env.DEV;
@@ -84,6 +89,7 @@ const modelId = persistedField("modelId");
 const automationEnabled = persistedField("automationEnabled");
 const checkingModels = ref(false);
 const showModelSettings = ref(false);
+const draftModelBudget = ref(createTaskModelBudget());
 const showTasks = persistedField("showTasks");
 const expandedSteps = ref<string[]>([]);
 const expandedRounds = ref<string[]>([]);
@@ -177,23 +183,34 @@ const modelCreditsTitle = computed(() => task.value?.modelPlanningBlocker
     ? "agent.modelCreditsReconciliation" : "agent.modelCreditsPaused")
   : "");
 const modelRecoveryScopeRejected = computed(() => isModelRecoveryScopeRejection(task.value?.modelPlanningBlocker?.error));
-const modelFormatFailure = computed(() => task.value?.modelPlanningBlocker?.error.code === "MODEL_FORMAT_INVALID" && !modelRecoveryScopeRejected.value);
+const modelRequirementFailure = computed(() => task.value?.modelPlanningBlocker?.error.code === "MODEL_REQUIREMENT_INVALID");
+const modelFormatFailure = computed(() => modelRequirementFailure.value || task.value?.modelPlanningBlocker?.error.code === "MODEL_FORMAT_INVALID" && !modelRecoveryScopeRejected.value);
 const modelRecoveryLimitReached = computed(() => task.value?.modelPlanningBlocker?.error.code === "MODEL_RECOVERY_BUDGET_EXHAUSTED");
-const explicitModelRetryAvailable = computed(() => isExplicitModelPlanningRetryable(task.value?.modelPlanningBlocker?.error));
+const modelAccountingFailure = computed(() => {
+  const error = task.value?.modelPlanningBlocker?.error;
+  return error?.origin === "core" && ["task_budget", "request_lifecycle", "request_recovery"].includes(error.stage ?? "");
+});
+const explicitModelRetryAvailable = computed(() => Boolean(task.value && store.canExplicitlyRetryModelPlanning(task.value)));
 const formatRetryBlocked = computed(() => Boolean(task.value?.requirementProcessing || task.value?.adjustmentInProgress
-  || task.value?.cancelRequested || modelRecoveryLimitReached.value && !explicitModelRetryAvailable.value));
+  || task.value?.cancelRequested || (modelRecoveryLimitReached.value || modelAccountingFailure.value) && !explicitModelRetryAvailable.value));
 const retryPlanningTitle = computed(() => task.value?.requirementProcessing || task.value?.adjustmentInProgress
   ? t("agent.formatRetryBlocked") : undefined);
 const modelCompatibilityTitle = computed(() => task.value?.modelPlanningBlocker && !modelCreditsTitle.value
-  ? t(modelRecoveryScopeRejected.value ? "agent.modelRecoveryScopePaused" : modelFormatFailure.value ? "agent.modelFormatPaused" : modelRecoveryLimitReached.value ? "agent.modelRecoveryPaused"
+  ? modelAccountingFailure.value
+    ? task.value.modelPlanningBlocker.error.stage === "task_budget"
+      ? locale.value.startsWith("en") ? "Task token budget paused" : "任务模型额度已暂停"
+      : locale.value.startsWith("en") ? "Model request needs review" : "模型请求需要核对"
+    : modelRequirementFailure.value ? locale.value.startsWith("en") ? "Requirement response rejected" : "需求响应未通过校验"
+    : t(modelRecoveryScopeRejected.value ? "agent.modelRecoveryScopePaused" : modelFormatFailure.value ? "agent.modelFormatPaused" : modelRecoveryLimitReached.value ? "agent.modelRecoveryPaused"
     : task.value.modelPlanningBlocker.error.code === "MODEL_OUTPUT_TRUNCATED" ? "agent.modelOutputTruncated" : "agent.modelCompatibilityPaused") : "");
 const usesOfficialModel = computed(() => store.models.find(model => model.id === task.value?.modelId)?.source === "official");
-const modelPauseDetail = computed(() => modelRecoveryScopeRejected.value && task.value?.modelPlanningBlocker
+const modelPauseDetail = computed(() => reconciledModelStopMessage(task.value) ?? ((modelRequirementFailure.value || modelRecoveryScopeRejected.value || modelAccountingFailure.value
+  || parseCandidateRejection(task.value?.modelPlanningBlocker?.error.candidateRejection)) && task.value?.modelPlanningBlocker
   ? coreText(modelServiceErrorMessage(task.value.modelPlanningBlocker.error))
   : modelRecoveryLimitReached.value && explicitModelRetryAvailable.value
   ? t("agent.modelRecoveryRetryHint")
   : usesOfficialModel.value && modelCompatibilityTitle.value && !modelFormatFailure.value && !modelRecoveryLimitReached.value
-    ? t("agent.officialModelCompatibilityHint") : coreText(task.value?.pauseReason ?? ""));
+    ? t("agent.officialModelCompatibilityHint") : coreText(task.value?.pauseReason ?? "")));
 const currentPlanAction = computed(() => task.value ? planAction(task.value) : "continuation");
 const normalContinuation = computed(() => Boolean(task.value && isNormalContinuation(task.value)));
 const planningCopy = computed(() => ({
@@ -533,7 +550,7 @@ async function submit() {
   showTasks.value = false;
   let selectedTask = task.value;
   if (!selectedTask) {
-    selectedTask = store.createTask(props.serverId, permission.value, modelId.value);
+    selectedTask = store.createTask(props.serverId, permission.value, modelId.value, draftModelBudget.value);
     agentWorkspaces.updateServer(props.serverId, { activeTaskId: selectedTask.id });
   }
   if (submissionErrorState.value?.taskId === selectedTask.id) submissionErrorState.value = undefined;
@@ -608,6 +625,10 @@ async function submit() {
 async function retryPlanning() {
   const current = task.value;
   if (!current) return;
+  if (current.pendingRequirements?.length) {
+    await store.retryModelPlanning(current.id);
+    return;
+  }
   if (explicitModelRetryAvailable.value) {
     await store.retryModelPlanning(current.id);
     return;
@@ -811,6 +832,14 @@ onBeforeUnmount(() => {
 <template>
   <section class="work-panel agent-panel">
     <p v-if="store.taskCacheReadError" class="evidence-warning task-cache-recovery-warning" role="alert">{{ store.taskCacheReadError }}</p>
+    <p v-if="store.persistenceWarning && !store.taskCacheReadError" class="evidence-warning task-persistence-warning" role="alert">
+      {{ store.persistenceWarning }}
+      <button type="button" @click="store.persist(true)">重试保存记录</button>
+    </p>
+    <p v-if="task?.evidenceArchiveWarning" class="evidence-warning task-evidence-archive-warning" role="alert">
+      {{ task.evidenceArchiveWarning }}
+      <button type="button" @click="store.retryTaskEvidenceArchive(task.id)">重试保存证据</button>
+    </p>
     <header class="agent-header">
       <div class="agent-title">
         <span class="agent-title-icon"><Bot :size="17" /></span>
@@ -1209,7 +1238,7 @@ onBeforeUnmount(() => {
               </span>
               <button class="button secondary" @click="store.rejectTask(task.id)">{{ t("agent.endTask") }}</button>
               <button v-if="modelCreditsTitle" class="button secondary" @click="router.push(usesOfficialModel ? '/account' : '/models')">{{ t(usesOfficialModel ? 'agent.manageModelCredits' : 'agent.manageModels') }}</button>
-              <button v-else-if="modelCompatibilityTitle && !modelFormatFailure && !modelRecoveryScopeRejected && !modelRecoveryLimitReached" class="button secondary" @click="showModelSettings = true">{{ t(usesOfficialModel ? 'agent.viewModelOptions' : 'agent.adjustModelSettings') }}</button>
+              <button v-else-if="modelCompatibilityTitle && !modelAccountingFailure && !modelFormatFailure && !modelRecoveryScopeRejected && !modelRecoveryLimitReached" class="button secondary" @click="showModelSettings = true">{{ t(usesOfficialModel ? 'agent.viewModelOptions' : 'agent.adjustModelSettings') }}</button>
               <button class="button primary" :disabled="formatRetryBlocked" :title="retryPlanningTitle" @click="retryPlanning">{{ t("agent.retryPlanning") }}</button>
             </div>
             <div v-else-if="task.status === 'awaiting_continuation' && currentRequestCompleted(task)" class="approval-bar continuation">
@@ -1227,12 +1256,12 @@ onBeforeUnmount(() => {
                   <strong>{{ adjustmentLabel }}</strong>
                   <small v-if="task.pauseReason">{{ modelPauseDetail }}</small>
                   <small v-if="normalContinuation">{{ t('agent.nextPlanHint') }}</small>
-                  <small v-else-if="currentPlanAction === 'blocked' && !task.protocolRepair && !modelFormatFailure && !modelRecoveryScopeRejected && !modelRecoveryLimitReached">{{ t(task.latestGoalReview?.decision.decision === 'adjust' && task.latestGoalReview.nextPlan?.length === 0 ? 'agent.noActionHint' : 'agent.nextStepBlockedHint') }}</small>
+                  <small v-else-if="currentPlanAction === 'blocked' && !task.protocolRepair && !modelAccountingFailure && !modelFormatFailure && !modelRecoveryScopeRejected && !modelRecoveryLimitReached">{{ t(task.latestGoalReview?.decision.decision === 'adjust' && task.latestGoalReview.nextPlan?.length === 0 ? 'agent.noActionHint' : 'agent.nextStepBlockedHint') }}</small>
                 </span>
               </span>
               <button class="button secondary" @click="store.rejectTask(task.id)">{{ t(task.protocolRepair || needsExecutionReconciliation ? "agent.keepResultsAndEnd" : "agent.endTask") }}</button>
               <button v-if="modelCreditsTitle" class="button secondary" @click="router.push(usesOfficialModel ? '/account' : '/models')">{{ t(usesOfficialModel ? 'agent.manageModelCredits' : 'agent.manageModels') }}</button>
-              <button v-else-if="modelCompatibilityTitle && !modelFormatFailure && !modelRecoveryScopeRejected && !modelRecoveryLimitReached" class="button secondary" @click="showModelSettings = true">{{ t(usesOfficialModel ? 'agent.viewModelOptions' : 'agent.adjustModelSettings') }}</button>
+              <button v-else-if="modelCompatibilityTitle && !modelAccountingFailure && !modelFormatFailure && !modelRecoveryScopeRejected && !modelRecoveryLimitReached" class="button secondary" @click="showModelSettings = true">{{ t(usesOfficialModel ? 'agent.viewModelOptions' : 'agent.adjustModelSettings') }}</button>
               <span v-if="isWaitingForTerminalRecovery" class="managed-approval-countdown">
                 <LoaderCircle class="spin" :size="13" />{{ t('agent.waitingTerminalRecovery') }}
               </span>
@@ -1339,6 +1368,8 @@ onBeforeUnmount(() => {
           />
           <button class="send-button" type="submit" :disabled="!input.trim() || Boolean(isBusy) || !modelId || !connectionReady" :title="connectionReady ? undefined : t('agent.sshReconnectRequired')"><Send :size="16" /></button>
         </div>
+        <TaskModelAccounting v-if="showDevelopmentFeatures" :task="task" :draft-policy="draftModelBudget" @policy="draftModelBudget = $event" />
+        <TaskExecutionTiming v-if="showDevelopmentFeatures && task" :task="task" />
       </form>
     </template>
     <ModelSettingsModal

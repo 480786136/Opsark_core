@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import { backend } from "@/services/backend";
+import { backend, ModelInvocationError } from "@/services/backend";
 import { useConnectionStore } from "@/features/connection/connectionStore";
 import { useOpsStore } from "./ops";
 import { modelTaskRequirementSnapshot } from "@/features/agent/taskGoal";
@@ -76,6 +76,114 @@ describe("requirement lifecycle through task submission and restart", () => {
     expect(task.requirementLifecycle?.revision).toBe(1);
     return { store, task };
   }
+
+  it("blocks every old-plan approval and dispatch after requirement classification fails, including restart", async () => {
+    const { store, task } = await submitInitial();
+    const originalPlan = JSON.stringify(task.plan);
+    vi.mocked(backend.processRequirement).mockRejectedValueOnce(new Error("requirementUpdate.focusIds 缺少目标 B"));
+    await store.submitRequirement("server", portInstruction, "safe", "model", "", task.id);
+    expect(task.status).toBe("planning_failed");
+    expect(task.pendingRequirements).toEqual([expect.objectContaining({ content: portInstruction, state: "failed" })]);
+    expect(JSON.stringify(task.plan)).toBe(originalPlan);
+    expect(task.requirementProcessing).toBe(false);
+    // Defend the action entrypoints too, not only the rendered button/state.
+    task.status = "awaiting_plan_approval";
+    await store.approvePlan(task.id);
+    await store.approvePlan(task.id, true);
+    expect(task.planApproval).toBeUndefined();
+    task.status = "running";
+    await store.advanceTask(task.id);
+    await store.runStep(task.id, task.plan[0].id);
+    expect(() => store.assertPreparedStep(task, task.plan[0])).toThrow("未完成理解");
+    store.persist(true);
+    store.$dispose();
+    setActivePinia(createPinia());
+    const restored = useOpsStore().tasks.find(item => item.id === task.id)!;
+    expect(restored.status).toBe("planning_failed");
+    expect(restored.pendingRequirements?.[0]?.content).toBe(portInstruction);
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("persists the barrier and invalidates old callbacks before credential hydration yields", async () => {
+    const { store, task } = await submitInitial();
+    const epoch = task.workflowEpoch!;
+    let release!: () => void;
+    vi.spyOn(store, "hydrateCredentials").mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    vi.mocked(backend.processRequirement).mockRejectedValueOnce(new Error("timeout"));
+    const submission = store.submitRequirement("server", portInstruction, "safe", "model", "", task.id);
+    expect(task.workflowEpoch).toBeGreaterThan(epoch);
+    expect(task.pendingRequirements?.[0]?.state).toBe("pending");
+    expect(JSON.parse(localStorage.getItem("opsark.tasks")!)[0].pendingRequirements[0].content).toBe(portInstruction);
+    await store.approvePlan(task.id, true);
+    expect(task.planApproval).toBeUndefined();
+    release();
+    await submission;
+    expect(task.pendingRequirements?.[0]?.state).toBe("failed");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("a side question and continue cannot clear a previously failed amendment; explicit retry reclassifies it", async () => {
+    const { store, task } = await submitInitial();
+    vi.mocked(backend.processRequirement).mockRejectedValueOnce(new Error("classification failed"));
+    await store.submitRequirement("server", portInstruction, "safe", "model", "", task.id);
+    const pending = JSON.parse(JSON.stringify(task.pendingRequirements));
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({ intent: "answer", relation: "side_question", answer: "端口是监听入口", plan: [] });
+    await store.submitRequirement("server", "端口是什么", "safe", "model", "", task.id);
+    expect(task.pendingRequirements).toEqual(pending);
+    expect(task.status).toBe("planning_failed");
+    vi.mocked(backend.processRequirement).mockImplementationOnce(async (content, runtime) => response(content, runtime.context ?? "{}", "continue", []));
+    await store.submitRequirement("server", "继续", "safe", "model", "", task.id);
+    expect(task.pendingRequirements).toEqual(pending);
+    vi.mocked(backend.processRequirement).mockImplementationOnce(async (content, runtime) => response(content, runtime.context ?? "{}", "supplement", [
+      { id: "port-8081", kind: "constraint", content: portInstruction, sourceQuote: portInstruction, supersedes: ["port-8080"] },
+    ]));
+    await store.retryModelPlanning(task.id);
+    expect(vi.mocked(backend.processRequirement).mock.lastCall?.[0]).toBe(portInstruction);
+    expect(task.pendingRequirements).toBeUndefined();
+    expect(task.status, task.pauseReason).toBe("awaiting_plan_approval");
+    expect(task.preparedPlan?.requirementRevision).toBe(2);
+    expect(task.planApproval).toBeUndefined();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("keeps supplements in submission order after failure instead of silently discarding earlier requirements", async () => {
+    const { store, task } = await submitInitial();
+    vi.mocked(backend.processRequirement).mockRejectedValueOnce(new Error("timeout"));
+    await store.submitRequirement("server", portInstruction, "safe", "model", "", task.id);
+    vi.mocked(backend.processRequirement).mockImplementation(async (content, runtime) => response(content, runtime.context ?? "{}", "supplement", [
+      content === portInstruction
+        ? { id: "port-8081", kind: "constraint", content, sourceQuote: content, supersedes: ["port-8080"] }
+        : { id: "firewall", kind: "goal", content, sourceQuote: content, supersedes: [] },
+    ]));
+    await store.submitRequirement("server", firewallInstruction, "safe", "model", "", task.id);
+    expect(task.requirementLifecycle?.revision).toBe(1);
+    expect(task.pendingRequirements?.map(item => item.content)).toEqual([portInstruction, firewallInstruction]);
+    await store.retryModelPlanning(task.id);
+    expect(task.requirementLifecycle?.revision).toBe(2);
+    expect(task.status).toBe("planning_failed");
+    expect(task.pendingRequirements?.map(item => item.content)).toEqual([firewallInstruction]);
+    await store.retryModelPlanning(task.id);
+    expect(task.requirementLifecycle?.revision).toBe(3);
+    expect(task.status, task.pauseReason).toBe("awaiting_plan_approval");
+    expect(task.pendingRequirements).toBeUndefined();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it("preserves normal side questions but binds plan approval and dispatch to the accepted requirement revision", async () => {
+    const { store, task } = await submitInitial();
+    const original = task.preparedPlan!;
+    vi.mocked(backend.processRequirement).mockResolvedValueOnce({ intent: "answer", relation: "side_question", answer: "仅内网访问", plan: [] });
+    await store.submitRequirement("server", "这个限制是什么意思", "safe", "model", "", task.id);
+    expect(task.status).toBe("awaiting_plan_approval");
+    expect(task.pendingRequirements).toBeUndefined();
+    expect(task.preparedPlan?.executionDigest).toBe(original.executionDigest);
+    expect(() => store.assertPreparedStep(task, task.plan[0])).not.toThrow();
+    task.requirementLifecycle!.revision += 1;
+    expect(() => store.assertPreparedStep(task, task.plan[0])).toThrow("需求版本已失效");
+    const current = store.prepareTaskPlan(task, task.plan, false);
+    expect(current.executionDigest).not.toBe(original.executionDigest);
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
 
   async function completedFirewallObservation() {
     const { store, task } = await submitInitial();
@@ -192,9 +300,11 @@ describe("requirement lifecycle through task submission and restart", () => {
     await vi.waitFor(() => expect(releaseOld).toBeTypeOf("function"));
     const oldEpoch = task.workflowEpoch;
     store.rejectTask(task.id);
-    const latestInstruction = "将端口改为 9090";
+    // Cancelling a classification does not drop the unclassified requirement.
+    // Explicitly retry that same source; a different supplement must wait.
+    const latestInstruction = portInstruction;
     vi.mocked(backend.processRequirement).mockImplementationOnce(async (content, runtime) => response(content, runtime.context ?? "{}", "supplement", [
-      { id: "port-9090", kind: "constraint", content: latestInstruction, sourceQuote: latestInstruction, supersedes: ["port-8080"] },
+      { id: "retried-port-8081", kind: "constraint", content: latestInstruction, sourceQuote: latestInstruction, supersedes: ["port-8080"] },
     ]));
     await store.submitRequirement("server", latestInstruction, "safe", "model", "", task.id);
     expect(task.workflowEpoch).toBeGreaterThan(oldEpoch!);
@@ -205,9 +315,9 @@ describe("requirement lifecycle through task submission and restart", () => {
     await oldSubmission;
     expect(task.requirementLifecycle).toEqual(currentState);
     expect(task.currentRoundId).toBe(currentRound);
-    expect(task.requirementLifecycle?.focus.requirementIds).toEqual(["port-9090"]);
+    expect(task.requirementLifecycle?.focus.requirementIds).toEqual(["retried-port-8081"]);
     expect(task.requirementLifecycle?.items.some(item => item.id === "port-8081")).toBe(false);
-    expect(task.plan[0].id).toBe("read-port-9090");
+    expect(task.plan[0].id).toBe("read-retried-port-8081");
     expect(task.requirementProcessing).toBe(false);
     expect(backend.executeCommand).not.toHaveBeenCalled();
   });
@@ -327,7 +437,29 @@ describe("requirement lifecycle through task submission and restart", () => {
     expect(backend.executeCommand).not.toHaveBeenCalled();
   });
 
-  it("reuses the staged next plan after a requirement review increments the lifecycle revision", async () => {
+  it.each(["candidate", "format_error"] as const)("discard results after a same-ID server record is replaced during model wait: %s", async responseKind => {
+    const { store, task } = await completedFirewallObservation();
+    const revision = task.requirementLifecycle!.revision;
+    const previousPlan = JSON.stringify(task.plan);
+    vi.spyOn(backend, "decideNextStage").mockImplementation(async () => {
+      store.servers = store.servers.map(server => server.id === task.serverId ? { ...server, host: "replaced.invalid" } : server);
+      if (responseKind === "format_error") throw new ModelInvocationError("invalid output", undefined,
+        { code: "MODEL_FORMAT_INVALID", origin: "core", stage: "json_parse", message: "invalid output", retryable: false, dispatchCertainty: "response_received" });
+      return { decision: "continue", reason: "还需独立检查", summary: "旧目标候选", source: "model",
+        steps: [{ id: "obsolete-target-check", title: "旧目标检查", description: "不得交给新目标", kind: "observe", command: "uname -a", validation: "", expected: "读取信息", risk: "low", status: "pending" }],
+        requirementReview: { baseRevision: revision, roundId: task.currentRoundId!, focusOutcome: "pending", overallOutcome: "pending",
+          items: [{ requirementId: "firewall", outcome: "unknown", evidenceIds: ["firewall-proof"], reason: "等待独立验收" }] } };
+    });
+    await store.advanceTask(task.id);
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    expect(task.requirementLifecycle!.revision).toBe(revision);
+    expect(JSON.stringify(task.plan)).toBe(previousPlan);
+    expect(task.latestGoalReview?.nextPlan).toBeUndefined();
+    expect(task.status).not.toBe("completed"); expect(task.status).not.toBe("awaiting_plan_approval");
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+  });
+
+  it.each(["unchanged", "host", "port", "username"] as const)("staged next plan reuse respects the current server identity: %s", async changed => {
     const { store, task } = await completedFirewallObservation();
     vi.spyOn(backend, "decideNextStage").mockResolvedValue({ decision: "continue", reason: "永久规则存在，本轮还需独立核对运行状态",
       summary: "继续执行本轮独立只读验收。", source: "model",
@@ -343,12 +475,24 @@ describe("requirement lifecycle through task submission and restart", () => {
     expect(task.requirementLifecycle?.revision).toBe(3);
     expect(task.latestGoalReview?.nextPlan?.map(step => step.id)).toEqual(["cached-next-check"]);
     expect(task.latestGoalReview?.policyFingerprint).toBeTruthy();
+    if (changed !== "unchanged") {
+      store.servers = store.servers.map(server => server.id === task.serverId
+        ? { ...server, [changed]: changed === "port" ? 2222 : changed === "host" ? "changed.invalid" : "changed-account" }
+        : server);
+      vi.mocked(backend.decideNextStage).mockRejectedValueOnce(new Error("OFFLINE_NEW_TARGET_REPLAN"));
+    }
     await store.requestAdjustment(task.id);
-    expect(task.status, task.pauseReason).toBe("awaiting_plan_approval");
-    expect(task.plan.map(step => step.id)).toEqual(["cached-next-check"]);
-    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    if (changed === "unchanged") {
+      expect(task.status, task.pauseReason).toBe("awaiting_plan_approval");
+      expect(task.plan.map(step => step.id)).toEqual(["cached-next-check"]);
+      expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    } else {
+      expect(backend.decideNextStage).toHaveBeenCalledTimes(2);
+      expect(task.plan.some(step => step.id === "cached-next-check")).toBe(false);
+      expect(task.status).not.toBe("awaiting_plan_approval");
+    }
     expect(task.requirementLifecycle?.revision).toBe(3);
-    expect(task.messages.some(message => message.content.includes("正在采用整体目标判断时已生成的下一阶段计划"))).toBe(true);
+    expect(task.messages.some(message => message.content.includes("正在采用整体目标判断时已生成的下一阶段计划"))).toBe(changed === "unchanged");
     expect(backend.executeCommand).not.toHaveBeenCalled();
   });
 });

@@ -115,6 +115,7 @@ pub(crate) struct OperationBudget(Arc<Mutex<State>>);
 
 pub(crate) struct GenerationBudget {
     pub(crate) request_id: String,
+    pub(crate) generation_index: u64,
     operation: OperationBudget,
     reservation: u64,
 }
@@ -348,6 +349,24 @@ impl OperationBudget {
         Ok(())
     }
 
+    /// A repair must have one full configured observation window left. This
+    /// does not promise completion or extend the original immutable deadline.
+    pub(crate) fn check_repair_window(&self, configured_seconds: u64) -> Result<(), String> {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        Self::check(&state)?;
+        let required = Duration::from_secs(configured_seconds.max(1));
+        let remaining = Duration::from_millis(state.limits.elapsed_ms).saturating_sub(state.started.elapsed());
+        if remaining < required {
+            let mut error: Value = serde_json::from_str(budget_error("MODEL_RECOVERY_BUDGET_EXHAUSTED",
+                "原模型操作剩余时间不足一个完整观察窗口，已停止派发新的修复请求", Some(&state))
+                .strip_prefix(crate::MODEL_TRACE_ERROR_PREFIX).unwrap()).unwrap();
+            error["modelError"]["recoveryBudget"]["remainingWaitMs"] = json!(remaining.as_millis() as u64);
+            error["modelError"]["recoveryBudget"]["requiredWaitMs"] = json!(required.as_millis() as u64);
+            return Err(format!("{}{error}", crate::MODEL_TRACE_ERROR_PREFIX));
+        }
+        Ok(())
+    }
+
     pub(crate) fn start_generation(&self, body: &Value) -> Result<GenerationBudget, String> {
         let reservation = estimate(body)?;
         let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
@@ -364,6 +383,7 @@ impl OperationBudget {
         state.generations += 1;
         Ok(GenerationBudget {
             request_id: crate::task_logs::call_id(),
+            generation_index: state.generations,
             operation: self.clone(),
             reservation,
         })
@@ -432,6 +452,21 @@ impl OperationBudget {
             ));
         }
         Ok(configured.max(1).min(remaining))
+    }
+
+    /// The immutable original operation deadline, including time already spent
+    /// on the generation POST. A status observation never replenishes it.
+    pub(crate) fn recovery_deadline(&self) -> Result<Instant, String> {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        Self::check(&state)?;
+        Ok(state.started + Duration::from_millis(state.limits.elapsed_ms))
+    }
+
+    /// Validated private identity for the durable lifecycle. Parameter/prompt
+    /// projection intentionally removes this metadata from the provider body.
+    pub(crate) fn lifecycle_identity(&self) -> (String, u64) {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        (state.id.clone(), state.started_at_ms)
     }
 
     pub(crate) fn snapshot(&self) -> Value {
@@ -560,6 +595,24 @@ mod tests {
     }
 
     #[test]
+    fn repair_requires_one_observation_window_without_claiming_a_slot_or_renewing_deadline() {
+        let body = body(json!({"maxElapsedMs":360000}));
+        let budget = budget(&body);
+        let deadline = budget.recovery_deadline().unwrap();
+        budget.check_repair_window(90).unwrap();
+        { let mut state = budget.0.lock().unwrap(); state.started = Instant::now() - Duration::from_secs(274); }
+        let before = budget.snapshot();
+        let error = budget.check_repair_window(90).unwrap_err();
+        let error: Value = serde_json::from_str(error.strip_prefix(crate::MODEL_TRACE_ERROR_PREFIX).unwrap()).unwrap();
+        assert_eq!(error["modelError"]["code"],"MODEL_RECOVERY_BUDGET_EXHAUSTED");
+        assert_eq!(error["modelError"]["recoveryBudget"]["requiredWaitMs"],90000);
+        assert!(error["modelError"]["recoveryBudget"]["remainingWaitMs"].as_u64().unwrap()<86001);
+        let after = budget.snapshot();
+        for key in ["generations","transportAttempts","candidateRegenerations","accountedTokens","recoveryBlocked"] { assert_eq!(before[key],after[key]); }
+        assert!(budget.recovery_deadline().unwrap()<deadline);
+    }
+
+    #[test]
     fn output_strategy_preserves_last_generation_and_honors_terminal_gates() {
         let body = body(json!({"maxGenerations":2}));
         let budget = budget(&body);
@@ -681,6 +734,17 @@ mod tests {
             OperationBudget::for_request("http://test/v1/chat/completions", "key", &old, 90)
                 .is_err()
         );
+    }
+    #[test]
+    fn original_wait_deadline_is_fixed_and_preserves_subsecond_remaining_time() {
+        let original=body(json!({"maxElapsedMs":1000}));let budget=budget(&original);
+        budget.0.lock().unwrap().started=Instant::now()-Duration::from_millis(500);
+        let deadline=budget.recovery_deadline().unwrap();
+        assert!(budget.remaining_timeout_seconds(1).is_err());
+        assert!(deadline.saturating_duration_since(Instant::now())>Duration::ZERO);
+        let reopened=OperationBudget::for_request("http://test/v1/chat/completions","key",&original,90).unwrap();
+        assert_eq!(reopened.recovery_deadline().unwrap(),deadline);
+        budget.block_recovery();assert!(reopened.recovery_deadline().is_err());
     }
     #[test]
     fn responses_reasoning_is_already_in_output_and_missing_usage_remains_unknown() {

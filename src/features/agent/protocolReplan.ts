@@ -1,6 +1,8 @@
 import type { OpsTask, PlanStep } from "@/types";
 import { compactReviewText } from "./longRunningReviewOutput";
 import { analyzePlanStepSafety } from "./planSafety";
+import { readOnlyPlanProtocol } from "@/services/recoveryRules";
+import { candidateRejectionFromPlan } from "@/services/candidateRejection";
 
 export function activeProtocolRepair(task: OpsTask) {
   const failure = task.protocolRepair;
@@ -30,9 +32,12 @@ export function protocolReplanContext(task: OpsTask) {
   return {
     source: "business_replan_after_protocol_failure",
     rejectedPlanExecuted: false,
+    candidateRejection: candidateRejectionFromPlan(repair),
     errorCode: repair.diagnostic?.code ?? repair.errorCode,
     fieldPath,
     ruleId,
+    readOnlyPlanProtocol: ruleId === "OBSERVE_COMMAND_MUTATION" || ruleId === "RECOVERY_DIAGNOSE_MUTATION"
+      ? readOnlyPlanProtocol() : undefined,
     reason: compactReviewText(failure.repairError, 600),
     rule: compactReviewText(repair.diagnostic?.expected ?? repair.validationError, 800),
     rejectedResponse: repair.rawModelResponse === undefined ? undefined : {

@@ -154,6 +154,11 @@ pub(crate) enum ReconciliationProof {
         version: u32,
         read_operation_id: String,
     },
+    #[serde(rename_all = "camelCase")]
+    BoundedFileAppend {
+        version: u32,
+        read_operation_id: String,
+    },
 }
 
 fn validate_id(id: &str) -> Result<(), String> {
@@ -184,7 +189,23 @@ fn credential_field(value: &Value, path: &str) -> Option<String> {
 fn contains_raw_secret(value: &Value) -> bool {
     credential_field(value, "").is_some()
 }
+/** A deletion confirmation is a one-attempt capability, scoped to its task.
+ * Its consumption is the committed attempt, never the mutable UI projection. */
+fn deletion_authorization_id(record: &PreparedOperation) -> Result<Option<&str>, String> {
+    let action = &record.intent["semantic"]["action"];
+    if action["type"] != "tool" || action["toolId"] != "files.delete_confirmed" {
+        return Ok(None);
+    }
+    let id = action["arguments"]["authorizationId"].as_str().ok_or_else(||
+        error("INVALID_DELETION_AUTHORIZATION", "missing deletion authorization identity"))?;
+    if record.effect != Effect::Change || record.phase != Phase::Tool || id.is_empty() || id.len() > 160
+        || !id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') {
+        return Err(error("INVALID_DELETION_AUTHORIZATION", "invalid deletion authorization identity or execution effect"));
+    }
+    Ok(Some(id))
+}
 fn validate_record(record: &PreparedOperation) -> Result<(), String> {
+    deletion_authorization_id(record)?;
     if record.version != VERSION
         || record.intent["version"] != "execution-intent@1"
         || record.intent["algorithm"] != "sha256"
@@ -550,6 +571,22 @@ impl Ledger {
                 "a change or interaction operation cannot be replayed",
             ));
         }
+        if let Some(authorization_id) = deletion_authorization_id(&operation.record)? {
+            // This query and the new attempt share one IMMEDIATE transaction.
+            // Historical attempts are the unique consumption index, including
+            // unknown/failed/not-dispatched outcomes; no schema backfill or UI
+            // snapshot acknowledgement can accidentally reissue a capability.
+            let mut query = tx.prepare("SELECT record FROM operations WHERE task_id=?1
+                AND EXISTS (SELECT 1 FROM attempts WHERE operation_id=operations.id)").map_err(storage)?;
+            let rows = query.query_map([&operation.record.task_id], |row| row.get::<_, String>(0)).map_err(storage)?;
+            for row in rows {
+                let previous: PreparedOperation = parse(&row.map_err(storage)?)?;
+                if deletion_authorization_id(&previous)? == Some(authorization_id) {
+                    return Err(error("DELETION_AUTHORIZATION_CONSUMED",
+                        "this task's deletion authorization already owns a committed attempt; changing step or operation cannot replay it"));
+                }
+            }
+        }
         if operation.record.effect == Effect::Change {
             for resource in &operation.record.resource_keys {
                 let owner: Option<String> = tx
@@ -886,6 +923,7 @@ impl Ledger {
                     &source_read,
                     source,
                     &file_probe_command(source)?,
+                    false,
                 )?;
                 let target_output = verified_read(
                     &tx,
@@ -895,6 +933,7 @@ impl Ledger {
                     &target_read,
                     target,
                     &file_probe_command(target)?,
+                    false,
                 )?;
                 if file_fingerprint(&source_output, source)?
                     != file_fingerprint(&target_output, target)?
@@ -948,8 +987,27 @@ impl Ledger {
                 let target = intent_target(semantic, "execution")?;
                 let read = read_operation(&tx, read_operation_id)?
                     .ok_or_else(|| error("NOT_FOUND", "service read not found"))?;
-                verified_read(&tx, root, &operation, attempt, &read, target, command)?;
+                verified_read(&tx, root, &operation, attempt, &read, target, command, false)?;
                 ("service", vec![read_operation_id.clone()])
+            }
+            ReconciliationProof::BoundedFileAppend { version, read_operation_id } => {
+                if *version != VERSION {
+                    return Err(error("UNSUPPORTED_VERSION", "unsupported reconciliation version"));
+                }
+                let contract = crate::bounded_file_reconciliation::from_semantic(semantic)
+                    .ok_or_else(|| error("RECONCILIATION_REJECTED", "original Shell has no supported frozen file contract"))?;
+                let target = intent_target(semantic, "execution")?;
+                let read = read_operation(&tx, read_operation_id)?
+                    .ok_or_else(|| error("NOT_FOUND", "file reconciliation read not found"))?;
+                let command = crate::bounded_file_reconciliation::probe(&contract, &attempt.execution_id)?;
+                let output = verified_read(&tx, root, &operation, attempt, &read, target, &command, true)?;
+                let observation = read.attempts.last().unwrap();
+                if observation.started_at < attempt.completed_at.unwrap_or(attempt.started_at)
+                    || observation.completed_at.is_none_or(|completed| now().saturating_sub(completed) > 120_000)
+                    || !crate::bounded_file_reconciliation::validate(&contract, &attempt.execution_id, &output) {
+                    return Err(error("RECONCILIATION_REJECTED", "missing, stale or mismatching executor receipt, process or file/backup evidence"));
+                }
+                ("bounded_file_append", vec![read_operation_id.clone()])
             }
         };
         let mut evidence_refs = Vec::new();
@@ -1134,6 +1192,7 @@ fn verified_read(
     read: &Operation,
     target: &Value,
     command: &str,
+    require_separate_stdout: bool,
 ) -> Result<String, String> {
     if read.record.effect != Effect::Read
         || read.record.task_id != original.record.task_id
@@ -1175,6 +1234,7 @@ fn verified_read(
         || attempt.started_at < original_attempt.started_at
         || attempt.cancel_requested
         || attempt.late
+        || read.cancel_requested
     {
         return Err(error(
             "RECONCILIATION_REJECTED",
@@ -1189,13 +1249,15 @@ fn verified_read(
         .result
         .as_ref()
         .ok_or_else(|| error("RECONCILIATION_REJECTED", "missing read result"))?;
-    if result["exitCode"] != 0 {
+    if result["exitCode"] != 0 || result["truncated"] == true || result["stdoutTruncated"] == true
+        || require_separate_stdout && result["stdoutTruncated"] != false {
         return Err(error(
             "RECONCILIATION_REJECTED",
             "read command did not succeed",
         ));
     }
-    let output = result["output"]
+    let output_field = if require_separate_stdout || result["stdout"].is_string() { "stdout" } else { "output" };
+    let output = result[output_field]
         .as_str()
         .ok_or_else(|| error("RECONCILIATION_REJECTED", "missing captured read output"))?;
     // Recheck content-addressed evidence at resolution time (files may have
@@ -1223,7 +1285,9 @@ fn verified_read(
                 .and_then(|text| serde_json::from_str::<Value>(text).ok())
             {
                 captured_result_matches |=
-                    captured["exitCode"] == 0 && captured["output"].as_str() == Some(output);
+                    captured["exitCode"] == 0 && captured[output_field].as_str() == Some(output)
+                    && captured["truncated"] != true && captured["stdoutTruncated"] != true
+                    && (!require_separate_stdout || captured["stdoutTruncated"] == false);
             }
         }
     }
@@ -1731,6 +1795,119 @@ mod tests {
         ledger
             .begin(operation, attempt, &format!("exec-{attempt}"))
             .unwrap()
+    }
+
+    fn deletion_record(id: &str, authorization: &str) -> PreparedOperation {
+        let mut value = record(id, Effect::Change);
+        value.phase = Phase::Tool;
+        value.intent["semantic"]["action"] = json!({"type":"tool", "toolId":"files.delete_confirmed",
+            "arguments":{"authorizationId":authorization}});
+        seal(value)
+    }
+
+    #[test]
+    fn deletion_authorization_consumption_survives_all_outcomes_and_restart() {
+        for status in [Status::Succeeded, Status::Failed, Status::Unknown, Status::NotDispatched] {
+            let root = TestRoot::new();
+            let mut ledger = Ledger::open(&root.0, "first-boot").unwrap();
+            ledger.prepare(deletion_record("original", "approved-files")).unwrap();
+            begin(&mut ledger, "original", "first-attempt");
+            let outcome = archived_outcome(&root.0, "original", "first-attempt", status.clone(), json!({"result":"preserved"}));
+            ledger.complete(&root.0, "original", "first-attempt", "receipt", outcome.clone(), false).unwrap();
+            drop(ledger);
+            let mut ledger = Ledger::open(&root.0, "second-boot").unwrap();
+            let mut replay = deletion_record("new-operation-and-step", "approved-files");
+            replay.round_id = Some("new-round".into()); replay.workflow_epoch = 99;
+            // Authorization identity, not an accidentally retained endpoint lock, blocks replay.
+            replay.intent["semantic"]["targets"] = json!([target("execution", "other.test", None)]);
+            ledger.prepare(seal(replay)).unwrap();
+            assert!(ledger.begin("new-operation-and-step", "replay", "replay-exec").unwrap_err()
+                .contains("DELETION_AUTHORIZATION_CONSUMED"));
+            assert!(ledger.get("new-operation-and-step").unwrap().attempts.is_empty());
+            assert_eq!(ledger.get("original").unwrap().attempts[0].outcome, Some(outcome));
+            if status == Status::NotDispatched {
+                assert!(ledger.begin("original", "retry", "retry-exec").unwrap_err()
+                    .contains("DELETION_AUTHORIZATION_CONSUMED"));
+            }
+        }
+    }
+
+    #[test]
+    fn deletion_authorization_lost_dispatch_receipt_remains_consumed_after_restart() {
+        let root = TestRoot::new();
+        let mut ledger = Ledger::open(&root.0, "before-crash").unwrap();
+        ledger.prepare(deletion_record("original-delete", "once-only")).unwrap();
+        let original = begin(&mut ledger, "original-delete", "original-attempt");
+        // No completion or task snapshot update: the begin IPC response or
+        // remote receipt may have been lost at process death.
+        drop(ledger);
+        let mut ledger = Ledger::open(&root.0, "after-crash").unwrap();
+        let recovered = ledger.get("original-delete").unwrap();
+        assert_eq!(recovered.state, Status::Unknown);
+        assert_eq!(recovered.attempts[0].id, original.id);
+        assert_eq!(recovered.attempts[0].status, Status::Unknown);
+        assert!(recovered.attempts[0].outcome.is_none());
+        let mut replay = deletion_record("renamed-delete", "once-only");
+        replay.intent["semantic"]["targets"] = json!([target("execution", "another-endpoint.test", None)]);
+        ledger.prepare(seal(replay)).unwrap();
+        assert!(ledger.begin("renamed-delete", "new-attempt", "new-exec").unwrap_err()
+            .contains("DELETION_AUTHORIZATION_CONSUMED"));
+        assert!(ledger.get("renamed-delete").unwrap().attempts.is_empty());
+        assert_eq!(ledger.get("original-delete").unwrap().attempts, recovered.attempts);
+    }
+
+    #[test]
+    fn deletion_authorization_begin_is_atomic_across_connections() {
+        let root = TestRoot::new();
+        let mut first = Ledger::open(&root.0, "boot").unwrap();
+        let mut second = Ledger::open(&root.0, "boot").unwrap();
+        first.prepare(deletion_record("concurrent-a", "same-approval")).unwrap();
+        let mut other = deletion_record("concurrent-b", "same-approval");
+        other.intent["semantic"]["targets"] = json!([target("execution", "another.test", None)]);
+        second.prepare(seal(other)).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let gate = barrier.clone();
+        let a = std::thread::spawn(move || { gate.wait(); first.begin("concurrent-a", "attempt-a", "exec-a") });
+        let b = std::thread::spawn(move || { barrier.wait(); second.begin("concurrent-b", "attempt-b", "exec-b") });
+        let results = [a.join().unwrap(), b.join().unwrap()];
+        assert_eq!(results.iter().filter(|item| item.is_ok()).count(), 1);
+        assert!(results.iter().filter_map(|item| item.as_ref().err()).all(|error|
+            error.contains("DELETION_AUTHORIZATION_CONSUMED")));
+        let ledger = Ledger::open(&root.0, "after-crash").unwrap();
+        assert_eq!(ledger.list(None).unwrap().iter().map(|item| item.attempts.len()).sum::<usize>(), 1);
+    }
+
+    #[test]
+    fn deletion_authorization_is_not_consumed_by_rejected_admission() {
+        let root = TestRoot::new();
+        let mut ledger = Ledger::open(&root.0, "boot").unwrap();
+        ledger.prepare(record("blocking-operation", Effect::Change)).unwrap();
+        begin(&mut ledger, "blocking-operation", "blocking-attempt");
+        ledger.prepare(deletion_record("delete", "not-yet-consumed")).unwrap();
+        assert!(ledger.begin("delete", "not-begun", "not-begun-exec").unwrap_err().contains("RESOURCE_CONFLICT"));
+        assert!(ledger.get("delete").unwrap().attempts.is_empty());
+        let outcome = archived_outcome(&root.0, "blocking-operation", "blocking-attempt", Status::Succeeded, json!({"done":true}));
+        ledger.complete(&root.0, "blocking-operation", "blocking-attempt", "unblock", outcome, false).unwrap();
+        begin(&mut ledger, "delete", "allowed-attempt");
+    }
+
+    #[test]
+    fn deletion_authorization_scope_and_effect_cannot_be_misclassified() {
+        let root = TestRoot::new();
+        let mut ledger = Ledger::open(&root.0, "boot").unwrap();
+        for id in ["", "bad approval", "a/b"] {
+            assert!(ledger.prepare(deletion_record("invalid", id)).unwrap_err().contains("INVALID_DELETION_AUTHORIZATION"));
+        }
+        let mut read = deletion_record("misclassified", "valid-id");
+        read.effect = Effect::Read; read.intent["semantic"]["effect"] = json!("read");
+        assert!(ledger.prepare(seal(read)).unwrap_err().contains("INVALID_DELETION_AUTHORIZATION"));
+        ledger.prepare(deletion_record("first-task", "same-id")).unwrap();
+        begin(&mut ledger, "first-task", "first");
+        let mut other = deletion_record("second-task", "same-id");
+        other.task_id = "task-2".into(); other.intent["semantic"]["taskId"] = json!("task-2");
+        other.intent["semantic"]["targets"] = json!([target("execution", "other-task.test", None)]);
+        ledger.prepare(seal(other)).unwrap();
+        begin(&mut ledger, "second-task", "second");
     }
 
     #[test]
@@ -2712,5 +2889,113 @@ mod tests {
         assert_eq!(operation.attempts[0].status, Status::Unknown);
         assert_eq!(operation.reconciliation.unwrap()["kind"], "file_transfer");
         assert!(file_fingerprint(&format!("15\n{hash}  /dest/file\n16\n"), &dest).is_err());
+    }
+
+    fn append_operation() -> PreparedOperation {
+        let mut original = record("append", Effect::Change);
+        original.intent["semantic"]["runtimeClass"] = json!("bounded");
+        original.intent["semantic"]["executionScope"] = json!("isolated_exec");
+        original.intent["semantic"]["action"]["command"] = json!("set -eu\nf='/tmp/record'\nb='/tmp/backup'\nprintf '%s\\n' 'old' | cmp - \"$f\"\ntest ! -e \"$b\"\ncp -p -- \"$f\" \"$b\"\nprintf '%s\\n' 'new' >> \"$f\"");
+        seal(original)
+    }
+    fn append_observation() -> String {
+        let c = crate::bounded_file_reconciliation::from_semantic(&append_operation().intent["semantic"]).unwrap();
+        format!("OPSARK_BOUNDED_FILE_V1\nexec-attempt\n{}\naaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n812\n731\n0\nCURRENT_BOOT\naaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\nPROCESS_GROUPS\n1\n900\nFILE_DIGESTS\n{}  /tmp/record\n{}  /tmp/backup\n{}  /tmp/record\n{}  /tmp/backup\nEND\n",
+            c.command_sha256, c.after_sha256, c.before_sha256, c.after_sha256, c.before_sha256)
+    }
+    fn append_read(root: &Path, ledger: &mut Ledger, id: &str, output: &str, truncated: bool) {
+        let original = append_operation();
+        let c = crate::bounded_file_reconciliation::from_semantic(&original.intent["semantic"]).unwrap();
+        let mut read = record(id, Effect::Read);
+        read.intent["semantic"]["action"]["command"] = json!(crate::bounded_file_reconciliation::probe(&c, "exec-attempt").unwrap());
+        ledger.prepare(seal(read)).unwrap();
+        let attempt = format!("attempt-{id}");
+        begin(ledger, id, &attempt);
+        let outcome = archived_outcome(root, id, &attempt, Status::Succeeded,
+            json!({"exitCode":0,"output":"presentation wrapper","stdout":output,"stdoutTruncated":truncated}));
+        ledger.complete(root, id, &attempt, &format!("event-{id}"), outcome, false).unwrap();
+    }
+    fn append_proof(id: &str) -> ReconciliationProof {
+        ReconciliationProof::BoundedFileAppend { version: 1, read_operation_id: id.into() }
+    }
+    #[test]
+    fn bounded_shell_write_lost_receipt_reconciles_without_replay_and_survives_restart() {
+        let root = TestRoot::new();
+        let mut ledger = Ledger::open(&root.0, "boot-a").unwrap();
+        ledger.prepare(append_operation()).unwrap();
+        begin(&mut ledger, "append", "attempt");
+        drop(ledger);
+        let mut ledger = Ledger::open(&root.0, "boot-b").unwrap();
+        assert_eq!(ledger.get("append").unwrap().state, Status::Unknown);
+        // Another endpoint owns an independent unresolved lock.
+        let mut other = record("other", Effect::Change);
+        other.intent["semantic"]["targets"][0]["host"] = json!("other.test");
+        other.resource_keys = vec!["endpoint:other.test:22".into()];
+        ledger.prepare(seal(other)).unwrap(); begin(&mut ledger, "other", "other-attempt");
+        append_read(&root.0, &mut ledger, "append-read", &append_observation(), false);
+        let resolved = ledger.resolve(&root.0, "append", "attempt", append_proof("append-read")).unwrap();
+        assert_eq!(resolved.state, Status::Unknown);
+        assert_eq!(resolved.attempts.len(), 1);
+        assert_eq!(resolved.attempts[0].status, Status::Unknown);
+        assert_eq!(resolved.reconciliation.as_ref().unwrap()["kind"], "bounded_file_append");
+        assert!(ledger.begin("append", "duplicate", "duplicate").is_err());
+        let locks: u64 = ledger.connection.query_row("SELECT COUNT(*) FROM resource_locks WHERE operation_id='other'", [], |row| row.get(0)).unwrap();
+        assert_eq!(locks, 1);
+        drop(ledger);
+        let mut ledger = Ledger::open(&root.0, "boot-c").unwrap();
+        assert!(ledger.get("append").unwrap().reconciliation.is_some());
+        ledger.prepare(record("next-change", Effect::Change)).unwrap();
+        begin(&mut ledger, "next-change", "next-attempt");
+    }
+    #[test]
+    fn bounded_shell_reconciliation_rejects_partial_effects_running_process_and_incomplete_evidence() {
+        let root = TestRoot::new();
+        let mut ledger = Ledger::open(&root.0, "boot-a").unwrap();
+        ledger.prepare(append_operation()).unwrap(); begin(&mut ledger, "append", "attempt");
+        drop(ledger);
+        let mut ledger = Ledger::open(&root.0, "boot-b").unwrap();
+        let valid = append_observation();
+        let c = crate::bounded_file_reconciliation::from_semantic(&append_operation().intent["semantic"]).unwrap();
+        let invalid = [valid.replace("exec-attempt", "exec-other"), valid.replace("\n900\n", "\n812\n"),
+            valid.replace("\n0\nCURRENT_BOOT", "\n1\nCURRENT_BOOT"), valid.replace(&c.after_sha256, &c.before_sha256),
+            valid.replace(&c.before_sha256, &"0".repeat(64)), valid.replace("\nEND\n", ""), "model says complete".into()];
+        for (index, output) in invalid.iter().enumerate() {
+            let id = format!("bad-read-{index}");
+            append_read(&root.0, &mut ledger, &id, output, false);
+            assert!(ledger.resolve(&root.0, "append", "attempt", append_proof(&id)).is_err());
+            assert!(ledger.get("append").unwrap().reconciliation.is_none());
+        }
+        append_read(&root.0, &mut ledger, "truncated", &valid, true);
+        assert!(ledger.resolve(&root.0, "append", "attempt", append_proof("truncated")).is_err());
+    }
+    #[test]
+    fn bounded_shell_reconciliation_storage_failure_keeps_unknown_and_lock_atomic() {
+        let root = TestRoot::new();
+        let mut ledger = Ledger::open(&root.0, "boot-a").unwrap();
+        ledger.prepare(append_operation()).unwrap(); begin(&mut ledger, "append", "attempt");
+        drop(ledger);
+        let mut ledger = Ledger::open(&root.0, "boot-b").unwrap();
+        append_read(&root.0, &mut ledger, "append-read", &append_observation(), false);
+        ledger.connection.execute_batch("CREATE TRIGGER fail_reconciliation BEFORE INSERT ON events WHEN NEW.kind='reconciled_current_state' BEGIN SELECT RAISE(FAIL, 'disk failure'); END;").unwrap();
+        assert!(ledger.resolve(&root.0, "append", "attempt", append_proof("append-read")).is_err());
+        assert!(ledger.get("append").unwrap().reconciliation.is_none());
+        let locks: u64 = ledger.connection.query_row("SELECT COUNT(*) FROM resource_locks WHERE operation_id='append'", [], |row| row.get(0)).unwrap();
+        assert_eq!(locks, 1);
+        ledger.connection.execute_batch("DROP TRIGGER fail_reconciliation").unwrap();
+        assert!(ledger.resolve(&root.0, "append", "attempt", append_proof("append-read")).is_ok());
+    }
+    #[test]
+    fn bounded_shell_reconciliation_rejects_expired_observation_even_when_hashes_match() {
+        let root = TestRoot::new();
+        let mut ledger = Ledger::open(&root.0, "boot-a").unwrap();
+        ledger.prepare(append_operation()).unwrap(); begin(&mut ledger, "append", "attempt");
+        drop(ledger);
+        let mut ledger = Ledger::open(&root.0, "boot-b").unwrap();
+        append_read(&root.0, &mut ledger, "stale-read", &append_observation(), false);
+        let mut stale = ledger.get("stale-read").unwrap().attempts.pop().unwrap();
+        stale.completed_at = Some(now() - 120_001);
+        ledger.connection.execute("UPDATE attempts SET record=?2 WHERE id=?1", params![stale.id, json(&stale).unwrap()]).unwrap();
+        assert!(ledger.resolve(&root.0, "append", "attempt", append_proof("stale-read")).is_err());
+        assert!(ledger.get("append").unwrap().reconciliation.is_none());
     }
 }

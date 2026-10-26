@@ -2,6 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ExecutionIntentSnapshot, PlanStep } from "@/types";
 import { executionDigest, canonicalExecutionJson } from "@/features/agent/planPreparation";
 import { backend } from "./backend";
+import { boundedFileAppendContract, boundedFileAppendProbe, validateBoundedFileAppendObservation } from "@/features/agent/boundedFileReconciliation";
+import { invalidateHostCapabilities } from "@/features/tools/hostCapabilities";
+import { isSshExecPayloadError } from "./sshCommandTransport";
 
 export type ExecutionState = "prepared" | "dispatching" | "succeeded" | "failed" | "unknown" | "not_dispatched";
 export type ExecutionOutcomeStatus = Exclude<ExecutionState, "prepared" | "dispatching">;
@@ -46,7 +49,7 @@ export interface ExecutionOperationRecord extends ExecutionOperationInput {
   state: ExecutionState; attempts: ExecutionAttemptRecord[]; cancelRequested: boolean;
   createdAt: number; updatedAt: number;
   reconciliation?: { version: 1; status: "completed"; reason: "current_state_verified"; attemptId: string; readOperationId: string; readOperationIds: string[];
-    evidenceRefs: string[]; kind: "file_transfer" | "service"; resolvedAt: number };
+    evidenceRefs: string[]; kind: "file_transfer" | "service" | "bounded_file_append"; resolvedAt: number };
 }
 /** Restore only an actual, attempt-bound step review; summaries and task status
  * are intentionally insufficient. Historical steps with compacted-away reviews
@@ -84,7 +87,7 @@ export interface CompleteExecutionAttempt {
 }
 export type ExecutionReconciliationProof =
   | { version: 1; kind: "file_transfer"; sourceReadOperationId: string; targetReadOperationId: string }
-  | { version: 1; kind: "service"; readOperationId: string };
+  | { version: 1; kind: "service" | "bounded_file_append"; readOperationId: string };
 export interface ExecutionLedgerRepository {
   prepare(record: ExecutionOperationInput): Promise<ExecutionOperationRecord>;
   begin(operationId: string, attemptId: string, executionId: string): Promise<ExecutionAttemptRecord>;
@@ -156,8 +159,18 @@ export function createMemoryExecutionLedgerRepository(): ExecutionLedgerReposito
   const records = new Map<string, ExecutionOperationRecord>();
   const events = new Map<string, { receipt: string; attempt: ExecutionAttemptRecord }>();
   const fail = (code: string): never => { throw new Error(`EXECUTION_LEDGER_${code}`); };
+  const deletionAuthorization = (record: ExecutionOperationInput) => {
+    const action = record.intent.semantic.action;
+    if (action.type !== "tool" || action.toolId !== "files.delete_confirmed") return undefined;
+    const id = action.arguments.authorizationId;
+    if (record.effect !== "change" || record.phase !== "tool" || typeof id !== "string" || !/^[A-Za-z0-9_-]{1,160}$/.test(id)) {
+      return fail("INVALID_DELETION_AUTHORIZATION");
+    }
+    return id;
+  };
   return {
     async prepare(input) {
+      deletionAuthorization(input);
       if (input.intent.version !== "execution-intent@1" || input.intent.algorithm !== "sha256"
         || input.intentDigest !== executionDigest({ version: "execution-intent@1", semantic: input.intent.semantic })
         || input.intent.digest !== input.intentDigest || input.intent.semantic.taskId !== input.taskId
@@ -181,6 +194,9 @@ export function createMemoryExecutionLedgerRepository(): ExecutionLedgerReposito
       if (["dispatching", "unknown"].includes(operation.state)) fail("UNRESOLVED");
       if (operation.effect !== "read" && ["succeeded", "failed"].includes(operation.state)) fail("ALREADY_FINISHED");
       if ([...records.values()].some(row => row.attempts.some(attempt => attempt.id === attemptId || attempt.executionId === executionId))) fail("ATTEMPT_CONFLICT");
+      const authorizationId = deletionAuthorization(operation);
+      if (authorizationId && [...records.values()].some(row => row.taskId === operation.taskId
+        && row.attempts.length > 0 && deletionAuthorization(row) === authorizationId)) fail("DELETION_AUTHORIZATION_CONSUMED");
       if (operation.effect === "change" && [...records.values()].some(row => row.operationId !== operationId
         && row.effect === "change" && ["dispatching", "unknown"].includes(row.state)
         && row.reconciliation?.status !== "completed"
@@ -227,23 +243,32 @@ export function createMemoryExecutionLedgerRepository(): ExecutionLedgerReposito
       const operation = records.get(operationId) ?? fail("NOT_FOUND");
       const attempt = operation.attempts.find(value => value.id === attemptId) ?? fail("ATTEMPT_NOT_FOUND");
       if (operation.reconciliation?.attemptId === attemptId) return copy(operation);
-      if (proof.version !== 1 || attempt.status === "not_dispatched" || attempt.status === "dispatching") fail("RECONCILIATION_INVALID");
-      const ids = proof.kind === "service" ? [proof.readOperationId] : [proof.sourceReadOperationId, proof.targetReadOperationId];
+      if (proof.version !== 1 || operation.attempts[operation.attempts.length - 1]?.id !== attemptId
+        || attempt.status === "not_dispatched" || attempt.status === "dispatching") fail("RECONCILIATION_INVALID");
+      const ids = proof.kind !== "file_transfer" ? [proof.readOperationId] : [proof.sourceReadOperationId, proof.targetReadOperationId];
       const reads = ids.map(id => records.get(id) ?? fail("RECONCILIATION_INVALID"));
       const quote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
       const fingerprints: string[] = [];
       for (let index = 0; index < reads.length; index++) {
         const read = reads[index], receipt = read.attempts[read.attempts.length - 1];
-        const result = receipt?.outcome?.result as { exitCode?: number; output?: string } | undefined;
-        const output = typeof result?.output === "string" ? result.output : fail("RECONCILIATION_INVALID");
+        const result = receipt?.outcome?.result as { exitCode?: number; output?: string; stdout?: string; stdoutTruncated?: boolean; truncated?: boolean } | undefined;
+        const captured = proof.kind === "bounded_file_append" || typeof result?.stdout === "string" ? result?.stdout : result?.output;
+        const output = typeof captured === "string" ? captured : fail("RECONCILIATION_INVALID");
         const action = read.intent.semantic.action.type === "shell" ? read.intent.semantic.action : fail("RECONCILIATION_INVALID");
         if (read.taskId !== operation.taskId || read.effect !== "read" || receipt?.status !== "succeeded"
-          || receipt.startedAt < attempt.startedAt || !receipt.outcome?.evidenceRefs.length || result?.exitCode !== 0
-          || typeof result.output !== "string" || read.intent.semantic.action.type !== "shell") fail("RECONCILIATION_INVALID");
-        const originalTarget = operation.intent.semantic.targets.find(value => value.role === (proof.kind === "service" ? "execution" : index === 0 ? "source" : "target")) ?? fail("RECONCILIATION_TARGET_MISMATCH");
+          || receipt.startedAt < attempt.startedAt || receipt.cancelRequested || receipt.late || read.cancelRequested
+          || !receipt.outcome?.evidenceRefs.length || result?.exitCode !== 0 || result.stdoutTruncated || result.truncated
+          || read.intent.semantic.action.type !== "shell") fail("RECONCILIATION_INVALID");
+        const originalTarget = operation.intent.semantic.targets.find(value => value.role === (proof.kind !== "file_transfer" ? "execution" : index === 0 ? "source" : "target")) ?? fail("RECONCILIATION_TARGET_MISMATCH");
         if (!read.intent.semantic.targets.some(value => value.host.toLowerCase() === originalTarget.host.toLowerCase()
-          && value.port === originalTarget.port && value.username === originalTarget.username)) fail("RECONCILIATION_TARGET_MISMATCH");
-        if (proof.kind === "service") {
+          && value.serverId === originalTarget.serverId && value.port === originalTarget.port && value.username === originalTarget.username)) fail("RECONCILIATION_TARGET_MISMATCH");
+        if (proof.kind === "bounded_file_append") {
+          const contract = boundedFileAppendContract(operation.intent.semantic) ?? fail("RECONCILIATION_INVALID");
+          if (result?.stdoutTruncated !== false || receipt.startedAt < (attempt.completedAt ?? attempt.startedAt)
+            || receipt.completedAt === undefined || Date.now() - receipt.completedAt > 120_000
+            || action.command !== boundedFileAppendProbe(contract, attempt.executionId)
+            || !validateBoundedFileAppendObservation(contract, attempt.executionId, output)) fail("RECONCILIATION_INVALID");
+        } else if (proof.kind === "service") {
           const validator = operation.intent.semantic.validator?.command ?? operation.intent.semantic.validation;
           if (operation.intent.semantic.action.type !== "shell" || operation.intent.semantic.runtimeClass !== "persistent_service" || !validator || action.command !== validator
             || !(/^(?:sudo -n )?systemctl (?:--user )?is-active (?:--quiet )?[A-Za-z0-9_@.:-]+$/.test(validator)
@@ -320,6 +345,9 @@ export function redactExecutionValue(value: unknown, redact: (text: string) => s
   if (value && typeof value === "object") {
     if (seen.has(value)) return "[Circular reference]";
     seen.add(value);
+    // Only the branded native preflight error may preserve this fixed, non-secret
+    // diagnostic. Arbitrary Error properties are deliberately not serialized.
+    if (isSshExecPayloadError(value)) return { name: value.name, message: redact(value.message), diagnostic: value.diagnostic };
     if (value instanceof Error) return { name: value.name, message: redact(value.message) };
     if (Array.isArray(value)) return value.map(item => redactExecutionValue(item, redact, seen));
     return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined).map(([key, item]) => [key,
@@ -330,7 +358,12 @@ export function redactExecutionValue(value: unknown, redact: (text: string) => s
 }
 function boundedResult(value: unknown): unknown {
   const text = JSON.stringify(value);
-  return text.length <= 8_192 ? value : { summary: text.slice(0, 8_192), truncated: true, archived: true };
+  if (text.length <= 8_192) return value;
+  // serde_json strings cannot contain a lone surrogate. Keep the bounded
+  // prefix intact when the UTF-16 limit falls inside a non-BMP character.
+  const splitPair = text.charCodeAt(8_191) >= 0xd800 && text.charCodeAt(8_191) <= 0xdbff
+    && text.charCodeAt(8_192) >= 0xdc00 && text.charCodeAt(8_192) <= 0xdfff;
+  return { summary: text.slice(0, splitPair ? 8_191 : 8_192), truncated: true, archived: true };
 }
 export function executionResourceKeys(intent: ExecutionIntentSnapshot): string[] {
   return [...new Set(intent.semantic.targets.filter(target => target.host && target.role !== "interaction")
@@ -348,6 +381,9 @@ export interface RecordedExecutionOptions<T> {
   /** Output/evidence redaction only. Never rewrites or gates approved intent. */
   redact?: (text: string) => string; evidenceWriter?: EvidenceWriter;
   onAttempt?: (operation: ExecutionOperationRecord, attempt: ExecutionAttemptRecord) => void;
+  /** Facts-only projection after durable commit, including late original receipts.
+   * Must handle its own projection/storage errors without changing the I/O result. */
+  onReceiptCommitted?: (operation: ExecutionOperationRecord, attempt: ExecutionAttemptRecord) => void | Promise<void>;
   onCommitted?: (operationId: string, attemptId: string, outcome: ExecutionOutcome) => void;
 }
 async function commitReceipt(current: LedgerScope, pending: PendingReceipt): Promise<ExecutionAttemptRecord> {
@@ -415,7 +451,9 @@ export async function runRecordedExecution<T>(inputOptions: RecordedExecutionOpt
     if (attempt.id !== attemptId || attempt.operationId !== operationId || attempt.executionId !== options.executionId
       || attempt.status !== "dispatching") throw new Error("EXECUTION_LEDGER_RESULT_MISMATCH");
     options.onAttempt?.(prepared, attempt);
-  } catch (error) { throw new ExecutionLedgerError("执行派发记录未通过持久化检查，尚未发送命令；请检查未决执行记录", "begin", false,
+  } catch (error) { throw new ExecutionLedgerError(String(error).includes("EXECUTION_LEDGER_DELETION_AUTHORIZATION_CONSUMED")
+    ? "本任务的文件删除确认已用于一次执行，不能换步骤重复使用；原记录已保留，尚未发送本次命令。"
+    : "执行派发记录未通过持久化检查，尚未发送命令；请检查未决执行记录", "begin", false,
     operationId, attemptId, undefined, error); }
   let value: T | undefined, executionError: unknown, failed = false, dispatched = false;
   let registered = false;
@@ -426,6 +464,13 @@ export async function runRecordedExecution<T>(inputOptions: RecordedExecutionOpt
       if (activeExecutions.has(options.executionId)) throw new Error("EXECUTION_LEDGER_EXECUTION_CONFLICT");
       activeExecutions.add(options.executionId);
       registered = true;
+      // A mutation can change runtimes or software on every frozen endpoint.
+      // Advance epochs only after durable admission, before I/O, so old in-flight
+      // reads cannot repopulate pre-change capabilities even if dispatch is lost.
+      if (effect === "change") {
+        for (const serverId of new Set(intent.semantic.targets.map(target => target.serverId).filter(
+          (value): value is string => typeof value === "string" && value.length > 0))) invalidateHostCapabilities(serverId);
+      }
       dispatched = true; value = await options.execute(); status = options.classifyResult?.(value) ?? "succeeded";
     }
     catch (error) { failed = true; executionError = error; status = options.classifyError?.(error) ?? "unknown"; }
@@ -439,10 +484,12 @@ export async function runRecordedExecution<T>(inputOptions: RecordedExecutionOpt
       roundId: options.task.currentRoundId, status, late, collectedAt: new Date().toISOString(), text: JSON.stringify(safeResult) },
     evidenceWriter: options.evidenceWriter ?? current.evidenceWriter, remoteResultKnown: dispatched && !failed };
   current.pending.set(attemptId, pending);
-  try { await commitReceipt(current, pending); }
+  let committed: ExecutionAttemptRecord;
+  try { committed = await commitReceipt(current, pending); }
   catch (error) { throw new ExecutionLedgerError("远端执行已结束，但结果尚未完整保存。请重试保存，不要重复执行命令", "result_commit",
     pending.remoteResultKnown, operationId, attemptId, pending.receipt.outcome.result, error); }
-  if (late || !dispatched) throw new ExecutionLedgerError("执行结果已保存；任务已取消或轮次已变化，不应用到当前任务", "stale_result",
+  await options.onReceiptCommitted?.(copy(prepared), copy(committed));
+  if (late || !dispatched || options.isCurrent && !options.isCurrent()) throw new ExecutionLedgerError("执行结果已保存；任务已取消或轮次已变化，不应用到当前任务", "stale_result",
     pending.remoteResultKnown, operationId, attemptId, pending.receipt.outcome.result);
   options.onCommitted?.(operationId, attemptId, copy(pending.receipt.outcome));
   if (failed) {

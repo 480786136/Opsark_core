@@ -1,8 +1,8 @@
 import { prepareTaskDecision, TaskDecisionError } from "./taskDecisionResolution";
 import { assertDecisionRepairPreserved, decisionRepairContext, decisionRepairFingerprint } from "./decisionRepair";
-import { backend, canRegenerateModelCandidate, exhaustedCandidateRecovery, modelCandidateDiagnostic, PlanProtocolError } from "@/services/backend";
+import { backend, canRegenerateModelCandidate, classifiedPlanContext, exhaustedCandidateRecovery, modelCandidateDiagnostic, PlanProtocolError, preserveCandidateRejection } from "@/services/backend";
 import { protocolRejectionFingerprint } from "@/services/planProtocolRepair";
-import { candidateRegenerationContext, createModelRecoveryContext } from "@/services/modelRecovery";
+import { candidateRegenerationContext, createModelRecoveryContext, outputStrategyFromContext, recoveryFromContext } from "@/services/modelRecovery";
 import type { ModelOutputStrategy } from "@/services/modelRecovery";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { OperationalRecoveryError, prepareOperationalDecision } from "./operationalRecovery";
@@ -10,6 +10,8 @@ import { workflowLifetime, StaleWorkflowError } from "./workflowLifetime";
 import { activeProtocolRepair, freshProtocolReplanSteps, protocolReplanContext } from "./protocolReplan";
 import { markProtocolReplanApprovals } from "./protocolReplanApproval";
 import { normalizePlanPreconditions } from "./planNormalizer";
+import { assertObservationPlanProgress, ObservationPlanError, observationPlanRepairContext } from "./observationPlanProgress";
+import type { ObservationPlanProgressOptions } from "./observationPlanProgress";
 import { DECISION_EVIDENCE_INSTRUCTION } from "./decisionEvidence";
 import type { RuntimeModel } from "@/services/backend";
 import { createRuntimeModel } from "@/features/agent/modelRuntime";
@@ -33,7 +35,7 @@ import { buildSkillContext } from "@/features/skills/skillRegistry";
 import { compactReviewText } from "@/features/agent/longRunningReviewOutput";
 import { buildTaskDecisionSnapshot } from "@/features/agent/taskDecisionSnapshot";
 import type { ToolDefinition } from "@/features/tools/types";
-import type { SkillDefinition } from "@/features/skills/types";
+import type { ModelSkillDefinition, SkillDefinition } from "@/features/skills/types";
 import type {
   AiGenerationSettings,
   Metrics,
@@ -41,12 +43,104 @@ import type {
   NextStageDecision,
   OpsTask,
   PlanStep,
+  RequirementProcessingResult,
   SecretMetadata,
   ServerProfile,
   StepReview,
 } from "@/types";
 
 type PlanGenerator = (requirement: string, runtimeModel?: RuntimeModel) => Promise<PlanStep[]>;
+
+export interface InitialPlanRecoveryEvent {
+  phase: "rejected" | "request" | "response" | "failed";
+  attempt: 1 | 2;
+  candidate?: PlanStep[];
+  diagnostic?: ReturnType<typeof observationPlanRepairContext>;
+  /** Contains the original budget/context, never the API credential. */
+  request?: { requirement: string; context: unknown; model: string; endpoint: string };
+  error?: string;
+}
+
+export interface PrepareInitialTaskPlanInput {
+  task: OpsTask;
+  requirement: string;
+  classified: RequirementProcessingResult;
+  runtimeModel: RuntimeModel;
+  skillDefinitions: ModelSkillDefinition[];
+  server?: ServerProfile;
+  tools: ToolDefinition[];
+  secretMetadata: SecretMetadata[];
+  skills?: SkillDefinition[];
+  /** Owns all ordinary normalization, authorization and atomic prepared-plan admission. */
+  prepareCandidate(candidate: PlanStep[]): void;
+  assertCurrent(): void;
+  /** Persist before the next model call, including the rejected original proposal. */
+  onAttempt(event: InitialPlanRecoveryEvent): void;
+}
+
+/** Initial classification is already committed. Recover only its unexecuted plan,
+ * not the requirement relation, scope, permission, approval or model-operation budget. */
+export async function prepareInitialTaskPlanWithRecovery(
+  input: PrepareInitialTaskPlanInput,
+  generatePlan: PlanGenerator = backend.generatePlan,
+): Promise<void> {
+  const lifetime = workflowLifetime(input.task);
+  const policy = nextStagePolicyFingerprint(input);
+  const endpoint = () => JSON.stringify(input.server && [input.server.id, input.server.host, input.server.port, input.server.username]);
+  const originalEndpoint = endpoint();
+  const assertCurrent = () => {
+    lifetime.assertCurrent();
+    input.assertCurrent();
+    // Classification may legitimately move a replacement goal to a new task.
+    // Its old runtime callback belongs to the pre-classification task; the
+    // caller supplies the post-classification owner guard for this admission.
+    if (input.task.pendingRequirements?.length || nextStagePolicyFingerprint(input) !== policy || endpoint() !== originalEndpoint) {
+      throw new StaleWorkflowError();
+    }
+  };
+  const snapshot = (candidate: PlanStep[]): PlanStep[] => JSON.parse(JSON.stringify(candidate));
+  assertCurrent();
+  try {
+    input.prepareCandidate(input.classified.plan);
+    return;
+  } catch (error) {
+    if (!(error instanceof ObservationPlanError)) throw error;
+    assertCurrent();
+    const diagnostic = observationPlanRepairContext(error);
+    input.onAttempt({ phase: "rejected", attempt: 1, candidate: snapshot(input.classified.plan), diagnostic, error: error.message });
+    const originalContext = JSON.parse(input.runtimeModel.context || "{}");
+    const owners = [originalContext._log, originalContext.baseSnapshot?._log, originalContext.task?._log,
+      originalContext._taskModelBudget].filter(owner => owner && typeof owner.taskId === "string");
+    if (owners.some(owner => owner.taskId !== input.task.id || owner.roundId !== input.task.currentRoundId)) {
+      // Classification can move a goal to a new task/round. Never charge a
+      // repair owned by the new task to the old operation, or silently reset
+      // that operation's recovery allowance and cancellation identity.
+      throw new Error("当前目标或轮次已变化，原候选未通过本地校验。已停止沿用旧模型请求自动重生成；请在当前目标中显式重新规划，原调用与消耗记录保留。");
+    }
+    const recovery = recoveryFromContext(input.runtimeModel.context);
+    // Never silently create a fresh budget for a candidate already generated by
+    // classification, or grant another regeneration to an explicit replan.
+    if (!recovery || typeof recovery.operationId !== "string" || !recovery.operationId.trim()
+      || !Number.isFinite(recovery.startedAtMs) || outputStrategyFromContext(input.runtimeModel.context) === "regenerate") throw error;
+    const context = candidateRegenerationContext(classifiedPlanContext(input.runtimeModel.context,
+      input.classified, input.skillDefinitions, input.requirement), diagnostic);
+    const runtime = { ...input.runtimeModel, context, assertCurrent };
+    input.onAttempt({ phase: "request", attempt: 2,
+      request: { requirement: input.requirement, context: JSON.parse(context), model: runtime.model, endpoint: runtime.endpoint } });
+    assertCurrent();
+    try {
+      const candidate = await generatePlan(input.requirement, runtime);
+      // Retain the response even when a newer requirement invalidates admission.
+      input.onAttempt({ phase: "response", attempt: 2, candidate: snapshot(candidate) });
+      assertCurrent();
+      input.prepareCandidate(candidate);
+    } catch (failure) {
+      input.onAttempt({ phase: "failed", attempt: 2, error: failure instanceof Error ? failure.message : String(failure),
+        ...(failure instanceof ObservationPlanError ? { diagnostic: observationPlanRepairContext(failure) } : {}) });
+      throw failure;
+    }
+  }
+}
 type SummaryGenerator = (
   requirement: string,
   steps: PlanStep[],
@@ -63,6 +157,7 @@ type NextStageDecider = (
 ) => Promise<NextStageDecision>;
 
 export interface PlanDiscoveryContinuationInput {
+  observationProgress?: ObservationPlanProgressOptions;
   task: OpsTask;
   requirement: string;
   server?: ServerProfile;
@@ -76,6 +171,7 @@ export interface PlanDiscoveryContinuationInput {
 }
 
 export interface PlanTaskAdjustmentInput {
+  observationProgress?: ObservationPlanProgressOptions;
   task: OpsTask;
   failedStep?: PlanStep;
   server?: ServerProfile;
@@ -121,6 +217,9 @@ export interface ReviewTaskGoalInput {
 }
 
 export interface DecideTaskNextStageInput extends ReviewTaskGoalInput {
+  /** Controller re-reads the durable ledger before prompting and after model latency. */
+  refreshBusinessAcceptance?(): Promise<void>;
+  observationProgress?: ObservationPlanProgressOptions;
   /** Audit/progress only; the service still owns the recovery and its budget. */
   onCandidateRegeneration?(error: unknown): void;
   /** Compatibility flag; candidate output recovery is now always bounded in this service. */
@@ -361,6 +460,8 @@ export async function decideTaskNextStage(
   };
   assertCurrent();
   const requirement = latestTaskRequirement(input.task);
+  await input.refreshBusinessAcceptance?.();
+  assertCurrent();
   if (input.model) await refreshTaskKnowledge(input.task.id, () => lifetime.current() && !input.isCancelled?.());
   assertCurrent();
   let context = buildNextStageContext({
@@ -403,6 +504,8 @@ export async function decideTaskNextStage(
     let fieldRepairCause: "operational" | "decision" | undefined;
     const maxProposals = 3; // initial, at most one local correction, at most one new candidate
     let protocolRecovered = Boolean(previousFailure);
+    let rejectedCandidate: unknown = previousFailure
+      ? new PlanProtocolError(previousFailure.repair, previousFailure.repairError) : undefined;
     let decision: NextStageDecision | undefined;
     let prepared: ReturnType<typeof prepareOperationalDecision> | undefined;
     let taskDecision: ReturnType<typeof prepareTaskDecision> | undefined;
@@ -423,7 +526,10 @@ export async function decideTaskNextStage(
           if (repairFingerprint) assertDecisionRepairPreserved(repairFingerprint, decision);
           if (protocolRecovered) decision = { ...decision, steps: freshProtocolReplanSteps(decision.steps) };
           prepared = prepareOperationalDecision(input.task, decision);
+          await input.refreshBusinessAcceptance?.();
+          assertCurrent();
           taskDecision = prepareTaskDecision(input.task, decision);
+          assertObservationPlanProgress(input.task, prepared.steps, input.tools, { target: input.server, ...input.observationProgress, admission: "proposal" });
         }
         break;
       } catch (error) {
@@ -448,13 +554,15 @@ export async function decideTaskNextStage(
               instruction: "上一方案尚未执行。只修正指出的决策、需求验收、阻断或执行核对问题；已提供的真实证据应复用，不重复失败变更或已成功检查。" } };
             continue;
           }
-        } else if (!canRegenerateModelCandidate(error)) throw error;
+        } else if (!(error instanceof ObservationPlanError) && !canRegenerateModelCandidate(error)) throw preserveCandidateRejection(error, rejectedCandidate);
         if (error instanceof PlanProtocolError) error.repair.modelRecovery = modelRecovery;
         if (strategy === "regenerate" || attempt + 1 >= maxProposals) {
+          if (error instanceof ObservationPlanError) throw error;
           throw exhaustedCandidateRecovery(error, error instanceof PlanProtocolError
-            && rejectedCandidates.has(protocolRejectionFingerprint(error.repair)) ? "no_progress" : "budget_exhausted");
+            && rejectedCandidates.has(protocolRejectionFingerprint(error.repair)) ? "no_progress" : "budget_exhausted", rejectedCandidate);
         }
         if (error instanceof PlanProtocolError) rejectedCandidates.add(protocolRejectionFingerprint(error.repair));
+        rejectedCandidate ??= error;
         input.onCandidateRegeneration?.(error);
         assertCurrent();
         strategy = "regenerate";
@@ -463,7 +571,8 @@ export async function decideTaskNextStage(
         // Rebuild from the original full context, not the compact/frozen patch.
         // This changes the candidate only, never the budget, evidence or authority.
         context = JSON.parse(candidateRegenerationContext(JSON.stringify(originalContext),
-          error instanceof OperationalRecoveryError || error instanceof TaskDecisionError
+          error instanceof ObservationPlanError ? observationPlanRepairContext(error)
+            : error instanceof OperationalRecoveryError || error instanceof TaskDecisionError
             ? { code: error.name, reason: error.message.slice(0, 1200) } : modelCandidateDiagnostic(error)));
         if (error instanceof PlanProtocolError) context = { ...context, protocolReplan: protocolReplanContext({
           ...input.task, protocolRepair: { roundId: input.task.currentRoundId,
@@ -584,6 +693,7 @@ export async function planDiscoveryContinuation(
   const continuation = selectContinuationSteps(recoveryHistory(input.task), candidates, taskAttemptContext(input.task));
   assertTaskPlanAuthorization(input.task, continuation);
   validateRecoveryReferences(recoveryHistory(input.task), continuation, taskAttemptContext(input.task));
+  assertObservationPlanProgress(input.task, continuation, input.tools, { target: input.server, ...input.observationProgress, admission: "proposal" });
   if (!continuation.length) throw new Error("模型未返回可执行的后续步骤");
   return continuation;
 }
@@ -666,6 +776,7 @@ export async function planTaskAdjustment(
     : selectAdjustmentSteps(recoveryHistory(input.task), replacement, taskAttemptContext(input.task));
   validateRecoveryReferences(recoveryHistory(input.task), selected, taskAttemptContext(input.task));
   assertTaskPlanAuthorization(input.task, selected);
+  assertObservationPlanProgress(input.task, selected, input.tools, { target: input.server, ...input.observationProgress, admission: "proposal" });
   if (!selected.length) throw new Error("模型未返回新的可执行调整步骤");
   return {
     requirement,

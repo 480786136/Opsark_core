@@ -11,7 +11,7 @@ describe("shared Draft-07 contracts", () => {
     expect(contracts.resultSchema).toEqual(toolResultSchema);
     expect(contracts.tools).toEqual(defaultToolCatalog.map(({ id, inputSchema, outputSchema }) =>
       ({ id, inputSchema, ...(outputSchema ? { outputSchema } : {}) })));
-    expect(contracts.tools.filter(tool => "outputSchema" in tool)).toHaveLength(12);
+    expect(contracts.tools.filter(tool => "outputSchema" in tool)).toHaveLength(23);
   });
   it.each(corpus.cases)("$name", fixture => {
     const item = fixture as { schema?: Record<string, unknown>; toolId?: string; contract?: string; value: unknown; valid: boolean };
@@ -48,6 +48,17 @@ describe("tool output boundary", () => {
       expect(enforceToolResult(software, { callId: software.id, toolId: software.toolId, success: true,
         data: { items: names.map(name => ({ name, installed: false })) } }).success).toBe(false);
     }
+  });
+  it("locates the historic software path failure without weakening patterns or leaking values", () => {
+    const call = { id: "software", toolId: "software.check", arguments: { names: ["test"] } };
+    const check = (path: string) => enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true,
+      data: { items: [{ name: "test", installed: true, path }] } });
+    const invalid = check("secret-alias-text");
+    expect(invalid.error?.message).toContain("/items/0/path (pattern)");
+    expect(invalid.error?.message).toContain("schema=");
+    expect(JSON.stringify(invalid)).not.toContain("secret-alias-text");
+    expect(check("/中文目录/实际\\命令").success).toBe(true);
+    expect(check("/usr/bin/test\u0000suffix").success).toBe(false);
   });
   it("uses Unicode code points and requires forward progress in evidence pages", () => {
     const evidence = { id: "e", toolId: "evidence.read", arguments: { evidenceId: "a".repeat(64), offset: 2, limit: 1 } };

@@ -1,4 +1,11 @@
 import { operationsToolCatalog } from "./operationsContracts";
+import { fileDeletionToolCatalog } from "./fileDeletionContracts";
+import { healthObservationTool } from "./healthObservation";
+import { logRotationTool } from "./logRotationInspection";
+import { databaseInspectionToolCatalog } from "./databaseInspectionContracts";
+import { fileManifestTool } from "./fileManifestContracts";
+import { httpDeliveryTool } from "./httpDeliveryContracts";
+import { nginxConfigTool } from "./nginxConfigContracts";
 import { fullSchemaPattern, schemaNonWhitespace, schemaWhitespace } from "./toolSchemaPatterns";
 import { toolOutputSchemas } from "./toolOutputSchemas";
 import { compileToolSchema } from "./toolParameterSchema";
@@ -291,8 +298,8 @@ export const defaultToolCatalog: ToolDefinition[] = [
     effect: "read",
     implementation: "readRemoteFileContent",
     name: "文件内容读取工具",
-    description: "有界、只读地读取远端 UTF-8 文本文件，为项目文档、声明文件和配置分析提供真实证据。",
-    usageInstructions: "仅读取已确认绝对路径、与当前决策有关的文本。多个已知路径可作为 observe 步骤放入顺序计划，也可在已知最终路径的变更和验收后读取；任一步失败停止剩余步骤。路径本身依赖未知输出时另起阶段。默认 64 KiB，最大 256 KiB；二进制拒绝，敏感值脱敏。优先 README、依赖声明或示例配置，不默认读取完整锁文件。",
+    description: "有界、只读地读取远端 UTF-8 文本正文（content），为项目文档、声明文件和配置分析提供真实证据。",
+    usageInstructions: "需要查看配置当前值、解析JSON或取得文本正文时使用本工具；删除预览和文件清单的路径、大小、SHA-256不能代替正文。仅读取已确认绝对路径、与当前决策有关的文本。多个已知路径可作为 observe 步骤放入顺序计划，也可在已知最终路径的变更和验收后读取；任一步失败停止剩余步骤。路径本身依赖未知输出时另起阶段。默认 64 KiB，最大 256 KiB；二进制拒绝，敏感值脱敏。优先 README、依赖声明或示例配置，不默认读取完整锁文件。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -317,8 +324,8 @@ export const defaultToolCatalog: ToolDefinition[] = [
     effect: "read",
     implementation: "checkSoftware",
     name: "软件可用性检查工具",
-    description: "在当前任务绑定终端中检查指定软件是否存在，并获取真实可执行路径和版本首行。",
-    usageInstructions: "一次检查 1 到 20 个由项目证据或用户需求明确指出的软件；不得借此扫描整台服务器或猜测技术栈。该工具只检查，不安装、不升级、不启动服务。",
+    description: "在当前任务绑定终端的 PATH 中查找指定软件的可执行文件，并获取绝对路径和可选版本首行。",
+    usageInstructions: "一次检查 1 到 20 个由项目证据或用户需求明确指出的软件；不得借此扫描整台服务器或猜测技术栈。installed 只表示 PATH 中存在可执行文件；shell 内建、别名和函数不作为安装证据，installed=false 也不证明同名内建不可用。只需要判断可执行文件时设置 includeVersions=false；版本首行不证明版本兼容。该工具只检查，不安装、不升级、不启动服务。",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -328,19 +335,20 @@ export const defaultToolCatalog: ToolDefinition[] = [
       },
       required: ["names"],
     },
-    outputDescription: "返回每个软件的安装状态、命令路径和版本首行。",
+    outputDescription: "返回每个软件在 PATH 中的可执行文件存在状态、绝对路径和可选版本首行；不将 shell 内建、别名或函数文本作为文件路径。",
     planMode: "read_batch",
     completionMode: "refine",
     refinementScope: "active-skill",
     executionMode: "terminal",
     enabled: true,
     builtIn: true,
-    version: 1,
+    version: 2,
     updatedAt: CATALOG_UPDATED_AT,
   },
   {
     id: "files.transfer_between_servers",
     effect: "change",
+    requiresTargetChange: true,
     implementation: "transferFileBetweenServers",
     name: "服务器间文件传输工具",
     description: "使用 Opsark 已保存的两台服务器凭据，在桌面后端中流式中转文件并进行 SHA-256 校验。",
@@ -366,6 +374,13 @@ export const defaultToolCatalog: ToolDefinition[] = [
     updatedAt: CATALOG_UPDATED_AT,
   },
   ...operationsToolCatalog,
+  healthObservationTool,
+  logRotationTool,
+  ...databaseInspectionToolCatalog,
+  fileManifestTool,
+  httpDeliveryTool,
+  nginxConfigTool,
+  ...fileDeletionToolCatalog,
 ];
 
 // Invalid or unsupported contracts fail at startup, before any model plan runs.

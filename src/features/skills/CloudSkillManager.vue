@@ -8,9 +8,12 @@ import { useActionConfirmation } from "@/components/useActionConfirmation";
 const props = defineProps<{ open: boolean }>();
 const emit = defineEmits<{ close: [] }>();
 const sync = useSkillAutoSyncStore();
-const { confirmationMessage, confirmAction, resolveConfirmation } = useActionConfirmation();
+const { confirmationMessage, confirmationId, confirmAction, resolveConfirmation } = useActionConfirmation();
 const activeSkills = computed(() => sync.cloudSkills.filter(skill => !skill.deleted));
-watch(() => props.open, open => { if (open) void sync.refreshCloudSkills(); });
+watch(() => props.open, open => {
+  if (open) void sync.refreshCloudSkills();
+  else resolveConfirmation(false);
+});
 async function remove(id: string, name: string) {
   if (!await confirmAction(`确定删除云端 Skill“${name}”吗？云端将保留已删除记录。`)) return;
   await sync.deleteCloudSkill(id);
@@ -33,7 +36,7 @@ async function remove(id: string, name: string) {
       </aside>
     </div>
   </Teleport>
-  <ConfirmActionDialog :message="confirmationMessage" title="删除云端 Skill" confirm-label="确认删除" @result="resolveConfirmation" />
+  <ConfirmActionDialog :message="confirmationMessage" :request-id="confirmationId" title="删除云端 Skill" confirm-label="确认删除" @result="resolveConfirmation" />
 </template>
 
 <style scoped>

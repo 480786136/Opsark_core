@@ -10,6 +10,7 @@ import type { ToolCall, ToolDefinition } from "@/features/tools/types";
 import type { PlanStep } from "@/types";
 import { failureDependencyBlocker } from "./failureDisposition";
 import { assertToolStepBoundary } from "./stepAction";
+import { assertPlanEvidenceRequirements, assertToolEvidenceCapability } from "@/features/tools/toolEvidenceCapability";
 
 export type StepDispatchDecision =
   | { kind: "tool"; call: ToolCall }
@@ -44,6 +45,7 @@ export function resolveStepDispatch(
   }
   try {
     assertToolStepBoundary(step);
+    assertPlanEvidenceRequirements(step);
     if (step.action?.type === "shell" && step.action.command !== step.command) throw new Error("Shell action 与执行命令不一致");
     assertShellToolBoundary(step.command, step.validation);
     if (step.executionIntent && !stepMatchesExecutionIntent(step as PlanStep)) {
@@ -67,6 +69,7 @@ export function resolveStepDispatch(
       call = parseToolAction(step.action, toolCallId, tools);
     }
     if (call) {
+      if (definition) assertToolEvidenceCapability({ id: step.id ?? "", expected: step.expected ?? "", description: step.description ?? "", action: step.action, evidenceRequirements: step.evidenceRequirements }, definition);
       if (definition?.effect === "change" && step.kind !== "change") return { kind: "invalid", error: "变更工具必须声明 kind=change 并通过审批" };
       if (allowedToolIds && !allowedToolIds.includes(call.toolId)) {
         return { kind: "invalid", error: `当前规划上下文未开放工具：${call.toolId}` };

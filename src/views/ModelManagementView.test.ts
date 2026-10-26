@@ -8,6 +8,7 @@ import { useOpsStore } from "@/stores/ops";
 import ModelManagementView from "./ModelManagementView.vue";
 import { useAccountStore } from "@/features/account/accountStore";
 import { backend } from "@/services/backend";
+import type { TaskModelRequest } from "@/services/taskModelRequests";
 import { directCapabilities, newModelCapabilities } from "@/features/agent/modelCapabilities";
 import { modelPresetConfiguration } from "@/features/agent/modelPresets";
 import { fetchOfficialCatalog, officialCatalogOrigin } from "@/features/account/officialCatalogApi";
@@ -77,6 +78,7 @@ it("explicit testing only checks the draft, and an explicit save retains its res
   const save = vi.spyOn(store, "saveModelProfile");
   document.querySelector<HTMLButtonElement>(".model-card")!.click(); await nextTick();
   const test = [...document.querySelectorAll<HTMLButtonElement>('.drawer-footer button')].find(button => button.textContent?.includes("Test this model"))!;
+  await vi.waitFor(() => expect(test.disabled).toBe(false));
   test.click(); await nextTick(); await nextTick();
   expect(check).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ model: "model", endpoint: "https://example.test/v1", capabilities: undefined, capabilitiesV2: undefined }), "structured");
   expect(save).not.toHaveBeenCalled();
@@ -182,6 +184,7 @@ async function choose(label: string, value: string) {
   document.querySelector<HTMLButtonElement>(`.parameter-options [data-value="${value}"]`)!.click(); await nextTick();
 }
 const testButton = () => [...document.querySelectorAll<HTMLButtonElement>('.drawer-footer button')].find(button => button.textContent?.includes("Test this model"))!;
+async function clickTest() { await vi.waitFor(() => expect(testButton().disabled).toBe(false)); testButton().click(); }
 const previewButton = () => [...document.querySelectorAll<HTMLButtonElement>('.validation-controls button')].find(button => button.textContent?.includes("Validation request preview"))!;
 const submit = () => document.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
 
@@ -222,10 +225,10 @@ it("allows an explicit connection probe for unknown capabilities without claimin
   const check = vi.spyOn(backend, "checkModel").mockResolvedValue({ available: true, reason: "Access passed",
     validation: { modelAccess: "passed", structuredOutput: "not_tested", businessContract: "not_tested" } });
   document.querySelector<HTMLButtonElement>(".model-card")!.click(); await nextTick();
-  testButton().click(); await nextTick(); await nextTick();
+  await clickTest(); await nextTick(); await nextTick();
   expect(check).not.toHaveBeenCalled();
   await choose("Validation scope", "parameters");
-  testButton().click(); await vi.waitFor(() => expect(check).toHaveBeenCalledOnce());
+  await clickTest(); await vi.waitFor(() => expect(check).toHaveBeenCalledOnce());
   expect(check).toHaveBeenCalledWith(expect.objectContaining({ capabilitiesV2: expect.objectContaining({ outputModes: { json_object: "unknown", json_schema: "unknown" } }) }), "parameters");
   await vi.waitFor(() => expect(document.querySelector('.validation-layers')?.textContent).toContain("Basic structure · Not tested"));
   expect(document.querySelector('.validation-layers')?.textContent).toContain("Business contract · Not tested");
@@ -237,8 +240,8 @@ it("clears a previous successful validation when a same-configuration retest fai
     validation: { modelAccess: "passed", structuredOutput: "passed", businessContract: "passed" } }).mockRejectedValueOnce(new Error("probe rejected"));
   vi.spyOn(backend, "saveCredential").mockResolvedValue();
   document.querySelector<HTMLButtonElement>(".model-card")!.click(); await nextTick();
-  testButton().click(); await vi.waitFor(() => expect(document.querySelector('.test-success')?.textContent).toContain("All layers passed"));
-  testButton().click(); await vi.waitFor(() => expect(document.querySelector('.drawer-footer [role="alert"]')?.textContent).toContain("probe rejected"));
+  await clickTest(); await vi.waitFor(() => expect(document.querySelector('.test-success')?.textContent).toContain("All layers passed"));
+  await clickTest(); await vi.waitFor(() => expect(document.querySelector('.drawer-footer [role="alert"]')?.textContent).toContain("probe rejected"));
   expect(document.querySelector('.validation-layers')).toBeNull();
   expect(document.querySelector('.test-success')).toBeNull();
   submit(); await vi.waitFor(() => expect(document.querySelector('[role="dialog"]')).toBeNull());
@@ -268,7 +271,7 @@ it("marks previous validation stale after a request change and does not persist 
   vi.spyOn(backend, "saveCredential").mockResolvedValue();
   vi.spyOn(backend, "checkModel").mockResolvedValue({ available: true, reason: "Access passed", validation: { modelAccess: "passed", structuredOutput: "passed", businessContract: "not_tested" } });
   document.querySelector<HTMLButtonElement>(".model-card")!.click(); await nextTick();
-  testButton().click(); await vi.waitFor(() => expect(document.querySelector('.validation-layers')).not.toBeNull());
+  await clickTest(); await vi.waitFor(() => expect(document.querySelector('.validation-layers')).not.toBeNull());
   const key = document.querySelector<HTMLInputElement>('[aria-label="API Key"]')!;
   key.value = "changed-key"; key.dispatchEvent(new Event("input")); await nextTick();
   expect(document.querySelector('.validation-layers')?.textContent).toContain("Validation expired");
@@ -307,4 +310,117 @@ it("marks an edited documented capability as a user declaration", async () => {
   await choose("Schema strict flag", "optional");
   submit(); await vi.waitFor(() => expect(save).toHaveBeenCalledOnce());
   expect(save.mock.calls[0][0].capabilitiesV2?.evidence.source).toBe("user_declared");
+});
+
+const probeRecord = (state: TaskModelRequest["state"]): TaskModelRequest => ({ requestId: "original-probe-request", operationId: "original-operation", state,
+  phase: state, cancelRequested: false, late: false, createdAtMs: 1, updatedAtMs: 2 });
+async function openLocalProbe() {
+  const store = await mount();
+  store.models[0].endpoint = "http://127.0.0.1:18767/v1";
+  store.models[0].requestLifecycleAdapter = { protocol: "opsark-local-v1", baseUrl: "http://127.0.0.1:18767/" };
+  document.querySelector<HTMLButtonElement>(".model-card")!.click(); await nextTick(); await nextTick();
+  return store;
+}
+it("renders a historically cancelled completed probe as recorded, not awaiting provider stop", async () => {
+  vi.spyOn(backend, "listModelProbeRequests").mockResolvedValue([{ ...probeRecord("completed"), cancelRequested: true,
+    usage: { total_tokens: 17843 } }]);
+  const check = vi.spyOn(backend, "checkModel");
+  await openLocalProbe();
+  await vi.waitFor(() => expect(document.querySelector(".probe-lifecycle")?.textContent).toContain("response recorded"));
+  expect(document.querySelector(".probe-lifecycle")?.textContent).toContain("cancellation request recorded");
+  expect(document.querySelector(".probe-lifecycle")?.textContent).not.toContain("provider confirmation required");
+  expect(document.querySelector(".probe-lifecycle")?.textContent).not.toContain("Query original");
+  expect(check).not.toHaveBeenCalled();
+});
+it("passes the explicit local adapter from the actual model editor test button", async () => {
+  await openLocalProbe();
+  const check = vi.spyOn(backend, "checkModel").mockResolvedValue({ available: true, reason: "synthetic" });
+  testButton().click();
+  await vi.waitFor(() => expect(check).toHaveBeenCalledWith(expect.objectContaining({ requestLifecycleAdapter: {
+    protocol: "opsark-local-v1", baseUrl: "http://127.0.0.1:18767/",
+  }, assertCurrent: expect.any(Function) }), "structured"));
+});
+it("restores the persisted unknown lock after closing and reopening, queries only the original, and requires an explicit new test", async () => {
+  let current = probeRecord("unknown");
+  vi.spyOn(backend, "listModelProbeRequests").mockImplementation(async () => [{ ...current }]);
+  const recover = vi.spyOn(backend, "recoverModelProbeRequest").mockImplementation(async () => { current = probeRecord("completed"); return current; });
+  const check = vi.spyOn(backend, "checkModel").mockResolvedValue({ available: true, reason: "explicit new test" });
+  await openLocalProbe();
+  await vi.waitFor(() => expect(testButton().disabled).toBe(true));
+  document.querySelector('[role="dialog"]')!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await nextTick();
+  document.querySelector<HTMLButtonElement>(".model-card")!.click(); await nextTick(); await nextTick();
+  expect(testButton().disabled).toBe(true); expect(check).not.toHaveBeenCalled();
+  const query = [...document.querySelectorAll<HTMLButtonElement>(".probe-lifecycle button")].find(button => button.textContent?.includes("Query original"))!;
+  query.click();
+  await vi.waitFor(() => expect(testButton().disabled).toBe(false));
+  expect(recover).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ endpoint: "http://127.0.0.1:18767/v1", apiKey: "secret" }), "original-probe-request");
+  expect(check).not.toHaveBeenCalled(); expect(document.querySelector(".validation-layers")).toBeNull();
+  testButton().click(); await vi.waitFor(() => expect(check).toHaveBeenCalledOnce());
+});
+it("keeps an unknown request blocked when original-result lookup fails", async () => {
+  vi.spyOn(backend, "listModelProbeRequests").mockResolvedValue([probeRecord("unknown")]);
+  vi.spyOn(backend, "recoverModelProbeRequest").mockRejectedValue(new Error("adapter unreachable"));
+  const check = vi.spyOn(backend, "checkModel");
+  await openLocalProbe();
+  const query = [...document.querySelectorAll<HTMLButtonElement>(".probe-lifecycle button")].find(button => button.textContent?.includes("Query original"))!;
+  query.click(); await vi.waitFor(() => expect(document.querySelector('.drawer-footer [role="alert"]')?.textContent).toContain("adapter unreachable"));
+  expect(testButton().disabled).toBe(true); expect(check).not.toHaveBeenCalled();
+});
+it("isolates late test success after cancellation without fabricating provider cancellation", async () => {
+  let resolve!: (value: { available: boolean; reason: string }) => void;
+  const check = vi.spyOn(backend, "checkModel").mockImplementation(() => new Promise(done => { resolve = done; }));
+  const cancel = vi.spyOn(backend, "cancelModelProbeRequests").mockResolvedValue([]);
+  await openLocalProbe();
+  testButton().click(); await nextTick();
+  const button = [...document.querySelectorAll<HTMLButtonElement>(".probe-lifecycle button")].find(item => item.textContent?.includes("Request test cancellation"))!;
+  button.click(); await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+  resolve({ available: true, reason: "late success" });
+  await vi.waitFor(() => expect(document.querySelector('.drawer-footer [role="alert"]')?.textContent).toContain("Test cancelled"));
+  expect(document.querySelector(".validation-layers")).toBeNull(); expect(document.querySelector(".test-success")).toBeNull();
+  expect(check).toHaveBeenCalledOnce();
+});
+it("blocks test dispatch if the persistent request ledger cannot be read", async () => {
+  vi.spyOn(backend, "listModelProbeRequests").mockRejectedValue(new Error("ledger unavailable"));
+  const check = vi.spyOn(backend, "checkModel");
+  await openLocalProbe();
+  await vi.waitFor(() => expect(document.querySelector('.probe-lifecycle [role="alert"]')?.textContent).toContain("ledger unavailable"));
+  testButton().click(); expect(check).not.toHaveBeenCalled();
+});
+it("does not apply a late completion after editing a request field while a test is pending", async () => {
+  let resolve!: (value: { available: boolean; reason: string }) => void;
+  vi.spyOn(backend, "checkModel").mockImplementation(() => new Promise(done => { resolve = done; }));
+  await openLocalProbe();
+  testButton().click(); await nextTick();
+  // Programmatic input simulates a concurrent configuration update; ordinary
+  // controls are disabled while the test is running.
+  const key = document.querySelector<HTMLInputElement>('[aria-label="API Key"]')!;
+  key.value = "replacement"; key.dispatchEvent(new Event("input")); await nextTick();
+  resolve({ available: true, reason: "old credential success" });
+  await vi.waitFor(() => expect(document.querySelector('.drawer-footer [role="alert"]')?.textContent).toContain("configuration changed"));
+  expect(document.querySelector(".validation-layers")).toBeNull();
+  expect(document.querySelector(".test-success")).toBeNull();
+});
+it("never commits a late test result after the editor is unmounted", async () => {
+  let resolve!: (value: { available: boolean; reason: string }) => void;
+  const check = vi.spyOn(backend, "checkModel").mockImplementation(() => new Promise(done => { resolve = done; }));
+  const store = await openLocalProbe();
+  const save = vi.spyOn(store, "saveModelProfile");
+  testButton().click(); await nextTick();
+  const guard = check.mock.calls[0][0].assertCurrent!;
+  app.unmount();
+  expect(guard).toThrow("configuration changed");
+  resolve({ available: true, reason: "late result" }); await nextTick(); await nextTick();
+  expect(save).not.toHaveBeenCalled(); expect(store.models[0].validationSnapshot).toBeUndefined();
+});
+it("delivers cancellation of a timed-out adapter request through original recovery without generating a new test", async () => {
+  vi.spyOn(backend, "listModelProbeRequests").mockResolvedValue([probeRecord("unknown")]);
+  const cancel = vi.spyOn(backend, "cancelModelProbeRequests").mockResolvedValue([{ ...probeRecord("unknown"), cancelRequested: true }]);
+  const recover = vi.spyOn(backend, "recoverModelProbeRequest").mockResolvedValue({ ...probeRecord("unknown"), cancelRequested: true });
+  const check = vi.spyOn(backend, "checkModel");
+  await openLocalProbe();
+  const button = [...document.querySelectorAll<HTMLButtonElement>(".probe-lifecycle button")].find(item => item.textContent?.includes("Request test cancellation"))!;
+  button.click(); await vi.waitFor(() => expect(recover).toHaveBeenCalledOnce());
+  expect(cancel).toHaveBeenCalledOnce();
+  expect(recover).toHaveBeenCalledWith(expect.objectContaining({ apiKey: "secret" }), "original-probe-request");
+  expect(check).not.toHaveBeenCalled(); expect(testButton().disabled).toBe(true);
 });

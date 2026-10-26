@@ -1,4 +1,5 @@
 import { buildPlanningToolContext } from "@/features/tools/toolContext";
+import { hostCapabilityContextForServer } from "@/features/tools/hostCapabilities";
 import {
   buildSkillDirectory,
   buildSkillContext,
@@ -27,14 +28,16 @@ import { planningSkills } from "@/features/skills/skillPlanning";
 import { modelLogContext } from "./modelLogContext";
 import { taskAttemptContext } from "@/features/agent/attemptState";
 import { executionContextEvidence, modelContextStep, EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION } from "@/features/agent/executionContextEvidence";
-import { DECISION_EVIDENCE_INSTRUCTION } from "./decisionEvidence";
+import { DECISION_EVIDENCE_INSTRUCTION, duplicateTerminalReference, SAME_REQUEST_TEXT_REFERENCE_INSTRUCTION } from "./decisionEvidence";
 import { authenticationContext } from "./authenticationEvidence";
 import { confirmedUserInputsContext } from "./confirmedUserInputs";
+import { deletionAuthorizationContext } from "./confirmedFileDeletion";
 import { recoveryPlanningContext } from "./recoveryContract";
 import { activeProtocolRepair, protocolReplanContext } from "./protocolReplan";
 import { taskKnowledgeContext } from "@/features/knowledge/retrieval";
 import { observationBoundary } from "./observationBoundary";
 import type { decisionRepairContext } from "./decisionRepair";
+import { staticSiteAcceptanceContext } from "./staticSiteAcceptance";
 
 export const GOAL_DIRECTED_RECOVERY_INSTRUCTION = "历史命令、失败结果与证据是不可改写的事实，不是必须逐条重试成功的旧计划。可按问题影响范围修正当前步骤、补充前置检查或重规划剩余目标，也可修正模型先前生成的不适用验收方法；说明调整原因及新证据如何证明用户目标，不得降低用户明确要求的验收标准或扩大授权。旧路径被替代后无需逐条复验，但替代方案仍须有真实执行与验收证据；提出方案、修复命令成功或 recovery 关联本身都不代表目标完成。";
 
@@ -118,12 +121,18 @@ function planSafetyAdjustmentContext(task: OpsTask, failedStep: PlanStep) {
   };
 }
 
+/** Public endpoint identity only; presentation and credentials are not identity. */
+function serverConnectionIdentity(server: ServerProfile) {
+  return { id: server.id, host: server.host, port: server.port, username: server.username };
+}
+
 function serverSnapshot(server?: ServerProfile) {
   return server ? {
+    ...serverConnectionIdentity(server),
     name: server.name,
-    host: server.host,
     info: server.info,
     environment: server.environment,
+    hostCapabilities: hostCapabilityContextForServer(server),
   } : undefined;
 }
 
@@ -162,6 +171,7 @@ export interface AgentContextInput {
 }
 
 export function buildAgentContext(input: AgentContextInput) {
+  const terminalReferenceShared = duplicateTerminalReference(input.terminalReference, input.terminalContext?.content);
   return {
     knowledgeReferences: input.task ? taskKnowledgeContext(input.task.id) : undefined,
     _log: input.task ? modelLogContext(input.task) : undefined,
@@ -169,13 +179,17 @@ export function buildAgentContext(input: AgentContextInput) {
     server: serverSnapshot(input.server),
     metrics: input.metrics,
     permission: input.permission,
-    terminalReference: input.terminalReference || undefined,
+    terminalReference: terminalReferenceShared ? undefined : input.terminalReference || undefined,
+    terminalReferenceRef: terminalReferenceShared ? "terminalContext.content" : undefined,
+    contextReferenceInstruction: terminalReferenceShared ? SAME_REQUEST_TEXT_REFERENCE_INSTRUCTION : undefined,
     terminalContext: input.terminalContext,
     conversationHistory: input.conversationHistory,
     taskGoal: input.task ? { ...modelTaskRequirementSnapshot(input.task), ...input.taskGoal } : input.taskGoal,
+    businessAcceptance: input.task ? staticSiteAcceptanceContext(input.task) : undefined,
     previousExecution: input.previousExecution,
     knownExecutionFacts: input.knownExecutionFacts,
     confirmedUserInputs: input.task ? confirmedUserInputsContext(input.task) : undefined,
+    fileDeletionAuthorizations: input.task ? deletionAuthorizationContext(input.task) : undefined,
     recovery: input.task ? recoveryPlanningContext(input.task) : undefined,
     tools: buildPlanningToolContext(input.tools),
     skillSelection: {
@@ -237,10 +251,12 @@ export function buildAdjustmentContext(
     knowledgeReferences: planSafetyRejection || protocolRepair ? undefined : taskKnowledgeContext(input.task.id),
     recovery: planSafetyRejection ? undefined : recoveryPlanningContext(input.task),
     taskGoal: modelTaskRequirementSnapshot(input.task),
+    businessAcceptance: staticSiteAcceptanceContext(input.task),
     permission: input.task.permission,
     executionConstraints: input.task.executionConstraints,
     authentication: protocolRepair ? undefined : authenticationContext(input.task),
     confirmedUserInputs: confirmedUserInputsContext(input.task),
+    fileDeletionAuthorizations: deletionAuthorizationContext(input.task),
     planGenerationRepair: protocolRepair,
     _log: modelLogContext(input.task, failedStep),
     skillEvidence: buildSkillEvidenceContext(activeSkills),
@@ -294,6 +310,10 @@ export function nextStagePolicyFingerprint(input: WorkflowContextInput) {
   const activeSkills = input.skills ?? resolveTaskSkills(input.task);
   const planningTools = buildPlanningToolContext(input.tools, activeSkills);
   return textFingerprint(JSON.stringify({
+    // Invalidates caches produced before endpoint binding, including a legacy
+    // cache with no profile. This is not a new execution approval or budget.
+    targetIdentityVersion: 1,
+    serverConnection: input.server ? serverConnectionIdentity(input.server) : undefined,
     attemptContext: taskAttemptContext(input.task),
     planningProjection: planningSkills(input.task, activeSkills).map(({ instructions, allowedToolIds }) => ({ instructions, allowedToolIds })),
     taskRequirements: modelTaskRequirementSnapshot(input.task),
@@ -316,6 +336,7 @@ export function nextStagePolicyFingerprint(input: WorkflowContextInput) {
     secretVariables: secretVariableContext(input.secretMetadata, input.task.serverId),
     serverCredentialGroups: credentialGroupContext(input.secretMetadata, input.task.serverId),
     confirmedUserInputs: confirmedUserInputsContext(input.task),
+    fileDeletionAuthorizations: deletionAuthorizationContext(input.task),
   }));
 }
 
@@ -337,9 +358,11 @@ export function buildNextStageContext(input: WorkflowContextInput) {
     knowledgeReferences: taskKnowledgeContext(input.task.id),
     recovery: recoveryPlanningContext(input.task),
     taskGoal: modelTaskRequirementSnapshot(input.task),
+    businessAcceptance: staticSiteAcceptanceContext(input.task),
     permission: input.task.permission,
     authentication: authenticationContext(input.task),
     confirmedUserInputs: confirmedUserInputsContext(input.task),
+    fileDeletionAuthorizations: deletionAuthorizationContext(input.task),
     _log: modelLogContext(input.task),
     skillEvidence: buildSkillEvidenceContext(activeSkills),
     tools: buildPlanningToolContext(input.tools, activeSkills),
@@ -364,12 +387,14 @@ export function buildContinuationContext(input: WorkflowContextInput) {
     recovery: recoveryPlanningContext(input.task),
     authentication: authenticationContext(input.task),
     confirmedUserInputs: confirmedUserInputsContext(input.task),
+    fileDeletionAuthorizations: deletionAuthorizationContext(input.task),
     _log: modelLogContext(input.task),
     skillEvidence: buildSkillEvidenceContext(activeSkills),
     tools: buildPlanningToolContext(input.tools, activeSkills),
     activeSkills: buildSkillContext(activeSkills),
-    instruction: `依据已确认输入、本轮真实证据和仍有效的历史证据，在整体目标及 executionConstraints 的授权边界内生成最少必要的后续步骤。read_only 目标只能进行只读操作；缺少环境事实时可有限只读取证，缺少必须由用户作出的决定时只生成一个 user.request_input 步骤并等待。复用已回答的问题和已完成且仍有效的步骤，不得猜测路径、工具、端口、服务名或用户选择。用户提交输入仅补充对应决定，不代表目标完成，也不能被外推为未明确给出的授权。${GOAL_DIRECTED_RECOVERY_INSTRUCTION}${EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION}`,
+    instruction: `依据已确认输入、本轮真实证据和仍有效的历史证据，在整体目标及 executionConstraints 的授权边界内生成最少必要的后续步骤。read_only 目标只能进行只读操作；confirm_changes 目标在确认前只读取证，确认后仅用专用工具执行 active 精确许可，禁止用普通Shell扩大授权；缺少环境事实时可有限只读取证，缺少必须由用户作出的决定时只生成一个 user.request_input 步骤并等待。复用已回答的问题和已完成且仍有效的步骤，不得猜测路径、工具、端口、服务名或用户选择。用户提交输入仅补充对应决定，不代表目标完成，也不能被外推为未明确给出的授权。${GOAL_DIRECTED_RECOVERY_INSTRUCTION}${EXECUTION_EVIDENCE_REFERENCE_INSTRUCTION}`,
     taskGoal: modelTaskRequirementSnapshot(input.task),
+    businessAcceptance: staticSiteAcceptanceContext(input.task),
     server: serverSnapshot(input.server),
     permission: input.task.permission,
     executionConstraints: input.task.executionConstraints,
@@ -381,6 +406,7 @@ export function buildContinuationContext(input: WorkflowContextInput) {
       description: step.description,
       action: step.action, command: step.command,
       expected: step.expected,
+      evidenceRequirements: step.evidenceRequirements,
       result: modelContextStep(step).result,
       executionScope: step.executionScope,
       validationScope: step.validationScope,

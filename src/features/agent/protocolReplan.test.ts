@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { activeProtocolRepair, freshProtocolReplanSteps, protocolReplanContext } from "./protocolReplan";
 import { buildAdjustmentContext, buildNextStageContext } from "./agentContext";
 import { analyzePlanStepSafety } from "./planSafety";
+import { normalizePlanPreconditions } from "./planNormalizer";
 import type { OpsTask, PlanStep } from "@/types";
 
 const rejected: PlanStep = {
@@ -20,6 +21,29 @@ const fixture = (): OpsTask => ({
 });
 
 describe("protocol failure to business plan boundary", () => {
+  it("accepts a catalog-backed read query as a fresh business candidate, retaining goal and approval boundaries", () => {
+    const task = fixture();
+    const candidate: PlanStep = { ...rejected, kind: "observe", command: "", expected: "指定地址 HTTP 状态与有限正文已采集，不将截断内容当完整验收",
+      action: { type: "tool", toolId: "services.inspect", arguments: { check: "health", url: "http://example.test/health", maxResponseBytes: 4096 } } };
+    const fresh = freshProtocolReplanSteps([candidate]);
+    expect(() => normalizePlanPreconditions(fresh)).not.toThrow();
+    expect(fresh[0].action).toEqual(candidate.action);
+    expect(fresh[0].status).toBe("pending");
+    expect(fresh[0].id).not.toBe(rejected.id);
+    expect(fresh[0]).not.toHaveProperty("approvedSafetySnapshot");
+    expect(task.protocolRepair!.repair.previousModelOutput).toEqual([rejected]);
+    expect(protocolReplanContext(task)!.instruction).toContain("新步骤必须重新通过协议、安全、授权和风险审批");
+  });
+  it("carries the same conservative capability boundary into business replanning without granting a new action", () => {
+    const task = fixture();
+    const context = protocolReplanContext(task)!;
+    expect(context.readOnlyPlanProtocol).toMatchObject({ requiresFullValidation: true,
+      unsupportedShellOperators: ["<<"], localRepair: { scope: "rejected_fields" } });
+    expect(context.readOnlyPlanProtocol!.localRepair.instruction).toContain("重新校验审批");
+    expect(context.readOnlyPlanProtocol!.localRepair.readOnlyInstruction).toContain("当前 context.tools");
+    expect(context.rejectedPlanExecuted).toBe(false);
+    expect(task.protocolRepair!.repair.previousModelOutput).toEqual([rejected]);
+  });
   it("exposes a rejected protocol proposal to the joint business decision without treating it as execution", () => {
     const task = fixture();
     const input = { task, tools: [], secretMetadata: [] };

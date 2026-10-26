@@ -1602,7 +1602,7 @@ describe("智能任务状态机", () => {
     task.status = "running";
     task.plan = [{
       ...structuredClone(plan[0]),
-      id: "tool-step", kind: "observe",
+      id: "tool-step",
       title: "获取项目文件结构",
       kind: "observe", command: "", action: { type: "tool" as const, toolId: "files.get_structure", arguments: {"rootPath":"/opt/app","excludeDirectories":["uploads"]} },
       validation: "",
@@ -3203,8 +3203,8 @@ describe("智能任务状态机", () => {
       reason: "需要诊断并复查构建产物",
       summary: "已生成诊断与复查步骤。",
       source: "model",
-      steps: ["diagnose-script", "inspect-artifact"].map(id => ({
-        ...structuredClone(plan[0]), id, kind: "observe", command: "pwd", validation: "", status: "pending",
+      steps: ["diagnose-script", "inspect-artifact"].map((id, index) => ({
+        ...structuredClone(plan[0]), id, kind: "observe", command: index === 0 ? "pwd" : "ls -ld /tmp", validation: "", status: "pending",
       })),
     });
     await store.adjustTask(task.id);
@@ -4019,7 +4019,7 @@ describe("智能任务状态机", () => {
     expect(backend.processRequirement).toHaveBeenCalledOnce();
   });
 
-  it("hydrate 期间停止旧提交后可立即继续，旧请求不会复活或释放新 owner", async () => {
+  it("hydrate 期间停止旧提交后可接收新消息，但继续不能绕过未完成需求，旧请求不释放新 owner", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "safe", "model-deepseek");
     task.rootGoal = "检查应用服务";
@@ -4067,7 +4067,10 @@ describe("智能任务状态机", () => {
     });
     await currentSubmission;
 
-    expect(task.plan[0].id).toBe("current-step");
+    expect(task.plan).toEqual([]);
+    expect(task.status).toBe("planning_failed");
+    expect(task.pendingRequirements?.map(item => item.content)).toEqual(["旧提交"]);
+    expect(backend.executeCommand).not.toHaveBeenCalled();
     expect(task.requirementProcessing).toBe(false);
   });
 
@@ -4129,7 +4132,7 @@ describe("智能任务状态机", () => {
     expect(backend.executeCommand).not.toHaveBeenCalled();
   });
 
-  it("停止旧提交后可立即继续，旧 finally 不会清除新提交的忙碌状态", async () => {
+  it("停止旧提交后继续仍保留未完成需求，旧 finally 不会清除新提交的忙碌状态", async () => {
     const store = useOpsStore();
     const task = store.createTask("srv-production-01", "safe", "model-deepseek");
     task.rootGoal = "检查应用服务";
@@ -4168,8 +4171,10 @@ describe("智能任务状态机", () => {
     });
     await newSubmission;
     expect(task.requirementProcessing).toBe(false);
-    expect(task.lastRequirementRelation).toBe("continue");
-    expect(task.plan[0].id).toBe("continued-step");
+    expect(task.status).toBe("planning_failed");
+    expect(task.pendingRequirements?.map(item => item.content)).toEqual(["补充检查日志"]);
+    expect(task.plan).toEqual([]);
+    expect(backend.executeCommand).not.toHaveBeenCalled();
     expect(backend.processRequirement).toHaveBeenCalledTimes(2);
   });
 

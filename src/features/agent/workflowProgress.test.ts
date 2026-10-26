@@ -19,6 +19,56 @@ function task(steps: PlanStep[]): OpsTask {
 }
 
 describe("generic workflow progress", () => {
+  it.each([{ validationPassed: false }, { acceptancePassed: false },
+    { semanticAcceptanceRequired: true, semanticAcceptanceStatus: "not_met" },
+    { semanticAcceptanceRequired: true, semanticAcceptanceStatus: "unknown" }])(
+    "does not reset stagnation for repeated exit-zero mutations with unproven acceptance: %j", facts => {
+      const steps = ["a", "b", "c"].map(id => {
+        const current = observed(id, "service remains unhealthy", { kind: "change", action: { type: "shell", command: `change-${id}` } });
+        Object.assign(current.result!.facts, facts, { commandDispatched: true });
+        return current;
+      });
+      expect(workflowProgress(task(steps))).toMatchObject({ stagnantPhases: 2, evidenceCount: 1 });
+      expect(automaticContinuationStop(task(steps))?.code).toBe("no_progress");
+    },
+  );
+  it.each([{ commandDispatched: false }, { dispatchState: "not_sent" }, { dispatchState: "unknown" }])(
+    "does not infer progress from changed output when dispatch is not confirmed: %j", facts => {
+      const steps = ["a", "b"].map(id => {
+        const current = observed(id, `claimed-${id}`, { kind: "change" });
+        Object.assign(current.result!.facts, facts);
+        return current;
+      });
+      expect(workflowProgress(task(steps))).toMatchObject({ stagnantPhases: 2, evidenceCount: 0 });
+      expect(automaticContinuationStop(task(steps))?.code).toBe("no_progress");
+    },
+  );
+  it("allows a confirmed accepted change but does not change task or requirement completion", () => {
+    const change = observed("changed", "service healthy", { kind: "change" });
+    Object.assign(change.result!.facts, { commandDispatched: true, semanticAcceptanceRequired: true, semanticAcceptanceStatus: "proven" });
+    const current = task([observed("a"), observed("b"), change]);
+    const before = JSON.stringify(current);
+    expect(workflowProgress(current)).toMatchObject({ stagnantPhases: 0, observationPhases: 0 });
+    expect(JSON.stringify(current)).toBe(before);
+    expect(current.status).toBe("awaiting_continuation");
+  });
+  it("uses adapter business fingerprints instead of changed envelopes, prose or unrelated extra facts", () => {
+    const probe = (id: string): PlanStep => observed(id, JSON.stringify({ callId: id, data: { installed: false }, timestamp: id }), {
+      action: { type: "tool", toolId: "software.check", arguments: { names: ["python3"] } },
+      result: { executionStatus: "success", observationStatus: "matched", warnings: [], evidenceIds: [id], facts: {
+        evidenceComplete: true, evidenceKind: "software_check", evidenceScope: "python3", evidenceFingerprint: "returned:missing",
+        extraDescription: id,
+      } },
+    });
+    const first = probe("first"), second = probe("second"), third = probe("third");
+    // Persisted mistakes cannot turn the read-only tool into a mutation boundary.
+    second.kind = "change";
+    expect(observationIdentity(first)).toEqual(observationIdentity(second));
+    expect(workflowProgress(task([first, second, third])).stagnantPhases).toBe(2);
+    expect(automaticContinuationStop(task([first, second, third]))?.code).toBe("no_progress");
+    third.result!.facts.evidenceFingerprint = "returned:installed";
+    expect(workflowProgress(task([first, second, third])).stagnantPhases).toBe(0);
+  });
   it("counts carried pending steps only when executed, not their earlier archived plan", () => {
     const pending = observed("carried", "", { status: "pending", result: undefined });
     const current = task([observed("first"), observed("carried", "built", { kind: "change" })]);

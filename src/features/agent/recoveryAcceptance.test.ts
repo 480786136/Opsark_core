@@ -1,6 +1,6 @@
 // The application deliberately has DOM-only types; this integration test runs in Node.
-// @ts-expect-error Node's built-in module is available to Vitest, not the application bundle.
-import { spawnSync } from "node:child_process";
+// @ts-expect-error This test-only JS helper uses Node/WSL; it is not part of the DOM application bundle.
+import { runPosixShell } from "../../../tests/helpers/posixRuntime.js";
 import { describe, expect, it } from "vitest";
 import type { OpsTask, PlanStep } from "@/types";
 import { classifyStepResult } from "@/services/validation";
@@ -87,7 +87,7 @@ describe("conservative historical proof recognition is stronger than command com
     expect(contract.requiresAcceptanceEvidence).toBe(true);
     expect(contract.supplementalVerification?.command).toContain(`(\n${original}\n)`);
     verify.command = contract.supplementalVerification!.command;
-    const execution = spawnSync("sh", ["-c", verify.command], { encoding: "utf8" });
+    const execution = runPosixShell(verify.command);
     expect(execution.status).toBe(0);
     observed(verify, context, execution.stdout, execution.status!);
     expect(isRelatedRecoveryStep(failed, verify, context)).toBe(true);
@@ -104,11 +104,11 @@ describe("conservative historical proof recognition is stronger than command com
   it("keeps absent tools blocking even though their original printer exits zero", () => {
     const original = "command -v __opsark_missing_acceptance_probe_72f84 || echo absent";
     const { failed, verify, context } = fixture(original);
-    const originalResult = spawnSync("sh", ["-c", original], { encoding: "utf8" });
+    const originalResult = runPosixShell(original);
     expect(originalResult.status).toBe(0);
     expect(originalResult.stdout).toContain("absent");
     verify.command = recoveryVerificationContract(failed).supplementalVerification!.command;
-    const execution = spawnSync("sh", ["-c", verify.command], { encoding: "utf8" });
+    const execution = runPosixShell(verify.command);
     expect(execution.status).not.toBe(0);
     observed(verify, context, execution.stdout, execution.status!);
     expect(hasVerifiedRecovery(failed, verify)).toBe(false);
@@ -135,7 +135,7 @@ describe("conservative historical proof recognition is stronger than command com
     expect(isRelatedRecoveryStep(failed, verify, context)).toBe(true);
     expect(recordedSupplementalAcceptance(verify.command)).toEqual(supplement);
     const unavailable = `printf 'PATH=%s\\n' "$(command -v __opsark_missing_acceptance_probe_72f84 || echo absent)"`;
-    const execution = spawnSync("sh", ["-c", supplementalRecoveryAcceptance(unavailable)!.command], { encoding: "utf8" });
+    const execution = runPosixShell(supplementalRecoveryAcceptance(unavailable)!.command);
     expect(execution.stdout).toContain("PATH=absent");
     expect(execution.status).not.toBe(0);
   });

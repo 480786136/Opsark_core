@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
 import { useAccountStore } from "@/features/account/accountStore";
 import { useOfficialCatalogStore } from "@/features/account/officialCatalogStore";
@@ -8,10 +8,13 @@ import { useI18n } from "vue-i18n";
 import ModelAdvancedParameters from "@/components/ModelAdvancedParameters.vue";
 import ParameterSelect from "@/components/ParameterSelect.vue";
 import { backend, modelServiceError, modelServiceErrorMessage } from "@/services/backend";
+import type { ModelProbeConnection } from "@/services/backend";
+import { modelRequestStateLabel, type TaskModelRequest } from "@/services/taskModelRequests";
 import { useOpsStore } from "@/stores/ops";
 import { localizeCoreText } from "@/features/preferences/coreText";
 import { directCapabilities, effectiveModelOutput, migratedModelIntegration, modelConfigurationFingerprint, newModelCapabilities, validateModelConfiguration } from "@/features/agent/modelCapabilities";
 import { hasMatchingPresetIdentity, modelPresetConfiguration, modelPresets } from "@/features/agent/modelPresets";
+import { localModelAdapterBase } from "@/features/agent/modelRuntime";
 import type { ModelApiProtocol, ModelProfile, ModelRequestPreview, ModelValidationResult } from "@/types";
 
 defineProps<{ embedded?: boolean }>();
@@ -29,11 +32,76 @@ const officialModels = computed(() => {
 const { t, locale } = useI18n();
 const zh = computed(() => locale.value.startsWith("zh"));
 const draft = ref<ModelProfile>();
+const localAdapterBase = computed(() => localModelAdapterBase(draft.value?.endpoint ?? ""));
+function setLocalRecovery(event: Event) {
+  if (!draft.value) return;
+  draft.value.requestLifecycleAdapter = (event.target as HTMLInputElement).checked && localAdapterBase.value
+    ? { protocol: "opsark-local-v1", baseUrl: localAdapterBase.value } : undefined;
+}
 const key = ref("");
 const busy = ref(false);
 const error = ref("");
 const testResult = ref("");
 const testing = ref(false);
+const probeRequests = ref<TaskModelRequest[]>([]);
+const probeRefreshing = ref(false);
+const probeControlBusy = ref(false);
+const probeLookupError = ref("");
+const probeCancelled = ref(false);
+let editorAlive = true;
+let probeLookupGeneration = 0;
+let testGeneration = 0;
+onBeforeUnmount(() => { editorAlive = false; testGeneration++; probeLookupGeneration++; });
+const probeConnection = computed<ModelProbeConnection | undefined>(() => draft.value && key.value && draft.value.endpoint && draft.value.model
+  ? { endpoint: draft.value.endpoint, model: draft.value.model, apiKey: key.value, apiProtocol: draft.value.apiProtocol ?? draft.value.capabilitiesV2?.preferredProtocol } : undefined);
+const probeUnresolved = computed(() => probeRequests.value.some(record => ["dispatching", "accepted", "unknown"].includes(record.state)));
+const probeStatus = (record: TaskModelRequest) => modelRequestStateLabel(record, zh.value ? "zh" : "en");
+const sameProbeConnection = (connection: ModelProbeConnection) => editorAlive && JSON.stringify(probeConnection.value) === JSON.stringify(connection);
+async function refreshProbeRequests(connection = probeConnection.value) {
+  const generation = ++probeLookupGeneration;
+  probeLookupError.value = "";
+  if (!connection) { probeRequests.value = []; probeRefreshing.value = false; return; }
+  probeRefreshing.value = true;
+  try {
+    const records = await backend.listModelProbeRequests(connection);
+    if (generation === probeLookupGeneration && sameProbeConnection(connection)) {
+      probeRequests.value = records;
+      if (records.some(record => ["dispatching", "accepted", "unknown"].includes(record.state))) {
+        tested.value = undefined; testFingerprint.value = ""; testResult.value = "";
+        if (draft.value) delete draft.value.validationSnapshot;
+      }
+    }
+  } catch (reason) {
+    if (generation === probeLookupGeneration && sameProbeConnection(connection)) probeLookupError.value = reason instanceof Error ? reason.message : String(reason);
+  } finally { if (generation === probeLookupGeneration) probeRefreshing.value = false; }
+}
+watch(probeConnection, () => { probeRequests.value = []; void refreshProbeRequests(); });
+async function controlProbe(action: "recover" | "cancel", requestId?: string) {
+  const connection = probeConnection.value;
+  if (!connection || probeControlBusy.value) return;
+  probeControlBusy.value = true;
+  if (action === "cancel") probeCancelled.value = true;
+  try {
+    if (action === "cancel") {
+      const records = await backend.cancelModelProbeRequests(connection);
+      // An active native probe has its cancellation watcher. After a timeout,
+      // explicitly query the same original record to deliver the cancellation
+      // and obtain a bound provider state, without issuing another generation.
+      const original = records.find(record => ["dispatching", "accepted", "unknown"].includes(record.state));
+      if (!testing.value && draft.value?.requestLifecycleAdapter && original && sameProbeConnection(connection)) {
+        await backend.recoverModelProbeRequest(connection, original.requestId);
+      }
+    }
+    else if (requestId) await backend.recoverModelProbeRequest(connection, requestId);
+    // Recovery updates evidence only. It must never mark this draft validated.
+    if (sameProbeConnection(connection)) await refreshProbeRequests(connection);
+  } catch (reason) {
+    if (sameProbeConnection(connection)) {
+      const classified = modelServiceError(reason);
+      error.value = classified ? modelServiceErrorMessage(classified) : reason instanceof Error ? reason.message : String(reason);
+    }
+  } finally { probeControlBusy.value = false; }
+}
 const previewing = ref(false);
 const preview = ref<ModelRequestPreview>();
 const previewFingerprint = ref("");
@@ -166,7 +234,9 @@ const modelStatus = (model: ModelProfile) =>
     : localizeCoreText(store.modelAvailability[model.id]?.reason) || t("settings.unchecked");
 
 async function edit(model?: ModelProfile) {
-  if (model?.source === "official") return;
+  if (busy.value || model?.source === "official") return;
+  testGeneration++;
+  probeCancelled.value = false;
   returnFocus = document.activeElement as HTMLElement;
   draft.value = model ? JSON.parse(JSON.stringify(model)) : {
     id: `model-${crypto.randomUUID()}`, name: "",
@@ -193,6 +263,10 @@ function close() {
 }
 function validateDraft() {
   if (!draft.value) throw new Error("模型配置不存在");
+  if (draft.value.requestLifecycleAdapter && (draft.value.requestLifecycleAdapter.protocol !== "opsark-local-v1"
+    || draft.value.requestLifecycleAdapter.baseUrl !== localAdapterBase.value)) {
+    throw new Error(zh.value ? "原请求查询只支持明确启用的同源本地适配器，请重新勾选或关闭该功能。" : "Original-request recovery requires an explicitly enabled same-origin local adapter. Re-enable or disable it.");
+  }
   try { validateModelConfiguration(draft.value); }
   catch (reason) { revealAdvancedSettings(); throw reason; }
   const seconds = Number(draft.value.timeoutSeconds ?? DEFAULT_MODEL_TIMEOUT_SECONDS);
@@ -207,7 +281,9 @@ function validateDraft() {
   }
 }
 async function testDraft() {
-  if (!draft.value || busy.value) return;
+  if (!draft.value || busy.value || probeRefreshing.value || probeLookupError.value || probeUnresolved.value || probeControlBusy.value) return;
+  const generation = ++testGeneration;
+  probeCancelled.value = false;
   error.value = ""; testResult.value = "";
   tested.value = undefined; testFingerprint.value = "";
   delete draft.value.validationSnapshot;
@@ -218,17 +294,30 @@ async function testDraft() {
     if (!apiKey) throw new Error(zh.value ? "请先填写 API Key 或登录官方账号" : "Enter an API key or sign in first");
     busy.value = true; testing.value = true;
     const testedFingerprint = fingerprint.value;
+    const testedMode = validationMode.value;
+    const assertCurrent = () => {
+      if (!editorAlive || generation !== testGeneration || probeCancelled.value || testedFingerprint !== fingerprint.value || testedMode !== validationMode.value) {
+        throw new Error(zh.value ? "原测试已取消或配置已变化，迟到响应仅留在请求记录中。" : "Test cancelled or configuration changed; the late response remains in the original request record.");
+      }
+    };
     const result = await backend.checkModel({ apiKey, endpoint: draft.value.endpoint, model: draft.value.model,
       capabilities: draft.value.capabilities, requestParameters: draft.value.requestParameters, timeoutSeconds: draft.value.timeoutSeconds,
-      apiProtocol: draft.value.apiProtocol, outputPolicy: draft.value.outputPolicy, capabilitiesV2: draft.value.capabilitiesV2 }, validationMode.value);
+      apiProtocol: draft.value.apiProtocol, outputPolicy: draft.value.outputPolicy, capabilitiesV2: draft.value.capabilitiesV2,
+      requestLifecycleAdapter: draft.value.requestLifecycleAdapter, assertCurrent }, testedMode);
+    assertCurrent();
     tested.value = { ...result, validation: result.validation ?? { modelAccess: result.available ? "passed" : "not_tested", structuredOutput: "not_tested", businessContract: "not_tested" } };
     testFingerprint.value = testedFingerprint;
     if (!result.available) throw new Error(result.reason);
     testResult.value = result.reason;
   } catch (reason) {
     const classified = modelServiceError(reason);
-    error.value = classified ? modelServiceErrorMessage(classified) : reason instanceof Error ? reason.message : String(reason);
-  } finally { testing.value = false; busy.value = false; }
+    if (editorAlive && generation === testGeneration) error.value = classified ? modelServiceErrorMessage(classified) : reason instanceof Error ? reason.message : String(reason);
+  } finally {
+    if (editorAlive && generation === testGeneration) {
+      testing.value = false; busy.value = false;
+      await refreshProbeRequests();
+    }
+  }
 }
 async function previewDraft() {
   if (!draft.value || busy.value) return;
@@ -371,6 +460,7 @@ async function remove() {
                     <label class="full"><span>API {{ zh ? '协议' : 'protocol' }}</span><ParameterSelect :model-value="draft.apiProtocol ?? draft.capabilitiesV2?.preferredProtocol ?? 'chat_completions'" :options="protocolOptions" ariaLabel="API protocol" @update:model-value="changeProtocol"/></label>
                     <label class="full"><span>{{ zh ? '结构输出策略' : 'Output policy' }}</span><ParameterSelect :model-value="draft.outputPolicy ?? 'auto'" :options="outputPolicyOptions" ariaLabel="Output policy" @update:model-value="draft.outputPolicy = $event as ModelProfile['outputPolicy']"/></label>
                     <label class="full"><span>{{ zh ? '请求超时（秒）' : 'Request timeout (seconds)' }}</span><input v-model.number="draft.timeoutSeconds" aria-label="timeoutSeconds" type="number" min="10" max="900" step="1" required/><small>{{ zh ? '响应较慢时可增加等待时间，默认 90 秒。' : 'Increase this for slower responses. The default is 90 seconds.' }}</small></label>
+                    <label v-if="localAdapterBase || draft.requestLifecycleAdapter" class="full"><span><input type="checkbox" aria-label="localRequestRecovery" :checked="Boolean(draft.requestLifecycleAdapter)" @change="setLocalRecovery" />{{ zh ? '启用本地适配器的原请求查询' : 'Enable original-request recovery for the local adapter' }}</span><small>{{ zh ? '仅在该本地服务支持 Opsark 请求查询协议时启用。超时后查询原请求，取消状态与最终用量分别保留。' : 'Enable only if this local service supports the Opsark request-status protocol. Timed-out requests are queried by their original identity; cancellation and usage remain separate.' }}</small></label>
                   </div>
                   <details v-if="draft.source !== 'official'" class="capability-limits">
                     <summary>{{ zh ? '接口兼容设置' : 'API compatibility' }}</summary>
@@ -391,7 +481,15 @@ async function remove() {
                 <details v-if="preview" class="request-preview" open><summary>{{ zh ? '验证请求的本地预览（实际构造器，不含密钥，不联网）' : 'Local validation request preview (actual builder, no key, no network)' }}{{ previewStale ? (zh ? ' · 已过期' : ' · Expired') : '' }}</summary><p>{{ zh ? '使用当前验证范围的固定样例，不是某个任务的真实提示词。' : 'Uses a fixed fixture for the selected validation scope, not a task prompt.' }}</p><p>{{ preview.apiProtocol }} · {{ preview.endpoint }}</p><pre>{{ JSON.stringify(preview, null, 2) }}</pre></details>
                 <p class="testing-notice">{{ zh ? '保存不会调用模型；测试会发送一条简短请求，可能产生少量费用。' : 'Saving makes no model request. Testing sends a short request and may incur a small charge.' }}</p>
               </fieldset>
-              <footer class="drawer-footer"><p v-if="error" role="alert">{{ localizeCoreText(error) }}</p><p v-if="testResult && !testStale" class="test-success" role="status">{{ testResult }}</p><span v-if="busy" role="status">{{ testing ? (zh ? '正在测试当前模型…' : 'Testing current model…') : previewing ? (zh ? '正在本地编译预览…' : 'Compiling local preview…') : (zh ? '正在保存…' : 'Saving…') }}</span><div><button v-if="draft.source !== 'official' && store.models.some(model => model.id === draft?.id)" class="button danger" type="button" :disabled="busy" @click="remove"><Trash2 :size="14"/>{{ t('settings.removeModel') }}</button><span class="footer-spacer"></span><button class="button secondary" type="button" :disabled="busy" @click="testDraft">{{ zh ? '测试当前模型' : 'Test this model' }}</button><button class="button secondary" type="button" :disabled="busy" @click="close">{{ zh ? '取消' : 'Cancel' }}</button><button class="button primary" :disabled="busy" type="submit"><Save :size="14"/>{{ t('common.save') }}</button></div></footer>
+              <section v-if="probeRequests.length || probeRefreshing || probeLookupError || testing" class="probe-lifecycle" aria-label="Model test requests">
+                <p v-if="probeLookupError" role="alert">{{ zh ? '原请求记录读取失败，已暂停新的测试。' : 'Original request records could not be read; new tests are paused.' }} {{ probeLookupError }}</p>
+                <p v-if="probeUnresolved">{{ zh ? '原测试尚未确认结束。查询只读取原结果，确认终态后可手动再次测试；修改连接后须切回原配置才能查询旧记录。' : 'The original test is unresolved. Querying only reads its original result; test again explicitly after a terminal state. Return to the original connection to query its records.' }}</p>
+                <p v-for="record in probeRequests.slice(-3).reverse()" :key="record.requestId"><code :title="record.requestId">{{ record.requestId.slice(0, 12) }}</code> · {{ probeStatus(record) }} <button v-if="draft.requestLifecycleAdapter && ['dispatching', 'accepted', 'unknown'].includes(record.state)" type="button" class="button secondary" :disabled="probeControlBusy || testing" @click="controlProbe('recover', record.requestId)">{{ zh ? '查询原请求' : 'Query original request' }}</button></p>
+                <button v-if="probeLookupError" type="button" class="button secondary" :disabled="probeRefreshing || probeControlBusy" @click="refreshProbeRequests()">{{ zh ? '重新读取记录' : 'Refresh request records' }}</button>
+                <button v-if="testing || probeUnresolved" type="button" class="button secondary" :disabled="probeControlBusy" @click="controlProbe('cancel')">{{ zh ? '请求取消测试' : 'Request test cancellation' }}</button>
+                <small v-if="probeCancelled">{{ zh ? '取消已请求，本地不再采用测试结果；服务方终态和用量以原请求记录为准。' : 'Cancellation requested; the local test result will not be applied. Provider state and usage remain in the original request record.' }}</small>
+              </section>
+              <footer class="drawer-footer"><p v-if="error" role="alert">{{ localizeCoreText(error) }}</p><p v-if="testResult && !testStale" class="test-success" role="status">{{ testResult }}</p><span v-if="busy" role="status">{{ testing ? (zh ? '正在测试当前模型…' : 'Testing current model…') : previewing ? (zh ? '正在本地编译预览…' : 'Compiling local preview…') : (zh ? '正在保存…' : 'Saving…') }}</span><div><button v-if="draft.source !== 'official' && store.models.some(model => model.id === draft?.id)" class="button danger" type="button" :disabled="busy" @click="remove"><Trash2 :size="14"/>{{ t('settings.removeModel') }}</button><span class="footer-spacer"></span><button class="button secondary" type="button" :disabled="busy || probeRefreshing || !!probeLookupError || probeUnresolved || probeControlBusy" @click="testDraft">{{ zh ? '测试当前模型' : 'Test this model' }}</button><button class="button secondary" type="button" :disabled="busy" @click="close">{{ zh ? '取消' : 'Cancel' }}</button><button class="button primary" :disabled="busy" type="submit"><Save :size="14"/>{{ t('common.save') }}</button></div></footer>
             </form>
           </section>
         </div>
@@ -401,6 +499,7 @@ async function remove() {
 </template>
 
 <style scoped>
+.probe-lifecycle{padding:12px 28px;border-top:1px solid var(--border);font-size:12px;line-height:1.6}.probe-lifecycle p{margin:6px 0}.probe-lifecycle small{display:block;color:var(--muted)}
 .embedded-models{padding:0!important}.embedded-models .page-header{margin-top:0}.capability-limits{margin-top:20px;border-top:1px solid var(--border);font-size:12px}.capability-limits>summary{padding:14px 0;cursor:pointer;color:var(--muted)}.capability-limits small,.testing-notice{display:block;color:var(--muted);font-size:11px;line-height:1.6;margin-top:12px}.drawer-footer .test-success{color:var(--accent)}.drawer-footer>div{flex-wrap:wrap}.connection-fields :deep(.parameter-select){width:100%}
 .catalog-status{font-size:12px;color:var(--muted);line-height:1.6;margin:0 0 16px}.official-model-card{position:relative;padding:0!important;border-color:color-mix(in srgb,var(--accent) 40%,var(--border))!important;background:color-mix(in srgb,var(--accent) 5%,var(--panel))!important}.official-model-card:before{content:"";position:absolute;inset:0 auto 0 0;width:3px;background:var(--accent);pointer-events:none}.official-model-open{display:flex;flex-direction:column;gap:12px;width:100%;height:100%;padding:20px;border:0;background:transparent;color:inherit;text-align:left;cursor:default}.official-model-open:disabled{opacity:1;cursor:default}.official-model-open:focus-visible{outline:2px solid var(--accent);outline-offset:-4px}.official-label{font-size:10px;font-weight:600;letter-spacing:.035em;color:var(--accent)}.official-model-card .card-footer{margin-top:auto}.official-model-lock{position:absolute;inset:0;display:flex;align-items:flex-end;justify-content:center;padding:16px;background:linear-gradient(to bottom,transparent 28%,color-mix(in srgb,var(--panel) 48%,transparent) 50%,var(--panel) 80%);color:var(--text);text-decoration:none}.official-model-lock>span{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border:1px solid color-mix(in srgb,var(--accent) 40%,var(--border));border-radius:6px;background:var(--panel);font-size:12px;font-weight:500;transition:background .18s}.official-model-lock:hover>span{background:var(--accent-soft)}.official-model-lock:focus-visible{outline:2px solid var(--accent);outline-offset:-4px}.official-model-lock:active>span{transform:translateY(1px)}.catalog-skeleton{pointer-events:none;min-height:188px}.catalog-skeleton small{color:var(--muted);font-size:12px}.skeleton-line{display:block;height:18px;width:70%;border-radius:4px;background:var(--border-soft)}.skeleton-line.short{width:45%;height:12px}
 .model-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(280px,100%),1fr));gap:16px;width:100%;max-width:1400px;min-width:0;overflow:hidden}.model-card{display:flex;flex-direction:column;gap:12px;width:100%;max-width:100%;min-width:0;overflow:hidden;text-align:left;padding:20px;border:1px solid var(--border);border-radius:12px;background:var(--panel);color:var(--text);cursor:pointer;transition:transform .18s,border-color .18s,background .18s}.model-card:hover{transform:translateY(-2px);border-color:var(--accent);background:var(--panel-2)}.model-card:focus-visible{outline:2px solid var(--accent);outline-offset:3px}.card-heading{display:flex;align-items:center;gap:12px;width:100%;min-width:0}.card-heading strong{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px}.model-symbol{flex-shrink:0;padding:9px;background:var(--accent-soft);color:var(--accent);border-radius:9px;display:flex}.card-arrow{margin-left:auto;flex-shrink:0;color:var(--muted)}.model-identity,.model-endpoint{display:block;width:100%;max-width:100%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--muted)}.model-endpoint{font-size:11px}.card-footer{display:flex;gap:7px;align-items:center;width:100%;min-width:0;overflow:hidden;border-top:1px solid var(--border-soft);padding-top:12px;font-size:11px;color:var(--muted)}.card-footer>span:nth-child(2){display:block;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.status-dot{width:6px;height:6px;border-radius:50%;background:var(--muted);flex-shrink:0}.status-dot.available{background:var(--accent)}.status-dot.unavailable{background:var(--red)}.edit-label{margin-left:auto;color:var(--accent);flex-shrink:0}.empty-card{min-height:170px;border:1px dashed var(--border);border-radius:12px;background:var(--panel);color:var(--muted);display:flex;align-items:center;justify-content:center;gap:12px;cursor:pointer}.drawer-overlay{position:fixed;inset:0;z-index:1200;background:var(--scrim);display:flex;justify-content:flex-end}.model-drawer-panel{width:min(620px,100vw);height:100%;display:flex;flex-direction:column;background:var(--panel);color:var(--text);border-left:1px solid var(--border);box-shadow:var(--shadow-dialog)}.drawer-header{display:flex;align-items:center;justify-content:space-between;padding:26px 28px;border-bottom:1px solid var(--border)}.drawer-header h2{font-size:20px;margin:8px 0 0;overflow-wrap:anywhere}.drawer-form{display:flex;flex-direction:column;flex:1;min-height:0}.drawer-body{border:0;margin:0;padding:24px 28px;overflow-y:auto;min-height:0;flex:1;min-width:0}.section-heading{display:flex;align-items:center;justify-content:space-between;margin-bottom:22px;font-size:13px}.enabled-control{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px}.connection-fields{display:grid;grid-template-columns:1fr 1fr;gap:18px}.connection-fields label{display:flex;flex-direction:column;gap:8px;font-size:12px;color:var(--muted)}.connection-fields .full{grid-column:1/-1}.connection-fields input{width:100%;min-width:0;height:40px;padding:0 12px;border:1px solid var(--border);border-radius:7px;background:var(--bg);color:var(--text)}input:focus-visible{outline:2px solid var(--accent);outline-offset:1px}.drawer-body :deep(.parameter-grid){grid-template-columns:repeat(2,minmax(0,1fr))}.drawer-footer{border-top:1px solid var(--border);padding:18px 28px;background:var(--panel)}.drawer-footer>div{display:flex;align-items:center;gap:10px}.footer-spacer{flex:1}.drawer-footer p{color:var(--red);font-size:12px;overflow-wrap:anywhere}.drawer-footer>span{display:block;font-size:12px;color:var(--muted);margin-bottom:10px}.model-drawer-enter-active,.model-drawer-leave-active{transition:opacity .2s}.model-drawer-enter-active .model-drawer-panel,.model-drawer-leave-active .model-drawer-panel{transition:transform .24s ease}.model-drawer-enter-from,.model-drawer-leave-to{opacity:0}.model-drawer-enter-from .model-drawer-panel,.model-drawer-leave-to .model-drawer-panel{transform:translateX(100%)}@media(prefers-reduced-motion:reduce){.model-card,.model-drawer-enter-active,.model-drawer-leave-active,.model-drawer-panel{transition:none!important}}@media(max-width:480px){.model-grid{grid-template-columns:1fr}.drawer-header,.drawer-body,.drawer-footer{padding:18px}.connection-fields{grid-template-columns:1fr}}

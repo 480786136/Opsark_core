@@ -12,6 +12,7 @@ import type {
 export const EXECUTION_POLICY_VERSION = "core-execution-policy@1";
 export interface PlanPreparationContext {
   taskId: string;
+  requirementRevision?: number;
   permission: PermissionLevel;
   requirement?: string;
   executionConstraints?: ExecutionConstraints;
@@ -116,7 +117,7 @@ function freeze<T>(value: T): T {
 const PREPARABLE = new Set<PlanStep["status"]>(["pending", "awaiting_approval", "awaiting_input"]);
 const STEP_FIELDS = new Set(["action", "retryBasis", "retryAfterStepId", "failureDependencies", "recoveryRuleVersion", "recovery",
   "authenticationGate", "authenticationAttempt", "protocolReplanApproval", "id", "attemptContext", "kind", "title", "description",
-  "command", "risk", "expected", "validation", "executionScope", "validationScope", "sessionContextChange", "runtimeClass", "validator",
+  "command", "risk", "expected", "evidenceRequirements", "validation", "executionScope", "validationScope", "sessionContextChange", "runtimeClass", "validator",
   "status", "output", "review", "result", "evidence", "startedAt", "elapsedSeconds", "progressMessage", "safetyApprovalSnapshot",
   "approvedSafetySnapshot", "executionIntent", "planRevision", "stepRevision", "approvalGrant",
   "executionLedgerAttempts", "ledgerAppliedAttemptIds", "ledgerVerifiedAttemptIds", "executionPolicy"]);
@@ -144,7 +145,7 @@ function shellTargets(context: PlanPreparationContext, step: PlanStep): Executio
 
 function semanticProjection(step: PlanStep): unknown {
   return { action: step.action, command: step.command, kind: step.kind, risk: step.risk,
-    expected: step.expected, validation: step.validation, validator: step.validator,
+    expected: step.expected, evidenceRequirements: step.evidenceRequirements, validation: step.validation, validator: step.validator,
     executionScope: step.executionScope, validationScope: step.validationScope,
     runtimeClass: step.runtimeClass, sessionContextChange: step.sessionContextChange };
 }
@@ -222,7 +223,7 @@ export function preparePlanForApproval(
     const position = original.findIndex(item => item.id === step.id);
     const semantic: ExecutionIntentSemantic = clone({
       taskId: context.taskId, stepId: step.id, action: step.action!, targets, kind: step.kind!, effect,
-      risk: step.risk, expected: step.expected,
+      risk: step.risk, expected: step.expected, evidenceRequirements: step.evidenceRequirements,
       ...(step.action.type === "shell" ? { executionScope: step.executionScope, validationScope: step.validationScope,
         validation: step.validation, validator: step.validator, runtimeClass: step.runtimeClass, sessionContextChange: step.sessionContextChange } : {}),
       dependencies: { precedingStepIds: original.slice(0, position).map(item => item.id), retryBasis: step.retryBasis,
@@ -257,12 +258,12 @@ export function preparePlanForApproval(
     const historical = previousById.get(step.id);
     return historical ? [clone(historical)] : [];
   });
-  const digest = executionDigest({ version: "prepared-plan@1", taskId: context.taskId,
+  const digest = executionDigest({ version: "prepared-plan@1", taskId: context.taskId, requirementRevision: context.requirementRevision,
     steps: stageSteps.map(step => ({ id: step.id, intent: step.intent.digest })) });
   const planRevision = context.previous ? context.previous.planRevision + (context.previous.executionDigest === digest ? 0 : 1) : 1;
   const compatibilitySteps = original.map(step => normalizedById.get(step.id) ?? step);
   compatibilitySteps.forEach(step => { if (normalizedById.has(step.id)) step.planRevision = planRevision; });
-  return freeze({ version: "prepared-plan@1", taskId: context.taskId, planRevision, executionDigest: digest,
+  return freeze({ version: "prepared-plan@1", taskId: context.taskId, requirementRevision: context.requirementRevision, planRevision, executionDigest: digest,
     displayDigest: executionDigest(compatibilitySteps.map(step => ({ id: step.id, title: step.title, description: step.description }))),
     steps: stageSteps, compatibilitySteps, changes });
 }

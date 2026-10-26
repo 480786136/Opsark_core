@@ -11,6 +11,24 @@ import SecretManagementView from "./SecretManagementView.vue";
 
 describe("SecretManagementView", () => {
   let host: HTMLElement;
+  const settle = async () => { await nextTick(); await nextTick(); };
+  async function mountDeletionFixture() {
+    const pinia = createPinia(), store = useOpsStore(pinia);
+    store.servers = ["a", "b"].map(suffix => ({
+      id: `server-${suffix}`, name: suffix === "a" ? "Alpha" : "Beta", host: `10.0.0.${suffix === "a" ? 1 : 2}`,
+      port: 22, username: "root", group: "test", status: "online" as const, environment: [],
+      info: { os: "Linux", kernel: "6", cpu: "CPU", cores: 1, memoryGb: 1, diskGb: 1, uptime: "1h" },
+      createdAt: new Date().toISOString(),
+    }));
+    store.secretMetadata = [
+      { key: "API_TOKEN", description: "甲服务器", scope: "server", serverId: "server-a" },
+      { key: "API_TOKEN", description: "乙服务器", scope: "server", serverId: "server-b" },
+    ];
+    const tabs = useServerWorkspaceTabsStore(pinia); tabs.open("server-a");
+    const app = createApp(SecretManagementView).use(pinia).use(i18n); app.mount(host); await settle();
+    host.querySelector<HTMLButtonElement>(".secret-list-row")!.click(); await settle();
+    return { app, store, tabs };
+  }
 
   beforeEach(() => {
     localStorage.clear();
@@ -151,5 +169,61 @@ describe("SecretManagementView", () => {
     document.querySelector<HTMLButtonElement>(".action-confirmation .button.primary")!.click();
     await vi.waitFor(() => expect(store.secretMetadata).toHaveLength(0));
     app.unmount();
+  });
+
+  it("编辑器在确认前关闭也只删除捕获的原服务器对象", async () => {
+    const { app, store } = await mountDeletionFixture();
+    const remove = vi.spyOn(store, "removeSecretMetadata").mockResolvedValue();
+    try {
+      document.querySelector<HTMLButtonElement>(".secret-drawer-footer .danger")!.click(); await settle();
+      const editor = document.querySelector<HTMLDialogElement>(".secret-drawer")!;
+      editor.close(); editor.dispatchEvent(new Event("close")); await settle();
+      expect(document.querySelector(".secret-drawer-header h2")!.textContent).not.toBe("API_TOKEN");
+      const confirm = document.querySelector<HTMLButtonElement>(".action-confirmation .primary")!;
+      confirm.click(); confirm.click(); await settle();
+      expect(remove).toHaveBeenCalledExactlyOnceWith("API_TOKEN", "server-a");
+      expect(editor.open).toBe(false);
+    } finally { app.unmount(); }
+  });
+
+  it("旧删除异步返回不关闭后来打开的另一服务器编辑器", async () => {
+    const { app, store, tabs } = await mountDeletionFixture();
+    let complete!: () => void;
+    const remove = vi.spyOn(store, "removeSecretMetadata").mockImplementation(() => new Promise<void>(resolve => { complete = resolve; }));
+    try {
+      document.querySelector<HTMLButtonElement>(".secret-drawer-footer .danger")!.click(); await settle();
+      document.querySelector<HTMLButtonElement>(".action-confirmation .primary")!.click(); await settle();
+      expect(remove).toHaveBeenCalledExactlyOnceWith("API_TOKEN", "server-a");
+      const editor = document.querySelector<HTMLDialogElement>(".secret-drawer")!;
+      editor.close(); editor.dispatchEvent(new Event("close"));
+      tabs.open("server-b"); await settle();
+      host.querySelector<HTMLButtonElement>(".secret-list-row")!.click(); await settle();
+      complete(); await settle();
+      expect(editor.open).toBe(true);
+      expect(editor.querySelector(".secret-server-context")!.textContent).toBe("Beta");
+      expect(editor.querySelector<HTMLInputElement>("input")!.value).toBe("API_TOKEN");
+      expect(host.querySelector(".secrets-notice")).toBeNull();
+      expect(remove).toHaveBeenCalledTimes(1);
+    } finally { app.unmount(); }
+  });
+
+  it("确认期间目标被替换或凭据组范围扩大时不执行删除", async () => {
+    const { app, store } = await mountDeletionFixture();
+    const remove = vi.spyOn(store, "removeSecretMetadata").mockResolvedValue();
+    try {
+      document.querySelector<HTMLButtonElement>(".secret-drawer-footer .danger")!.click(); await settle();
+      store.secretMetadata[0] = { ...store.secretMetadata[0] };
+      document.querySelector<HTMLButtonElement>(".action-confirmation .primary")!.click(); await settle();
+      expect(remove).not.toHaveBeenCalled();
+      expect(document.querySelector(".secret-drawer [role='alert']")).not.toBeNull();
+      document.querySelector<HTMLDialogElement>(".secret-drawer")!.close();
+      document.querySelector<HTMLDialogElement>(".secret-drawer")!.dispatchEvent(new Event("close")); await settle();
+      store.secretMetadata[0].credentialGroupId = "group-one";
+      host.querySelector<HTMLButtonElement>(".secret-list-row")!.click(); await settle();
+      document.querySelector<HTMLButtonElement>(".secret-drawer-footer .danger")!.click(); await settle();
+      store.secretMetadata.push({ key: "NEW_MEMBER", description: "新增", scope: "server", serverId: "server-a", credentialGroupId: "group-one" });
+      document.querySelector<HTMLButtonElement>(".action-confirmation .primary")!.click(); await settle();
+      expect(remove).not.toHaveBeenCalled();
+    } finally { app.unmount(); }
   });
 });

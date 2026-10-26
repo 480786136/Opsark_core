@@ -159,7 +159,11 @@ describe("SSH 连接与工作台数据集成", () => {
     useConnectionStore().disconnect("a");
     await ops.runStep(task.id, "step");
     expect(task.plan[0].status).toBe("pending");
-    expect(task.pauseReason).toContain("不会自动重放");
+    // This legacy step has no admitted intent: connection recovery must stop
+    // conservatively instead of depending on the older pause-message wording.
+    expect(task.connectionRecovery?.state).toBe("stopped");
+    expect(task.managedAdjustmentPhase).toBe("manual_required");
+    expect(task.pauseReason).toContain("原计划和已有结果保留");
     expect(backend.executeCommand).not.toHaveBeenCalled();
   });
 

@@ -87,6 +87,13 @@ describe("skill registry", () => {
     ]);
   });
 
+  it("selects Nginx delivery guidance for installation, website and backend forwarding requirements", () => {
+    for (const request of ["安装 nginx 并让我访问默认页面", "把新网站部署到这台机器的 Nginx", "后端已运行，把入口通过 Nginx 转发过去"]) {
+      expect(suggestSkillsByRules(request).map(skill => skill.id)).toContain("nginx-delivery");
+    }
+    expect(suggestSkillsByRules("安装 Redis 并验证本机连接").map(skill => skill.id)).not.toContain("nginx-delivery");
+  });
+
   it("provides file transfer and integrity guidance without embedding credentials", () => {
     const [skill] = suggestSkillsByRules("请进行跨服务器文件传输");
     const context = buildSkillContext([skill]);
@@ -128,10 +135,25 @@ describe("skill registry", () => {
       .find((skill) => skill.id === "application-deployment")!;
 
     expect(deployment).toMatchObject({
-      version: 8,
+      version: 9,
       category: "deployment",
     });
     expect(deployment.description).not.toContain("前后端");
+  });
+
+  it("registers and selects the log rotation Skill with its actual delivery boundaries", () => {
+    const registry = resolveSkillRegistry({ overrides: [], customSkills: [] });
+    const registered = registry.filter(skill => skill.id === "log-rotation");
+    expect(registered).toHaveLength(1);
+    expect(registered[0]).toMatchObject({ version: 1, category: "environment", enabled: true });
+    const selected = suggestSkillsByRules("日志轮转");
+    expect(selected.map(skill => skill.id)).toEqual(["log-rotation"]);
+    const context = buildSkillContext(selected);
+    expect(context).toHaveLength(1);
+    expect(context[0].instructions).toContain("logs.inspect_rotation");
+    expect(context[0].instructions).toContain("不能把“配置文件存在”当作实际轮转完成");
+    expect(context[0].instructions).toContain("copytruncate 在复制与截断之间可能丢记录");
+    expect(context[0].instructions).toContain("有限窗口无缺失不证明未来永不丢失");
   });
 
   it("exposes all enabled Skills as a lightweight multi-select directory", () => {
@@ -144,6 +166,8 @@ describe("skill registry", () => {
       "database-inspection-operations",
       "application-deployment",
       "file-transfer-integrity",
+      "log-rotation",
+      "nginx-delivery",
     ]);
     expect(directory[0]).toMatchObject({
       category: "connectivity",

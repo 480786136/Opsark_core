@@ -3,6 +3,9 @@ export interface ToolDefinition {
   id: string;
   implementation: string;
   effect?: "read" | "change" | "interaction";
+  /** Core-owned planning eligibility; never an execution grant. Connection and
+   * credential interactions do not imply changes to the managed resource. */
+  requiresTargetChange?: boolean;
   name: string;
   description: string;
   usageInstructions: string;
@@ -105,6 +108,9 @@ export interface UserInputResult {
 }
 
 export interface PendingUserInput extends UserInputRequest {
+  /** Core-generated authorization forms use their own tool receipt, not a generic answer. */
+  toolId?: string;
+  deletionPreviewId?: string;
   taskId: string;
   stepId: string;
   callId: string;

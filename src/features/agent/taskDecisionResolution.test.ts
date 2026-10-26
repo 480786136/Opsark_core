@@ -46,6 +46,21 @@ function decision(withResolution = false): NextStageDecision {
 }
 
 describe("task decision evidence and historical issue receipts", () => {
+  it.each(["partial", "redacted", "truncated"])("does not turn %s tool observations into requirement completion or recovery", mode => {
+    const current = task();
+    const read = current.plan[1];
+    read.result!.facts.evidenceComplete = false;
+    Object.assign(read.evidence![0].facts, { evidenceComplete: false, inspectionStatus: mode === "partial" ? "partial" : "complete",
+      observationsRedacted: mode === "redacted", truncated: mode === "truncated" });
+    expect(() => prepareTaskDecision(current, decision())).toThrow();
+    expect(() => prepareTaskDecision(current, decision(true))).toThrow();
+    const pending = decision(); pending.decision = "adjust";
+    pending.requirementReview!.focusOutcome = "pending"; pending.requirementReview!.overallOutcome = "pending";
+    pending.requirementReview!.items[0].outcome = "unknown";
+    pending.blocking = { kind: "external", reason: "采集范围不足，保留当前事实与缺口", requirementIds: ["deploy"] };
+    expect(prepareTaskDecision(current, pending).currentRequestReview?.completed).toBe(false);
+  });
+
   it("persists an exact historical resolution and leaves the failed execution unchanged", () => {
     const current = task(), originalFailure = JSON.stringify(current.plan[0]);
     const prepared = prepareTaskDecision(current, decision(true));

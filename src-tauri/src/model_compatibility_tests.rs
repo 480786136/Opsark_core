@@ -83,8 +83,15 @@ fn shell_runtime_placement_never_discards_conflicts_or_non_null_tool_arguments()
 }
 
 fn field_repair_request(strict: bool) -> Value {
+    crate::task_model_budget::initialize_test_runtime().unwrap();
+    let task_id = format!("task-field-repair-{}", crate::task_logs::call_id());
+    crate::task_model_budget::register(crate::task_model_budget::TaskBudgetRegistration {
+        task_id: task_id.clone(), round_id: "round".into(),
+        max_task_tokens: 1_000_000, max_round_tokens: 1_000_000, safety_reserve_tokens: 0,
+    }).unwrap();
     with_request_context(request(strict), |context| {
-        context["_log"] = json!({"taskId":"task-field-repair","roundId":"round"});
+        context["_log"] = json!({"taskId":task_id,"roundId":"round"});
+        context["_taskModelBudget"] = json!({"version":1,"taskId":task_id,"roundId":"round"});
         context["workflowPhase"] = json!("protocol_repair");
         context["protocolRepairBudget"] = json!({"remainingModelCalls":1});
         context["planGenerationRepair"] = json!({"responseMode":"rejected_fields","originalPlanMergedLocally":true,
@@ -109,8 +116,8 @@ fn task_zeujmj_command_repair_returns_only_command_and_merges_frozen_prose_local
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(!requests[0].to_string().contains("完整的被拒步骤"));
-        let context: Value = serde_json::from_str(field_repair_request(strict)["_opsarkContext"].as_str().unwrap()).unwrap();
         let original = field_repair_request(strict);
+        let context: Value = serde_json::from_str(original["_opsarkContext"].as_str().unwrap()).unwrap();
         let full = crate::model_compatibility::full_contract("计划生成", &original).unwrap();
         let repair = crate::scoped_model_repair::ScopedRepair::new("计划生成", &original, &full).unwrap();
         let (_, log) = crate::prompt_layers::prepare_request(&repair.request(&original));
@@ -276,6 +283,49 @@ fn request(strict: bool) -> Value {
             "tokenField":"max_tokens","defaultOutputTokens":5000,"maxOutputTokens":16384}}).to_string();
     json!({"model":"test", "max_tokens":1000,"_opsarkContext":context,
         "messages":[{"role":"system","content":"Return JSON with a steps array. Never execute anything."},{"role":"user","content":context}]})
+}
+
+#[test]
+fn stage18_native_argument_rejection_preserves_cause_without_dispatching_a_field_patch() {
+    let invalid=json!({"steps":[{"kind":"observe","title":"private-candidate-value","description":"private-candidate-value",
+        "action":{"type":"tool","toolId":"files.preview_deletion","arguments":{"paths":[]}},"expected":"private-candidate-value","validation":"","risk":"low",
+        "executionScope":null,"validationScope":null,"runtimeClass":null,"sessionContextChange":null,"recovery":null,"retryBasis":null}]});
+    let (url,server)=provider(vec![(200,response(&invalid.to_string(),"stop"))]);
+    let mut body=request(true);let mut context:Value=serde_json::from_str(&crate::model_budget::ensure_context(body["_opsarkContext"].as_str().unwrap()).unwrap()).unwrap();
+    context["_modelRecovery"]["maxElapsedMs"]=json!(2000);
+    context["_modelOutputRecovery"]=json!({"strategy":"initial"});
+    context["tools"]=json!([{"id":"files.preview_deletion","inputSchema":{"type":"object","additionalProperties":false,"required":["paths"],
+        "properties":{"paths":{"type":"array","minItems":1,"items":{"type":"string"}}}}}]);
+    body["_opsarkContext"]=json!(context.to_string());
+    let result=run(&url,&body).unwrap_err();let error=typed_error(&result);
+    assert_eq!(error["modelError"]["code"],"MODEL_FORMAT_INVALID", "{error}");
+    assert_eq!(error["modelError"]["recoveryBudget"]["fieldRepairs"],0);
+    assert_eq!(error["modelError"]["recoveryBudget"]["generations"],1);
+    assert_eq!(error["modelError"]["candidateRejection"],json!({"version":1,"code":"TOOL_ARGUMENT_INVALID","keyword":"minItems", "stepIndex":0,
+        "toolIds":["files.preview_deletion"],"rejectedCandidateExecuted":false}));
+    assert!(!result.contains("private-candidate-value"));
+    assert_eq!(server.join().unwrap().len(),1);
+}
+
+#[test]
+fn stage18_native_field_repair_stop_preserves_rejection_and_original_budget() {
+    let invalid=json!({"steps":[{"kind":"observe","title":42,"description":"private-candidate-value",
+        "action":{"type":"shell","command":"uname -a"},"expected":"private-candidate-value","validation":"","risk":"low",
+        "executionScope":null,"validationScope":null,"runtimeClass":null,"sessionContextChange":null,"recovery":null,"retryBasis":null}]});
+    let (url,server)=provider(vec![(200,response(&invalid.to_string(),"stop"))]);
+    let mut body=request(true);
+    let mut context:Value=serde_json::from_str(&crate::model_budget::ensure_context(body["_opsarkContext"].as_str().unwrap()).unwrap()).unwrap();
+    context["_modelRecovery"]["maxElapsedMs"]=json!(2000);
+    context["_modelOutputRecovery"]=json!({"strategy":"initial"});
+    body["_opsarkContext"]=json!(context.to_string());
+    let result=run(&url,&body).unwrap_err();let error=typed_error(&result);
+    assert_eq!(error["modelError"]["code"],"MODEL_RECOVERY_BUDGET_EXHAUSTED", "{error}");
+    assert_eq!(error["modelError"]["recoveryBudget"]["requiredWaitMs"],3000);
+    assert_eq!(error["modelError"]["recoveryBudget"]["fieldRepairs"],0);
+    assert_eq!(error["modelError"]["recoveryBudget"]["generations"],1);
+    assert_eq!(error["modelError"]["candidateRejection"],json!({"version":1,"code":"MODEL_FORMAT_INVALID","stepIndex":0,"rejectedCandidateExecuted":false}));
+    assert!(!result.contains("private-candidate-value"));
+    assert_eq!(server.join().unwrap().len(),1);
 }
 
 fn run(url: &str, body: &Value) -> Result<Value, String> {

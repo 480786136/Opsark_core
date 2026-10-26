@@ -1,5 +1,8 @@
 [
   {"name":"ordinary observe cannot hide mutation","step":{"id":"next","kind":"observe","command":"mktemp -d"},"code":"OBSERVE_COMMAND_MUTATION","field":"command"},
+  {"name":"structured shell mutation wins over stale read-only compatibility command","step":{"id":"next","kind":"observe","action":{"type":"shell","command":"mktemp -d"},"command":"uname -a"},"code":"OBSERVE_COMMAND_MUTATION","field":"action.command"},
+  {"name":"structured read-only command wins over stale mutation compatibility command","step":{"id":"next","kind":"observe","action":{"type":"shell","command":"uname -a"},"command":"mktemp -d"},"code":null,"field":null},
+  {"name":"structured diagnosis mutation wins over stale compatibility command","step":{"id":"next","kind":"observe","action":{"type":"shell","command":"rm /tmp/x"},"command":"uname -a","recovery":{"failedStepId":"failed","targetContext":"original","purpose":"diagnose"}},"code":"RECOVERY_DIAGNOSE_MUTATION","field":"action.command"},
   {"name":"historical observe is not reclassified","step":{"id":"next","status":"completed","kind":"observe","command":"mktemp -d"},"code":null,"field":null},
   {"name":"legal diagnosis","step":{"id":"next","kind":"observe","command":"uname -a","recovery":{"failedStepId":"failed","targetContext":"original","purpose":"diagnose"}},"code":null,"field":null},
   {"name":"legal repair","step":{"id":"next","kind":"change","command":"touch /tmp/x","recovery":{"failedStepId":"failed","targetContext":"original","purpose":"repair"}},"code":null,"field":null},

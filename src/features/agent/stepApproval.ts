@@ -29,6 +29,7 @@ export function planSafetySnapshot(step: PlanStep) {
     risk: step.risk,
     kind: step.kind,
     expected: step.expected,
+    evidenceRequirements: step.evidenceRequirements,
     command: step.command,
     validation: step.validation,
     validator: step.validator,
@@ -59,6 +60,7 @@ export function stepMatchesExecutionIntent(step: PlanStep): boolean {
     && equal(semantic.action, step.action)
     && (semantic.action.type === "shell" ? semantic.action.command === step.command : step.command === "")
     && semantic.kind === step.kind && semantic.risk === step.risk && semantic.expected === step.expected
+    && equal(semantic.evidenceRequirements, step.evidenceRequirements)
     && (semantic.action.type === "tool" ? step.validation === "" : equal(semantic.validation, step.validation))
     && equal(semantic.validator, step.validator)
     && equal(semantic.executionScope, step.executionScope)
@@ -133,6 +135,7 @@ export function acceptStepApproval(step: PlanStep, plan?: PreparedPlan): Accepte
 
 function samePreparedPlan(requested: PreparedPlan, current: PreparedPlan): boolean {
   const digest = (plan: PreparedPlan) => executionDigest({ version: "prepared-plan@1", taskId: plan.taskId,
+    requirementRevision: plan.requirementRevision,
     steps: plan.steps.map(step => ({ id: step.id, intent: step.intent.digest })) });
   return requested.version === "prepared-plan@1" && current.version === "prepared-plan@1"
     && requested.taskId === current.taskId && requested.planRevision === current.planRevision

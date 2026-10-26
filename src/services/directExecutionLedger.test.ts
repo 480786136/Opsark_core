@@ -7,10 +7,14 @@ import { configureExecutionLedger, createMemoryExecutionLedgerRepository, flushP
 import { projectExecutionLedgerRecovery, readExecutionLedger } from "@/features/agent/executionLedgerRecovery";
 import { executionDigest } from "@/features/agent/planPreparation";
 import type { ExecutionIntentSemantic } from "@/types";
+import { isSshExecPayloadError } from "./sshCommandTransport";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => undefined) }));
 const connection = { host: "server.example", port: 22, username: "deploy", password: "value-never-in-intent" };
+const nativePreflight = () => "OPSARK_SSH_EXEC_PREFLIGHT_V1:" + JSON.stringify({ version: 1, origin: "core",
+  code: "SSH_EXEC_PAYLOAD_TOO_LARGE", stage: "exec_preflight", dispatchCertainty: "not_dispatched",
+  retryable: false, payloadBytes: 40000, payloadLimitExclusive: 34744 });
 
 describe("direct backend durable execution boundary", () => {
   beforeEach(() => {
@@ -110,6 +114,46 @@ describe("direct backend durable execution boundary", () => {
     vi.mocked(invoke).mockRejectedValue(new Error("transport read"));
     await expect(backend.renameSftpEntry(connection, "/srv/a", "/srv/b")).rejects.toMatchObject({ stage: "execution" });
     await expect(backend.deleteSftpEntry(connection, "/srv/b", "file")).rejects.toMatchObject({ stage: "begin", code: "EXECUTION_LEDGER_RESOURCE_BUSY" });
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("records a trusted native preflight rejection with its structured evidence and no automatic replay", async () => {
+    vi.mocked(invoke).mockRejectedValue(nativePreflight());
+    let failure: unknown;
+    try { await backend.executeCommand("printf planned", connection, false, { executionId: "oversized-direct" }); }
+    catch (error) { failure = error; }
+    expect(isSshExecPayloadError(failure)).toBe(true);
+    const [record] = await listExecutionLedger(directExecutionLedgerOwner);
+    expect(record).toMatchObject({ state: "not_dispatched", attempts: [{ status: "not_dispatched", outcome: {
+      status: "not_dispatched", result: { error: { diagnostic: { code: "SSH_EXEC_PAYLOAD_TOO_LARGE",
+        payloadBytes: 40000, payloadLimitExclusive: 34744, dispatchCertainty: "not_dispatched" } } },
+    } }] });
+    expect(record.attempts[0].outcome?.evidenceRefs).toHaveLength(1);
+    expect(record.attempts).toHaveLength(1); expect(invoke).toHaveBeenCalledTimes(1);
+    expect(projectExecutionLedgerRecovery([record]).items.some(item => item.kind === "uncertain")).toBe(false);
+  });
+
+  it.each(["SSH 命令执行失败: [Session(-34)]", new Error(nativePreflight())])(
+    "keeps an untrusted transport failure unknown and preserves the resource lock", async failure => {
+      vi.mocked(invoke).mockRejectedValue(failure);
+      await expect(backend.executeCommand("printf planned", connection, false, { executionId: "untrusted-direct" }))
+        .rejects.toMatchObject({ stage: "execution" });
+      expect((await listExecutionLedger(directExecutionLedgerOwner))[0]).toMatchObject({ state: "unknown" });
+      await expect(backend.executeCommand("printf next", connection, false, { executionId: "next-direct" }))
+        .rejects.toMatchObject({ stage: "begin", code: "EXECUTION_LEDGER_RESOURCE_BUSY" });
+      expect(invoke).toHaveBeenCalledTimes(1);
+    });
+
+  it("retains preflight evidence through result-commit failure and flushes without a second native invocation", async () => {
+    const writer = vi.fn().mockRejectedValueOnce(new Error("disk full")).mockResolvedValue("preflight-evidence");
+    configureExecutionLedger(directExecutionLedgerOwner, createMemoryExecutionLedgerRepository(), writer);
+    vi.mocked(invoke).mockRejectedValue(nativePreflight());
+    await expect(backend.executeCommand("printf planned", connection, false, { executionId: "preflight-save-failure" }))
+      .rejects.toMatchObject({ stage: "result_commit", remoteResultKnown: false });
+    await flushPendingReceipts(directExecutionLedgerOwner);
+    const [record] = await listExecutionLedger(directExecutionLedgerOwner);
+    expect(record).toMatchObject({ state: "not_dispatched", attempts: [{ outcome: { status: "not_dispatched",
+      result: { error: { diagnostic: { payloadBytes: 40000 } } }, evidenceRefs: ["preflight-evidence"] } }] });
     expect(invoke).toHaveBeenCalledTimes(1);
   });
 

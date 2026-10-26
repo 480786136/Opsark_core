@@ -82,8 +82,17 @@ export function buildToolStepOutcome(input: BuildToolStepOutcomeInput): ToolStep
     unsupported: "当前环境不支持此检查，请选择已授权的替代方法。",
     error: "检查返回错误，请结合真实退出码和范围处理。",
   };
-  const inspectionMessage = facts.evidenceKind === "operations_inspection" ? inspectionMessages[String(facts.inspectionStatus)] : undefined;
-  const unsupported = facts.evidenceKind === "operations_inspection" && facts.inspectionStatus === "unsupported";
+  const inspection = ["operations_inspection", "package_management", "file_metadata", "log_rotation", "database_inspection", "file_manifest", "http_delivery", "nginx_configuration"].includes(String(facts.evidenceKind));
+  const mismatch = facts.evidenceKind === "log_rotation" && facts.sequenceStatus === "mismatch";
+  const incomplete = inspection && facts.evidenceComplete !== true;
+  const inspectionMessage = facts.evidenceKind === "nginx_configuration" ? facts.configurationStatus === "parsed"
+    ? "已解析原始收据中的配置声明；这不是新的服务器采样，也未证明配置加载或代理交付。"
+    : "配置声明尚有未知范围；请核对原收据、目录覆盖或后续变更。"
+    : mismatch ? "指定序号窗口已采集，但存在缺失或重复；不能据此判定轮转无损。"
+    : inspection ? incomplete && facts.inspectionStatus === "complete"
+      ? "已取得受限或脱敏观测，尚不能作为完整验收证据。" : inspectionMessages[String(facts.inspectionStatus)] : undefined;
+  const unsupported = inspection && facts.inspectionStatus === "unsupported";
+  const warning = truncated || incomplete || mismatch;
   if (call.toolId === "context.expand" && result.data && typeof result.data === "object"
     && "skillId" in result.data && typeof result.data.skillId === "string") {
     Object.assign(facts, { expandedSkillId: result.data.skillId });
@@ -106,9 +115,9 @@ export function buildToolStepOutcome(input: BuildToolStepOutcomeInput): ToolStep
     }],
     result: {
       executionStatus: "success",
-      observationStatus: truncated ? "warning" : "matched",
+      observationStatus: warning ? "warning" : "matched",
       facts,
-      warnings: truncated ? [inspectionMessage ?? "工具结果达到限制，后续应缩小范围继续获取。"] : [],
+      warnings: warning ? [inspectionMessage ?? "工具结果达到限制，后续应缩小范围继续获取。"] : [],
       evidenceIds: [evidenceId],
     },
     review: {

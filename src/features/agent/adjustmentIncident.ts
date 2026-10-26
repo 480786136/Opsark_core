@@ -4,6 +4,7 @@ import type {
   OpsTask,
   PlanStep,
 } from "@/types";
+import { hasActiveConnectionRecovery } from "./connectionRecovery";
 
 export interface AdjustmentTargetState {
   paneId?: string;
@@ -26,6 +27,7 @@ export interface AdjustmentBlockerSnapshot {
 
 const VOLATILE_EVIDENCE_KEYS = /^(?:id|evidenceIds|executionId|reviewRound|elapsedSeconds|durationMs|collectedAt|createdAt|updatedAt|timestamp)$/i;
 const TERMINAL_RECOVERY_PATTERN = /(?:\bpty\b|\bshell\b.*(?:busy|occupied|release|reconnect)|terminal.*(?:busy|occupied|release|reconnect)|绑定终端|终端.*(?:未就绪|未释放|被占用|断开|重连|超时)|命令结束标记|执行通道.*(?:断开|异常)|connection closed|channel closed|socket closed)/i;
+const LEGACY_CONNECTION_PAUSE_PATTERN = /^SSH 连接(?:不可用或已更换|已断开或更换)[，。]/;
 
 export function isTerminalTransportFailure(error: unknown) {
   return isSshConnectionSetupFailure(error)
@@ -99,6 +101,11 @@ function failureCategory(task: OpsTask, failedStep?: PlanStep) {
   const category = failedStep?.result?.facts.category;
   if (typeof category === "string" && category.trim()) return category.trim();
   if (failedStep?.result?.facts.stoppedByPeriodicReview === true) return "periodic_review";
+  if (!failedStep && hasActiveConnectionRecovery(task)) return "connection_transport";
+  if (!failedStep && task.managedStopReason === "transport_recovery"
+    && !["completed", "cancelled", "failed"].includes(task.status)) return "connection_recovery";
+  if (!failedStep && !["completed", "cancelled", "failed"].includes(task.status)
+    && LEGACY_CONNECTION_PAUSE_PATTERN.test(task.pauseReason ?? "")) return "connection_recovery";
   if (task.status === "awaiting_continuation") return "goal_continuation";
   return failedStep?.result?.executionStatus ?? "workflow_adjustment";
 }
@@ -110,7 +117,7 @@ function incidentKind(
   target: AdjustmentTargetState,
 ): AdjustmentIncidentKind {
   if (target.terminalBusy) return "transport";
-  if (["terminal_transport", "terminal_recovery", "validation_protocol_exception"].includes(category)) {
+  if (["terminal_transport", "terminal_recovery", "connection_transport", "connection_recovery", "validation_protocol_exception"].includes(category)) {
     return "transport";
   }
   if (failedStep) return "business";

@@ -1,4 +1,5 @@
 import { operationsProgressIdentity } from "@/features/tools/operationsObservation";
+import { defaultToolCatalog } from "@/features/tools/toolCatalog";
 import type { OpsTask, PlanStep } from "@/types";
 import { textFingerprint } from "./longRunningReviewOutput";
 
@@ -22,6 +23,15 @@ export function observationIdentity(step: PlanStep) {
   } catch { /* Legacy opaque target identities remain distinct. */ }
   const inspection = operationsProgressIdentity(step);
   if (inspection) return textFingerprint(JSON.stringify({ target, inspection }));
+  // Tool adapters already fingerprint the returned business content. Executor
+  // envelopes (IDs/timing) and unrelated model facts cannot manufacture progress.
+  const facts = step.result?.facts;
+  if (facts?.evidenceComplete === true && typeof facts.evidenceFingerprint === "string"
+    && typeof facts.evidenceKind === "string") {
+    return textFingerprint(JSON.stringify({ target, evidenceKind: facts.evidenceKind,
+      evidenceScope: facts.evidenceScope, content: facts.evidenceFingerprint,
+      status: step.result?.observationStatus }));
+  }
   const output = (step.output ?? step.evidence?.map(item => item.rawOutput).join("\n") ?? "")
     .replace(/\[exit:\s*-?\d+\]/g, "").trim().replace(/\r\n/g, "\n");
   return textFingerprint(JSON.stringify({
@@ -40,10 +50,37 @@ function isConfirmedUserDecision(step: PlanStep) {
 }
 
 function isDispatchedChangeAttempt(step: PlanStep) {
-  return step.kind === "change"
+  return hasChangeEffect(step)
     && Boolean(step.result)
     && step.result?.facts.commandDispatched !== false
     && ["completed", "failed"].includes(step.status);
+}
+
+function hasKnownExecutionEvidence(step: PlanStep) {
+  const result = step.result;
+  return Boolean(result && ["success", "failed"].includes(result.executionStatus)
+    && result.facts.commandDispatched !== false
+    && !["unknown", "not_sent"].includes(String(result.facts.dispatchState)));
+}
+
+/** An executed change and a verified change are different boundaries. Existing
+ * negative/unknown acceptance must not be erased by exit 0 or changed action text. */
+function isConfirmedChange(step: PlanStep) {
+  const result = step.result;
+  return hasChangeEffect(step) && step.status === "completed" && result?.executionStatus === "success"
+    && hasKnownExecutionEvidence(step) && !result.failureReason
+    && result.facts.validationPassed !== false && result.facts.acceptancePassed !== false
+    && (result.facts.semanticAcceptanceRequired !== true || result.facts.semanticAcceptanceStatus === "proven");
+}
+
+function hasChangeEffect(step: PlanStep) {
+  if (step.action?.type === "tool") {
+    const toolId = step.action.toolId;
+    const tool = defaultToolCatalog.find(item => item.id === toolId);
+    if (tool?.effect === "change") return true;
+    if (tool?.effect === "read" || tool?.effect === undefined && tool?.planMode === "read_batch") return false;
+  }
+  return step.kind === "change";
 }
 
 /** A round-wide guard, independent of per-incident command fingerprints. */
@@ -70,8 +107,7 @@ export function workflowProgress(task: OpsTask) {
       || ["terminal_transport", "terminal_recovery", "validation_protocol_exception"].includes(String(step.result?.facts.category)))) continue;
     completedPhases += 1;
     if (steps.some(step => !excluded.has(step.id))) automaticPhases += 1;
-    const changed = steps.some(step => step.kind === "change" && step.status === "completed"
-      && step.result?.executionStatus === "success");
+    const changed = steps.some(isConfirmedChange);
     const decisionConfirmed = steps.some(isConfirmedUserDecision);
     const changeAttempted = steps.some(isDispatchedChangeAttempt);
     // A confirmed user decision starts a new semantic incident and invalidates
@@ -81,7 +117,7 @@ export function workflowProgress(task: OpsTask) {
     if (changed || decisionConfirmed) seen.clear();
     let added = false;
     for (const step of steps) {
-      if (!step.result || !step.output && !step.evidence?.length) continue;
+      if (!hasKnownExecutionEvidence(step) || !step.output && !step.evidence?.length) continue;
       const identity = observationIdentity(step);
       if (!seen.has(identity)) added = true;
       seen.add(identity);

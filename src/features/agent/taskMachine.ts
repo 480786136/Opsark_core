@@ -1,4 +1,6 @@
 import type { OpsTask, TaskStatus } from "@/types";
+import { recordTaskTerminalTransition } from "./taskTerminalEvidence";
+import { hasCurrentPlanApproval, stepMatchesExecutionIntent } from "./stepApproval";
 
 const TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
   draft: ["planning", "cancelled"],
@@ -24,8 +26,35 @@ export function transitionTask(task: OpsTask, nextStatus: TaskStatus, timestamp 
   if (!canTransitionTask(task.status, nextStatus)) {
     throw new Error(`非法任务状态迁移：${task.status} -> ${nextStatus}`);
   }
+  recordTaskTerminalTransition(task, task.status, nextStatus, timestamp);
   task.status = nextStatus;
   task.updatedAt = timestamp;
+  return task;
+}
+
+/** Resume one controller-claimed, never-dispatched step without issuing a new approval. */
+export function resumeUndispatchedConnectionPlan(task: OpsTask, timestamp = Date.now()) {
+  const record = task.connectionRecovery;
+  const step = task.plan.find(item => !["completed", "failed", "skipped"].includes(item.status));
+  if (task.status !== "needs_adjustment" || task.cancelRequested || task.goalCancellation
+    || !record || record.state !== "resuming" || record.resumeCount !== 1
+    || record.dispatchState !== "not_dispatched" || timestamp >= record.deadlineAt
+    || record.taskId !== task.id || record.roundId !== task.currentRoundId
+    || record.workflowEpoch !== (task.workflowEpoch ?? 0)
+    || record.requirementRevision !== (task.requirementLifecycle?.revision ?? 0)
+    || record.permission !== task.permission || record.credentialRevision !== (task.credentialRevision ?? 0)
+    || task.requirementProcessing || task.pendingRequirements?.length
+    || !step || step.id !== record.stepId || step.status !== "pending"
+    || step.executionIntent?.digest !== record.intentDigest || !stepMatchesExecutionIntent(step)
+    || step.executionLedgerAttempts?.length || task.currentExecutionId
+    || !task.preparedPlan || task.preparedPlan.executionDigest !== record.planExecutionDigest
+    || !hasCurrentPlanApproval(task.preparedPlan, task.planApproval)) {
+    throw new Error("连接恢复的原计划或未派发条件已失效，不能继续执行");
+  }
+  const at = new Date(timestamp).toISOString();
+  recordTaskTerminalTransition(task, task.status, "running", at);
+  task.status = "running";
+  task.updatedAt = at;
   return task;
 }
 

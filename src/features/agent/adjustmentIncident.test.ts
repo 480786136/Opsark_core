@@ -8,7 +8,7 @@ import {
   recordAdjustmentPlan,
   recordAdjustmentExecution,
 } from "./adjustmentIncident";
-import type { OpsTask, PlanStep } from "@/types";
+import type { OpsTask, PlanStep, TaskConnectionRecovery } from "@/types";
 
 function failedStep(output = "connection refused"): PlanStep {
   return {
@@ -140,5 +140,47 @@ describe("adjustment incident fingerprint", () => {
 
     expect(snapshot.category).toBe("command_failed");
     expect(snapshot.kind).toBe("business");
+  });
+
+  it("本任务当前结构化连接阻断不依赖展示文案分类", () => {
+    const task = taskWith({ ...failedStep(), status: "pending", result: undefined });
+    task.workflowEpoch = 2;
+    task.connectionRecovery = { version: 1, state: "waiting", reasonCode: "connection_unavailable",
+      taskId: task.id, roundId: task.currentRoundId, workflowEpoch: 2 } as TaskConnectionRecovery;
+    task.pauseReason = "等待原连接恢复";
+    const snapshot = buildAdjustmentBlockerSnapshot(task, undefined, target);
+    expect(snapshot).toMatchObject({ kind: "transport", category: "connection_transport" });
+    task.pauseReason = "展示语言变化后仍等待";
+    expect(buildAdjustmentBlockerSnapshot(task, undefined, target).fingerprint).toBe(snapshot.fingerprint);
+  });
+
+  it("历史无failedStep的SSH门禁及已有transport stopReason仍走连接恢复", () => {
+    const task = taskWith({ ...failedStep(), status: "pending", result: undefined });
+    task.pauseReason = "SSH 连接不可用或已更换，任务已暂停。请重连并核对执行记录；未收到结果的命令不会自动重放。";
+    expect(buildAdjustmentBlockerSnapshot(task, undefined, target)).toMatchObject({ kind: "transport", category: "connection_recovery" });
+    task.pauseReason = "等待当前通道";
+    task.managedStopReason = "transport_recovery";
+    expect(buildAdjustmentBlockerSnapshot(task, undefined, target).kind).toBe("transport");
+  });
+
+  it("错误轮次/代次或已终态连接记录不抢占新业务阻断", () => {
+    const task = taskWith({ ...failedStep(), status: "pending", result: undefined });
+    task.connectionRecovery = { version: 1, state: "waiting", reasonCode: "connection_unavailable",
+      taskId: task.id, roundId: "old", workflowEpoch: 0 } as TaskConnectionRecovery;
+    expect(buildAdjustmentBlockerSnapshot(task, undefined, target).kind).toBe("business");
+    task.connectionRecovery.roundId = task.currentRoundId;
+    task.connectionRecovery.workflowEpoch = 1;
+    expect(buildAdjustmentBlockerSnapshot(task, undefined, target).kind).toBe("business");
+    task.connectionRecovery.workflowEpoch = 0;
+    task.connectionRecovery.state = "completed";
+    expect(buildAdjustmentBlockerSnapshot(task, undefined, target).kind).toBe("business");
+  });
+
+  it("结构化连接旧记录不覆盖真实业务failedStep分类", () => {
+    const task = taskWith(failedStep());
+    task.managedStopReason = "transport_recovery";
+    task.connectionRecovery = { version: 1, state: "waiting", reasonCode: "connection_unavailable",
+      taskId: task.id, roundId: task.currentRoundId, workflowEpoch: 0 } as TaskConnectionRecovery;
+    expect(buildAdjustmentBlockerSnapshot(task, task.plan[0], target)).toMatchObject({ kind: "business", category: "command_failed" });
   });
 });

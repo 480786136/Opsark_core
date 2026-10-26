@@ -43,3 +43,17 @@ it("does not equate distinct evidence just because truncated previews match", ()
   expect(result.evidence![0].rawOutputRef).toBeUndefined();
   expect(result.evidence![0].rawOutput).toBe("same header");
 });
+
+it("does not archive sensitive historical form values", async () => {
+  const { step, task } = fixture(); step.result!.facts.toolId = "user.request_input";
+  const save = vi.fn(); await archiveToolEvidence(task, step, save, value => value);
+  expect(save).not.toHaveBeenCalled(); expect(step.evidence![0].archive).toBeUndefined();
+});
+it("does not label a changed body with the fingerprint of another saved body", async () => {
+  const { step, task } = fixture(); const original = step.evidence![0].rawOutput;
+  const save = vi.fn(async () => { step.evidence![0].rawOutput = "changed"; return "b".repeat(64); });
+  const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+  await archiveToolEvidence(task, step, save, value => value);
+  expect(save.mock.calls[0]).toBeDefined(); expect(step.evidence![0].archive).toBeUndefined();
+  expect(step.evidence![0].archiveError).toContain("重试保存"); expect(step.output).toBe(original); warning.mockRestore();
+});

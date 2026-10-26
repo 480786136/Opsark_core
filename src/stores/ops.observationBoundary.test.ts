@@ -86,7 +86,20 @@ describe("real observations before store change dispatch", () => {
 
   it("does not interrupt an independent read batch for per-tool model reviews", async () => {
     const { store, task, execute, adjustment } = setup();
-    task.plan = [inspect(), inspect("more-ports")];
+    task.plan = [inspect(), { ...inspect("service-status"), title: "读取应用服务状态",
+      action: { type: "tool", toolId: "services.inspect", arguments: { check: "status", service: "app.service" } } }];
+    let readIndex = 0;
+    execute.mockImplementation(async () => {
+      const first = readIndex++ === 0;
+      const stdout = `OPSARK_RESULT ${JSON.stringify({
+        request: normalizeOperationsRequest("services.inspect", first ? { check: "ports" } : { check: "status", service: "app.service" }),
+        status: "complete", items: [{ kind: first ? "ports" : "service", subject: first ? "server:listening" : "app.service",
+          text: first ? "tcp LISTEN 0 5 0.0.0.0:8080" : "Id=app.service\nLoadState=loaded\nActiveState=active\nSubState=running", exitCode: 0 }],
+        scannedEntries: 0, matchedEntries: 1, skippedCount: 0, skipped: [], coverageComplete: true,
+        truncated: false, elapsedMs: 22, finishedAt: new Date().toISOString(),
+      })}\n`;
+      return { success: true, simulated: true, exitCode: 0, output: stdout, stdout, stderr: "", stdoutTruncated: false };
+    });
     const decide = vi.spyOn(backend, "decideNextStage").mockResolvedValue({ decision: "complete", reason: "观察完成", summary: "已记录端口",
       source: "model", steps: [] });
     await store.runStep(task.id, "ports");

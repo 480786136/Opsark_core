@@ -207,7 +207,7 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
   const inspectionPlanning = operationsPlanningContext([...bestOutputSource.values()]);
   const recoverySteps = progression.rereadEvidence ? selectRecoverySteps(task) : [];
   const recoveryKeys = new Set(recoverySteps.map(taskStepEvidenceKey));
-  const project = decisionOutputProjector(allowArchive);
+  const project = decisionOutputProjector(allowArchive, undefined, true);
   const canonicalOutputRefs = new Map<string, string>();
   const projectStep: StepOutputProjector = (step, limit, location) => {
     if (isUserInputEvidenceStep(step)) {
@@ -220,8 +220,15 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
     }
     const key = taskStepEvidenceKey(step);
     const source = bestOutputSource.get(key) ?? step;
+    const evidence = source.evidence?.map(item => {
+      const archive = item.archive;
+      return archive && (archive.taskId && archive.taskId !== task.id
+        || archive.stepId && archive.stepId !== source.id
+        || archive.targetContext && archive.targetContext !== source.attemptContext)
+        ? { ...item, archive: undefined } : item;
+    });
     if (operationsObservation(source)) {
-      const metadata = decisionOutput(source.output, source.evidence, 0, allowArchive);
+      const metadata = decisionOutput(source.output, evidence, 0, allowArchive);
       const contentRef = inspectionPlanning.refs.get(key);
       return metadata ? { ...metadata, contentRef,
         instruction: contentRef ? "运维事实摘要见 contentRef；这是压缩摘要，完整条目及缺口见本步骤 references，不能把省略当成未采集。" : metadata.instruction } : undefined;
@@ -233,7 +240,7 @@ export function buildTaskDecisionSnapshot(task: OpsTask, failedStep?: PlanStep, 
         instruction: "同一执行证据正文已在 contentRef 展示；无需再次执行。" } : undefined;
     }
     if (source.output) canonicalOutputRefs.set(key, location);
-    return project(source.output, source.evidence, recoveryKeys.has(key) ? 6_000 : limit);
+    return project(source.output, evidence, recoveryKeys.has(key) ? 6_000 : limit);
   };
   // Incident, current plan, recent phases and recovered/history outputs all
   // spend the same budget. Repeated executions have references, not more text.

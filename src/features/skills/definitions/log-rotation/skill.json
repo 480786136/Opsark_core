@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "log-rotation",
+  "name": "日志轮转与持续写入验收",
+  "category": "environment",
+  "description": "依据实际日志写入、重开与调度机制配置轮转、压缩和保留策略，并验证真实产物、继续写入和有限记录窗口。",
+  "version": 1,
+  "enabled": true,
+  "builtIn": true,
+  "matchRules": ["日志轮转", "日志滚动", "压缩旧日志", "配置 logrotate", "regex:(?:日志|log).*(?:轮转|滚动|保留|压缩)|logrotate"],
+  "updatedAt": "2026-10-12T00:00:00.000Z",
+  "instructions": "instructions.md"
+}

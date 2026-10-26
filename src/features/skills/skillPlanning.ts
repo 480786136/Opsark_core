@@ -76,6 +76,21 @@ export function planningSkills(task: OpsTask, skills: SkillDefinition[]): SkillD
     // All information stages exited: full rules still govern final acceptance.
     if (stageIndex < 0) return skill;
     const stage = contract.stages[stageIndex];
+    // A domain parser being unable to classify real file content is not a
+    // request to discover the same project indefinitely. Restore the complete
+    // reference, but retain the receipt as file_content, never as a manifest.
+    // This applies to contracts using the adapter, not a business/filename list.
+    const files = evidence.filter(item => item.kind === "file_content" && item.toolId === "files.read_content"
+      && item.complete && item.facts.evidenceNonEmpty === true);
+    if (contract.evidenceAdapters?.includes("project_manifest")
+      && stage.exitRequirements?.some(requirement => requirement.kind === "project_manifest"
+        && !planningEvidenceSatisfies(evidence, [requirement])) && files.length) {
+      return {
+        ...skill,
+        planningEvidence: { stageId: "full-context", observed: files.map(({ evidenceId, kind, scope, facts }) => ({ evidenceId, kind, scope, facts })) },
+        instructions: `${skill.instructions}\n\n已读取的完整文件见 skillEvidence。当前声明适配器未取得本阶段要求的项目声明，已恢复完整流程参考；这些文件仅证明读取到对应内容，不证明技术栈、版本、依赖已安装或业务交付。应结合已读交接的真实内容决定后续动作；确有缺失再读取相关资料，不为满足阶段名称重复扫描、猜测 Node 或创建占位软件检查。工具权限、用户约束与最终验收保持不变。`,
+      };
+    }
     const requirements = [...(stage.requiresEvidence ?? []), ...(stage.exitRequirements ?? [])];
     const matches = new Map(requirements.flatMap(requirement => matchPlanningEvidence(evidence, requirement))
       .map(item => [JSON.stringify([item.kind, item.scope]), item]));

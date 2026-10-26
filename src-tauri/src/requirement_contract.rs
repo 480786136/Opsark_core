@@ -15,14 +15,34 @@ fn strings() -> Value {
 fn array(items: Value) -> Value {
     json!({"type":"array","items":items})
 }
+fn acceptance_coverage() -> Value {
+    let nullable_text = json!({"anyOf":[text(),{"type":"null"}]});
+    let mut item = object(json!({
+        "requirementId":text(), "strategy":{"type":"string","enum":["general_review","static_site"]},
+        "sourceQuote":text(), "reason":text(),
+        "staticSite":object(json!({"artifactPath":nullable_text,"entryUrl":nullable_text,
+            "preserveExisting":{"type":"boolean"},"preserveOtherSites":{"type":"boolean"}}))
+    }));
+    item["required"].as_array_mut().unwrap().retain(|field| field != "staticSite");
+    let mut coverage = array(item);
+    coverage["description"] = json!(ACCEPTANCE_RULE);
+    coverage
+}
 pub(crate) fn update() -> Value {
-    object(json!({
+    let mut focus = strings();
+    focus["description"] = json!(FOCUS_RULE);
+    let mut schema = object(json!({
         "baseRevision":{"type":"integer","minimum":0}, "sourceMessageId":text(),
         "additions":array(object(json!({"id":text(),"kind":{"type":"string","enum":["goal","constraint"]},
             "content":text(),"sourceQuote":text(),"supersedes":strings()}))),
         "changes":array(object(json!({"id":text(),"status":{"type":"string","enum":["active","deferred","cancelled"]},
-            "sourceQuote":text(),"reason":text()}))), "focusIds":strings()
-    }))
+            "sourceQuote":text(),"reason":text()}))), "focusIds":focus,
+        "acceptanceCoverage":acceptance_coverage()
+    }));
+    // Old archived submissions remain readable. New trusted submissions opt in
+    // below; the model cannot remove this requirement by omitting the field.
+    schema["required"].as_array_mut().unwrap().retain(|field| field != "acceptanceCoverage");
+    schema
 }
 pub(crate) fn review() -> Value {
     object(
@@ -159,6 +179,72 @@ fn lifecycle_base(context: &Value, revision: u64) -> Value {
         )
 }
 
+fn validate_acceptance_coverage(context: &Value, delta: &Value, requirement: &str) -> Result<(), String> {
+    let required = match context.pointer("/requirementSubmission/acceptanceContractVersion") {
+        None => false,
+        Some(value) if value.as_u64() == Some(1) => true,
+        Some(_) => return Err("需求验收契约版本不支持，不能降级为旧协议".into()),
+    };
+    let Some(coverage) = delta.get("acceptanceCoverage") else {
+        return if required { Err("requirementUpdate.acceptanceCoverage 缺失：新增目标和约束必须逐项声明验收策略".into()) } else { Ok(()) };
+    };
+    let coverage = coverage.as_array().ok_or("acceptanceCoverage 必须是数组")?;
+    let additions = delta["additions"].as_array().ok_or("新增需求列表缺失")?;
+    let mut seen = HashSet::new();
+    for item in coverage {
+        let id = item["requirementId"].as_str().ok_or("验收策略缺少需求 ID")?;
+        let addition = additions.iter().find(|addition| addition["id"] == id)
+            .ok_or("验收策略只能引用本次新增要求，不能覆盖历史策略")?;
+        if !seen.insert(id) {
+            return Err("同一新增要求不能重复声明验收策略".into());
+        }
+        if !item["sourceQuote"].as_str().is_some_and(|quote| !quote.trim().is_empty() && requirement.contains(quote))
+            || !item["reason"].as_str().is_some_and(|reason| !reason.trim().is_empty()) {
+            return Err("验收策略必须引用当前用户原文并说明分类依据".into());
+        }
+        match item["strategy"].as_str() {
+            Some("general_review") => {
+                if item.get("staticSite").is_some() {
+                    return Err("general_review 不能携带或替代静态站点契约".into());
+                }
+            }
+            Some("static_site") => {
+                if addition["kind"] != "goal" || !item["staticSite"].is_object() {
+                    return Err("static_site 只能用于目标，且必须保留完整静态站点条件".into());
+                }
+                for field in ["artifactPath", "entryUrl"] {
+                    let value = &item["staticSite"][field];
+                    if !value.is_null() && !value.as_str().is_some_and(|value| !value.trim().is_empty() && requirement.contains(value)) {
+                        return Err(format!("staticSite.{field} 必须来自当前用户原文；未明确时使用 null 保留缺口"));
+                    }
+                }
+                if let Some(path) = item["staticSite"]["artifactPath"].as_str() {
+                    if !path.starts_with('/') || path == "/" || path.contains("//")
+                        || path.chars().any(|c| c <= '\u{1f}' || c == '\u{7f}' || c == '\\')
+                        || path.split('/').any(|part| part == "." || part == "..") {
+                        return Err("staticSite.artifactPath 必须为明确的远端POSIX绝对路径".into());
+                    }
+                }
+                if let Some(entry) = item["staticSite"]["entryUrl"].as_str() {
+                    let valid = reqwest::Url::parse(entry).ok().is_some_and(|url| {
+                        matches!(url.scheme(), "http" | "https") && url.username().is_empty()
+                            && !url.password().is_some_and(|value| !value.is_empty())
+                            && !url.fragment().is_some_and(|value| !value.is_empty())
+                    });
+                    if !valid {
+                        return Err("staticSite.entryUrl 必须为无凭据和片段的HTTP或HTTPS入口".into());
+                    }
+                }
+            }
+            _ => return Err("未知验收策略不能退回通用验收".into()),
+        }
+    }
+    if coverage.len() != additions.len() {
+        return Err("acceptanceCoverage 必须精确覆盖本次新增的每一个 goal 和 constraint".into());
+    }
+    Ok(())
+}
+
 /// Mirrors applyTaskRequirementUpdate: classification changes obligations, never
 /// completion. The private full base supplies exact historical sources locally.
 fn updated_lifecycle(
@@ -169,6 +255,7 @@ fn updated_lifecycle(
 ) -> Result<Value, String> {
     crate::schema_validation::validate(&update(), delta)
         .map_err(|error| format!("requirementUpdate 结构无效：{error}"))?;
+    validate_acceptance_coverage(context, delta, requirement)?;
     if !matches!(
         relation,
         "new_goal" | "replace_goal" | "supplement" | "continue"
@@ -282,6 +369,13 @@ fn updated_lifecycle(
         }
         let mut item = json!({"id":addition["id"],"kind":addition["kind"],"content":addition["content"],
             "source":source,"status":"active","supersedes":addition["supersedes"],"evidenceIds":[]});
+        if let Some(coverage) = delta["acceptanceCoverage"].as_array().and_then(|coverage| {
+            coverage.iter().find(|entry| entry["requirementId"] == addition["id"])
+        }) {
+            let mut acceptance = coverage.clone();
+            acceptance.as_object_mut().unwrap().remove("requirementId");
+            item["acceptance"] = acceptance;
+        }
         if let Some(created_at) = &created_at {
             item["lastChangedAt"] = created_at.clone();
         }
@@ -320,8 +414,11 @@ fn updated_lifecycle(
     {
         return Err("本轮处理范围必须引用有效需求".into());
     }
-    if additions.iter().any(|item| !focus.contains(&item["id"])) {
-        return Err("新增要求必须纳入本轮处理范围".into());
+    let missing_ids: Vec<_> = additions.iter()
+        .filter(|item| !focus.contains(&item["id"]))
+        .map(|item| item["id"].clone()).collect();
+    if !missing_ids.is_empty() {
+        return Err(format!("requirementUpdate.focusIds 缺少新增要求 ID：{}；新增 goal 和 constraint 都必须纳入本轮处理范围", json!(missing_ids)));
     }
     let mut projected = json!({"version":1,"revision":revision.checked_add(1).ok_or("需求版本超出范围")?,"items":items,
         "focus":{"sourceMessageId":delta["sourceMessageId"],"requirementIds":focus}});
@@ -329,6 +426,50 @@ fn updated_lifecycle(
         projected["focus"]["roundId"] = round_id;
     }
     Ok(projected)
+}
+
+/// Focus omissions are a field repair, not another intent/authorization decision.
+/// Admit this smaller prompt only if appending the missing IDs makes the complete
+/// delta valid against the original immutable local lifecycle and user message.
+pub(crate) fn focus_repair(original: &Value, context: &str, requirement: &str) -> Option<Value> {
+    if original["intent"] != "execute" { return None; }
+    let delta = original.get("requirementUpdate")?;
+    crate::schema_validation::validate(&update(), delta).ok()?;
+    let focus = delta["focusIds"].as_array()?;
+    let missing: Vec<_> = delta["additions"].as_array()?.iter()
+        .filter(|item| !focus.contains(&item["id"]))
+        .map(|item| item["id"].clone()).collect();
+    if missing.is_empty() { return None; }
+    let mut corrected = delta.clone();
+    corrected["focusIds"].as_array_mut()?.extend(missing.clone());
+    if validate_update("execute", original["relation"].as_str(), Some(&corrected), context, requirement).is_some() {
+        return None;
+    }
+    Some(json!({"field":"requirementUpdate.focusIds","missingIds":missing,
+        "originalDecision":original,
+        "instruction":"仅把 missingIds 补入原 focusIds，保留已有 ID；返回完整分类对象，其他字段必须原样保留，包括需求原文、来源、历史状态变更、约束、意图和 Skill。不得新增授权、删除禁止条件或重写目标。"}))
+}
+
+/// A bounded repair must not silently reclassify or change user authorization.
+pub(crate) fn validate_focus_repair(repair: &Value, decision: &Value) -> Option<String> {
+    let malformed = || Some("focusIds 局部修正缺少完整分类对象或有效 ID 数组".into());
+    let original = &repair["originalDecision"];
+    let mut comparable = decision.clone();
+    let Some(update) = comparable.get_mut("requirementUpdate").and_then(Value::as_object_mut) else { return malformed(); };
+    update.insert("focusIds".into(), original["requirementUpdate"]["focusIds"].clone());
+    if &comparable != original {
+        return Some("focusIds 局部修正只能补齐缺失 ID，不能修改其他需求、来源、约束或分类字段".into());
+    }
+    let (Some(previous), Some(missing), Some(focus)) = (
+        original["requirementUpdate"]["focusIds"].as_array(), repair["missingIds"].as_array(),
+        decision["requirementUpdate"]["focusIds"].as_array()) else { return malformed(); };
+    if !unique_strings(&decision["requirementUpdate"]["focusIds"]) { return malformed(); }
+    let expected: HashSet<_> = previous.iter().chain(missing).filter_map(Value::as_str).collect();
+    let actual: HashSet<_> = focus.iter().filter_map(Value::as_str).collect();
+    if actual != expected {
+        return Some("focusIds 局部修正必须保留已有范围并补齐全部 missingIds，不能增加无关范围".into());
+    }
+    None
 }
 
 fn requirement_context(state: &Value) -> Value {
@@ -585,5 +726,10 @@ pub(crate) fn project_classified_context(
     serde_json::to_string(&value).map_err(|error| format!("需求投影序列化失败：{error}"))
 }
 
-pub(crate) const UPDATE_RULE: &str = "需求版本协议：context.requirementSubmission 存在且 intent=execute 时必须提供 requirementUpdate，baseRevision/sourceMessageId 使用上下文原值。additions 每项包含新 id、kind=goal|constraint、content、当前用户原文中的 sourceQuote、supersedes（被明确替代的旧 ID 数组）；changes 每项包含旧 id、status=active|deferred|cancelled、sourceQuote、reason；focusIds 是本轮直接处理的目标 ID。未变的旧项不必重传，不能通过遗漏取消要求，也不能把已完成目标重新当作待办。只在用户明确修改时替代/取消/暂缓，改端口不等于替换部署目标；只内网、禁止删除等有效约束必须保留。新目标拆分 goal 与 constraint，分类阶段不能声称满足目标。continue 只能选择已有有效 focus，additions 和 changes 必须为空；任何修改、取消、暂缓或恢复旧要求均分类 supplement，不得把‘继续’新增为目标。旁问/终端上下文请求不更新要求。独立新目标或整体替换的更新只包含新输入的条目，不继承旧目标。constraints 的三个文本数组尽可能使用对应有效需求条目的 content 原文，便于精确替代；不要把已被替代的旧端口或旧条件再次写入当前约束。";
+pub(crate) const FOCUS_RULE: &str = "focusIds 是本轮处理的有效需求 ID 数组，包含 goal 和 constraint；必须包含 additions 中每一个新增 ID，不能只填目标而漏掉新增限制。ID 不得重复，不能引用暂缓、取消、被替代或不存在的条目。未进入 focus 的旧有效约束仍继续生效。";
+pub(crate) fn update_rule() -> String {
+    format!("{UPDATE_RULE}\n{FOCUS_RULE}\n{ACCEPTANCE_RULE}")
+}
+pub(crate) const ACCEPTANCE_RULE: &str = "业务验收策略：requirementSubmission.acceptanceContractVersion=1 时，requirementUpdate 必须提供 acceptanceCoverage 数组，对本次 additions 的每一个 goal 和 constraint 精确覆盖一次。每项为 {requirementId,strategy:general_review|static_site,sourceQuote,reason,staticSite?}，sourceQuote 引用当前用户原文，reason 说明分类依据。静态站点发布目标使用 static_site，staticSite={artifactPath:string|null,entryUrl:string|null,preserveExisting:boolean,preserveOtherSites:boolean}；路径和入口必须直接来自当前原文，未明确填 null 并保留待发现/澄清缺口，不能从验收响应反推。保护条件按完整用户消息及有效约束解释，不得为了通过验收省略。其他目标与约束使用 general_review 并说明如何验收；未知或未解释的静态交付不得降级为通用验收。general_review 不带 staticSite；static_site 只用于goal。没有新增要求时返回空数组，不能重写既有冻结策略或将static_site降级；需求改变沿原修订流程重新准备和审批。Core会按已冻结条件和真实执行证据确定静态交付是否成立，不能用软件检查、备份完成或HTTP 200代替完整交付。";
+const UPDATE_RULE: &str = "需求版本协议：context.requirementSubmission 存在且 intent=execute 时必须提供 requirementUpdate，baseRevision/sourceMessageId 使用上下文原值。additions 每项包含新 id、kind=goal|constraint、content、当前用户原文中的 sourceQuote、supersedes（被明确替代的旧 ID 数组）；changes 每项包含旧 id、status=active|deferred|cancelled、sourceQuote、reason。未变的旧项不必重传，不能通过遗漏取消要求，也不能把已完成目标重新当作待办。只在用户明确修改时替代/取消/暂缓，改端口不等于替换部署目标；只内网、禁止删除等有效约束必须保留。新目标拆分 goal 与 constraint，分类阶段不能声称满足目标。continue 只能选择已有有效 focus，additions 和 changes 必须为空；任何修改、取消、暂缓或恢复旧要求均分类 supplement，不得把‘继续’新增为目标。旁问/终端上下文请求不更新要求。独立新目标或整体替换的更新只包含新输入的条目，不继承旧目标。constraints 的三个文本数组尽可能使用对应有效需求条目的 content 原文，便于精确替代；不要把已被替代的旧端口或旧条件再次写入当前约束。";
 pub(crate) const REVIEW_RULE: &str = "阶段验收协议：taskGoal.lifecycle.revision>0 时，按最新 focus、仍有效 goals/constraints 和真实证据输出 requirementReview={baseRevision,roundId,focusOutcome:completed|pending,overallOutcome:completed|pending,items:[{requirementId,outcome:satisfied|unmet|unknown,evidenceIds,reason}]}。focusOutcome 与 overallOutcome 只允许 completed|pending，unmet|unknown 仅用于 items[].outcome；未取得证据时 focusOutcome=pending。已完成历史只是参考，约束继续生效；未完成目标不得悄悄丢弃。focusOutcome=completed 表示本轮追加已完成，overallOutcome=pending 表示仍有其他有效目标未完成，此时可 adjust+steps=[]，summary交付本轮结果并明确未完事项，不重复旧步骤。只有 overallOutcome=completed 才能 decision=complete。对 satisfied 引用真实、适用目标与时效的证据，不把原验收被拦截覆盖后续成功查询，也不把旧成功当现在成功。独立只读验收本身就是证据，无需再为只读查询套一层独立验收。后续相关证据已解决历史问题时提供 issueResolutions=[{issueId,evidenceIds,reason}]，引用上下文真实 issueId，解释如何解决，保留原失败历史。空 adjust 在本轮尚未完成时必须附 blocking={kind:external|user_input,reason,requirementIds}；user_input 必须复用真实待答表单，否则生成唯一 user.request_input 步骤，不能只写‘等待用户’而没有问题。用户已明确的端口和方案不要重复确认。重复查询必须说明此前证据为何不足、失效或用户明确要求刷新；没有新缺口不得机械复查。";

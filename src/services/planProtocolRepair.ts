@@ -1,5 +1,6 @@
 import type { PlanStep } from "@/types";
 import { textFingerprint } from "@/features/agent/longRunningReviewOutput";
+import { readOnlyPlanProtocol } from "./recoveryRules";
 
 export interface PlanRepairDiagnostic {
   code: string;
@@ -53,7 +54,7 @@ export function planSemanticFingerprint(steps: PlanStep[]) {
   const ids = new Map(steps.map((step, index) => [step.id, index]));
   return textFingerprint(stableProtocolValue(steps.map(step => ({
     kind: step.kind, action: step.action, command: step.command, validation: step.validation,
-    expected: step.expected, risk: step.risk, executionScope: step.executionScope ?? "agent_session",
+    expected: step.expected, evidenceRequirements: step.evidenceRequirements, risk: step.risk, executionScope: step.executionScope ?? "agent_session",
     validationScope: step.validationScope ?? "isolated_exec", runtimeClass: step.runtimeClass ?? "bounded",
     sessionContextChange: step.sessionContextChange ?? null,
     recovery: step.recovery ? { ...step.recovery,
@@ -87,6 +88,7 @@ export function protocolRepairAuthority(context: string) {
   return {
     _log: source._log ?? task._log,
     _requestParameters: source._requestParameters,
+    _planEvidenceContract: source._planEvidenceContract,
     _modelCapabilities: source._modelCapabilities,
     _modelIntegration: source._modelIntegration,
     _modelRecovery: source._modelRecovery,
@@ -112,7 +114,8 @@ export function protocolRepairScopeFingerprint(context: string, diagnostic?: Pla
     permission: authority.permission, executionConstraints: authority.executionConstraints,
     confirmedUserInputs: authority.confirmedUserInputs, activeSkills: authority.activeSkills,
     target: record(authority.recovery).currentTargetContext,
-    server: record(authority.server).host,
+    server: { id: record(authority.server).id, host: record(authority.server).host,
+      port: record(authority.server).port, username: record(authority.server).username },
   }));
 }
 
@@ -144,7 +147,10 @@ export function compactProtocolRepairContext<T extends {
   const { previousModelOutput: _fullPlan, progress: _progress, nextStageDecision: _decision, modelRecovery: _modelRecovery, ...feedback } = repair;
   return JSON.stringify({
     ...authority,
+    _planEvidenceContract: steps.length && steps.every(step => step.evidenceRequirements !== undefined) ? { version: 1 } : undefined,
     workflowPhase: "protocol_repair",
+    readOnlyPlanProtocol: repair.diagnostic?.code === "OBSERVE_COMMAND_MUTATION"
+      || repair.diagnostic?.code === "RECOVERY_DIAGNOSE_MUTATION" ? readOnlyPlanProtocol() : undefined,
     recovery: {
       currentTargetContext: recovery.currentTargetContext,
       failedAttempts: failedAttempts
@@ -157,7 +163,7 @@ export function compactProtocolRepairContext<T extends {
       ...feedback,
       previousModelOutput: steps.map(step => ({
         kind: step.kind, title: step.title, description: step.description,
-        action: step.action, command: step.command, expected: step.expected, validation: step.validation, risk: step.risk,
+        action: step.action, command: step.command, expected: step.expected, evidenceRequirements: step.evidenceRequirements, validation: step.validation, risk: step.risk,
         executionScope: step.executionScope, validationScope: step.validationScope,
         runtimeClass: step.runtimeClass, sessionContextChange: step.sessionContextChange, recovery: step.recovery,
       })),

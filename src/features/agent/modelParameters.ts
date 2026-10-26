@@ -30,3 +30,8 @@ export function parameterContext(context: string, input?: ModelRequestParameters
   return JSON.stringify({ ...JSON.parse(context || "{}"), ...(parameters ? { _requestParameters: parameters } : {}),
     ...(capabilities ? { _modelCapabilities: capabilities } : {}), ...(configured ? { _modelIntegration: integration } : {}) });
 }
+
+/** Version negotiation for full candidate generation; older stored plans stay readable. */
+export function planEvidenceContext(context: string): string {
+  return JSON.stringify({ ...JSON.parse(context || "{}"), _planEvidenceContract: { version: 1 } });
+}

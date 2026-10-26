@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fmt};
 
 pub(crate) const DIALECT: &str = "opsark.strict-output.common.v1";
-pub(crate) const COMPILER_REVISION: &str = "j0-a.1";
+pub(crate) const COMPILER_REVISION: &str = "j0-a.3";
 const METADATA_MARKER: &str = "opsark:json-object-metadata";
 const MAX_DEPTH: usize = 10;
 const MAX_PROPERTIES: usize = 5_000;
@@ -498,6 +498,17 @@ impl Compiler {
                     "items".into(),
                     self.compile_node(items, &child(path, "items"))?,
                 );
+                if let Some(minimum) = source.get("minItems").and_then(Value::as_u64).filter(|n| *n > 0) {
+                    // The conservative profile still does not claim provider
+                    // enforcement of minItems. Keep it in residual/local rules
+                    // and place its exact scalar value beside the array too.
+                    let hint = format!("minItems={minimum}; local check.");
+                    let description = result.get("description").and_then(Value::as_str)
+                        .map_or_else(|| hint.clone(), |old| format!("{old} {hint}"));
+                    result.insert("description".into(), json!(description));
+                    self.record(&child(path,"description"),"minItems","annotation",
+                        "非空数组约束同时在字段旁提示；不宣称服务方执行，原残余本地校验保持");
+                }
             }
             Some(_) => {
                 if source.contains_key("properties")
@@ -762,6 +773,14 @@ pub(crate) fn compile(schema: &Value) -> Result<CompiledSchema, CompileError> {
         report,
     })
 }
+
+#[cfg(test)]
+#[path = "model_schema_stage18_tests.rs"]
+mod stage18_tests;
+
+#[cfg(test)]
+#[path = "model_schema_stage19_tests.rs"]
+mod stage19_tests;
 
 #[cfg(test)]
 mod tests {

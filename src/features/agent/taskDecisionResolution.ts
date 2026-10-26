@@ -1,5 +1,6 @@
 import type { ExecutionEvidence, NextStageDecision, OpsTask, PlanStep, TaskHistoryIssue } from "@/types";
 import { applyTaskRequirementReview } from "./taskRequirements";
+import { assertStaticSiteRequirementComplete, staticSiteRequirements } from "./staticSiteAcceptance";
 import { executionDigest, executionIntentMatches } from "./planPreparation";
 import { textFingerprint } from "./longRunningReviewOutput";
 import { isRemoteToolObservation, scopedToolEvidence, toolExecutionScope } from "./toolEvidenceScope";
@@ -131,6 +132,10 @@ export function taskDecisionEvidenceIds(task: OpsTask): string[] {
 function acceptsCompletion(item: { step: PlanStep; evidence: ExecutionEvidence }) {
   return item.step.result?.executionStatus === "success" && item.step.status !== "failed"
     && item.step.result.facts.validationPassed !== false
+    // Coverage is an executor observation, independent of exit code. Keep
+    // partial/redacted receipts available for diagnosis, never generic success.
+    && !(item.step.action?.type === "tool" && isRemoteToolObservation(item.step.action.toolId)
+      && (item.step.result.facts.evidenceComplete === false || item.evidence.facts.evidenceComplete === false))
     && !(item.step.result.facts.semanticAcceptanceRequired === true && item.step.result.facts.semanticAcceptanceStatus !== "proven");
 }
 
@@ -230,6 +235,11 @@ export function stepHasResolvedIssue(task: OpsTask, step: PlanStep) {
 
 /** Validate first; caller commits all projections only after the entire proposal is accepted. */
 export function prepareTaskDecision(task: OpsTask, decision: NextStageDecision) {
+  if (decision.decision === "complete" || decision.requirementReview?.focusOutcome === "completed") {
+    for (const requirement of staticSiteRequirements(task)) {
+      try { assertStaticSiteRequirementComplete(task, requirement.id); } catch (error) { fail(error instanceof Error ? error.message : String(error)); }
+    }
+  }
   const evidence = evidenceCatalog(task);
   const currentEvidence = currentEvidenceCatalog(task, evidence);
   const acceptanceEvidence = currentEvidence.filter(acceptsCompletion);
@@ -253,6 +263,7 @@ export function prepareTaskDecision(task: OpsTask, decision: NextStageDecision) 
       && !onlyDiagnosticReads(decision)) fail("未核实的失败记录仅可用于 unknown 和同目标只读诊断，不能据此重试、变更或解除执行阻断。");
     for (const assessment of decision.requirementReview.items) {
       if (assessment.outcome !== "satisfied") continue;
+      try { assertStaticSiteRequirementComplete(task, assessment.requirementId); } catch (error) { fail(error instanceof Error ? error.message : String(error)); }
       const requirement = task.requirementLifecycle?.items.find(item => item.id === assessment.requirementId);
       const boundary = Date.parse(requirement?.lastChangedAt ?? requirement?.source.createdAt
         ?? task.messages.find(message => message.id === requirement?.source.sourceMessageId)?.createdAt ?? "");

@@ -30,13 +30,15 @@ const editingServerId = ref("");
 const editingServer = computed(() => store.servers.find((server) => server.id === editingServerId.value));
 const groupCount = computed(() => new Set(store.servers.map((server) => server.group).filter(Boolean)).size);
 const hasAmount = (value: unknown) => Number.isFinite(Number(value)) && Number(value) > 0;
-const { confirmationMessage, confirmAction, resolveConfirmation } = useActionConfirmation();
+const { confirmationMessage, confirmationId, confirmAction, resolveConfirmation } = useActionConfirmation();
 async function removeServer(server: (typeof store.servers)[number]) {
+  const targetId = server.id;
   const message = zh.value
     ? `确定删除服务器“${server.name}”吗？该服务器的连接配置、保存的凭据和本地工作区数据将一并移除。`
     : `Delete server “${server.name}”? Its connection settings, saved credentials, and local workspace data will also be removed.`;
   if (!await confirmAction(message)) return;
-  store.removeServer(server.id);
+  if (store.servers.find(item => item.id === targetId) !== server) return;
+  store.removeServer(targetId);
 }
 
 onMounted(async () => {
@@ -102,6 +104,7 @@ onMounted(async () => {
     <AddServerModal v-if="adding" @close="adding = false" />
     <AddServerModal v-if="editingServer" :server="editingServer" @close="editingServerId = ''" />
     <ConfirmActionDialog
+      :request-id="confirmationId"
       :message="confirmationMessage"
       :title="zh ? '删除服务器' : 'Delete server'"
       :confirm-label="zh ? '确认删除' : 'Delete'"

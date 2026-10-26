@@ -17,12 +17,15 @@ describe("file-backed Skill definitions", () => {
   });
   it("keeps source identity stable across Windows line endings", () => {
     expect(skillSourceFingerprint("one\r\ntwo")).toBe(skillSourceFingerprint("one\ntwo"));
+    const lf = Object.fromEntries(Object.entries(resources).map(([path, text]) => [path, text.replace(/\r\n/g, "\n")]));
+    const crlf = Object.fromEntries(Object.entries(lf).map(([path, text]) => [path, text.replace(/\n/g, "\r\n")]));
+    for (const skill of loadBuiltInSkills()) expect(loadSkillDefinition(skill.id, crlf)).toEqual(loadSkillDefinition(skill.id, lf));
   });
   it("loads every catalog entry and preserves every paragraph in the stage contract", () => {
     const skills = loadBuiltInSkills();
-    expect(skills).toHaveLength(7);
+    expect(skills).toHaveLength(9);
     for (const skill of skills) {
-      expect(skill.instructions).toBe(resources[`./definitions/${skill.id}/instructions.md`]);
+      expect(skill.instructions).toBe(resources[`./definitions/${skill.id}/instructions.md`].replace(/\r\n/g, "\n"));
       const contract = skill.planningContract;
       if (!contract || contract.initialOnly) continue;
       const allRules = [contract.globalInstructions, contract.acceptanceInstructions, ...contract.stages.map(stage => stage.instructions)].join("\n");
@@ -42,7 +45,7 @@ describe("file-backed Skill definitions", () => {
     delete files["./definitions/project-build/stages/discover.md"];
     const skill = loadSkillDefinition("project-build", files);
     expect(skill.planningContract).toBeUndefined();
-    expect(skill.instructions).toBe(resources["./definitions/project-build/instructions.md"]);
+    expect(skill.instructions).toBe(resources["./definitions/project-build/instructions.md"].replace(/\r\n/g, "\n"));
   });
   it("uses full rules when the source was edited without updating the stage contract", () => {
     const path = "./definitions/project-build/instructions.md";

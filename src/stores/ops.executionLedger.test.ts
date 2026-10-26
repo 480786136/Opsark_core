@@ -2,13 +2,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { backend } from "@/services/backend";
 import { configureExecutionLedger, createMemoryExecutionLedgerRepository, listExecutionLedger,
-  pendingExecutionReceipts, resetExecutionLedgerForTests } from "@/services/executionLedger";
+  pendingExecutionReceipts, resetExecutionLedgerForTests, runRecordedExecution } from "@/services/executionLedger";
 import { useConnectionStore } from "@/features/connection/connectionStore";
 import { directExecutionLedgerOwner, runDirectExecution } from "@/services/directExecutionLedger";
 import { executionDigest } from "@/features/agent/planPreparation";
 import { useOpsStore } from "./ops";
 import type { PlanStep, ServerProfile } from "@/types";
 import { normalizeOperationsRequest } from "@/features/tools/operationsInspection";
+import { boundedFileAppendContract } from "@/features/agent/boundedFileReconciliation";
+import { normalizeSshCommandInvokeError } from "@/services/sshCommandTransport";
 
 const server: ServerProfile = { id: "ledger-server", host: "ledger.example.invalid", port: 22, username: "tester",
   name: "台账集成测试", group: "test", status: "offline", environment: [], createdAt: "2026-09-26T00:00:00Z",
@@ -21,6 +23,10 @@ const deferred = <T>() => {
   const promise = new Promise<T>(yes => { resolve = yes; });
   return { promise, resolve };
 };
+const preflightError = () => normalizeSshCommandInvokeError("OPSARK_SSH_EXEC_PREFLIGHT_V1:" + JSON.stringify({
+  version: 1, origin: "core", code: "SSH_EXEC_PAYLOAD_TOO_LARGE", stage: "exec_preflight",
+  dispatchCertainty: "not_dispatched", retryable: false, payloadBytes: 40000, payloadLimitExclusive: 34744,
+}));
 function preparedTask() {
   const store = useOpsStore();
   const task = store.createTask(server.id, "safe", "ledger-model");
@@ -62,6 +68,214 @@ describe("J2 store dispatch and durable recovery", () => {
       coverageComplete: true, truncated: false, elapsedMs: 1, finishedAt: "2026-09-27T00:00:00Z" };
     return { store, task, data };
   }
+
+  async function uncertainAppendTask() {
+    const { store, task } = preparedTask(), repository = createMemoryExecutionLedgerRepository();
+    const command = "set -eu\nf='/tmp/record'\nb='/tmp/backup'\nprintf '%s\\n' 'old' | cmp - \"$f\"\ntest ! -e \"$b\"\ncp -p -- \"$f\" \"$b\"\nprintf '%s\\n' 'new' >> \"$f\"";
+    task.plan = [{ ...proposal(), title: "备份并追加一条记录", kind: "change", risk: "medium", runtimeClass: "bounded",
+      command, action: { type: "shell", command }, expected: "原记录完整保留且仅追加一次" }];
+    store.prepareTaskPlan(task);
+    configureExecutionLedger(store, repository, async (_taskId, evidence) => executionDigest(evidence));
+    const execute = vi.fn(async () => { throw new Error("transport lost after append"); });
+    await expect(store.recordStepExecution(task, task.plan[0], "command", "append-original", () => true, execute)).rejects.toThrow();
+    task.status = "needs_adjustment"; task.plan[0].status = "failed";
+    task.executionReconciliation = { id: "append-incident", stepId: task.plan[0].id, serverId: server.id,
+      recordedAt: new Date().toISOString(), command, expected: task.plan[0].expected, knownStepIds: [], reason: "回执丢失" };
+    const original = (await listExecutionLedger(store, task.id))[0];
+    const c = boundedFileAppendContract(original.intent.semantic)!;
+    const boot = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const stdout = ["OPSARK_BOUNDED_FILE_V1", "append-original", c.commandSha256, boot, "812", "731", "0", "CURRENT_BOOT", boot,
+      "PROCESS_GROUPS", "1", "900", "FILE_DIGESTS", `${c.afterSha256}  /tmp/record`, `${c.beforeSha256}  /tmp/backup`,
+      `${c.afterSha256}  /tmp/record`, `${c.beforeSha256}  /tmp/backup`, "END"].join("\n");
+    return { store, task, repository, original, execute, stdout };
+  }
+
+  it("records trusted native rejection for an Agent command without losing the bounded diagnostic", async () => {
+    const { store, task } = preparedTask();
+    const execute = vi.fn(async () => { throw preflightError(); });
+    await expect(store.recordStepExecution(task, task.plan[0], "command", "native-rejected-command", () => true, execute))
+      .rejects.toMatchObject({ name: "SshExecPayloadError", code: "SSH_EXEC_PAYLOAD_TOO_LARGE" });
+    const [record] = await listExecutionLedger(store, task.id);
+    expect(record).toMatchObject({ state: "not_dispatched", attempts: [{ status: "not_dispatched", outcome: {
+      result: { error: { diagnostic: { payloadBytes: 40000, dispatchCertainty: "not_dispatched" } } },
+    } }] });
+    expect(record.attempts[0].outcome?.evidenceRefs).toHaveLength(1); expect(execute).toHaveBeenCalledOnce();
+  });
+
+  it("propagates native preflight through the real tool adapter to Agent operation and evidence", async () => {
+    const { store, task } = inspectionTask();
+    vi.mocked(backend.executeCommand).mockRejectedValue(preflightError());
+    const call = { id: "native-rejected-tool", toolId: "files.find_large", arguments: { path: "/srv", maxEntries: 10 } };
+    const result = await store.recordStepExecution(task, task.plan[0], "tool", call.id, () => true,
+      () => store.executeToolCall(server.id, call));
+    expect(result).toMatchObject({ success: false, error: { code: "SSH_EXEC_PAYLOAD_TOO_LARGE", category: "unavailable",
+      dispatchState: "not_sent" }, data: { dispatchPreflight: { payloadBytes: 40000, retryable: false } } });
+    const [record] = await listExecutionLedger(store, task.id);
+    expect(record).toMatchObject({ state: "not_dispatched", attempts: [{ status: "not_dispatched", outcome: {
+      result: { error: { code: "SSH_EXEC_PAYLOAD_TOO_LARGE", dispatchState: "not_sent" },
+        data: { dispatchPreflight: { payloadBytes: 40000 } } },
+    } }] });
+    expect(record.attempts).toHaveLength(1); expect(backend.executeCommand).toHaveBeenCalledOnce();
+  });
+
+  it.each(["PROBE_DECODER_UNAVAILABLE", "PROBE_SOURCE_INVALID"] as const)(
+    "preserves an actual remote decoder failure as sent/failed: %s", async code => {
+      const { store, task } = inspectionTask();
+      const stdout = "OPSARK_PROBE_DELIVERY " + JSON.stringify({ version: 1, code,
+        stage: code === "PROBE_DECODER_UNAVAILABLE" ? "decoder_import" : "source_decode" }) + "\n";
+      vi.mocked(backend.executeCommand).mockResolvedValue({ success: false, simulated: false, output: "delivery failed",
+        stdout, stderr: "", stdoutTruncated: false, exitCode: 125 });
+      const call = { id: "decoder-rejected", toolId: "files.find_large", arguments: { path: "/srv", maxEntries: 10 } };
+      const result = await store.recordStepExecution(task, task.plan[0], "tool", call.id, () => true,
+        () => store.executeToolCall(server.id, call));
+      expect(result).toMatchObject({ success: false, error: { code, dispatchState: "sent" } });
+      expect(JSON.stringify(result.data)).toContain("125");
+      expect(JSON.stringify(result.data)).toContain("OPSARK_PROBE_DELIVERY");
+      expect((await listExecutionLedger(store, task.id))[0]).toMatchObject({ state: "failed",
+        attempts: [{ status: "failed", outcome: { result: { error: { code, dispatchState: "sent" } } } }] });
+      expect(backend.executeCommand).toHaveBeenCalledOnce();
+    });
+
+  it.each(["stderr", "mixed_stdout", "truncated", "unknown_completeness", "wrong_exit"])(
+    "does not trust an incomplete or mixed decoder receipt: %s", async kind => {
+      const { store } = inspectionTask();
+      const raw = 'OPSARK_PROBE_DELIVERY {"version":1,"code":"PROBE_SOURCE_INVALID","stage":"source_decode"}\n';
+      const receipt = { success: false, simulated: false, output: "failed", stdout: raw, stderr: "", stdoutTruncated: false, exitCode: 125 };
+      if (kind === "stderr") receipt.stderr = "unexpected error";
+      if (kind === "mixed_stdout") receipt.stdout += 'OPSARK_RESULT {}\n';
+      if (kind === "truncated") receipt.stdoutTruncated = true;
+      if (kind === "unknown_completeness") Reflect.deleteProperty(receipt, "stdoutTruncated");
+      if (kind === "wrong_exit") receipt.exitCode = 1;
+      vi.mocked(backend.executeCommand).mockResolvedValue(receipt);
+      const result = await store.executeToolCall(server.id, { id: "untrusted-decoder", toolId: "files.find_large",
+        arguments: { path: "/srv", maxEntries: 10 } });
+      expect(result).toMatchObject({ success: false, error: { code: "TOOL_OUTPUT", category: "output", dispatchState: "sent" } });
+      if (kind === "wrong_exit") expect(result.data).toBeUndefined();
+      else expect(result.data).toMatchObject({ probeDeliveryReceipt: {
+        exitCode: 125, stdout: receipt.stdout, stderr: receipt.stderr, capturedPartial: true,
+      } });
+      expect(backend.executeCommand).toHaveBeenCalledOnce();
+    });
+
+  it("retains a late preflight rejection under the original attempt without applying it to a new workflow", async () => {
+    const { store, task } = preparedTask();
+    const gate = deferred<void>(); let current = true;
+    const execute = vi.fn(async () => { await gate.promise; throw preflightError(); });
+    const pending = store.recordStepExecution(task, task.plan[0], "command", "late-native-rejection", () => current, execute);
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    current = false; gate.resolve();
+    await expect(pending).rejects.toMatchObject({ stage: "stale_result" });
+    expect((await listExecutionLedger(store, task.id))[0]).toMatchObject({ state: "not_dispatched",
+      attempts: [{ status: "not_dispatched", late: true }] });
+    expect(task.plan[0].ledgerAppliedAttemptIds ?? []).toHaveLength(0);
+  });
+
+  it("redacts secrets in an untrusted decoder receipt while retaining the sent failure evidence", async () => {
+    const { store } = inspectionTask();
+    vi.mocked(backend.executeCommand).mockResolvedValue({ success: false, simulated: false, output: "failed",
+      stdout: 'OPSARK_PROBE_DELIVERY {"unexpected":"fixture-only"}\n', stderr: "credential=fixture-only",
+      stdoutTruncated: false, exitCode: 125 });
+    const result = await store.executeToolCall(server.id, { id: "redacted-delivery", toolId: "files.find_large",
+      arguments: { path: "/srv", maxEntries: 10 } });
+    expect(result).toMatchObject({ success: false, error: { code: "TOOL_OUTPUT", dispatchState: "sent" },
+      data: { probeDeliveryReceipt: { exitCode: 125, stdoutPresent: true, stderrPresent: true, capturedPartial: true } } });
+    expect(JSON.stringify(result)).not.toContain("fixture-only");
+    expect(JSON.stringify(result)).toContain("OPSARK_PROBE_DELIVERY");
+  });
+
+  it("does not retroactively classify a legacy SDK error as a native preflight rejection", async () => {
+    const { store, task } = inspectionTask();
+    vi.mocked(backend.executeCommand).mockRejectedValue(new Error("SSH 命令执行失败: [Session(-34)]"));
+    const call = { id: "legacy-sdk-error", toolId: "files.find_large", arguments: { path: "/srv", maxEntries: 10 } };
+    const result = await store.recordStepExecution(task, task.plan[0], "tool", call.id, () => true,
+      () => store.executeToolCall(server.id, call));
+    expect(result).toMatchObject({ success: false, error: { code: "TOOL_EXECUTION_FAILED", dispatchState: "unknown" } });
+    expect(result.data).toBeUndefined();
+    expect((await listExecutionLedger(store, task.id))[0]).toMatchObject({ state: "failed", attempts: [{ status: "failed" }] });
+  });
+
+  it("cannot use a later preflight rejection to replace or unlock an existing unknown write", async () => {
+    const { store, task, original } = await uncertainAppendTask();
+    const execute = vi.fn(async () => { throw preflightError(); });
+    await expect(store.recordStepExecution(task, task.plan[0], "command", "new-command-id", () => true, execute))
+      .rejects.toMatchObject({ stage: "begin" });
+    expect(execute).not.toHaveBeenCalled();
+    const [record] = await listExecutionLedger(store, task.id);
+    expect(record.operationId).toBe(original.operationId);
+    expect(record.state).toBe("unknown"); expect(record.attempts).toHaveLength(1);
+  });
+
+  it("G02 automatically reconciles before the next model decision without a recovery click or second append", async () => {
+    const { store, task, original, execute, stdout } = await uncertainAppendTask();
+    vi.mocked(backend.executeCommand).mockResolvedValue({ success: true, simulated: true, output: "wrapped", stdout, stdoutTruncated: false, exitCode: 0 });
+    vi.mocked(backend.decideNextStage).mockImplementation(async () => {
+      const resolved = (await listExecutionLedger(store, task.id)).find(row => row.operationId === original.operationId)!;
+      expect(resolved.reconciliation?.status).toBe("completed");
+      expect(task.executionReconciliation?.resolution?.status).toBe("completed");
+      return { decision: "complete", reason: "原目标证据与台账一致", summary: "完成", source: "model", steps: [] };
+    });
+    await store.beginAdjustment(task.id, true);
+    expect(execute).toHaveBeenCalledOnce();
+    expect(backend.executeCommand).toHaveBeenCalledOnce();
+    const read = vi.mocked(backend.executeCommand).mock.calls[0];
+    expect(read[0]).toContain("/tmp/opsark-receipt-append-original/done");
+    expect(read[0]).not.toContain("cp -p");
+    expect(read[3]?.captureStreams).toBe(true);
+    expect(backend.decideNextStage).toHaveBeenCalledOnce();
+    const resolved = (await listExecutionLedger(store, task.id)).find(row => row.operationId === original.operationId)!;
+    expect(resolved.state).toBe("unknown"); expect(resolved.attempts).toHaveLength(1);
+    expect(task.executionLedgerRecovery?.items.some(item => item.attemptId === original.attempts[0].id)).toBe(false);
+    expect(task.automaticReconciliationAttempts).toEqual([original.attempts[0].id]);
+    expect(task.status).toBe("completed");
+  });
+
+  it("G02 missing receipt stays unknown and a later adjustment cannot automatically repeat the same probe", async () => {
+    const { store, task, original, execute } = await uncertainAppendTask();
+    vi.mocked(backend.executeCommand).mockResolvedValue({ success: false, simulated: true, output: "receipt missing", stdout: "", stdoutTruncated: false, exitCode: 1 });
+    await store.reconcilePendingExecution(task.id);
+    await store.reconcilePendingExecution(task.id);
+    expect(execute).toHaveBeenCalledOnce();
+    expect(backend.executeCommand).toHaveBeenCalledOnce();
+    expect((await listExecutionLedger(store, task.id)).find(row => row.operationId === original.operationId)?.reconciliation).toBeUndefined();
+    expect(task.executionReconciliation?.resolution).toBeUndefined();
+    expect(task.executionLedgerRecovery?.items.some(item => item.kind === "uncertain")).toBe(true);
+    expect(task.automaticReconciliationAttempts).toEqual([original.attempts[0].id]);
+  });
+
+  it.each(["pending", "failed"] as const)("G01 a %s requirement prevents manual reconciliation before ledger reads or remote dispatch", async state => {
+    const { store, task, repository, original } = await uncertainAppendTask();
+    task.pendingRequirements = [{ id: "new-target-request", content: "停止原目标，先处理新需求", baseRevision: 1,
+      state, receivedAt: new Date().toISOString() }];
+    const list = vi.spyOn(repository, "list");
+    const resolve = vi.spyOn(repository, "resolve");
+    await store.reconcileExecutionAttempt(task.id, original.attempts[0].id);
+    expect(list).not.toHaveBeenCalled();
+    expect(resolve).not.toHaveBeenCalled();
+    expect(backend.executeCommand).not.toHaveBeenCalled();
+    expect(task.executionReconciliation?.resolution).toBeUndefined();
+    expect(task.pendingRequirements[0].state).toBe(state);
+  });
+
+  it("G02 a successful probe cannot resolve another attempt or release its endpoint ownership", async () => {
+    const { store, task, original, stdout } = await uncertainAppendTask();
+    const semantic = { ...original.intent.semantic, stepId: "other-step", targets: [{ ...original.intent.semantic.targets[0], host: "other.test", serverId: "other-server" }] };
+    const otherIntent = { version: "execution-intent@1" as const, algorithm: "sha256" as const, semantic,
+      digest: executionDigest({ version: "execution-intent@1", semantic }) };
+    await expect(runRecordedExecution({ owner: store, task: { id: task.id }, step: { id: "other-step", executionIntent: otherIntent },
+      phase: "command", executionId: "other-write", execute: async () => { throw new Error("other lost response"); } })).rejects.toThrow();
+    vi.mocked(backend.executeCommand).mockResolvedValue({ success: true, simulated: true, output: "wrapped", stdout, stdoutTruncated: false, exitCode: 0 });
+    await store.reconcilePendingExecution(task.id);
+    const records = await listExecutionLedger(store, task.id);
+    expect(records.find(row => row.operationId === original.operationId)?.reconciliation?.status).toBe("completed");
+    expect(records.find(row => row.stepId === "other-step")?.reconciliation).toBeUndefined();
+    const nextSemantic = { ...semantic, stepId: "another-step" };
+    const nextIntent = { ...otherIntent, semantic: nextSemantic, digest: executionDigest({ version: "execution-intent@1", semantic: nextSemantic }) };
+    const dispatch = vi.fn(async () => ({ success: true }));
+    await expect(runRecordedExecution({ owner: store, task: { id: task.id }, step: { id: "another-step", executionIntent: nextIntent },
+      phase: "command", executionId: "another-write", execute: dispatch })).rejects.toThrow();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(task.executionLedgerRecovery?.items.filter(item => item.kind === "uncertain")).toHaveLength(1);
+  });
 
   it("J4 registers the approved read intent before sending its probe and records bounded evidence", async () => {
     const { store, task, data } = inspectionTask(), repository = createMemoryExecutionLedgerRepository();
@@ -157,6 +371,9 @@ describe("J2 store dispatch and durable recovery", () => {
     expect(task.executionLedgerError).toMatchObject({ stage: "result_commit", remoteResultKnown: true });
     expect(pendingExecutionReceipts(store, task.id)).toHaveLength(1);
     expect(task.plan[0].result?.executionStatus).not.toBe("failed");
+    // The save-only action becomes available after the asynchronous refresh,
+    // rather than relying on an incidental number of Promise continuations.
+    await vi.waitFor(() => expect(task.executionLedgerRecovery?.items.some(item => item.action === "retry_storage")).toBe(true));
     await store.retryExecutionLedgerStorage(task.id);
     expect(complete).toHaveBeenCalledTimes(3);
     expect(pendingExecutionReceipts(store, task.id)).toHaveLength(0);

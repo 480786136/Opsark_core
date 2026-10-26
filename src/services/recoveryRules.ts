@@ -13,6 +13,22 @@ export interface RecoveryProtocolIssue {
 
 export const RECOVERY_RULE_VERSION = rules.version;
 
+/** The repair prompt describes the same conservative boundary as the validator.
+ * This is not an executable allowlist or a substitute for full safety checks. */
+export function readOnlyPlanProtocol() {
+  return {
+    ruleVersion: rules.version,
+    unsupportedShellOperators: rules.shell.unsupportedShellOperators,
+    opaqueInterpreters: rules.shell.opaqueInterpreters,
+    interpreterQueryOptions: rules.shell.safeInterpreterOptions,
+    interpreterReadOnlyOptions: rules.shell.interpreterReadOnlyOptions,
+    safeWriteTargets: rules.shell.safeWriteTargets,
+    maxNestedDepth: rules.shell.maxNestedDepth,
+    requiresFullValidation: true,
+    localRepair: rules.localRepairPolicy,
+  };
+}
+
 export class RecoveryProtocolError extends Error {
   constructor(readonly issue: RecoveryProtocolIssue) {
     super(`${issue.code} / ${issue.fieldPath}${issue.matchedToken ? ` / matchedToken=${issue.matchedToken}` : ""}：${issue.expected}`);
@@ -48,10 +64,23 @@ function issueFor(code: RuleCode, step: RecoveryStep, stepIndex: number, matched
     ruleVersion: rules.version, ...(matchedToken ? { matchedToken } : {}) };
 }
 
+/** Persisted diagnostics are feedback, never authority to widen a field patch. */
+export function currentRecoveryRepairScope(issue: RecoveryProtocolIssue, step: RecoveryStep | undefined): boolean {
+  if (!step || !Object.prototype.hasOwnProperty.call(rules.errors, issue.code)) return false;
+  const actual = recoveryMetadataIssue(step, issue.stepIndex);
+  return !!actual && actual.allowedRepairPaths.length > 0
+    && issue.ruleVersion === actual.ruleVersion && issue.code === actual.code
+    && issue.fieldPath === actual.fieldPath
+    && issue.allowedRepairPaths.length === actual.allowedRepairPaths.length
+    && issue.allowedRepairPaths.every((path, index) => path === actual.allowedRepairPaths[index]);
+}
+
 export function recoveryMetadataIssue(step: RecoveryStep, stepIndex = 0): RecoveryProtocolIssue | undefined {
+  // Match Rust and the actual structured action, not a stale compatibility copy.
+  const command = step.action?.command ?? step.command;
   const observeIssue = () => {
     if (step.kind !== "observe" || (step.status && step.status !== "pending")) return undefined;
-    const mutation = commandMutation(step.command);
+    const mutation = commandMutation(command);
     return mutation ? issueFor("OBSERVE_COMMAND_MUTATION", step, stepIndex, mutation) : undefined;
   };
   if (step.recovery === undefined || step.recovery === null) return observeIssue();
@@ -67,7 +96,7 @@ export function recoveryMetadataIssue(step: RecoveryStep, stepIndex = 0): Recove
   const purpose = rules.purposeRules[relation.purpose as keyof typeof rules.purposeRules];
   if ("kind" in purpose && step.kind !== purpose.kind) return issueFor("RECOVERY_KIND_MISMATCH", step, stepIndex);
   if (purpose.readonly) {
-    const mutation = commandMutation(step.command);
+    const mutation = commandMutation(command);
     if (mutation) return issueFor("RECOVERY_DIAGNOSE_MUTATION", step, stepIndex, mutation);
   }
   return observeIssue();

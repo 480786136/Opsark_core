@@ -21,7 +21,66 @@ function record(overrides: Partial<ExecutionOperationRecord> = {}, semantics: Pa
 const server = (id: string, host: string) => ({ id, host, port: 22, username: "deploy" }) as ServerProfile;
 const servers = [server("server-a", "a.example"), server("server-b", "b.example")];
 
+it("offers bounded Shell reconciliation with exact append and executor evidence, without replaying the write", () => {
+  const command = "set -eu\nf='/tmp/record'\nb='/tmp/backup'\nprintf '%s\\n' 'old' | cmp - \"$f\"\ntest ! -e \"$b\"\ncp -p -- \"$f\" \"$b\"\nprintf '%s\\n' 'new' >> \"$f\"";
+  const operation = record({}, { action: { type: "shell", command }, runtimeClass: "bounded", executionScope: "isolated_exec" });
+  expect(projectExecutionLedgerRecovery([operation], { servers }).items[0].action).toBe("reconcile");
+  const draft = buildReadOnlyReconciliation(operation, { id: operation.taskId }, servers);
+  expect(draft.kind).toBe("bounded_file_append");
+  expect(draft.reads).toHaveLength(1);
+  expect(draft.reads[0].command).toContain("/tmp/opsark-receipt-exec-a/done");
+  expect(draft.reads[0].command).not.toContain("cp -p");
+  expect(draft.reads[0].command).not.toContain(">>");
+  const unsupported = record({}, { action: { type: "shell", command: command + "\ntouch /unrelated" }, runtimeClass: "bounded", executionScope: "isolated_exec" });
+  expect(projectExecutionLedgerRecovery([unsupported], { servers }).items[0].action).toBe("none");
+});
+
 describe("versioned pure recovery readers", () => {
+  it("preserves terminal and observation identity and rejects malformed timing without overwriting history", () => {
+    const terminalEvidence = { version: 1, taskId: "task-a", cancellations: [{ roundId: "r", workflowEpoch: 2,
+      requestedAt: "2026-10-12T00:00:00Z", reason: "terminate", executionId: "original" }],
+      terminals: [], remoteAttempts: [], modelRequests: [] };
+    const window = { version: 1, binding: { taskId: "task-a", roundId: "r", workflowEpoch: 2, stepId: "step-a", executionId: "window" },
+      policy: { windowMs: 60_000, intervalMs: 5000, probeTimeoutMs: 5000 }, preparationStartedAt: 1000, startedAt: 2000,
+      observationElapsedMs: 0, maxSampleGapMs: 0, state: "preparing", windowSatisfied: false, samples: [] };
+    const row = { id: "task-a", serverId: "server-a", status: "cancelled", plan: [], messages: [], terminalEvidence, observationWindows: [window] };
+    expect(readTaskProjection([row])).toMatchObject({ compatible: true, tasks: [row] });
+    for (const terminal of [null, { ...terminalEvidence, taskId: "other" }, { ...terminalEvidence, version: 2 },
+      { ...terminalEvidence, cancellations: "lost" }, { ...terminalEvidence, terminals: [{ roundId: "r", workflowEpoch: 2, status: "cancelled", transitionedAt: "last event" }] },
+      { ...terminalEvidence, remoteAttempts: [{ operationId: "op", attemptId: "a", state: "exit_recorded", exitCode: 130 }] },
+      { ...terminalEvidence, modelRequests: [{ requestId: "r", usageStatus: "reported", usage: {} }] }]) {
+      const original = { ...row, terminalEvidence: terminal }, text = JSON.stringify(original);
+      expect(readTaskProjection([original]).compatible).toBe(false);
+      expect(JSON.stringify(original)).toBe(text);
+    }
+    for (const windows of [null, {}, [window, window], [{ ...window, binding: { ...window.binding, taskId: "other" } }],
+      [{ ...window, policy: { ...window.policy, windowMs: -1 } }], [{ ...window, state: "completed" }],
+      [{ ...window, state: "interrupted" }], [{ ...window, finishedAt: 3000 }], [{ ...window, windowSatisfied: true }],
+      [{ ...window, samples: [{ status: "valid", matched: true }] }]]) {
+      const original = { ...row, observationWindows: windows }, text = JSON.stringify(original);
+      expect(readTaskProjection([original]).compatible).toBe(false);
+      expect(JSON.stringify(original)).toBe(text);
+    }
+    expect(readTaskProjection([{ ...row, observationWindows: [{ ...window, state: "interrupted", interruptedAt: 3000 }] }]).compatible).toBe(true);
+  });
+  it("preserves persisted pending requirement fences and rejects malformed blockers rather than dropping them", () => {
+    const pending = { id: "revision-message-1", content: "停止A，改为B", baseRevision: 2, state: "failed", receivedAt: "2026-10-12T08:00:00Z", error: "request failed" };
+    const row = { id: "task-a", serverId: "server-a", status: "awaiting_plan_approval", messages: [], plan: [],
+      pendingRequirements: [pending], automaticReconciliationAttempts: ["attempt-old"] };
+    expect(readTaskProjection([row])).toMatchObject({ compatible: true, tasks: [row] });
+    for (const value of [null, {}, [pending, pending], [{ ...pending, id: "" }], [{ ...pending, content: 42 }],
+      [{ ...pending, baseRevision: -1 }], [{ ...pending, baseRevision: 1.5 }], [{ ...pending, state: "resolved" }], [{ ...pending, state: ["pending"] }],
+      [{ ...pending, receivedAt: 123 }], [{ ...pending, sourceMessageId: {} }], [{ ...pending, error: [] }]]) {
+      const input = { ...row, pendingRequirements: value };
+      const original = JSON.stringify(input);
+      expect(readTaskProjection([input]).compatible).toBe(false);
+      expect(JSON.stringify(input)).toBe(original);
+    }
+    for (const value of [null, "attempt-old", [""], [12]]) {
+      expect(readTaskProjection([{ ...row, automaticReconciliationAttempts: value }]).compatible).toBe(false);
+    }
+    expect(readTaskProjection([{ ...row, pendingRequirements: [], automaticReconciliationAttempts: [] }]).compatible).toBe(true);
+  });
   it("preserves old historical fields, polluted tool fields and their evidence through repeated reads", () => {
     const historical = { id: "task-a", serverId: "server-a", status: "completed", messages: [], plan: [{
       id: "old-step", status: "completed", command: "original command  ", validation: "original validator",

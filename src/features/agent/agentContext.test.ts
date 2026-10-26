@@ -15,8 +15,24 @@ import { confirmedInputScope } from "@/features/agent/confirmedUserInputs";
 import { taskRequirementSnapshot } from "./taskGoal";
 import { buildTaskDecisionSnapshot } from "./taskDecisionSnapshot";
 import { buildLongRunningReviewContext } from "./reviewContext";
+import { invalidateHostCapabilities, recordHostCapabilities } from "@/features/tools/hostCapabilities";
 
 describe("agent context", () => {
+  it("projects current native host capabilities to planning and drops invalidated facts", () => {
+    const server = createServer(), task = createTask();
+    recordHostCapabilities({ serverId: server.id, host: server.host, port: server.port, username: server.username, connectionGeneration: 7 },
+      { version: 1, observedAt: null, facts: [{ name: "jq", supported: false }, { name: "python.json", supported: true }] },
+      { toolCallId: "native-probe" });
+    const input = { server, task, tools: [], secretMetadata: [] };
+    try {
+      for (const context of [buildNextStageContext(input), buildContinuationContext(input), buildAdjustmentContext(input)]) {
+        expect(context.server?.hostCapabilities?.source.toolCallId).toBe("native-probe");
+        expect(context.server?.hostCapabilities?.alternatives.join("\n")).toContain("不重复jq");
+      }
+      invalidateHostCapabilities(server.id);
+      expect(buildNextStageContext(input).server?.hostCapabilities).toBeUndefined();
+    } finally { invalidateHostCapabilities(server.id); }
+  });
   it("shares the same supplemental acceptance requirements across planning, monitoring and final review", () => {
     const current = createTask();
     current.rootGoal = "磁盘还剩多少空间";
@@ -222,6 +238,8 @@ describe("agent context", () => {
       "database-inspection-operations",
       "application-deployment",
       "file-transfer-integrity",
+      "log-rotation",
+      "nginx-delivery",
     ]);
     expect(context.activeSkills).toEqual([]);
     expect(context.skillDirectory[0].category).toBe("connectivity");

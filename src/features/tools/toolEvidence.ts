@@ -1,11 +1,19 @@
 import { operationsInputSchemas } from "./operationsContracts";
+import { healthObservationResultIssue, type HealthObservationResult } from "./healthObservation";
+import { logRotationEvidenceFacts, logRotationResultIssue, type LogRotationResult } from "./logRotationInspection";
+import { databaseInspectionResultIssue, type DatabaseInspectionResult } from "./databaseInspection";
+import { databaseInspectionEvidenceFacts } from "./databaseInspectionPresentation";
+import { fileManifestResultIssue, fileManifestEvidenceFacts, type FileManifestResult } from "./fileManifestInspection";
+import { httpDeliveryResultIssue, httpDeliveryEvidenceFacts } from "./httpDeliveryInspection";
+import type { HttpDeliveryResult } from "./httpDeliveryContracts";
+import { nginxConfigResultIssue, type NginxConfigResult } from "./nginxConfigContracts";
 import { operationsResultIssue, type OperationsInspectionResult } from "./operationsInspection";
 import { normalizeFileStructureRequest } from "@/features/tools/fileStructure";
 import { normalizeSoftwareCheckRequest } from "@/features/tools/softwareCheck";
 import type { ToolCall, ToolResult } from "@/features/tools/types";
 
 export interface ToolEvidenceFacts extends Record<string, unknown> {
-  evidenceKind?: "directory_structure" | "path_state" | "file_content" | "software_check" | "operations_inspection";
+  evidenceKind?: "directory_structure" | "path_state" | "file_content" | "file_metadata" | "software_check" | "operations_inspection" | "package_management" | "health_observation" | "log_rotation" | "database_inspection" | "file_manifest" | "http_delivery" | "nginx_configuration";
   evidenceScope?: string;
   evidenceComplete: boolean;
   evidenceNonEmpty?: boolean;
@@ -164,12 +172,104 @@ export function buildToolEvidenceFacts(call: ToolCall, result: ToolResult): Tool
     || !isRecord(result.data)) {
     return { evidenceComplete: false };
   }
+  if (call.toolId === "nginx.inspect_configuration") {
+    try {
+      const data = result.data as unknown as NginxConfigResult;
+      if (nginxConfigResultIssue(call.arguments, data)) return { evidenceComplete: false };
+      return { evidenceKind: "nginx_configuration", evidenceScope: data.request.entryPath, evidenceComplete: false,
+        inspectionStatus: data.analysis.status === "parsed" ? "complete" : "partial", configurationStatus: data.analysis.status,
+        sourceEvidenceIds: data.sourceEvidenceIds, configurationLoaded: false, freshRemoteObservation: false,
+        evidenceFingerprint: observationFingerprint(JSON.stringify([data.analysis.globalFingerprint, data.analysis.nonTargetFingerprint, data.analysis.selected, data.analysis.reasons])) };
+    } catch { return { evidenceComplete: false }; }
+  }
+  if (call.toolId === "http.inspect_delivery") {
+    try {
+      const data = result.data as unknown as HttpDeliveryResult;
+      if (data.binding.executionId !== call.id || httpDeliveryResultIssue(call.arguments, data)) return { evidenceComplete: false };
+      return { ...httpDeliveryEvidenceFacts(data), evidenceKind: "http_delivery", inspectionStatus: data.status,
+        evidenceScope: data.request.url, evidenceFingerprint: observationFingerprint(JSON.stringify([data.target, data.response, data.correlation])) };
+    } catch { return { evidenceComplete: false }; }
+  }
+  if (call.toolId === "files.inspect_manifest") {
+    try {
+      const data = result.data as unknown as FileManifestResult;
+      if (fileManifestResultIssue(call.arguments, data)) return { evidenceComplete: false };
+      return { ...fileManifestEvidenceFacts(data), evidenceKind: "file_manifest",
+        evidenceFingerprint: observationFingerprint(JSON.stringify([
+          [...data.entries].sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0),
+          [...data.issues].sort((a, b) => JSON.stringify([a.path, a.reason]).localeCompare(JSON.stringify([b.path, b.reason]))), data.status,
+        ])) };
+    } catch { return { evidenceComplete: false }; }
+  }
+  if (call.toolId === "database.inspect_postgres") {
+    try {
+      const data = result.data as unknown as DatabaseInspectionResult;
+      if (databaseInspectionResultIssue(call.arguments, data)) return { evidenceComplete: false };
+      return { ...databaseInspectionEvidenceFacts(data), evidenceFingerprint: observationFingerprint(JSON.stringify(data.tables)) };
+    } catch { return { evidenceComplete: false }; }
+  }
+  if (call.toolId === "logs.inspect_rotation") {
+    try {
+      const data = result.data as unknown as LogRotationResult;
+      if (logRotationResultIssue(call.arguments, data)) return { evidenceComplete: false };
+      return { ...logRotationEvidenceFacts(data), evidenceKind: "log_rotation", inspectionStatus: data.status,
+        evidenceScope: JSON.stringify(data.request), evidenceFingerprint: observationFingerprint(JSON.stringify(data)) };
+    } catch { return { evidenceComplete: false }; }
+  }
+  if (call.toolId === "services.observe") {
+    try {
+      const data = result.data as unknown as HealthObservationResult;
+      if (healthObservationResultIssue(call.arguments, data)) return { evidenceComplete: false };
+      const r = data.observation;
+      return { evidenceKind: "health_observation", evidenceScope: data.request.url,
+        evidenceComplete: !r.persistenceError && (r.state === "matched" || r.windowSatisfied),
+        observationState: r.state, windowSatisfied: r.windowSatisfied, observationElapsedMs: r.observationElapsedMs,
+        firstValidProbeAt: r.firstValidProbeAt, finishedAt: r.finishedAt,
+        validSamples: r.samples.filter(item => item.status === "valid" && !item.late).length,
+        // Time passing is the requested observation progress, not proof of recovery.
+        healthMatched: r.state === "matched", evidenceFingerprint: observationFingerprint(JSON.stringify(r)) };
+    } catch { return { evidenceComplete: false }; }
+  }
   if (operationsInputSchemas[call.toolId]) {
     const data = result.data as unknown as OperationsInspectionResult;
     try {
       if (operationsResultIssue(call.toolId, call.arguments, data)) return { evidenceComplete: false };
+      if (call.toolId === "packages.inspect") {
+        const item = data.items[0];
+        return { evidenceKind: "package_management", evidenceScope: JSON.stringify(data.request.packages),
+          evidenceComplete: data.coverageComplete && !data.truncated && result.truncated !== true && item?.observationsRedacted !== true,
+          inspectionStatus: data.status, packageManagementDecision: item?.decision,
+          packageManagementNextAction: item?.nextAction, packages: item?.packages,
+          sourceCoverage: item?.sourcesStatus, observedAt: item?.observedAt,
+          limitations: item?.limitations, waitOutcome: item?.waitOutcome,
+          evidenceFingerprint: observationFingerprint(JSON.stringify(data.items)),
+          scanCoverage: { request: data.request, skippedCount: data.skippedCount, skipped: data.skipped } };
+      }
+      if (call.toolId === "files.inspect") {
+        const item = data.items[0];
+        const complete = data.coverageComplete && !data.truncated && result.truncated !== true
+          && item?.stability === "stable" && item.linkTargetRedacted !== true;
+        return { evidenceKind: "file_metadata", evidenceScope: String(data.request.path), evidenceComplete: complete,
+          pathExists: item?.exists, fileType: item?.fileType, fileMetadata: item?.metadata,
+          consistency: item?.consistency, limitations: item?.limitations,
+          sampleStartedAt: item?.sampleStartedAt, sampleFinishedAt: item?.sampleFinishedAt,
+          hashStatus: item?.hashStatus, inspectionStatus: data.status,
+          ...(complete && item?.hashStatus === "complete" ? { contentSha256: item.sha256 } : {}),
+          evidenceFingerprint: observationFingerprint(JSON.stringify(data.items)),
+          scanCoverage: { request: data.request, skippedCount: data.skippedCount, skipped: data.skipped } };
+      }
+      if (call.toolId === "services.inspect" && data.request.check === "status") {
+        const item = data.items[0], identity = item?.processIdentity as Record<string, unknown> | undefined;
+        const complete = data.coverageComplete && !data.truncated && item?.observationsRedacted !== true;
+        return { evidenceKind: "operations_inspection", evidenceScope: JSON.stringify(data.request), evidenceComplete: complete,
+          inspectionStatus: data.status, serviceProperties: item?.properties,
+          processIdentity: identity, processIdentityVerified: complete && identity?.status === "stable",
+          // Two consistent local samples are not evidence of a restart/reboot.
+          restartVerified: false, bootAutostartVerified: false,
+          evidenceFingerprint: observationFingerprint(JSON.stringify(data.items)) };
+      }
       return { evidenceKind: "operations_inspection", evidenceScope: JSON.stringify(data.request),
-        evidenceComplete: data.coverageComplete && !data.truncated,
+        evidenceComplete: data.coverageComplete && !data.truncated && !data.items.some(item => item.bodyRedacted === true || item.observationsRedacted === true),
         inspectionStatus: data.status, scanCoverage: { request: data.request, skippedCount: data.skippedCount, skipped: data.skipped },
         evidenceFingerprint: observationFingerprint(JSON.stringify(data.items)) };
     } catch { return { evidenceComplete: false }; }

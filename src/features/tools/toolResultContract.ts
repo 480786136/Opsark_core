@@ -1,4 +1,11 @@
 import { operationsInputSchemas } from "./operationsContracts";
+import { healthObservationResultIssue } from "./healthObservation";
+import { logRotationResultIssue, type LogRotationResult } from "./logRotationInspection";
+import { databaseInspectionResultIssue, type DatabaseInspectionResult } from "./databaseInspection";
+import { fileManifestResultIssue, type FileManifestResult } from "./fileManifestInspection";
+import { httpDeliveryResultIssue } from "./httpDeliveryInspection";
+import type { HttpDeliveryResult } from "./httpDeliveryContracts";
+import { nginxConfigResultIssue, type NginxConfigResult } from "./nginxConfigContracts";
 import { operationsResultIssue, type OperationsInspectionResult } from "./operationsInspection";
 import { normalizeFileStructureRequest } from "./fileStructure";
 import { compileToolSchema } from "./toolParameterSchema";
@@ -11,10 +18,21 @@ function schemaIssue(schema: Record<string, unknown>, value: unknown): string | 
   if (validate(value)) return undefined;
   // Never include returned data or validator value excerpts in errors/logs.
   const first = validate.errors?.[0];
-  return `${first?.instancePath || "/"} (${first?.keyword ?? "schema"})`;
+  const missing = first?.keyword === "required" && typeof first.params.missingProperty === "string"
+    ? "/" + first.params.missingProperty.replace(/~/g, "~0").replace(/\//g, "~1") : "";
+  return `${(first?.instancePath ?? "") + missing || "/"} (${first?.keyword ?? "schema"}); schema=${first?.schemaPath ?? "#"}`;
 }
 function relationIssue(call: ToolCall, data: Record<string, any>): string | undefined {
   const args = call.arguments;
+  if (call.toolId === "nginx.inspect_configuration") return nginxConfigResultIssue(args, data as NginxConfigResult);
+  if (call.toolId === "http.inspect_delivery") {
+    if (data.binding?.executionId !== call.id) return "HTTP 回执不属于本次执行";
+    return httpDeliveryResultIssue(args, data as HttpDeliveryResult);
+  }
+  if (call.toolId === "files.inspect_manifest") return fileManifestResultIssue(args, data as FileManifestResult);
+  if (call.toolId === "services.observe") return healthObservationResultIssue(args, data as import("./healthObservation").HealthObservationResult, call.id);
+  if (call.toolId === "logs.inspect_rotation") return logRotationResultIssue(args, data as LogRotationResult);
+  if (call.toolId === "database.inspect_postgres") return databaseInspectionResultIssue(args, data as unknown as DatabaseInspectionResult);
   if (operationsInputSchemas[call.toolId]) return operationsResultIssue(call.toolId, args, data as OperationsInspectionResult);
   if (call.toolId === "files.read_content") {
     if (data.path !== args.path || data.returnedBytes > data.totalBytes
@@ -55,7 +73,7 @@ export function enforceToolResult(call: ToolCall, value: unknown): ToolResult {
       return item;
     });
     value = JSON.parse(serialized);
-    if (!envelope(value)) issue = "结果封装不符合契约";
+    if (!envelope(value)) issue = `结果封装不符合契约：${schemaIssue(toolResultSchema, value)}`;
     else {
       const result = value as ToolResult;
       if (result.callId !== call.id || result.toolId !== call.toolId) issue = "结果调用标识不匹配";

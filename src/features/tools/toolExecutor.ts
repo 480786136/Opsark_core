@@ -3,6 +3,7 @@ import { operationsInputSchemas } from "./operationsContracts";
 import { enforceToolResult } from "./toolResultContract";
 import { toolFailure, ToolExecutionError } from "./toolFailure";
 import { ExecutionLedgerError } from "@/services/executionLedger";
+import { isSshExecPayloadError } from "@/services/sshCommandTransport";
 import type { StepAction } from "@/types";
 import { fillToolDefaults, validateSchemaValue } from "./toolParameterSchema";
 import { normalizeFileStructureRequest } from "@/features/tools/fileStructure";
@@ -33,7 +34,23 @@ import type {
   UserInputResult,
 } from "@/features/tools/types";
 
+import { normalizeHealthObservationRequest, type HealthObservationRequest, type HealthObservationResult } from "./healthObservation";
+import { normalizeLogRotationRequest, type LogRotationRequest, type LogRotationResult } from "./logRotationInspection";
+import { normalizeDatabaseInspectionRequest, type PostgresInspectionRequest, type DatabaseInspectionResult } from "./databaseInspection";
+import { normalizeFileManifestRequest, type FileManifestRequest, type FileManifestResult } from "./fileManifestInspection";
+import { normalizeHttpDeliveryRequest } from "./httpDeliveryInspection";
+import type { HttpDeliveryRequest, HttpDeliveryResult } from "./httpDeliveryContracts";
+import { normalizeNginxConfigRequest, type NginxConfigRequest, type NginxConfigResult } from "./nginxConfigContracts";
+
 export interface ToolExecutionDependencies {
+  inspectNginxConfiguration?(request: NginxConfigRequest): Promise<NginxConfigResult>;
+  inspectHttpDelivery?(request: HttpDeliveryRequest): Promise<HttpDeliveryResult>;
+  inspectFileManifest?(request: FileManifestRequest): Promise<FileManifestResult>;
+  inspectPostgres?(request: PostgresInspectionRequest): Promise<DatabaseInspectionResult>;
+  inspectLogRotation?(request: LogRotationRequest): Promise<LogRotationResult>;
+  observeService?(request: HealthObservationRequest): Promise<HealthObservationResult>;
+  previewFileDeletion?(paths: string[]): Promise<Record<string, unknown>>;
+  deleteConfirmedFiles?(authorizationId: string): Promise<Record<string, unknown>>;
   inspectOperations?(toolId: string, request: Record<string, unknown>): Promise<OperationsInspectionResult>;
   readEvidence?(evidenceId: string, offset: number, limit: number): Promise<Record<string, unknown>>;
   expandPlanningContext?(skillId: string): Promise<{ skillId: string }>;
@@ -149,6 +166,9 @@ export function validatePreparedToolArguments(tool: ToolDefinition, value: Recor
 
 /** Validates built-in atomic tool contracts before a plan reaches execution. */
 function normalizeKnownToolArguments(toolId: string, value: Record<string, unknown>, final = false) {
+  if (toolId === "nginx.inspect_configuration") return { ...normalizeNginxConfigRequest(value) };
+  if (toolId === "http.inspect_delivery") return { ...normalizeHttpDeliveryRequest(value) };
+  if (toolId === "files.inspect_manifest") return { ...normalizeFileManifestRequest(value) };
   if (operationsInputSchemas[toolId]) return normalizeOperationsRequest(toolId, value);
   if (toolId === "files.read_content") return { ...parseFileContentArguments(value) };
   if (toolId === "server.resolve_connection") return { ...parseConnectionTarget(value) };
@@ -373,6 +393,18 @@ export async function executeToolCall(
       }
       return request;
     };
+    if (tool.implementation === "previewFileDeletion" || tool.implementation === "deleteConfirmedFiles") {
+      const execute = tool.implementation === "previewFileDeletion"
+        ? () => dependencies.previewFileDeletion?.(call.arguments.paths as string[])
+        : () => dependencies.deleteConfirmedFiles?.(String(call.arguments.authorizationId));
+      if (tool.implementation === "previewFileDeletion" && !dependencies.previewFileDeletion
+        || tool.implementation === "deleteConfirmedFiles" && !dependencies.deleteConfirmedFiles) {
+        throw new ToolExecutionError("当前任务不支持精确文件删除流程", "unavailable", "not_sent");
+      }
+      started = true;
+      const data = await execute();
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data });
+    }
     if (tool.implementation === "expandPlanningContext") {
       validateToolArguments(tool, call.arguments);
       if (!dependencies.expandPlanningContext) throw new Error("当前上下文不支持展开 Skill");
@@ -422,6 +454,48 @@ export async function executeToolCall(
       const data = await dependencies.readRemoteFileContent(checked(parseFileContentArguments(call.arguments)));
       return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data, truncated: data.truncated });
     }
+    if (tool.implementation === "inspectNginxConfiguration") {
+      if (!dependencies.inspectNginxConfiguration) throw new ToolExecutionError("当前任务不支持已采集配置分析", "unavailable", "not_sent");
+      const request = checked(normalizeNginxConfigRequest(call.arguments));
+      started = true;
+      const data = await dependencies.inspectNginxConfiguration(request);
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data });
+    }
+    if (tool.implementation === "inspectHttpDelivery") {
+      if (!dependencies.inspectHttpDelivery) throw new ToolExecutionError("当前执行环境不支持 HTTP 交付证据采集", "unavailable", "not_sent");
+      const request = checked(normalizeHttpDeliveryRequest(call.arguments));
+      started = true;
+      const data = await dependencies.inspectHttpDelivery(request);
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data });
+    }
+    if (tool.implementation === "inspectFileManifest") {
+      if (!dependencies.inspectFileManifest) throw new ToolExecutionError("当前执行环境不支持文件清单采集", "unavailable", "not_sent");
+      const request = checked(normalizeFileManifestRequest(call.arguments));
+      started = true;
+      const data = await dependencies.inspectFileManifest(request);
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data, truncated: data.truncated });
+    }
+    if (tool.implementation === "inspectPostgres") {
+      if (!dependencies.inspectPostgres) throw new ToolExecutionError("当前执行环境不支持PostgreSQL证据采集", "unavailable", "not_sent");
+      const request = checked(normalizeDatabaseInspectionRequest(call.arguments));
+      started = true;
+      const data = await dependencies.inspectPostgres(request);
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data });
+    }
+    if (tool.implementation === "inspectLogRotation") {
+      if (!dependencies.inspectLogRotation) throw new ToolExecutionError("当前执行环境不支持日志轮转证据采集", "unavailable", "not_sent");
+      const request = checked(normalizeLogRotationRequest(call.arguments));
+      started = true;
+      const data = await dependencies.inspectLogRotation(request);
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data });
+    }
+    if (tool.implementation === "observeService") {
+      if (!dependencies.observeService) throw new Error("当前执行环境不支持健康窗口观察");
+      const request = checked(normalizeHealthObservationRequest(call.arguments));
+      started = true;
+      const data = await dependencies.observeService(request);
+      return enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data });
+    }
     if (tool.implementation === "inspectOperations") {
       if (!dependencies.inspectOperations) throw new Error("当前执行环境不支持运维检查");
       const request = checked(normalizeOperationsRequest(call.toolId, call.arguments));
@@ -454,6 +528,7 @@ export async function executeToolCall(
       toolId: call.toolId,
       success: false,
       error: toolFailure(error, started),
+      ...(isSshExecPayloadError(error) ? { data: { dispatchPreflight: error.diagnostic } } : {}),
       ...(error instanceof ToolExecutionError && error.partialData ? { data: error.partialData } : {}),
     };
   }

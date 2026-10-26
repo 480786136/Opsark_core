@@ -1042,7 +1042,7 @@ fn project_model_call_metadata(
         .filter(|event| {
             matches!(
                 *event,
-                "request_sent" | "response_received" | "request_failed" | "response_failed" | "compatibility_attempt"
+                "request_sent" | "response_received" | "request_failed" | "response_failed" | "compatibility_attempt" | "task_budget_rejected"
             )
         })
         .unwrap_or("unknown");
@@ -1062,6 +1062,18 @@ fn project_model_call_metadata(
         }
         for key in ["schemaDowngraded", "cachedJsonOnly", "compactRepair"] {
             if let Some(flag) = value[key].as_bool() { projected.insert(key.into(), json!(flag)); }
+        }
+    }
+    if event == "task_budget_rejected" {
+        projected.insert("dispatchCertainty".into(), json!("not_dispatched"));
+        if let Some(code) = value.pointer("/diagnostic/code").and_then(Value::as_str)
+            .filter(|code| matches!(*code, "MODEL_TASK_BUDGET_EXHAUSTED" | "MODEL_TASK_BUDGET_DUPLICATE_ATTEMPT" |
+                "MODEL_TASK_BUDGET_REQUEST_ALREADY_RESERVED" | "MODEL_TASK_BUDGET_EVIDENCE_CONFLICT" | "MODEL_TASK_BUDGET_INVALID" |
+                "MODEL_TASK_BUDGET_STORAGE" | "MODEL_TASK_BUDGET_UNREGISTERED" | "MODEL_TASK_BUDGET_UNINITIALIZED")) {
+            projected.insert("diagnosticCode".into(), json!(code));
+        }
+        if let Some(admission) = project_task_budget_admission(value.pointer("/diagnostic/taskBudgetAdmission")) {
+            projected.insert("taskBudgetAdmission".into(), admission);
         }
     }
 
@@ -1104,11 +1116,67 @@ fn project_model_call_metadata(
     if let Some(metrics) = project_context_metrics(value.get("contextMetrics")) {
         projected.insert("contextMetrics".into(), metrics);
     }
+    if let Some(adjustment) = project_output_budget_adjustment(value.get("outputBudgetAdjustment")) {
+        projected.insert("outputBudgetAdjustment".into(), adjustment);
+    }
     if let Some(usage) = project_token_usage(value.pointer("/response/usage")) {
         projected.insert("tokenUsage".into(), usage);
     }
 
     Value::Object(projected)
+}
+
+fn project_task_budget_admission(value: Option<&Value>) -> Option<Value> {
+    let value = value?.as_object()?;
+    if value.get("version").and_then(Value::as_u64) != Some(1) { return None; }
+    let mut projected = serde_json::Map::new();
+    projected.insert("version".into(), json!(1));
+    projected.insert("inputEstimateIsExact".into(), json!(false));
+    if value.get("usageEstimator").and_then(Value::as_str) == Some("complete-wire-utf8-bytes-plus-output-cap-plus-1024") {
+        projected.insert("usageEstimator".into(), value["usageEstimator"].clone());
+    }
+    if let Some(lane) = value.get("lane").and_then(Value::as_str).filter(|lane| matches!(*lane, "business" | "safety")) {
+        projected.insert("lane".into(), json!(lane));
+    }
+    for field in ["requestBytes", "outputTokenLimit", "estimationOverheadTokens", "requiredReservedTokens"] {
+        if let Some(number) = value.get(field).and_then(Value::as_u64) { projected.insert(field.into(), json!(number)); }
+    }
+    let mut scopes = serde_json::Map::new();
+    for key in ["task", "round"] {
+        let Some(scope) = value.get("scopes").and_then(|scopes| scopes.get(key)).and_then(Value::as_object) else { continue; };
+        let mut projected_scope = serde_json::Map::new();
+        for field in ["maxTotalTokens", "accountedTokens", "knownUsageTokens", "unknownReservedTokens", "unknownUsageAttempts",
+            "usageEvidenceConflicts", "conservativeConflictTokens", "laneTokenLimit", "laneAccountedTokens",
+            "availableTotalTokens", "availableLaneTokens", "availableBusinessTokens", "availableTokens", "reservationShortfallTokens",
+            "transportAttempts", "maxTransportAttempts", "safetyAttempts", "maxSafetyAttempts"] {
+            if let Some(number) = scope.get(field).and_then(Value::as_u64) { projected_scope.insert(field.into(), json!(number)); }
+        }
+        if let Some(reasons) = scope.get("blockedReasons").and_then(Value::as_array) {
+            let allowed: Vec<Value> = reasons.iter().filter_map(Value::as_str)
+                .filter(|reason| matches!(*reason, "total_tokens" | "lane_tokens" | "transport_attempts" | "safety_attempts"))
+                .take(4).map(|reason| json!(reason)).collect();
+            projected_scope.insert("blockedReasons".into(), json!(allowed));
+        }
+        scopes.insert(key.into(), Value::Object(projected_scope));
+    }
+    projected.insert("scopes".into(), Value::Object(scopes));
+    Some(Value::Object(projected))
+}
+
+fn project_output_budget_adjustment(value: Option<&Value>) -> Option<Value> {
+    let value=value?;
+    if value["reason"] != "automatic_output_cap_fitted_to_persistent_budget"
+        || value["method"] != "complete_wire_byte_reservation_bounded_search" { return None; }
+    let mut projected=project_task_budget_admission(Some(value))?;
+    for field in ["originalOutputTokenLimit","effectiveOutputTokenLimit","minimumOutputTokenLimit",
+        "originalRequiredReservedTokens","effectiveRequiredReservedTokens","availableTokens"] {
+        if let Some(number)=value[field].as_u64() { projected[field]=json!(number); }
+    }
+    projected["reason"]=value["reason"].clone();
+    projected["method"]=value["method"].clone();
+    projected["providerMinimumDeclared"]=json!(false);
+    projected["actualBillingLimitGuaranteed"]=json!(false);
+    Some(projected)
 }
 
 fn project_context_metrics(value: Option<&Value>) -> Option<Value> {
@@ -1981,6 +2049,63 @@ mod tests {
         assert_eq!(filtered.total, 1);
         assert_eq!(filtered.items[0]["event"], "request_sent");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn budget_rejection_query_preserves_numeric_diagnostics_without_private_context() {
+        let root = std::env::temp_dir().join(call_id());
+        let secret = "SENTINEL_BUDGET_REJECTION_PROMPT_MUST_NOT_LEAK";
+        append(&root,"model-calls",json!({"event":"task_budget_rejected","requestId":"budget-request",
+            "callId":"budget-attempt","requestName":"Summary generation","timestampMs":1000,
+            "dispatchCertainty":"not_dispatched","diagnostic":{"code":"MODEL_TASK_BUDGET_EXHAUSTED","message":secret,
+                "taskBudgetAdmission":{"version":1,"requestBytes":120000,"outputTokenLimit":16384,
+                    "estimationOverheadTokens":1024,"requiredReservedTokens":137408,"lane":"business",
+                    "usageEstimator":"complete-wire-utf8-bytes-plus-output-cap-plus-1024","inputEstimateIsExact":false,
+                    "prompt":secret,"wireDigest":secret,"modelOperationId":secret,
+                    "scopes":{"task":{"maxTotalTokens":250000,"accountedTokens":146393,
+                        "availableTokens":103607,"reservationShortfallTokens":33801,
+                        "unknownReservedTokens":0,"unknownUsageAttempts":0,
+                        "blockedReasons":["total_tokens","lane_tokens",secret],"privateContext":secret},
+                        "round":{"knownUsageTokens":146393,"availableTokens":103607}}}}}),
+            &json!({"taskId":"budget-task","roundId":"budget-round"})).unwrap();
+        let mut model_query = event_query(Some("budget-task"),20);
+        model_query.stream="model-calls".into();
+        model_query.event=Some("TASK_BUDGET_REJECTED".into());
+        let result=query(&root,model_query.clone()).unwrap();
+        assert_eq!(result.total,1);
+        let item=&result.items[0];
+        assert_eq!(item["event"],"task_budget_rejected");
+        assert_eq!(item["diagnosticCode"],"MODEL_TASK_BUDGET_EXHAUSTED");
+        assert_eq!(item["dispatchCertainty"],"not_dispatched");
+        assert_eq!(item["taskBudgetAdmission"]["requiredReservedTokens"],137408);
+        assert_eq!(item["taskBudgetAdmission"]["scopes"]["task"]["blockedReasons"],json!(["total_tokens","lane_tokens"]));
+        assert_eq!(item["taskBudgetAdmission"]["scopes"]["task"]["reservationShortfallTokens"],33801);
+        assert_eq!(item["taskBudgetAdmission"]["inputEstimateIsExact"],false);
+        assert!(!item.to_string().contains(secret));
+        assert!(item.get("tokenUsage").is_none());
+        model_query.search=Some(secret.into());
+        assert_eq!(query(&root,model_query).unwrap().total,0);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn output_budget_adjustment_projection_is_bounded_and_does_not_claim_hard_billing_limit() {
+        let secret="SENTINEL_OUTPUT_BUDGET_PROMPT_MUST_NOT_LEAK";
+        let projected=project_model_call_metadata(&json!({"event":"request_sent","callId":"cap-call","requestId":"cap-request",
+            "outputBudgetAdjustment":{"version":1,"reason":"automatic_output_cap_fitted_to_persistent_budget",
+                "method":"complete_wire_byte_reservation_bounded_search","requestBytes":131826,
+                "originalOutputTokenLimit":16384,"effectiveOutputTokenLimit":13609,"minimumOutputTokenLimit":5000,
+                "availableTokens":146459,"originalRequiredReservedTokens":149234,"effectiveRequiredReservedTokens":146459,
+                "actualBillingLimitGuaranteed":true,"providerMinimumDeclared":true,"prompt":secret,
+                "scopes":{"task":{"unknownUsageAttempts":0,"availableBusinessTokens":146459,"private":secret}}}}),
+            "tasks/synthetic/model-calls.jsonl",1,1000);
+        assert_eq!(projected["outputBudgetAdjustment"]["effectiveOutputTokenLimit"],13609);
+        assert_eq!(projected["outputBudgetAdjustment"]["minimumOutputTokenLimit"],5000);
+        assert_eq!(projected["outputBudgetAdjustment"]["scopes"]["task"]["availableBusinessTokens"],146459);
+        assert_eq!(projected["outputBudgetAdjustment"]["actualBillingLimitGuaranteed"],false);
+        assert_eq!(projected["outputBudgetAdjustment"]["providerMinimumDeclared"],false);
+        assert_eq!(projected["outputBudgetAdjustment"]["inputEstimateIsExact"],false);
+        assert!(!projected.to_string().contains(secret));
     }
 
     #[test]

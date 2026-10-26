@@ -535,6 +535,198 @@ fn business_context(protocol: &str, generations: u64) -> String {
     context.to_string()
 }
 
+fn stage31_fixture() -> Value {
+    serde_json::from_str(include_str!("../../tests/fixtures/joint-requirement-stage30.json")).unwrap()
+}
+
+fn stage31_context(protocol: &str, policy: &str) -> (Value, String, String) {
+    crate::task_model_budget::initialize_test_runtime().unwrap();
+    let base: Value=serde_json::from_str(&business_context(protocol,6)).unwrap();
+    let mut context=stage31_fixture()["context"].clone();
+    context["_modelIntegration"]=base["_modelIntegration"].clone();
+    context["_modelIntegration"]["outputPolicy"]=json!(policy);
+    context["_modelRecovery"]=base["_modelRecovery"].clone();
+    context["_modelOutputRecovery"]=json!({"strategy":"initial"});
+    context["_planEvidenceContract"]=json!({"version":1});
+    let task=crate::task_logs::call_id();let round="stage31-round".to_owned();
+    context["_log"]=json!({"taskId":task,"roundId":round,"serverId":"offline-server","phaseIndex":0});
+    context["_taskModelBudget"]=json!({"version":1,"taskId":task,"roundId":round});
+    crate::task_model_budget::register(crate::task_model_budget::TaskBudgetRegistration {
+        task_id:task.clone(),round_id:round.clone(),max_task_tokens:250000,max_round_tokens:250000,safety_reserve_tokens:0}).unwrap();
+    (context,task,round)
+}
+
+#[test]
+fn stage31_real_joint_failure_preserves_classification_and_all_log_stages_with_one_post() {
+    for protocol in ["chat_completions","responses"] {
+        for policy in ["require_schema","json_only"] {
+            let f=stage31_fixture();let mut payload=f["payload"].clone();
+            if policy=="json_only" {
+                // JSON-only variants omit optional fields; the exact strict
+                // historical payload remains unchanged in the schema variants.
+                let mut value=f["response"].clone();value.as_object_mut().unwrap().remove("terminalContextLines");
+                for x in value["requirementUpdate"]["acceptanceCoverage"].as_array_mut().unwrap(){x.as_object_mut().unwrap().remove("staticSite");}
+                payload["choices"][0]["message"]["content"]=json!(value.to_string());
+            }
+            let text=payload["choices"][0]["message"]["content"].as_str().unwrap();
+            let response=if protocol=="responses" {completed(text)}else{payload};
+            let expected_usage=response["usage"]["total_tokens"].clone();
+            let (endpoint,provider)=server(vec![(200,response)]);let (context,task,round)=stage31_context(protocol,policy);
+            let root=std::env::temp_dir().join("opsark-stage31").join(&task);std::fs::create_dir_all(&root).unwrap();
+            let body=crate::requirement_planning::request("offline-model",f["requirement"].as_str().unwrap(),&context.to_string(),&Default::default()).unwrap();
+            let preview=preview_model_request(&endpoint,&body,"需求理解",false).unwrap();
+            let runtime=tokio::runtime::Runtime::new().unwrap();
+            let result=runtime.block_on(crate::requirement_planning::process("offline-key",&endpoint,"offline-model",
+                f["requirement"].as_str().unwrap(),&context.to_string(),&[],Default::default(),5,Some(&root.join("developer.jsonl")))).unwrap();
+            assert_eq!(result.intent,"execute");assert_eq!(result.constraints.unwrap().change_policy,"confirm_changes");
+            assert!(result.plan.is_empty());let error=result.plan_error.unwrap();assert_eq!(error_code(&error),"MODEL_FORMAT_INVALID");
+            assert!(error.contains("files.preview_deletion") && error.contains("/steps/0/action/arguments/paths"));
+            let requests=provider.join().unwrap();assert_eq!(requests.len(),1);assert_eq!(requests[0].1,preview["request"]);
+            let cost=crate::task_model_budget::query(&task,&round).unwrap();assert_eq!(cost["task"]["knownUsageTokens"],expected_usage);
+            let stream=root.join("logs/tasks").join(format!("task-{:x}",Sha256::digest(task.as_bytes()))).join("model-calls.jsonl");
+            let rows:Vec<Value>=std::fs::read_to_string(stream).unwrap().lines().map(|l|serde_json::from_str(l).unwrap()).collect();
+            for event in ["compatibility_attempt","request_sent","response_received","output_validation_failed","joint_classification_validated_after_plan_rejection"] {
+                assert!(rows.iter().any(|r|r["event"]==event),"missing {event}");
+            }
+            assert!(rows.iter().all(|r|r["taskId"]==task && r["roundId"]==round));
+            assert!(!root.join("logs/system/model-calls.jsonl").exists());
+        }
+    }
+}
+
+#[test]
+fn stage31_rejected_candidate_capture_excludes_unknown_usage_other_operations_and_non_plan_errors() {
+    use crate::model_compatibility::OutputDiagnostic;
+    for negative in 0..7 {
+        let mut diagnostic=OutputDiagnostic::new("MODEL_FORMAT_INVALID","business_validation","invalid");
+        diagnostic.json_pointer=Some("/steps/0/action/arguments/paths".into());
+        let mut body=json!({"_opsarkOperationContract":"requirement.plan@1"});
+        let mut detail=json!({"dispatchCertainty":"response_received","httpStatus":200,"recoveryBudget":{
+            "generations":1,"unknownUsageAttempts":0,"fieldRepairs":0,"candidateRegenerations":0,"recoveryBlocked":false}});
+        match negative {
+            0=>body["_opsarkOperationContract"]=json!("plan.generate@1"),
+            1=>detail["dispatchCertainty"]=json!("may_have_dispatched"),
+            2=>detail["recoveryBudget"]["unknownUsageAttempts"]=json!(1),
+            3=>detail["recoveryBudget"]["fieldRepairs"]=json!(1),
+            4=>diagnostic.json_pointer=Some("/constraints/environmentPolicy".into()),
+            5=>detail["recoveryBudget"]["recoveryBlocked"]=json!(true),
+            _=>detail["recoveryBudget"]["candidateRegenerations"]=json!(1),
+        }
+        let mut captured=None;let mut target=Some(&mut captured);
+        retain_rejected_requirement_candidate(format!("{}{}",crate::MODEL_TRACE_ERROR_PREFIX,json!({"modelError":detail})),
+            &diagnostic,&body,&stage31_fixture()["payload"],&mut target);
+        assert!(captured.is_none(),"negative={negative}");
+    }
+}
+
+#[test]
+fn stage31_log_metadata_is_atomic_bounded_and_opaque_text_cannot_override_identity() {
+    let raw=json!({"taskId":"wrong-flat","_log":{"taskId":"current","phaseIndex":0},
+        "baseSnapshot":{"_log":{"taskId":"stale","roundId":"stale-round"}},"facts":{"_log":{"taskId":"forged"}}});
+    let log=crate::prompt_layers::model_log_context(&raw);assert_eq!(log["taskId"],"current");assert!(log.get("roundId").is_none());
+    let invalid=json!({"_log":{"taskId":"bad\nidentity","phaseIndex":-1},"baseSnapshot":{"_log":{"taskId":"stale"}}});
+    assert_eq!(crate::prompt_layers::model_log_context(&invalid),json!({}));
+    let flat=json!({"taskId":"t","roundId":"r","requestId":"exact-request","secret":"must-not-copy"});
+    assert_eq!(crate::prompt_layers::model_log_context(&flat),json!({"taskId":"t","roundId":"r","requestId":"exact-request"}));
+    assert_eq!(crate::prompt_layers::model_log_context(&json!({"message":raw.to_string(),"facts":raw})),json!({}));
+    let nested=json!({"baseSnapshot":{"_log":{"taskId":"legacy","roundId":"legacy-round"}}});
+    assert_eq!(crate::prompt_layers::model_log_context(&nested),json!({"taskId":"legacy","roundId":"legacy-round"}));
+}
+
+#[test]
+fn stage31_native_classification_handoff_reuses_original_deadline_budget_and_one_candidate_slot() {
+    let f=stage31_fixture();let (context,task,round)=stage31_context("chat_completions","require_schema");
+    let good:Value=serde_json::from_str(include_str!("../../tests/fixtures/joint-requirement-stage28.json")).unwrap();
+    let mut step=good["response"]["steps"][0].clone();
+    step["action"]["arguments"]["path"]=json!("/opt/opsark-core-test-20261025-stage30/AGENT-22/配置A.json");
+    let fresh=json!({"choices":[{"message":{"content":json!({"steps":[step]}).to_string()},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":20,"completion_tokens":30,"total_tokens":50}});
+    let (endpoint,provider)=server(vec![(200,f["payload"].clone()),(200,fresh)]);
+    let runtime=tokio::runtime::Runtime::new().unwrap();
+    let classified=runtime.block_on(crate::requirement_planning::process("offline-key",&endpoint,"offline-model",f["requirement"].as_str().unwrap(),
+        &context.to_string(),&[],Default::default(),5,None)).unwrap();
+    assert!(classified.plan.is_empty() && classified.plan_error.is_some());
+    let original_body=crate::requirement_planning::request("offline-model",f["requirement"].as_str().unwrap(),&context.to_string(),&Default::default()).unwrap();
+    let original_budget=crate::model_budget::OperationBudget::for_request(&format!("{endpoint}/chat/completions"),"offline-key",&original_body,5).unwrap();
+    let original_deadline=original_budget.recovery_deadline();
+    let projected=crate::requirement_contract::project_classified_context(&context.to_string(),classified.relation.as_deref(),classified.requirement_update.as_ref(),
+        f["requirement"].as_str().unwrap(),Some(&serde_json::to_value(&classified.constraints).unwrap())).unwrap();
+    let mut next:Value=serde_json::from_str(&projected).unwrap();
+    next["_modelOutputRecovery"]=json!({"strategy":"regenerate"});
+    assert_eq!(next["_modelRecovery"],context["_modelRecovery"]);assert_eq!(next["_taskModelBudget"],context["_taskModelBudget"]);
+    let result=runtime.block_on(crate::generate_ai_plan_with_trace("offline-key".into(),endpoint.clone(),"offline-model".into(),
+        f["requirement"].as_str().unwrap().into(),next.to_string(),None,5,&mut Default::default(),None)).unwrap();
+    assert_eq!(result.len(),1);assert_eq!(result[0].status,"pending");
+    assert_eq!(original_budget.recovery_deadline(),original_deadline);
+    assert_eq!(original_budget.snapshot()["candidateRegenerations"],1);
+    let cost=crate::task_model_budget::query(&task,&round).unwrap();assert_eq!(cost["task"]["knownUsageTokens"],47565);
+    assert_eq!(cost["task"]["maxTotalTokens"],250000);assert_eq!(cost["round"]["maxTotalTokens"],250000);
+    // A third regeneration is refused by the original budget before HTTP.
+    let again=runtime.block_on(crate::generate_ai_plan_with_trace("offline-key".into(),endpoint,"offline-model".into(),
+        f["requirement"].as_str().unwrap().into(),next.to_string(),None,5,&mut Default::default(),None)).unwrap_err();
+    assert_eq!(error_code(&again),"MODEL_RECOVERY_BUDGET_EXHAUSTED");
+    assert_eq!(original_budget.snapshot()["candidateRegenerations"],1);
+    assert_eq!(original_budget.snapshot()["generations"],2);
+    assert_eq!(provider.join().unwrap().len(),2);
+}
+
+#[test]
+fn stage31_invalid_classification_remains_a_stop_with_bound_log_identity() {
+    let f=stage31_fixture();let (context,task,_)=stage31_context("chat_completions","require_schema");
+    let mut response=f["payload"].clone();let mut value=f["response"].clone();
+    value["relation"]=json!("side_question");response["choices"][0]["message"]["content"]=json!(value.to_string());
+    let (endpoint,provider)=server(vec![(200,response)]);
+    let root=std::env::temp_dir().join("opsark-stage31-stop").join(&task);std::fs::create_dir_all(&root).unwrap();
+    let runtime=tokio::runtime::Runtime::new().unwrap();
+    let error=runtime.block_on(crate::requirement_planning::process("offline-key",&endpoint,"offline-model",
+        f["requirement"].as_str().unwrap(),&context.to_string(),&[],Default::default(),5,Some(&root.join("developer.jsonl")))).unwrap_err();
+    assert_eq!(error_code(&error),"MODEL_FORMAT_INVALID");assert_eq!(provider.join().unwrap().len(),1);
+    let stream=root.join("logs/tasks").join(format!("task-{:x}",Sha256::digest(task.as_bytes()))).join("model-calls.jsonl");
+    let rows:Vec<Value>=std::fs::read_to_string(stream).unwrap().lines().map(|l|serde_json::from_str(l).unwrap()).collect();
+    let stop=rows.iter().find(|r|r["event"]=="joint_classification_reuse_stopped").unwrap();
+    assert_eq!(stop["taskId"],task);assert_eq!(stop["classificationValidated"],false);
+    assert_eq!(stop["reasonCode"],"CLASSIFICATION_NOT_VALIDATED");
+    assert!(rows.iter().all(|r|r["event"]!="joint_classification_validated_after_plan_rejection"));
+}
+
+#[test]
+fn stage29_invalid_classification_has_one_local_post_and_keeps_accounted_usage() {
+    for protocol in ["chat_completions", "responses"] {
+        for policy in ["require_schema", "json_only"] {
+            for field in ["changePolicy", "environmentPolicy", "failurePolicy"] {
+                let mut context: Value = serde_json::from_str(&business_context(protocol, 3)).unwrap();
+                context["_modelIntegration"]["outputPolicy"] = json!(policy);
+                let body = json!({"model":"offline-model","_opsarkContext":context.to_string(),
+                    "messages":[{"role":"system","content":"Return JSON."},
+                    {"role":"user","content":format!("分类上下文：\n{context}")} ]});
+                let mut value = json!({"intent":"execute","answer":"","selectedSkillIds":[],"constraints":{
+                    "changePolicy":"confirm_changes","environmentPolicy":"unspecified","failurePolicy":"unspecified",
+                    "prohibitedActions":[],"requiredConditions":[],"userDirectives":[]}});
+                value["constraints"][field] = json!("");
+                let response = if protocol == "responses" { completed(&value.to_string()) } else {
+                    json!({"choices":[{"message":{"content":value.to_string()},"finish_reason":"stop"}],
+                        "usage":{"prompt_tokens":20,"completion_tokens":30,"total_tokens":50}})
+                };
+                let (endpoint, provider) = server(vec![(200, response)]);
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                let error = runtime.block_on(post_model_request(&endpoint, "offline-key", &body,
+                    "需求理解", 5, None)).unwrap_err();
+                let parsed: Value = serde_json::from_str(error.strip_prefix(crate::MODEL_TRACE_ERROR_PREFIX).unwrap()).unwrap();
+                let issue = &parsed["modelError"];
+                assert_eq!(issue["code"], "MODEL_REQUIREMENT_INVALID");
+                assert_eq!(issue["jsonPointer"], format!("/constraints/{field}"));
+                assert_eq!(issue["httpStatus"], 200);
+                assert_eq!(issue["recoveryBudget"]["generations"], 1);
+                assert_eq!(issue["recoveryBudget"]["knownUsageTokens"], 50);
+                assert_eq!(issue["recoveryBudget"]["fieldRepairs"], 0);
+                assert_eq!(issue["recoveryBudget"]["candidateRegenerations"], 0);
+                assert_eq!(issue["candidateRejection"]["rejectedCandidateExecuted"], false);
+                assert_eq!(provider.join().unwrap().len(), 1);
+            }
+        }
+    }
+}
+
 #[test]
 fn missing_steps_adjust_repair_keeps_legal_requirement_outcomes_and_operation_budget() {
     for protocol in ["chat_completions", "responses"] {
@@ -546,6 +738,7 @@ fn missing_steps_adjust_repair_keeps_legal_requirement_outcomes_and_operation_bu
                 context["executionConstraints"] = json!({"changePolicy":"read_only"});
                 context["confirmedUserInputs"] = json!({"choice":"preserve-data"});
                 context["baseSnapshot"] = json!({"currentToolResults":[{"evidenceId":"proof-current","scope":{"targetId":"server-current"},"content":"trusted current evidence"}]});
+                context["_log"]["replyLanguage"] = json!("en");
                 let mut repaired = json!({"decision":"adjust","reason":"Report current focus or concrete blocker",
                     "summary":"Other goals remain pending","steps":[],"planUpdate":null,"reconciliation":null,"issueResolutions":null,
                     "requirementReview":{"baseRevision":3,"roundId":"round-current","focusOutcome":focus_outcome,
@@ -584,9 +777,15 @@ fn missing_steps_adjust_repair_keeps_legal_requirement_outcomes_and_operation_bu
                 let second = requests[1].1[field].as_array().unwrap();
                 assert_eq!(&second[..first.len()], first.as_slice());
                 assert_eq!(second.len(), first.len() + 1);
+                let original_system = first.iter().filter(|message| message["role"] == "system")
+                    .map(|message| message["content"].as_str().unwrap()).collect::<Vec<_>>().join("\n");
+                assert_eq!(original_system.matches("Output language: English,").count(), 1);
+                assert_eq!(original_system.matches("只读计划组织（通用）：").count(),
+                    usize::from(policy == "require_schema"));
                 let feedback = second.last().unwrap()["content"].as_str().unwrap();
                 assert!(feedback.contains("允许 steps=[]"));
                 assert!(feedback.contains("完整业务校验"));
+                assert!(!feedback.contains("只读计划组织（通用）："));
                 for (_, request) in &requests {
                     let text = request.to_string();
                     assert!(text.contains("trusted current evidence"));
@@ -596,6 +795,59 @@ fn missing_steps_adjust_repair_keeps_legal_requirement_outcomes_and_operation_bu
             }
         }
     }
+}
+
+#[test]
+fn initial_system_contract_retention_is_operation_local_and_rejects_role_or_position_changes() {
+    let mut initial = json!({"messages":[{"role":"system","content":"original contract"},
+        {"role":"user","content":"unchanged real evidence"}]});
+    let mut retained = None;
+    retain_initial_system_contract(&mut initial, &mut retained).unwrap();
+    let mut repair = initial.clone();
+    repair["messages"][0]["content"] = json!("fresh projection omitted original contract");
+    repair["messages"].as_array_mut().unwrap().push(json!({"role":"system","content":"bounded field feedback"}));
+    retain_initial_system_contract(&mut repair, &mut retained).unwrap();
+    assert_eq!(repair["messages"][0], initial["messages"][0]);
+    assert_eq!(repair["messages"][1], initial["messages"][1]);
+    assert_eq!(repair["messages"][2]["content"], "bounded field feedback");
+
+    let mut other = json!({"messages":[{"role":"system","content":"another operation"}]});
+    let mut unrelated = None;
+    retain_initial_system_contract(&mut other, &mut unrelated).unwrap();
+    assert_eq!(other["messages"][0]["content"], "another operation");
+    assert_ne!(retained, unrelated);
+    let mut replaced_role = repair.clone();
+    replaced_role["messages"][0]["role"] = json!("user");
+    assert_eq!(error_code(&retain_initial_system_contract(&mut replaced_role, &mut retained).unwrap_err()),
+        "MODEL_RECOVERY_SCOPE_REJECTED");
+    for mut missing in [json!({"messages":[]}), json!({"messages":null})] {
+        assert_eq!(error_code(&retain_initial_system_contract(&mut missing, &mut retained).unwrap_err()),
+            "MODEL_RECOVERY_SCOPE_REJECTED");
+    }
+}
+
+#[test]
+fn independent_field_repair_does_not_receive_fresh_read_only_planning_guidance() {
+    let mut context: Value = serde_json::from_str(&business_context("chat_completions", 2)).unwrap();
+    context["executionConstraints"] = json!({"changePolicy":"read_only"});
+    context["baseSnapshot"] = json!({"currentToolResults":[{"evidenceId":"real-evidence","content":"unchanged evidence"}]});
+    let raw = context.to_string();
+    let body = crate::build_next_stage_request_body("offline-model", "Inspect current target", &raw,
+        &crate::AiGenerationSettings::default());
+    let (mut body, _) = crate::model_compatibility::prepare(&body, "阶段联合决策", false).unwrap();
+    let field_schema = json!({"type":"object","properties":{"value":{"type":"array","items":{"type":"string"}}},
+        "required":["value"],"additionalProperties":false});
+    set_field_repair_schema(&mut body, &field_schema).unwrap();
+    let configured = crate::model_parameters::prepare(&body).unwrap();
+    let (mut projected, diagnostic) = crate::prompt_layers::prepare_request(&configured);
+    assert!(diagnostic.get("readOnlyPlanningPolicy").is_none());
+    let expected = projected.clone();
+    let mut independent_contract = None;
+    retain_initial_system_contract(&mut projected, &mut independent_contract).unwrap();
+    assert_eq!(projected, expected);
+    assert!(!projected["messages"].to_string().contains("只读计划组织（通用）："));
+    assert!(projected["messages"].to_string().contains("unchanged evidence"));
+    assert_eq!(projected["response_format"]["json_schema"]["name"], "opsark_field_repair");
 }
 
 #[test]
@@ -844,6 +1096,7 @@ fn explicit_business_probe_validates_the_real_plan_consumer_without_execution() 
             Some(integration.clone()),
             Some("business".into()),
             Some(5),
+            None,
         ))
         .unwrap();
     assert_eq!(result.validation["businessContract"], "passed");
@@ -864,6 +1117,7 @@ fn explicit_business_probe_validates_the_real_plan_consumer_without_execution() 
             Some(integration),
             Some("business".into()),
             Some(5),
+            None,
         ))
         .unwrap_err();
     assert_eq!(error_code(&error), "MODEL_PROBE_CONTRACT_INVALID");

@@ -129,6 +129,7 @@ export function effectiveModelOutput(model: Pick<ModelProfile, "capabilities"> &
 /** Credential identity is one-way hashed; display names are not request configuration. */
 export function modelConfigurationFingerprint(model: ModelProfile, credentialIdentity = "") {
   return executionDigest({ endpoint: model.endpoint, model: model.model, timeoutSeconds: model.timeoutSeconds,
+    ...(model.requestLifecycleAdapter ? { requestLifecycleAdapter: model.requestLifecycleAdapter } : {}),
     capabilities: model.capabilities, requestParameters: model.requestParameters, integration: {
       apiProtocol: model.apiProtocol, outputPolicy: model.outputPolicy, capabilitiesV2: model.capabilitiesV2 },
     credentialIdentity: credentialIdentity ? executionDigest(credentialIdentity) : undefined });

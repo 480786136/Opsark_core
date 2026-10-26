@@ -43,6 +43,27 @@ function update(overrides: Partial<TaskRequirementUpdate> = {}): TaskRequirement
 }
 
 describe("requirement lifecycle", () => {
+  it.each(["port", "no-config-write"])("requires both new goals and constraints in focus, reporting missing %s atomically", missing => {
+    const current = task();
+    const before = JSON.stringify(current);
+    const mixedSource = { ...portSource, content: "将端口改为 8081，禁止修改其他配置" };
+    const mixed = update({ changes: [], additions: [...update().additions,
+      { id: "no-config-write", kind: "constraint", content: "禁止修改其他配置", sourceQuote: "禁止修改其他配置", supersedes: [] }],
+      focusIds: ["port", "no-config-write"].filter(id => id !== missing) });
+    expect(() => applyTaskRequirementUpdate(current, mixed, { source: mixedSource }))
+      .toThrow(`requirementUpdate.focusIds 缺少新增要求 ID：["${missing}"]`);
+    expect(JSON.stringify(current)).toBe(before);
+    mixed.focusIds = ["port", "no-config-write"];
+    const next = applyTaskRequirementUpdate(current, mixed, { source: mixedSource });
+    const projection = projectRequirementsContext(next);
+    expect(projection.focus.map(entry => entry.id)).toEqual(["port", "no-config-write"]);
+    expect(projection.activeConstraints).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "private", content: "只允许内网访问", source }),
+      expect.objectContaining({ id: "no-config-write", source: mixedSource }),
+    ]));
+    expect(JSON.stringify(current)).toBe(before);
+  });
+
   it.each(["missing", "empty"])("enables required review for a %s initial planning lifecycle without changing the original task", mode => {
     const current = task();
     current.status = "planning_failed";

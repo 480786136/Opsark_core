@@ -10,7 +10,7 @@ import { imageSource, readFeedbackImages, type FeedbackImage } from "@/features/
 import ConfirmActionDialog from "@/components/ConfirmActionDialog.vue";
 import { useActionConfirmation } from "@/components/useActionConfirmation";
 
-const { confirmationMessage, confirmAction, resolveConfirmation } = useActionConfirmation();
+const { confirmationMessage, confirmationId, confirmAction, resolveConfirmation } = useActionConfirmation();
 const confirmationTitle = ref("温馨提示"), confirmationLabel = ref("确认并提交");
 const ops = useOpsStore(), account = useAccountStore(), updates = useUpdateStore();
 const owner = computed(() => account.current?.user.id);
@@ -89,16 +89,18 @@ async function readTicket(ticket: Ticket) {
   assertOwner(id); detail.value = result;
 }
 async function removeTicket(ticket: Ticket) {
+  const targetId = ticket.id;
   const id = identity(); confirmationTitle.value = "删除反馈正文"; confirmationLabel.value = "确认删除";
   if (!await confirmAction("删除这条反馈保存的正文、联系方式、图片、日志与回复？此操作不可恢复，工单元数据会保留。")) return;
-  assertOwner(id); await cloudRequest("feedback_delete", { id: ticket.id }, id); assertOwner(id);
-  detail.value = null; await refreshTickets();
+  assertOwner(id); await cloudRequest("feedback_delete", { id: targetId }, id); assertOwner(id);
+  if (detail.value?.id === targetId) detail.value = null;
+  await refreshTickets();
 }
 const statusLabels: Record<string, string> = { open: "待处理", in_progress: "处理中", resolved: "已解决", deleted: "已删除", expired: "已过期" };
 </script>
 
 <template>
-  <ConfirmActionDialog :message="confirmationMessage" :title="confirmationTitle" :confirm-label="confirmationLabel" @result="resolveConfirmation" />
+  <ConfirmActionDialog :message="confirmationMessage" :request-id="confirmationId" :title="confirmationTitle" :confirm-label="confirmationLabel" @result="resolveConfirmation" />
   <div class="page management-page support-page">
     <header class="page-header"><div><span class="eyebrow">SUPPORT / OPSARK</span><h1>联系、反馈与更新</h1><p>把遇到的问题告诉我们，一起让 OpsArk 更好用。</p></div><span class="support-version">v{{ updates.displayVersion }}</span></header>
     <div class="support-layout">

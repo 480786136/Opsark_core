@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ModelInvocationError, type RuntimeModel } from "@/services/backend";
+import { ModelInvocationError, modelServiceError, type RuntimeModel } from "@/services/backend";
 import type { ModelProfile, ModelServiceError, NextStageDecision, OpsTask, PlanStep } from "@/types";
 import { decideTaskNextStage } from "./agentService";
 import { StaleWorkflowError } from "./workflowLifetime";
@@ -82,11 +82,32 @@ describe("stage output recovery uses a bounded full-candidate regeneration", () 
     const error = modelError();
     const decide = vi.fn<Decider>().mockRejectedValue(error);
 
-    await expect(decideTaskNextStage({ ...input, recoverProtocolFailures: true }, decide)).rejects.toBe(error);
+    const stopped = await decideTaskNextStage({ ...input, recoverProtocolFailures: true }, decide).catch(error => error);
+    expect(stopped).toBeInstanceOf(ModelInvocationError);
+    expect(modelServiceError(stopped)).toMatchObject({ ...error.modelError,
+      candidateRejection: { version: 1, code: "MODEL_FORMAT_INVALID", rejectedCandidateExecuted: false } });
 
     expect(decide).toHaveBeenCalledTimes(2);
     const contexts = decide.mock.calls.map(([, runtime]) => JSON.parse(runtime!.context));
     expect(contexts.map(context => context._modelOutputRecovery.strategy)).toEqual(["initial", "regenerate"]);
+    expect(contexts[1]._modelRecovery).toEqual(contexts[0]._modelRecovery);
+    expect(task).toEqual(before);
+  });
+
+  it("keeps the original tool rejection when a regenerated stage is blocked before dispatch", async () => {
+    const { task, input } = setup();
+    const before = structuredClone(task);
+    const candidateRejection = { version: 1 as const, code: "TOOL_ARGUMENT_INVALID" as const,
+      toolIds: ["files.preview_deletion"], keyword: "minItems", stepIndex: 0, rejectedCandidateExecuted: false as const };
+    const first = modelError({ stage: "business_validation", jsonPointer: "/steps/0/action/arguments/paths", candidateRejection });
+    const guard = modelError({ code: "MODEL_RECOVERY_BUDGET_EXHAUSTED", stage: "recovery_budget",
+      modelOperationId: "same-operation", requestKey: "last-original-request",
+      recoveryBudget: { remainingWaitMs: 88067, requiredWaitMs: 90000, fieldRepairs: 0, candidateRegenerations: 0 } });
+    const decide = vi.fn<Decider>().mockRejectedValueOnce(first).mockRejectedValueOnce(guard);
+    const result = await decideTaskNextStage(input, decide).catch(error => error);
+    expect(modelServiceError(result)).toEqual({ ...guard.modelError, candidateRejection });
+    expect(decide).toHaveBeenCalledTimes(2); // second IPC attempt is stopped locally, no third proposal
+    const contexts = decide.mock.calls.map(([, runtime]) => JSON.parse(runtime!.context));
     expect(contexts[1]._modelRecovery).toEqual(contexts[0]._modelRecovery);
     expect(task).toEqual(before);
   });

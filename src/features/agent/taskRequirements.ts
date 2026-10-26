@@ -8,6 +8,7 @@ import type {
   TaskRequirementSource,
   TaskRequirementUpdate,
 } from "@/types";
+import { validateAcceptanceCoverage } from "./staticSiteAcceptance";
 
 export class TaskRequirementError extends Error {
   constructor(message: string) {
@@ -67,6 +68,13 @@ function validLifecycle(value: TaskRequirementLifecycle): boolean {
       && nonempty(item.lastReview.reason) && Array.isArray(item.lastReview.evidenceIds)
       && item.lastReview.evidenceIds.every(nonempty) && Number.isInteger(item.lastReview.revision)
       && item.lastReview.revision <= value.revision))) return false;
+  for (const item of value.items) {
+    if (item.acceptance === undefined) continue;
+    try { validateAcceptanceCoverage({ baseRevision: value.revision, sourceMessageId: item.source.sourceMessageId ?? "",
+      additions: [{ id: item.id, kind: item.kind, content: item.content, sourceQuote: item.source.content, supersedes: [] }], changes: [], focusIds: [item.id],
+      acceptanceCoverage: [{ ...item.acceptance, requirementId: item.id }] }, item.source.content); }
+    catch { return false; }
+  }
   return unique(value.items.map(item => item.id)) && unique(value.focus.requirementIds)
     && value.focus.requirementIds.every(id => value.items.some(item => item.id === id));
 }
@@ -74,6 +82,7 @@ function validLifecycle(value: TaskRequirementLifecycle): boolean {
 /** Read-only migration. A legacy completed task is not proof that every requirement is satisfied. */
 export function ensureTaskRequirementLifecycle(task: OpsTask, sources = fallbackSources(task)): TaskRequirementLifecycle {
   if (task.requirementLifecycle?.version === 1 && validLifecycle(task.requirementLifecycle)) return clone(task.requirementLifecycle);
+  if (task.requirementLifecycle?.items?.some(item => item.acceptance !== undefined)) fail("已有验收契约无法安全读取，不能退回旧版通用需求或清除静态交付条件。");
   const items: TaskRequirementItem[] = [];
   for (const source of sources) {
     if (source && nonempty(source.content) && !items.some(item => sameSource(item.source, source))) items.push(legacyItem(source, items));
@@ -186,6 +195,7 @@ export function applyTaskRequirementUpdate(
     if (!nonempty(quote) || !source.content.includes(quote)) fail("需求变更缺少当前用户原文依据。");
   };
   if (!Array.isArray(update.additions) || !Array.isArray(update.changes) || !Array.isArray(update.focusIds)) fail("需求更新列表不完整。");
+  try { validateAcceptanceCoverage(update, source.content); } catch (error) { fail(String(error)); }
   const ids = state.items.map(item => item.id);
   const replaceable = new Set(state.items.filter(item => effective(item) || item.status === "deferred").map(item => item.id));
   if (!unique(update.additions.map(item => item.id)) || update.additions.some(item => !nonempty(item.id) || ids.includes(item.id))) {
@@ -201,12 +211,20 @@ export function applyTaskRequirementUpdate(
       // Explicit splitting can replace the same legacy source once with several
       // additions, but the source list and the superseding relationships remain.
       if (!previous || !replaceable.has(id)) fail("只能替代现有有效或暂缓需求。");
+      if (previous.acceptance?.strategy === "static_site"
+        && update.acceptanceCoverage?.find(i => i.requirementId === addition.id)?.strategy !== "static_site") {
+        fail("已登记的静态交付条件不能在重规划或补充需求时降级为通用复核；新目标请使用独立目标流程。");
+      }
       touched.add(id);
       previous.status = "superseded";
       previous.supersededBy ||= addition.id;
     }
     state.items.push({ id: addition.id, kind: addition.kind, content: addition.content, source: clone(source), lastChangedAt: source.createdAt,
-      status: "active", supersedes: [...addition.supersedes], evidenceIds: [] });
+      status: "active", supersedes: [...addition.supersedes], evidenceIds: [],
+      ...(update.acceptanceCoverage?.find(i => i.requirementId === addition.id) ? { acceptance: (() => {
+        const { requirementId: _id, ...acceptance } = update.acceptanceCoverage!.find(i => i.requirementId === addition.id)!;
+        return clone(acceptance);
+      })() } : {}) });
   }
   for (const change of update.changes) {
     assertQuote(change.sourceQuote);
@@ -224,7 +242,8 @@ export function applyTaskRequirementUpdate(
   if (!unique(update.focusIds) || !update.focusIds.length || update.focusIds.some(id => !state.items.some(item => item.id === id && effective(item)))) {
     fail("本轮处理范围必须引用有效需求。");
   }
-  if (update.additions.some(item => !update.focusIds.includes(item.id))) fail("新增要求必须纳入本轮处理范围。");
+  const missingFocusIds = update.additions.filter(item => !update.focusIds.includes(item.id)).map(item => item.id);
+  if (missingFocusIds.length) fail(`requirementUpdate.focusIds 缺少新增要求 ID：${JSON.stringify(missingFocusIds)}；新增 goal 和 constraint 都必须纳入本轮处理范围。`);
   state.revision += 1;
   state.focus = { roundId: context.roundId ?? task.currentRoundId, sourceMessageId: source.sourceMessageId,
     requirementIds: [...update.focusIds] };

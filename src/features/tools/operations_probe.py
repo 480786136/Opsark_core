@@ -1,12 +1,17 @@
 """Bundled read-only probe, sent over the existing managed SSH executor.
 
-Python 3.8+ / POSIX. No shell evaluation, installation, elevation or remote files.
+Python 3.6+ / POSIX. No shell evaluation, installation, elevation or remote files.
 The controller validates input first; the script is not a public command API.
 """
 import datetime
+import codecs
+import errno
+import hashlib
 import heapq
+import http.client
 import json
 import os
+import re
 import selectors
 import shutil
 import signal
@@ -21,6 +26,141 @@ import urllib.request
 
 class StopProbe(Exception):
     pass
+
+
+class UnsafePath(Exception):
+    """An ancestor cannot be traversed without following a link."""
+    pass
+
+
+def exact_parent(path):
+    """Open every directory component without symlinks; caller owns returned fd."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    chain = []
+    try:
+        info = os.fstat(descriptor)
+        chain.append((info.st_dev, info.st_ino))
+        components = [part for part in path.split("/") if part]
+        for component in components[:-1]:
+            if component in (".", ".."):
+                raise UnsafePath()
+            info = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                raise UnsafePath()
+            try:
+                nested = os.open(component, flags, dir_fd=descriptor)
+            except OSError as error:
+                if error.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise UnsafePath()
+                raise
+            os.close(descriptor)
+            descriptor = nested
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                raise UnsafePath()
+            chain.append((opened.st_dev, opened.st_ino))
+        return descriptor, components[-1] if components else ".", chain
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def file_identity(info):
+    # Decimal strings preserve device/inode and nanoseconds beyond JS safe ints.
+    return dict(device=str(info.st_dev), inode=str(info.st_ino), mode="%04o" % stat.S_IMODE(info.st_mode),
+                uid=info.st_uid, gid=info.st_gid, sizeBytes=info.st_size,
+                modifiedAtNs=str(info.st_mtime_ns), changedAtNs=str(info.st_ctime_ns))
+
+
+def same_file(left, right):
+    return stat.S_IFMT(left.st_mode) == stat.S_IFMT(right.st_mode) and file_identity(left) == file_identity(right)
+
+
+SERVICE_PROPERTIES = ("Id", "LoadState", "ActiveState", "SubState", "MainPID", "Result", "ExecMainStatus",
+                      "ActiveEnterTimestamp", "UnitFileState", "ExecStart", "FragmentPath", "ExecMainStartTimestampMonotonic")
+
+
+def service_properties(text):
+    values = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in SERVICE_PROPERTIES:
+            if key in values:
+                return None
+            values[key] = value
+    return values if all(values.get(key) for key in ("Id", "LoadState", "ActiveState", "SubState")) else None
+
+
+def missing_service_properties(item, service):
+    """A narrow observation pattern, not a claim about why systemctl failed.
+
+    Never retry permission/no-unit/noisy errors, malformed PID or arbitrary
+    exit 1. The fallback can only collect basic facts and remains partial.
+    """
+    if item["exitCode"] != 1:
+        return None
+    lines = [line for line in item["text"].splitlines() if line]
+    if not lines or any("=" not in line or line.split("=", 1)[0] not in SERVICE_PROPERTIES for line in lines):
+        return None
+    values = service_properties(item["text"])
+    if not values or values.get("LoadState") != "loaded" or values["Id"] not in (service, service + ".service"):
+        return None
+    pid = values.get("MainPID", "")
+    if not re.fullmatch(r"0|[1-9][0-9]*", pid) or int(pid) > 9007199254740991:
+        return None
+    missing = [key for key in SERVICE_PROPERTIES if key not in values]
+    return missing if missing else None
+
+
+def bounded_proc_text(path, limit):
+    """Fixed kernel paths only; no caller path, symlink or unbounded content."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        output = bytearray()
+        while len(output) <= limit:
+            chunk = os.read(descriptor, limit + 1 - len(output))
+            if not chunk:
+                break
+            output.extend(chunk)
+        if len(output) > limit:
+            raise ValueError("proc observation exceeds bound")
+        return bytes(output).decode("ascii", "strict").strip()
+    finally:
+        os.close(descriptor)
+
+
+def service_process_snapshot(pid):
+    boot = bounded_proc_text("/proc/sys/kernel/random/boot_id", 64)
+    if not re.fullmatch(r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", boot):
+        raise ValueError("invalid boot identity")
+    text = bounded_proc_text("/proc/%s/stat" % pid, 4096)
+    if not text.startswith(str(pid) + " (") or ") " not in text:
+        raise ValueError("invalid process identity")
+    # comm can contain spaces and ')'; field 22 follows the final ') '.
+    fields = text.rsplit(") ", 1)[1].split()
+    if len(fields) <= 19 or not re.fullmatch(r"[1-9][0-9]*", fields[19]):
+        raise ValueError("invalid process start time")
+    return boot, fields[19]
+
+
+def capability_report(result):
+    """Only local runtime/executable observations, never inferred business health."""
+    facts = [dict(name="python.runtime", supported=sys.version_info >= (3, 6),
+                  version=".".join(map(str, sys.version_info[:3])), executable=sys.executable),
+             dict(name="python.json", supported=True),
+             dict(name="posix.fd_scan", supported=hasattr(os, "O_NOFOLLOW")
+                  and getattr(os, "scandir", None) in getattr(os, "supports_fd", set())
+                  and os.open in getattr(os, "supports_dir_fd", set()))]
+    for name in ("systemctl", "journalctl", "ss", "netstat", "curl", "jq"):
+        executable = shutil.which(name)
+        facts.append(dict(name=name, supported=bool(executable), **({"executable": executable} if executable else {})))
+    # No '--value' probe is needed: the collector uses old and new systemd's
+    # property=value format. Its success proves only that exact operation.
+    if result["request"].get("check") == "status":
+        verified = result["status"] == "complete" and bool(result["items"])
+        facts.append(dict(name="systemctl.show.properties", supported=True if verified else None))
+    return dict(version=1, observedAt=datetime.datetime.now(datetime.timezone.utc).isoformat(), facts=facts)
 
 
 def run(tool, request):
@@ -68,10 +208,10 @@ def run(tool, request):
         elif key[:3] > largest[0][:3]:
             heapq.heapreplace(largest, key)
 
-    def command(args, kind, subject):
+    def command(args, kind, subject, publish=True):
         executable = shutil.which(args[0])
         if not executable:
-            skip(subject, "unsupported")
+            skip(args[0], "unsupported")
             result["status"] = "unsupported"
             return
         # No shell and no caller-provided executable/flags. Drain a bounded pipe;
@@ -99,13 +239,19 @@ def run(tool, request):
                             skip(subject, "output_limit")
                             return
             code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
-            result["items"].append(dict(kind=kind, subject=subject,
-                                        text=output.decode("utf-8", "replace"), exitCode=code))
-            result["matchedEntries"] += 1
+            item = dict(kind=kind, subject=subject, text=output.decode("utf-8", "replace"), exitCode=code)
+            if publish:
+                result["items"].append(item)
+                result["matchedEntries"] += 1
             if code != 0:
                 # Keep the real exit code; never infer permission/success from a pipeline.
                 skip(subject, "error")
                 result["status"] = "error"
+            elif kind == "service":
+                if service_properties(item["text"]) is None:
+                    skip(subject, "error")
+                    result["status"] = "error"
+            return item
         finally:
             selector.close()
             if process.poll() is None:
@@ -116,10 +262,222 @@ def run(tool, request):
                 process.wait()
             process.stdout.close()
             child[0] = None
-            if output and not any(item.get("subject") == subject for item in result["items"]):
+            if publish and output and not any(item.get("subject") == subject for item in result["items"]):
                 result["items"].append(dict(kind=kind, subject=subject,
                                             text=output.decode("utf-8", "replace"), exitCode=process.returncode))
                 result["matchedEntries"] += 1
+
+    def service_status(service):
+        sample_started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        args = ["systemctl", "show", "--no-pager", "--property=Id,LoadState,ActiveState,SubState,MainPID,Result,ExecMainStatus,ActiveEnterTimestamp,UnitFileState,ExecStart,FragmentPath,ExecMainStartTimestampMonotonic", "--", service]
+        item = command(args, "service", service)
+        if item is None:
+            return
+        identity = dict(status="unknown", service=service, sampleStartedAt=sample_started,
+                        sampleFinishedAt=sample_started, consistency="sampled_non_atomic", reason="collection_incomplete")
+        item["processIdentity"] = identity
+        try:
+            missing = missing_service_properties(item, service)
+            if missing:
+                item["compatibilityAttempt"] = dict(originalExitCode=1, reason="missing_requested_properties", missingProperties=missing)
+                # One fixed basic observation; its identity verification below
+                # reuses the same reduced argv and the original total deadline.
+                # Never issue unfiltered show --all or expose Environment.
+                args = ["systemctl", "show", "--no-pager", "--property=Id,LoadState,ActiveState,SubState,MainPID", "--", service]
+                basic = command(args, "service", service, publish=False)
+                if basic is None:
+                    identity["reason"] = "properties_unavailable"
+                    return
+                item.update(text=basic["text"], exitCode=basic["exitCode"])
+                if basic["exitCode"] == 0 and service_properties(basic["text"]) is not None:
+                    # The initial requested property coverage remains missing.
+                    result["status"] = "partial"
+            first = service_properties(item["text"])
+            if item["exitCode"] != 0 or first is None:
+                identity["reason"] = "properties_unavailable"
+                return
+            item["properties"] = first
+            if "MainPID" not in first:
+                identity["reason"] = "missing_main_pid"
+                return
+            raw_pid = first["MainPID"]
+            if not re.fullmatch(r"0|[1-9][0-9]*", raw_pid) or int(raw_pid) > 9007199254740991:
+                identity["reason"] = "invalid_main_pid"
+                return
+            pid = int(raw_pid)
+            identity["pid"] = pid
+            try:
+                before = service_process_snapshot(pid) if pid else None
+            except (OSError, ValueError, UnicodeError):
+                identity["reason"] = "proc_unavailable"
+                return
+            second_item = command(args, "service", service, publish=False)
+            if second_item is not None:
+                identity["verificationExitCode"] = second_item["exitCode"]
+            second = service_properties(second_item["text"]) if second_item and second_item["exitCode"] == 0 else None
+            if second is None:
+                identity["reason"] = "properties_unavailable"
+                return
+            if "MainPID" not in second:
+                identity["reason"] = "missing_main_pid"
+                return
+            if not re.fullmatch(r"0|[1-9][0-9]*", second["MainPID"]) or int(second["MainPID"]) > 9007199254740991:
+                identity["reason"] = "invalid_main_pid"
+                return
+            if second.get("MainPID") != raw_pid:
+                identity.update(status="changed", reason="main_pid_changed")
+                return
+            if set(second) != set(first):
+                identity["reason"] = "properties_unavailable"
+                return
+            if second != first:
+                identity.update(status="changed", reason="properties_changed")
+                return
+            if pid == 0:
+                identity.update(status="not_running", reason="no_main_process")
+                return
+            try:
+                after = service_process_snapshot(pid)
+            except (OSError, ValueError, UnicodeError):
+                identity["reason"] = "proc_unavailable"
+                return
+            if before != after:
+                identity.update(status="changed", reason="boot_changed" if before[0] != after[0] else "process_changed")
+                return
+            identity.update(status="stable", bootId=after[0], startTimeTicks=after[1])
+            del identity["reason"]
+        finally:
+            identity["sampleFinishedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    def exact_file():
+        path = request["path"]
+        tick(path)
+        parent = None
+        descriptor = None
+        item = None
+        sample_started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        try:
+            try:
+                parent, name, chain = exact_parent(path)
+                before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                item = dict(kind="file_metadata", subject=path, exists=False, fileType="missing",
+                            stability="stable", hashStatus="not_applicable", hashedBytes=0, verifiedReadPasses=0,
+                            sampleStartedAt=sample_started, consistency="single_observation",
+                            limitations=["non_atomic_sample", "absence_at_sample"])
+                result["items"].append(item)
+                result["matchedEntries"] = 1
+                return
+            kind = "regular" if stat.S_ISREG(before.st_mode) else "directory" if stat.S_ISDIR(before.st_mode) else "symlink" if stat.S_ISLNK(before.st_mode) else "other"
+            item = dict(kind="file_metadata", subject=path, exists=True, fileType=kind, metadata=file_identity(before),
+                        stability="unknown", hashStatus="not_requested" if not request["hash"] else "unavailable" if kind == "regular" else "not_applicable", hashedBytes=0, verifiedReadPasses=0,
+                        sampleStartedAt=sample_started, consistency="unverified", limitations=["non_atomic_sample"])
+            if kind == "directory":
+                item["limitations"].append("self_metadata_only")
+            if kind == "symlink":
+                item["limitations"].append("target_not_followed")
+                target = os.readlink(name, dir_fd=parent)
+                # A non-UTF8 link must not be silently replaced with a different name.
+                target.encode("utf-8", "strict")
+                item["linkTarget"] = target
+            result["items"].append(item)
+            result["matchedEntries"] = 1
+            digest = None
+            if request["hash"] and kind == "regular":
+                limit = request["maxHashBytes"]
+                if before.st_size > limit:
+                    item["hashStatus"] = "limit_exceeded"
+                    skip(path, "output_limit")
+                else:
+                    # O_NONBLOCK prevents a raced FIFO replacement from hanging;
+                    # O_NOFOLLOW prevents a raced link from reading its target.
+                    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                    opened = os.fstat(descriptor)
+                    if not same_file(before, opened):
+                        item.update(stability="changed", hashStatus="changed")
+                        skip(path, "changed")
+                        return
+                    hasher = hashlib.sha256()
+                    while True:
+                        if time.monotonic() >= deadline:
+                            raise StopProbe()
+                        remaining = limit - item["hashedBytes"]
+                        # One bounded sentinel byte verifies EOF even for procfs
+                        # regular files whose st_size does not describe content.
+                        chunk = os.read(descriptor, min(65536, remaining + 1))
+                        if not chunk:
+                            digest = hasher.hexdigest()
+                            item["verifiedReadPasses"] = 1
+                            break
+                        accepted = chunk[:remaining]
+                        hasher.update(accepted)
+                        item["hashedBytes"] += len(accepted)
+                        if len(chunk) > remaining:
+                            item["hashStatus"] = "limit_exceeded"
+                            skip(path, "output_limit")
+                            break
+                    if digest is not None:
+                        # Coarse filesystem timestamps can miss a same-size
+                        # rewrite. Compare a second bounded read of this fd.
+                        # This is still an observation, not a transaction/lease.
+                        os.lseek(descriptor, 0, os.SEEK_SET)
+                        verification = hashlib.sha256()
+                        verified_bytes = 0
+                        while True:
+                            if time.monotonic() >= deadline:
+                                raise StopProbe()
+                            remaining = limit - verified_bytes
+                            chunk = os.read(descriptor, min(65536, remaining + 1))
+                            if not chunk:
+                                break
+                            verification.update(chunk[:remaining])
+                            verified_bytes += min(len(chunk), remaining)
+                            if len(chunk) > remaining:
+                                break
+                        if chunk or verified_bytes != item["hashedBytes"] or verification.hexdigest() != digest:
+                            item.update(stability="changed", hashStatus="changed")
+                            skip(path, "changed")
+                            return
+                        item["verifiedReadPasses"] = 2
+            # Reopen the original lexical path: a held fd alone would otherwise
+            # report a renamed/replaced ancestor as the current requested object.
+            check_parent = None
+            try:
+                check_parent, check_name, check_chain = exact_parent(path)
+                after = os.stat(check_name, dir_fd=check_parent, follow_symlinks=False)
+                stable = chain == check_chain and same_file(before, after)
+                if descriptor is not None:
+                    stable = stable and same_file(before, os.fstat(descriptor))
+                if kind == "symlink":
+                    stable = stable and item["linkTarget"] == os.readlink(check_name, dir_fd=check_parent)
+            except (OSError, UnsafePath):
+                stable = False
+            finally:
+                if check_parent is not None:
+                    os.close(check_parent)
+            if digest is not None and item["hashedBytes"] != before.st_size:
+                stable = False
+            item["stability"] = "stable" if stable else "changed"
+            item["consistency"] = "metadata_checked" if stable else "unverified"
+            if not stable:
+                if request["hash"] and kind == "regular":
+                    item["hashStatus"] = "changed"
+                skip(path, "changed")
+            elif digest is not None:
+                item.update(hashStatus="complete", sha256=digest)
+        except UnsafePath:
+            result["status"] = "unsupported"
+            skip(path, "unsupported")
+        except UnicodeError:
+            result["status"] = "unsupported"
+            skip(path, "unsupported")
+        finally:
+            if item is not None:
+                item["sampleFinishedAt"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            if descriptor is not None:
+                os.close(descriptor)
+            if parent is not None:
+                os.close(parent)
 
     def scan():
         root = request["path"]
@@ -261,12 +619,27 @@ def run(tool, request):
         def redirect_request(self, *_args, **_kwargs):
             return None
 
-    if sys.version_info < (3, 8) or not hasattr(os, "O_NOFOLLOW"):
-        missing = []
-        if sys.version_info < (3, 8):
-            missing.append(dict(path="python3>=3.8 (actual %s)" % ".".join(map(str, sys.version_info[:3])), reason="unsupported"))
-        if not hasattr(os, "O_NOFOLLOW"):
-            missing.append(dict(path="POSIX os.O_NOFOLLOW", reason="unsupported"))
+    missing = []
+    if sys.version_info < (3, 6):
+        missing.append(dict(path="python>=3.6 (actual %s)" % ".".join(map(str, sys.version_info[:3])), reason="unsupported"))
+    for feature in ("SIGALRM", "setitimer", "ITIMER_REAL"):
+        if not hasattr(signal, feature):
+            missing.append(dict(path="POSIX signal." + feature, reason="unsupported"))
+    if tool == "files.find_large" or (tool == "disk.inspect" and request["check"] == "directory"):
+        for feature in ("O_NOFOLLOW", "O_DIRECTORY", "scandir"):
+            if not hasattr(os, feature):
+                missing.append(dict(path="POSIX os." + feature, reason="unsupported"))
+        if getattr(os, "scandir", None) not in getattr(os, "supports_fd", set()) or os.open not in getattr(os, "supports_dir_fd", set()):
+            missing.append(dict(path="POSIX fd-relative directory traversal", reason="unsupported"))
+    if tool == "files.inspect":
+        for feature in ("O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK"):
+            if not hasattr(os, feature):
+                missing.append(dict(path="POSIX os." + feature, reason="unsupported"))
+        if not all(method in getattr(os, "supports_dir_fd", set()) for method in (os.open, os.stat, os.readlink)) or os.stat not in getattr(os, "supports_follow_symlinks", set()):
+            missing.append(dict(path="POSIX no-follow fd-relative metadata", reason="unsupported"))
+    if tool == "disk.inspect" and request["check"] == "capacity" and not hasattr(os, "statvfs"):
+        missing.append(dict(path="POSIX os.statvfs", reason="unsupported"))
+    if missing:
         result.update(status="unsupported", coverageComplete=False, truncated=True,
                       skippedCount=len(missing), skipped=missing,
                       finishedAt=datetime.datetime.now(datetime.timezone.utc).isoformat())
@@ -276,7 +649,9 @@ def run(tool, request):
         previous[signum] = signal.signal(signum, stop)
     signal.setitimer(signal.ITIMER_REAL, request["timeoutSeconds"])
     try:
-        if tool == "files.find_large" or (tool == "disk.inspect" and request["check"] == "directory"):
+        if tool == "files.inspect":
+            exact_file()
+        elif tool == "files.find_large" or (tool == "disk.inspect" and request["check"] == "directory"):
             scan()
         elif tool == "disk.inspect" and request["check"] == "capacity":
             info = os.statvfs(request["path"])
@@ -297,11 +672,12 @@ def run(tool, request):
                 result["status"] = "unsupported"
                 skip("systemd", "unsupported")
             elif check == "status":
-                command(["systemctl", "show", "--no-pager", "--property=Id,LoadState,ActiveState,SubState,MainPID,Result,ExecMainStatus,ActiveEnterTimestamp", "--", service], "service", service)
+                service_status(service)
             elif check == "logs":
                 command(["journalctl", "--no-pager", "--quiet", "--unit=" + service, "--lines=" + str(request["logLines"]), "--since=" + str(request["sinceMinutes"]) + " minutes ago", "--output=short-iso"], "logs", service)
             elif check == "ports":
-                command(["ss", "-lntup"], "ports", "server:listening")
+                args = ["ss", "-lntup"] if shutil.which("ss") else ["netstat", "-lntup"]
+                command(args, "ports", "server:listening")
             elif check == "health":
                 url = request["url"]
                 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
@@ -310,8 +686,42 @@ def run(tool, request):
                 except urllib.error.HTTPError as error:
                     response = error
                 with response:
-                    result["items"].append(dict(kind="health", subject=url, httpStatus=response.code))
+                    item = dict(kind="health", subject=url, httpStatus=response.code)
+                    result["items"].append(item)
                     result["matchedEntries"] = 1
+                    limit = request.get("maxResponseBytes", 0)
+                    if limit:
+                        body = bytearray()
+                        finished = False
+                        try:
+                            while len(body) <= limit:
+                                chunk = getattr(response, "read1", response.read)(min(4096, limit + 1 - len(body)))
+                                if not chunk:
+                                    remaining = getattr(response, "length", getattr(getattr(response, "fp", None), "length", None))
+                                    if remaining not in (None, 0):
+                                        raise http.client.IncompleteRead(bytes(body))
+                                    finished = True
+                                    break
+                                body.extend(chunk)
+                        finally:
+                            # Keep headers and already-read bytes even if the
+                            # body stalls or is cancelled. Never turn binary or
+                            # invalid UTF-8 into apparent complete text evidence.
+                            complete = finished and len(body) <= limit
+                            item.update(body="", returnedBytes=0, bodyTruncated=not complete, bodyEncoding="utf-8")
+                            try:
+                                decoder = codecs.getincrementaldecoder("utf-8")("strict")
+                                content = decoder.decode(bytes(body[:limit]), final=complete)
+                                if any(ord(char) < 32 and char not in "\t\r\n" for char in content):
+                                    raise UnicodeError("non-text response")
+                                item.update(body=content, returnedBytes=len(content.encode("utf-8")))
+                            except UnicodeError:
+                                item.update(bodyEncoding="unavailable", bodyTruncated=True)
+                                skip(url, "unsupported")
+                            if len(body) > limit:
+                                skip(url, "output_limit")
+                            if item["bodyTruncated"]:
+                                result["truncated"] = True
     except StopProbe as error:
         reason = str(error) or stop_reason[0]
         if reason != "entry_limit":
@@ -323,7 +733,7 @@ def run(tool, request):
     except (TimeoutError, subprocess.TimeoutExpired):
         result["status"] = "timeout"
         skip(request.get("path", "server"), "timeout")
-    except (OSError, ValueError, urllib.error.URLError):
+    except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException):
         result["status"] = "error"
         skip(request.get("path", request.get("url", "server")), "error")
     finally:
@@ -356,4 +766,6 @@ def run(tool, request):
 
 if __name__ == "__main__":
     payload = json.loads(sys.argv[1])
-    print("OPSARK_RESULT " + json.dumps(run(payload["toolId"], payload["request"]), ensure_ascii=True), flush=True)
+    result = run(payload["toolId"], payload["request"])
+    print("OPSARK_CAPABILITIES " + json.dumps(capability_report(result), ensure_ascii=True), flush=True)
+    print("OPSARK_RESULT " + json.dumps(result, ensure_ascii=True), flush=True)

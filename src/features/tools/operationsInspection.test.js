@@ -1,7 +1,5 @@
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, rmSync, statSync, linkSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { posix } from "node:path";
+import { createPosixFixture, posixFixtureFs, runPosixShell } from "../../../tests/helpers/posixRuntime.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildOperationsCommand, normalizeOperationsRequest, parseOperationsOutput } from "./operationsInspection";
 import { defaultToolCatalog } from "./toolCatalog";
@@ -11,12 +9,18 @@ import { buildToolEvidenceFacts } from "./toolEvidence";
 import { buildToolStepOutcome } from "@/features/agent/toolStepResult";
 import { bindPreparedToolTargets } from "./toolPreparation";
 const roots = [];
-function fixture() { const path = mkdtempSync(join(tmpdir(), "opsark-readonly-")); roots.push(path); return path; }
+// Each real fixture starts several POSIX processes; concurrent WSL startup can
+// exceed Vitest's 5s case limit even while every individual probe stays bounded.
+const POSIX_FIXTURE_TEST_TIMEOUT_MS = 30000;
+const { join } = posix;
+const { writeFileSync, mkdirSync, symlinkSync, rmSync, statSync, linkSync } = posixFixtureFs;
+function fixture() { const path = createPosixFixture(); roots.push(path); return path; }
 function probe(toolId, value) {
     const request = normalizeOperationsRequest(toolId, value);
     const command = buildOperationsCommand(toolId, request);
-    const output = execFileSync("/bin/sh", ["-c", command], { encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
-    return parseOperationsOutput(toolId, request, output);
+    const execution = runPosixShell(command, { timeout: 5000, maxBuffer: 1024 * 1024 });
+    if (execution.status !== 0) throw new Error(`POSIX probe failed (${execution.status}): ${execution.stderr}`);
+    return parseOperationsOutput(toolId, request, execution.stdout);
 }
 afterEach(() => { for (const path of roots.splice(0))
     rmSync(path, { recursive: true, force: true }); });
@@ -37,7 +41,7 @@ describe("J4 bounded read-only probes", () => {
         expect(tool.version).toBe(2);
         const old = { ...deep.request }; delete old.reportDepth;
         expect(() => validatePreparedToolArguments(tool, old)).toThrow();
-    });
+    }, POSIX_FIXTURE_TEST_TIMEOUT_MS);
     it("executes quoted literal paths and reports top files, exclusions and symlinks without following them", () => {
         const root = fixture(), path = join(root, "quote' $(touch NEVER)\n目录");
         mkdirSync(path);
@@ -52,7 +56,7 @@ describe("J4 bounded read-only probes", () => {
         expect(data.skipped.map(item => item.reason).sort()).toEqual(["excluded", "symlink"]);
         const call = { id: "scan", toolId: "files.find_large", arguments: data.request };
         expect(buildToolEvidenceFacts(call, { callId: call.id, toolId: call.toolId, success: true, data }).evidenceComplete).toBe(false);
-    });
+    }, POSIX_FIXTURE_TEST_TIMEOUT_MS);
     it("distinguishes an empty match from a missing path, depth and entry limits", () => {
         const path = fixture();
         mkdirSync(join(path, "child"));
@@ -61,7 +65,7 @@ describe("J4 bounded read-only probes", () => {
         expect(probe("files.find_large", { path: join(path, "missing") })).toMatchObject({ status: "error", coverageComplete: false });
         expect(probe("files.find_large", { path, minBytes: 0, maxDepth: 1 })).toMatchObject({ status: "partial", coverageComplete: false, truncated: true });
         expect(probe("files.find_large", { path, minBytes: 0, maxEntries: 1 })).toMatchObject({ status: "partial", scannedEntries: 1, coverageComplete: false });
-    });
+    }, POSIX_FIXTURE_TEST_TIMEOUT_MS);
     it("reports actual allocation and avoids double counting hard links in directory totals", () => {
         const path = fixture(), file = join(path, "file");
         writeFileSync(file, "payload");
@@ -72,7 +76,7 @@ describe("J4 bounded read-only probes", () => {
         const capacity = probe("disk.inspect", { path });
         expect(capacity.items[0].totalBytes).toBeGreaterThan(0);
         expect(capacity.items[0].availableBytes).toBeLessThanOrEqual(capacity.items[0].freeBytes);
-    });
+    }, POSIX_FIXTURE_TEST_TIMEOUT_MS);
     it("uses typed prepared dispatch and refuses output from a different scope", async () => {
         const path = fixture(), data = probe("disk.inspect", { path });
         const tool = defaultToolCatalog.find(tool => tool.id === "disk.inspect");
@@ -85,7 +89,7 @@ describe("J4 bounded read-only probes", () => {
         expect(enforceToolResult(call, { callId: call.id, toolId: call.toolId, success: true, data: { ...data, request: { ...args, path: "/other" } } })).toMatchObject({ success: false, error: { code: "TOOL_OUTPUT_INVALID" } });
         const outcome = buildToolStepOutcome({ call, result: { callId: call.id, toolId: call.toolId, success: true, data }, completedAt: "now", evidenceId: "e" });
         expect(outcome.result.facts.evidenceComplete).toBe(true);
-    });
+    }, POSIX_FIXTURE_TEST_TIMEOUT_MS);
     it("rejects hidden write arguments, unsafe selectors, URL credentials and relative paths before dispatch", () => {
         for (const [toolId, args] of [
             ["disk.inspect", { path: "/", command: "anything" }], ["disk.inspect", { path: "relative" }],

@@ -1,6 +1,7 @@
 import type { ExecutionIntentSemantic, ExecutionIntentSnapshot, ExecutionTargetRef, StepAction } from "@/types";
 import { executionDigest } from "@/features/agent/planPreparation";
 import { cancelExecutionById, isRecordedExecution, runRecordedExecution, type ExecutionOutcomeStatus } from "./executionLedger";
+import { isSshExecPayloadError } from "./sshCommandTransport";
 
 const owner = {};
 export const directExecutionLedgerOwner = owner;
@@ -31,7 +32,8 @@ export async function runDirectExecution<T>(options: DirectExecutionOptions<T>):
   const redact = (value: string) => secrets.reduce((text, secret) => text.split(secret).join("[REDACTED]"), value);
   return runRecordedExecution({ owner, task: { id: taskId }, step: { id: stepId, executionIntent: intent },
     phase: options.phase, executionId: options.executionId, execute: options.execute, redact,
-    classifyResult: options.classifyResult, classifyError: effect === "read" ? () => "failed" : undefined });
+    classifyResult: options.classifyResult, classifyError: error => isSshExecPayloadError(error) ? "not_dispatched"
+      : effect === "read" ? "failed" : "unknown" });
 }
 
 export async function fileContentIdentity(data: Uint8Array) {

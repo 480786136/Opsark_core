@@ -48,7 +48,7 @@ describe("restoreUserInputRequests", () => {
     const createCallId = vi.fn().mockReturnValueOnce("restored-1").mockReturnValueOnce("restored-2");
     const restored = restoreUserInputRequests([current], defaultToolCatalog, createCallId);
     expect(restored).toEqual([{
-      ...inputArguments, taskId: current.id, stepId: "input-step", callId: "restored-1",
+      ...inputArguments, taskId: current.id, stepId: "input-step", callId: "restored-1", toolId: "user.request_input",
       roundId: "round-1", workflowEpoch: 3, serverId: "target-server", command: JSON.stringify(current.plan[0].action),
     }]);
     expect(restoreUserInputRequests([current], defaultToolCatalog, createCallId)[0].callId).toBe("restored-2");

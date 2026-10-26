@@ -107,7 +107,10 @@ export interface ExecutionEvidence {
   rawOutput: string;
   collectedAt: string;
   scope?: ExecutionScopeEvidence;
-  archive?: { evidenceId: string; fingerprint: string; characters: number; capturedPartial: boolean };
+  archive?: { evidenceId: string; fingerprint: string; characters: number; capturedPartial: boolean;
+    taskId?: string; roundId?: string; serverId?: string; stepId?: string; sourceEvidenceId?: string; targetContext?: string };
+  /** Storage failure only; retrying this must never re-execute the command. */
+  archiveError?: string;
 }
 
 export interface StepResult {
@@ -210,6 +213,8 @@ export interface ExecutionInputBinding {
   target?: string;
 }
 
+export type PlanEvidenceKind = "file_content";
+
 export interface ExecutionIntentSemantic {
   taskId: string;
   stepId: string;
@@ -219,6 +224,8 @@ export interface ExecutionIntentSemantic {
   effect: "read" | "change" | "interaction";
   risk: RiskLevel;
   expected: string;
+  /** Proposed result data, never proof of completeness or execution authority. */
+  evidenceRequirements?: PlanEvidenceKind[];
   executionScope?: ExecutionScope;
   validationScope?: ExecutionScope;
   validation?: string;
@@ -280,6 +287,8 @@ export type PreparedStep =
 export interface PreparedPlan {
   readonly version: "prepared-plan@1";
   readonly taskId: string;
+  /** Controller-owned requirement revision included in the approval identity. */
+  readonly requirementRevision?: number;
   readonly planRevision: number;
   readonly executionDigest: string;
   readonly displayDigest: string;
@@ -358,6 +367,8 @@ export interface PlanStep {
   command: string;
   risk: RiskLevel;
   expected: string;
+  /** Proposed result data, never proof of completeness or execution authority. */
+  evidenceRequirements?: PlanEvidenceKind[];
   validation: string;
   /** Legacy persisted plans are normalized to isolated_exec before execution. */
   executionScope?: ExecutionScope;
@@ -394,7 +405,7 @@ export interface TaskMessage {
 }
 
 export interface ExecutionConstraints {
-  changePolicy: "unspecified" | "read_only" | "requested_changes_only" | "allow_necessary_changes";
+  changePolicy: "unspecified" | "read_only" | "confirm_changes" | "requested_changes_only" | "allow_necessary_changes";
   environmentPolicy: "unspecified" | "preserve" | "allow_isolated_changes" | "allow_host_changes";
   failurePolicy: "unspecified" | "strict" | "best_effort";
   prohibitedActions: string[];
@@ -538,6 +549,41 @@ export interface TransportRecoveryAttempt {
   updatedAt: string;
 }
 
+export type ConnectionRecoveryDecisionCode =
+  | "checking_dispatch" | "waiting_for_connection" | "ready_to_resume" | "invalid_recovery"
+  | "cancelled" | "task_inactive" | "context_changed" | "requirements_changed"
+  | "approval_changed" | "plan_changed" | "target_changed" | "generation_changed"
+  | "credential_changed" | "dispatch_unknown" | "operation_present" | "ledger_unavailable"
+  | "step_not_pending" | "deadline_expired" | "resume_exhausted"
+  | "preconditions_changed" | "prepared_not_current";
+
+/** Controller-owned pause before dispatch. It never authorizes or replays an operation. */
+export interface TaskConnectionRecovery {
+  version: 1;
+  reasonCode: "connection_unavailable" | "connection_generation_changed";
+  state: "checking" | "waiting" | "resuming" | "stopped" | "completed";
+  taskId: string;
+  roundId?: string;
+  workflowEpoch: number;
+  stepId: string;
+  stepRevision: number;
+  planRevision: number;
+  requirementRevision: number;
+  intentDigest: string;
+  planExecutionDigest: string;
+  /** SHA-256 of public approval identities, intent digests and permission; no input/secret values. */
+  approvalFingerprint: string;
+  permission: PermissionLevel;
+  credentialRevision: number;
+  target: { serverId: string; host: string; port: number; username?: string; generation: number };
+  /** Epoch milliseconds; repeated checks and restoration must retain the original window. */
+  startedAt: number;
+  deadlineAt: number;
+  resumeCount: number;
+  dispatchState: "not_dispatched" | "unknown";
+  stopReason?: ConnectionRecoveryDecisionCode;
+}
+
 export type ManagedAdjustmentPhase =
   | "countdown"
   | "generating"
@@ -574,6 +620,8 @@ export interface TaskRequirementItem {
   kind: "goal" | "constraint";
   content: string;
   source: TaskRequirementSource;
+  /** User-grounded strategy; a frozen static delivery cannot fall back to prose review. */
+  acceptance?: TaskRequirementAcceptance;
   /** When a user last created or reactivated this obligation, independent of its original source. */
   lastChangedAt?: string;
   status: TaskRequirementStatus;
@@ -611,6 +659,14 @@ export interface TaskRequirementUpdate {
   }>;
   changes: Array<{ id: string; status: "active" | "deferred" | "cancelled"; sourceQuote: string; reason: string }>;
   focusIds: string[];
+  acceptanceCoverage?: Array<TaskRequirementAcceptance & { requirementId: string }>;
+}
+
+export interface TaskRequirementAcceptance {
+  strategy: "general_review" | "static_site";
+  sourceQuote: string;
+  reason: string;
+  staticSite?: { artifactPath: string | null; entryUrl: string | null; preserveExisting: boolean; preserveOtherSites: boolean };
 }
 
 /** Acceptance is bound to the requirement revision and the executor-owned evidence set. */
@@ -623,6 +679,25 @@ export interface TaskRequirementReview {
 }
 
 export interface OpsTask {
+  evidenceArchiveWarning?: string;
+  modelTokenBudget?: import("@/features/agent/taskModelBudget").TaskModelBudgetPolicy;
+  terminalEvidence?: import("@/features/agent/taskTerminalEvidence").TaskTerminalEvidence;
+  observationWindows?: import("@/features/agent/observationRuntime").ObservationRuntimeRecord[];
+  modelBudgetSnapshot?: import("@/features/agent/taskModelBudget").TaskModelBudgetSnapshot;
+  modelRequests?: import("@/services/taskModelRequests").TaskModelRequest[];
+  modelAccountingError?: string;
+  /** At most one automatic evidence probe per original uncertain attempt. Manual checks remain available. */
+  automaticReconciliationAttempts?: string[];
+  /** Unclassified user requirements block every approval/dispatch, including after restart. */
+  pendingRequirements?: Array<{
+    id: string;
+    content: string;
+    baseRevision: number;
+    state: "pending" | "failed";
+    receivedAt: string;
+    sourceMessageId?: string;
+    error?: string;
+  }>;
   executionLedgerRecovery?: import("@/features/agent/executionLedgerRecovery").ExecutionLedgerRecovery;
   executionLedgerError?: { stage: string; message: string; operationId?: string; attemptId?: string; remoteResultKnown: boolean };
   executionLedgerLoading?: boolean;
@@ -740,6 +815,8 @@ export interface OpsTask {
   adjustmentIncident?: AdjustmentIncident;
   /** Bounds deterministic command replay to once per actual terminal generation. */
   transportRecovery?: TransportRecoveryAttempt;
+  /** Bounded continuation of an unchanged, definitively undispatched pending step. */
+  connectionRecovery?: TaskConnectionRecovery;
   /** Changes whenever task-visible server or service credentials actually change. */
   credentialRevision?: number;
   authenticationEvidence?: import("@/features/agent/authenticationEvidence").AuthenticationEvidence[];
@@ -760,6 +837,8 @@ export interface OpsTask {
    * both are promoted into a durable server credential group in the keychain.
    */
   submittedInputs?: Record<string, SubmittedTaskInput>;
+  /** Core-owned exact candidate snapshots; ordinary form answers never create these grants. */
+  fileDeletionAuthorizations?: import("@/features/agent/confirmedFileDeletion").FileDeletionAuthorization[];
   /** Legacy/task audit metadata; durable pairing is owned by SecretMetadata.credentialGroupId. */
   submittedSecretBindings?: Record<string, SubmittedSecretBinding>;
   createdAt: string;
@@ -864,6 +943,8 @@ export interface ModelCapabilities {
 }
 
 export interface ModelProfile extends ModelIntegration {
+  /** Explicit local protocol opt-in; never inferred from provider error text. */
+  requestLifecycleAdapter?: { protocol: "opsark-local-v1"; baseUrl: string };
   validationSnapshot?: { fingerprint: string; validatedAt: string; result: ModelValidationResult };
   capabilities?: ModelCapabilities;
   /** Official profiles exist only for the active cloud session; never persist credentials. */
@@ -908,7 +989,20 @@ export interface RequirementProcessingResult {
   developerTrace?: ModelDeveloperTrace;
 }
 
+export interface CandidateRejectionDiagnostic {
+  version: 1;
+  code: "TOOL_ARGUMENT_INVALID" | "TOOL_EVIDENCE_CAPABILITY_MISMATCH" | "PLAN_EVIDENCE_REQUIREMENTS_INVALID" | "PLAN_CANDIDATE_REJECTED" | "MODEL_FORMAT_INVALID" | "MODEL_OUTPUT_TRUNCATED" | "MODEL_RECOVERY_SCOPE_REJECTED" | "MODEL_OUTPUT_REPAIR_EXHAUSTED";
+  stepIndex?: number;
+  toolIds?: string[];
+  keyword?: string;
+  rejectedCandidateExecuted: false;
+}
+
 export interface ModelServiceError {
+  /** Safe prior rejection metadata, never a candidate, arguments or authority. */
+  candidateRejection?: CandidateRejectionDiagnostic;
+  taskBudget?: import("@/features/agent/taskModelBudget").TaskModelBudgetSnapshot;
+  taskBudgetAdmission?: import("@/features/agent/taskModelBudget").TaskBudgetAdmissionDiagnostic;
   /** Actual transport status, absent when Core rejected the request before sending it. */
   httpStatus?: number;
   gatewayHttpStatus?: number;
@@ -942,6 +1036,8 @@ export interface ModelServiceError {
   recoveryBudget?: {
     fieldRepairs?: number;
     candidateRegenerations?: number;
+    remainingWaitMs?: number;
+    requiredWaitMs?: number;
     generations?: number;
     transportAttempts?: number;
     elapsedMs?: number;
@@ -1018,6 +1114,7 @@ export type ModelTransportEventName =
   | "response_received"
   | "request_failed"
   | "response_failed"
+  | "task_budget_rejected"
   | "unknown";
 
 /**
@@ -1025,6 +1122,10 @@ export type ModelTransportEventName =
  * Request, response, responseText, error, URL and file contents never cross the IPC boundary.
  */
 export interface ModelTransportEvent {
+  taskBudgetAdmission?: import("@/features/agent/taskModelBudget").TaskBudgetAdmissionDiagnostic;
+  outputBudgetAdjustment?: import("@/features/agent/taskModelBudget").OutputBudgetAdjustmentDiagnostic;
+  diagnosticCode?: string;
+  dispatchCertainty?: "not_dispatched";
   capabilityVersion?: string;
   apiProtocol?: ModelApiProtocol;
   effectiveOutputMode?: string;

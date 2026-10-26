@@ -6,6 +6,7 @@ import { taskReplyLanguage } from "./replyLanguage";
 export function modelLogContext(task: OpsTask, step?: PlanStep) {
   return { taskId: task.id, roundId: task.currentRoundId, stepId: step?.id,
     replyLanguage: taskReplyLanguage(task),
+    ...(task.modelTokenBudget ? { _modelTokenBudget: task.modelTokenBudget } : {}),
     serverId: task.executionTargetServerId ?? task.serverId,
     phaseIndex: (task.phaseHistory ?? []).filter(phase => phase.roundId === task.currentRoundId).length };
 }

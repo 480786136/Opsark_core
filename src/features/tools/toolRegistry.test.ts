@@ -55,7 +55,12 @@ describe("tool registry", () => {
     expect(context.some((tool) => tool.id === "server.basic_info")).toBe(false);
     expect(context.some((tool) => tool.id === "server.realtime_metrics")).toBe(false);
     expect(context.some((tool) => tool.id === "files.get_structure")).toBe(true);
-    expect(context.every(tool => tool.outputSchema?.additionalProperties === false)).toBe(true);
+    for (const tool of context) {
+      const registered = tools.find(item => item.id === tool.id)!;
+      expect(tool).not.toHaveProperty("outputSchema");
+      expect(tool.inputSchema).toEqual(registered.inputSchema);
+      expect(registered.outputSchema?.additionalProperties).toBe(false);
+    }
     expect(context[0]).not.toHaveProperty("implementation");
     expect(context[0]).not.toHaveProperty("builtIn");
   });

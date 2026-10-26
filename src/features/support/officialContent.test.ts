@@ -75,7 +75,9 @@ it("loads guidance-only publications and ignores legacy permission metadata", ()
   body.schema_version = 2;
   value.content = JSON.stringify(body);
   const current = validateOfficialContent(value).skills!;
-  expect(current).toHaveLength(7);
+  expect(current).toHaveLength(9);
+  expect(current.find(skill => skill.id === "log-rotation")).toMatchObject({ version: 1, enabled: true });
+  expect(current.find(skill => skill.id === "nginx-delivery")).toMatchObject({ version: 1, enabled: true });
   const legacy = validateOfficialContent(envelope("skills", 1, items.map(skill => ({
     ...skill, allowShell: false, allowedToolIds: ["retired.tool"], forbiddenToolIds: ["software.check"],
   })))).skills!;

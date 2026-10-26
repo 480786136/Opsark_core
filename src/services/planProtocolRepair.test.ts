@@ -35,6 +35,67 @@ beforeEach(() => Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {
 afterEach(() => { Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); vi.resetAllMocks(); });
 
 describe("bounded protocol repair", () => {
+  it.each([
+    { allowedRepairPaths: ["steps[0].command", "steps[0].risk"] },
+    { fieldPath: "steps[0].risk" },
+    { ruleVersion: 999 },
+    { code: "MODEL_DECLARED_SAFE" },
+  ])("rejects stale or widened recovery authority before spending a model call: %j", async patch => {
+    const repair = repairOf();
+    repair.diagnostic = { ...repair.diagnostic!, ...patch };
+    await expect(backend.generatePlan("继续诊断", runtime({ planGenerationRepair: repair })))
+      .rejects.toThrow("PROTOCOL_REPAIR_SCOPE_UNKNOWN");
+    expect(invoke).not.toHaveBeenCalled();
+    expect(repair.previousModelOutput[0].command).toContain("mktemp");
+  });
+
+  it("retains exact shell action metadata, rule version and acceptance outside the command patch", () => {
+    const original = { ...diagnose(), action: { type: "shell" as const, command: diagnose().command }, recoveryRuleVersion: RECOVERY_RULE_VERSION };
+    const repair = repairOf([original]);
+    const valid = { ...original, command: "uname -a", action: { type: "shell" as const, command: "uname -a" } };
+    expect(() => assertPlanRepairScope(repair, [valid])).not.toThrow();
+    for (const patch of [
+      { risk: "low" }, { validation: "true" }, { expected: "anything" }, { recoveryRuleVersion: 999 },
+      { executionScope: "isolated_exec" }, { recovery: { ...original.recovery, targetContext: "other-host" } },
+      { action: { ...valid.action, host: "another-host" } },
+      { action: { type: "tool", toolId: "services.inspect", arguments: { check: "status", service: "demo" } } },
+    ]) expect(() => assertPlanRepairScope(repair, [{ ...valid, ...patch } as PlanStep])).toThrow();
+  });
+
+  it("provides the precise unsupported shell boundary only to relevant local repair prompts", () => {
+    const step = diagnose("python3 - <<'PY'\nprint('read')\nPY");
+    const repair = repairOf([step]);
+    const context = JSON.parse(compactProtocolRepairContext(runtime({ server: { host: "host", port: 22, username: "user" } }).context, repair));
+    expect(context.readOnlyPlanProtocol).toMatchObject({ requiresFullValidation: true,
+      unsupportedShellOperators: ["<<"], opaqueInterpreters: expect.arrayContaining(["python3"]),
+      localRepair: { scope: "rejected_fields", immutableFields: expect.arrayContaining(["risk", "expected", "validation"]) } });
+    expect(context.readOnlyPlanProtocol.localRepair.readOnlyInstruction).toContain("不能仅将 heredoc 改为 python -c");
+    expect(context.planGenerationRepair.diagnostic).toEqual(repair.diagnostic);
+    expect(context.planGenerationRepair.previousModelOutput[0].command).toBe(step.command);
+    expect(context.permission).toBe("safe");
+    expect(context.executionConstraints).toEqual({ changePolicy: "read_only" });
+    expect(context.tools).toEqual([]);
+  });
+
+  it("does not accept converting a rejected heredoc into an equally opaque inline interpreter", async () => {
+    const repair = repairOf([diagnose("python3 - <<'PY'\nprint('read')\nPY")]);
+    vi.mocked(invoke).mockResolvedValueOnce([diagnose("python3 -B -c 'print(1)'")]);
+    const error = await backend.generatePlan("继续诊断", runtime({ planGenerationRepair: repair })).catch(error => error);
+    expect(error).toBeInstanceOf(PlanProtocolError);
+    expect(error.repair.diagnostic).toMatchObject({ code: "RECOVERY_DIAGNOSE_MUTATION", matchedToken: "python3" });
+    expect(error.repair.progress.attemptCount).toBe(1);
+    expect(invoke).toHaveBeenCalledOnce();
+    expect(repair.previousModelOutput[0].command).toContain("<<");
+  });
+
+  it("never shares a repair progress scope across different accounts or ports on the same host", () => {
+    const source = { server: { id: "server", host: "host", port: 22, username: "user" } };
+    const key = protocolRepairScopeFingerprint(runtime(source).context);
+    for (const change of [{ port: 2222 }, { username: "root" }, { id: "other-server" }]) {
+      expect(protocolRepairScopeFingerprint(runtime({ server: { ...source.server, ...change } }).context)).not.toBe(key);
+    }
+  });
+
   it.each([JSON.stringify(missingSteps), '{"decision":"adjust","steps":{}}', '{"decision":'])(
     "preserves an unparsed next-stage response without manufacturing a no-action decision: %s", async rawResponse => {
       vi.mocked(invoke).mockRejectedValueOnce("OPSARK_MODEL_TRACE_V1:" + JSON.stringify({

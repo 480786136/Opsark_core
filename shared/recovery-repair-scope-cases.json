@@ -1,0 +1,12 @@
+[
+  {"name":"current command-only scope","patch":{},"allowed":true},
+  {"name":"widened risk field","patch":{"allowedRepairPaths":["steps[2].action.command","steps[2].risk"]},"allowed":false},
+  {"name":"whole action is not a command field","patch":{"allowedRepairPaths":["steps[2].action"]},"allowed":false},
+  {"name":"another step is not in scope","patch":{"allowedRepairPaths":["steps[1].action.command"]},"allowed":false},
+  {"name":"mismatched diagnostic pointer","patch":{"fieldPath":"steps[2].risk"},"allowed":false},
+  {"name":"legacy command alias is not structured action authority","patch":{"allowedRepairPaths":["steps[2].command"]},"allowed":false},
+  {"name":"duplicate field permission rejected","patch":{"allowedRepairPaths":["steps[2].action.command","steps[2].action.command"]},"allowed":false},
+  {"name":"unknown rule cannot authorize repair","patch":{"code":"MODEL_DECLARED_SAFE"},"allowed":false},
+  {"name":"stale rule version rejected","patch":{"ruleVersion":999},"allowed":false},
+  {"name":"removed permission cannot authorize repair","patch":{"allowedRepairPaths":[]},"allowed":false}
+]

@@ -1,5 +1,7 @@
 use reqwest::StatusCode;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use crate::model_request_lifecycle::{RequestHandle, RequestState};
 
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -7,6 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const MODEL_RESPONSE_ATTEMPTS: usize = 3;
 #[path = "model_format_repair.rs"]
 mod format_repair;
+#[path = "model_output_budget.rs"]
+mod output_budget;
 
 fn correlation_headers(
     api_key: &str,
@@ -61,13 +65,13 @@ fn correlation_headers(
     headers
 }
 
-fn append_model_log(path: Option<&Path>, event: Value, context: &Value) {
+pub(crate) fn append_model_log(path: Option<&Path>, event: Value, context: &Value) {
     let Some(path) = path else { return };
     let result = crate::task_logs::append(
         path.parent().unwrap_or(Path::new(".")),
         "model-calls",
         event,
-        context,
+        &crate::prompt_layers::model_log_context(context),
     );
     if let Err(error) = result {
         eprintln!("开发者模型日志写入失败：{error}");
@@ -359,6 +363,7 @@ fn format_repair_feedback(
         "计划生成" => "只返回原计划契约；保留必要命令和验收，提供当前最小完整步骤，不用空 steps 掩盖错误。",
         "阶段联合决策" | "阶段格式修复（兼容模式）" =>
             "只返回原阶段决策契约，steps 必须为数组；continue 必须有真实下一步，adjust 按原需求验收与阻断规则决定是否有步骤，不得因格式失败改判完成。",
+        "需求理解" if schema["properties"].get("steps").is_some() => "修复原联合对象；保留已正确的需求分类、关系、需求版本及授权，steps仍须遵守原计划Schema。不得重新分类、扩大授权或宣称执行。",
         "需求理解" => "只修复需求理解的 intent、answer、selectedSkillIds、constraints 等原契约字段；不得生成执行计划或新增授权。",
         "结果复核" => "只修复复核的 decision、reason、summary 及原契约验收字段；保持真实执行证据，不得重新生成或执行计划。",
         "Skill 生成" => "只修复 Skill 的 name、category、description、matchRules、instructions 字段；不得返回执行计划。",
@@ -418,6 +423,38 @@ fn model_error_with_context(
     format!("{}{payload}", crate::MODEL_TRACE_ERROR_PREFIX)
 }
 
+/// Retain only safe program-derived rejection metadata when the subsequent
+/// repair cannot be dispatched. Never carry candidate text, values or authority.
+fn with_candidate_rejection(error: String, diagnostic: &crate::model_compatibility::OutputDiagnostic, candidate: Option<&Value>, context: &Value) -> String {
+    let Some(raw) = error.strip_prefix(crate::MODEL_TRACE_ERROR_PREFIX) else { return error; };
+    let Ok(mut envelope) = serde_json::from_str::<Value>(raw) else { return error; };
+    if !envelope["modelError"].is_object() { return error; }
+    let code = match diagnostic.code.as_str() {
+        "MODEL_FORMAT_INVALID" | "MODEL_OUTPUT_TRUNCATED" | "MODEL_RECOVERY_SCOPE_REJECTED" | "MODEL_OUTPUT_REPAIR_EXHAUSTED" => diagnostic.code.as_str(),
+        _ => "PLAN_CANDIDATE_REJECTED",
+    };
+    let mut rejection = json!({"version":1,"code":code,"rejectedCandidateExecuted":false});
+    if let Some(index) = diagnostic.json_pointer.as_deref().and_then(|path|path.strip_prefix("/steps/"))
+        .and_then(|path|path.split('/').next()).and_then(|index|index.parse::<usize>().ok()).filter(|index|*index<10000) {
+        rejection["stepIndex"] = json!(index);
+        if let Some(action) = candidate.and_then(|value|value.get("steps")).and_then(Value::as_array).and_then(|steps|steps.get(index)).and_then(|step|step.get("action")) {
+            if let Some(tool) = context["tools"].as_array().and_then(|tools|tools.iter().find(|tool|
+                action["type"]=="tool" && tool["id"].is_string() && tool["id"]==action["toolId"])) {
+                rejection["toolIds"] = json!([tool["id"]]);
+                let arguments_path = format!("/steps/{index}/action/arguments");
+                if diagnostic.json_pointer.as_deref().is_some_and(|path| path == arguments_path || path.starts_with(&format!("{arguments_path}/"))) {
+                    if let Err(issue) = crate::schema_validation::diagnose(&tool["inputSchema"], &action["arguments"]) {
+                        rejection["code"] = json!("TOOL_ARGUMENT_INVALID");
+                        rejection["keyword"] = json!(issue.keyword);
+                    }
+                }
+            }
+        }
+    }
+    if envelope["modelError"].get("candidateRejection").is_none() { envelope["modelError"]["candidateRejection"] = rejection; }
+    format!("{}{envelope}",crate::MODEL_TRACE_ERROR_PREFIX)
+}
+
 fn set_field_repair_schema(body: &mut Value, schema: &Value) -> Result<(), String> {
     if body["response_format"]["type"] == "json_schema" {
         let compiled = crate::model_schema::compile(schema).map_err(|failure| {
@@ -442,6 +479,52 @@ pub(crate) async fn post_model_request(
     timeout_seconds: u64,
     developer_log_path: Option<&Path>,
 ) -> Result<Value, String> {
+    post_model_request_inner(url, api_key, body, request_name, timeout_seconds, developer_log_path, None).await
+}
+
+/// Private handoff of one received and rejected joint proposal. It is never an
+/// executable plan or an IPC result; classification still needs its full gate.
+pub(crate) struct RejectedRequirementCandidate {
+    pub(crate) payload: Value,
+    pub(crate) error: String,
+}
+
+pub(crate) async fn post_requirement_candidate(
+    url: &str, api_key: &str, body: &Value, timeout_seconds: u64,
+    developer_log_path: Option<&Path>, rejected: &mut Option<RejectedRequirementCandidate>,
+) -> Result<Value, String> {
+    post_model_request_inner(url, api_key, body, "需求理解", timeout_seconds, developer_log_path, Some(rejected)).await
+}
+
+fn retain_rejected_requirement_candidate(
+    error: String, diagnostic: &crate::model_compatibility::OutputDiagnostic,
+    body: &Value, payload: &Value, target: &mut Option<&mut Option<RejectedRequirementCandidate>>,
+) -> String {
+    let details = error.strip_prefix(crate::MODEL_TRACE_ERROR_PREFIX)
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok()).unwrap_or_default();
+    let model_error = &details["modelError"];
+    let budget = &model_error["recoveryBudget"];
+    if body["_opsarkOperationContract"] == "requirement.plan@1"
+        && diagnostic.code == "MODEL_FORMAT_INVALID"
+        && matches!(diagnostic.stage.as_str(), "wire_validation" | "business_validation")
+        && diagnostic.json_pointer.as_deref().is_some_and(|p| p == "/steps" || p.starts_with("/steps/"))
+        && model_error["dispatchCertainty"] == "response_received"
+        && model_error["httpStatus"].as_u64().is_some_and(|n| (200..300).contains(&n))
+        && budget["generations"] == 1 && budget["unknownUsageAttempts"] == 0
+        && budget["fieldRepairs"] == 0 && budget["candidateRegenerations"] == 0
+        && budget["recoveryBlocked"] == false
+    {
+        if let Some(target) = target.as_mut() {
+            **target = Some(RejectedRequirementCandidate { payload: payload.clone(), error: error.clone() });
+        }
+    }
+    error
+}
+
+async fn post_model_request_inner(
+    url: &str, api_key: &str, body: &Value, request_name: &str, timeout_seconds: u64,
+    developer_log_path: Option<&Path>, mut rejected: Option<&mut Option<RejectedRequirementCandidate>>,
+) -> Result<Value, String> {
     use crate::model_compatibility::{self as compatibility, OutputDiagnostic};
     use sha2::{Digest, Sha256};
     use std::collections::HashSet;
@@ -450,7 +533,8 @@ pub(crate) async fn post_model_request(
     let cache = JSON_ONLY.get_or_init(|| Mutex::new(HashSet::new()));
     let context: Value =
         serde_json::from_str(body["_opsarkContext"].as_str().unwrap_or("{}")).unwrap_or_default();
-    let scoped_operation = matches!(request_name, "计划生成" | "阶段联合决策" | "阶段格式修复（兼容模式）");
+    let scoped_operation = matches!(request_name, "计划生成" | "阶段联合决策" | "阶段格式修复（兼容模式）")
+        || request_name == "需求理解" && body["_opsarkOperationContract"] == "requirement.plan@1";
     let output_strategy = if scoped_operation {
         crate::model_budget::output_strategy(&context)?
     } else { None };
@@ -477,6 +561,13 @@ pub(crate) async fn post_model_request(
         request_name,
         api_key.starts_with(crate::account::KEY_PREFIX) || api_key.starts_with("omk_"),
     )?;
+    // This control is constructed from the original explicit parameter metadata,
+    // never from model output or a caller-supplied body marker. Protocol wire()
+    // removes it before serialization.
+    body.as_object_mut().unwrap().remove("_opsarkBudgetOutputPolicy");
+    if let Some(policy) = output_budget::policy(&context, original_body, &body, request_name) {
+        body["_opsarkBudgetOutputPolicy"] = policy;
+    }
     let protocol = body["_opsarkProtocolConfig"]["apiProtocol"].as_str().unwrap_or("chat_completions").to_owned();
     let endpoint = crate::model_protocol::endpoint(url, &protocol)?;
     let url = endpoint.as_str();
@@ -488,6 +579,7 @@ pub(crate) async fn post_model_request(
         timeout_seconds,
     )?;
     if let Some(strategy) = output_strategy {
+        if strategy != OutputRecoveryStrategy::Initial { budget.check_repair_window(timeout_seconds)?; }
         budget.claim_output_strategy(strategy, &body)?;
     }
     // A provider rejection of one wire contract says nothing about another
@@ -520,6 +612,10 @@ pub(crate) async fn post_model_request(
     let mut field_repair: Option<format_repair::FieldRepair> = None;
     let mut syntax_recovery_used = false;
     let mut read_only_recovery = false;
+    // Preserve this operation's actual initial system contract across narrower
+    // format-repair schemas. This is local Rust state, never caller metadata or
+    // assistant output, and is populated only by the normal prompt projection.
+    let mut initial_system_contract = None;
     loop {
         let attempt_output_recovery = if output_strategy.is_some() && field_repair.is_some() {
             json!({"strategy":"field_repair"})
@@ -547,6 +643,7 @@ pub(crate) async fn post_model_request(
             timeout_seconds,
             developer_log_path,
             &budget,
+            &mut initial_system_contract,
         )
         .await
         .map_err(|error| {
@@ -584,6 +681,21 @@ pub(crate) async fn post_model_request(
             }
             other => other?,
         };
+        if transport["recoveredOriginal"] == true {
+            // Route through the same application-owned context projection as
+            // request_sent. The business context keeps IDs under _log; passing
+            // it directly to task_logs would silently put this event in system.
+            let (_, recovery_log_context) = crate::prompt_layers::prepare_request(
+                &crate::model_parameters::prepare(&body)?);
+            append_model_log(developer_log_path,json!({
+                "event":"response_received","timestampMs":unix_millis(),"requestName":request_name,
+                "requestId":transport["requestKey"],"callId":transport["callId"],"status":status,
+                "state":"completed","recoveredOriginal":true,"source":transport["recoverySource"],
+                "operationElapsedMs":budget.snapshot()["elapsedMs"],"durationMs":budget.snapshot()["elapsedMs"],
+                "response":{"usage":payload.get("usage")},
+                "contractValidation":"pending","budget":budget.snapshot(),
+            }),&recovery_log_context);
+        }
         crate::model_protocol::normalize_response(&mut payload, &protocol).map_err(|mut diagnostic| {
             crate::model_protocol::attach_response_diagnostics(&payload, &protocol, &mut diagnostic);
             model_error_with_context(compatibility::output_error(&diagnostic, Some(status)), &budget, Some(&transport))
@@ -696,11 +808,12 @@ pub(crate) async fn post_model_request(
             || coordinated_stop
             || repair_diagnostics.len() >= 3 || repair_diagnostics.contains(&repair_key)
             || schema.is_none() || (!truncated && !diagnostic.repairable()) {
-            return Err(model_error_with_context(
+            let error = with_candidate_rejection(model_error_with_context(
                 compatibility::output_error(&diagnostic, Some(status)),
                 &budget,
                 Some(&transport),
-            ));
+            ), &diagnostic, prior_value.as_ref(), &context);
+            return Err(retain_rejected_requirement_candidate(error, &diagnostic, original_body, &payload, &mut rejected));
         }
         if missing_steps_decision.is_none() && matches!(request_name, "阶段联合决策" | "阶段格式修复（兼容模式）") {
             missing_steps_decision = prior_value
@@ -725,15 +838,20 @@ pub(crate) async fn post_model_request(
         if scoped_operation && !truncated {
             if let Some(candidate) = &prior_value {
                 let Some(repair) = format_repair::FieldRepair::new(candidate, schema.as_ref().unwrap(), &diagnostic) else {
-                    return Err(model_error_with_context(compatibility::output_error(&diagnostic, Some(status)), &budget, Some(&transport)));
+                    let error = with_candidate_rejection(model_error_with_context(compatibility::output_error(&diagnostic, Some(status)), &budget, Some(&transport)), &diagnostic, prior_value.as_ref(), &context);
+                    return Err(retain_rejected_requirement_candidate(error, &diagnostic, original_body, &payload, &mut rejected));
                 };
                 if output_strategy.is_some() {
                     // Missing executable steps is a candidate-generation problem,
                     // not permission to invent actions inside a field patch.
                     if repair.opens_steps {
-                        return Err(model_error_with_context(compatibility::output_error(&diagnostic, Some(status)), &budget, Some(&transport)));
+                        let error = model_error_with_context(compatibility::output_error(&diagnostic, Some(status)), &budget, Some(&transport));
+                        return Err(retain_rejected_requirement_candidate(error, &diagnostic, original_body, &payload, &mut rejected));
                     }
-                    budget.claim_output_strategy(OutputRecoveryStrategy::FieldRepair, &body)?;
+                    budget.check_repair_window(timeout_seconds)
+                        .map_err(|error| with_candidate_rejection(error,&diagnostic,prior_value.as_ref(),&context))?;
+                    budget.claim_output_strategy(OutputRecoveryStrategy::FieldRepair, &body)
+                        .map_err(|error| with_candidate_rejection(error,&diagnostic,prior_value.as_ref(),&context))?;
                 }
                 feedback = repair.feedback(&diagnostic, &context);
                 feedback_role = "system";
@@ -785,6 +903,10 @@ mod compatibility_tests;
 #[path = "model_transport_tests.rs"]
 mod transport_tests;
 
+#[cfg(test)]
+#[path = "model_original_wait_tests.rs"]
+mod original_wait_tests;
+
 fn transport_error(
     code: &str,
     stage: &str,
@@ -826,6 +948,8 @@ fn transport_error(
         "billingMode",
         "reserved",
         "actual",
+        "adapterHttpStatus",
+        "adapterReason",
     ] {
         if let Some(value) = diagnostic.get(field) {
             error[field] = value.clone();
@@ -833,6 +957,229 @@ fn transport_error(
     }
     let payload = json!({"message":message,"modelError":error});
     format!("{}{payload}", crate::MODEL_TRACE_ERROR_PREFIX)
+}
+
+/// The local adapter protocol is opt-in Core configuration, never inferred from
+/// provider errors. Every observation binds the original exact wire bytes.
+async fn recover_local_adapter(lifecycle: &RequestHandle, authorization: &str, allowance_seconds:u64) -> Result<Option<(Value,u16)>,String> {
+    recover_local_adapter_with_budget(lifecycle,authorization,Duration::from_secs(allowance_seconds.min(15)),None,false).await
+}
+
+/// Only a still-awaited native invocation may consume its original result.
+/// Historical UI reconciliation uses the short wrapper above and never resumes
+/// a workflow. Both task requests and synchronous configuration probes qualify.
+async fn await_local_adapter(lifecycle: &RequestHandle, authorization: &str, budget: &crate::model_budget::OperationBudget) -> Result<Option<(Value,u16)>,String> {
+    recover_local_adapter_with_budget(lifecycle,authorization,Duration::from_secs(15),Some(budget),false).await
+}
+
+async fn recover_local_adapter_with_budget(lifecycle: &RequestHandle, authorization: &str, initial_allowance:Duration,
+    budget: Option<&crate::model_budget::OperationBudget>, accounting_only: bool) -> Result<Option<(Value,u16)>,String> {
+    let original = lifecycle.read()?;
+    let adapter = original.adapter.as_ref().ok_or_else(|| transport_error("MODEL_ADAPTER_UNAVAILABLE","request_lifecycle",
+        "原请求没有受信任的结果查询适配器",&original.request_id,None,false,&json!({})))?;
+    let operation_deadline = budget.map(|budget|budget.recovery_deadline()).transpose()?;
+    let short_deadline = Instant::now() + initial_allowance;
+    let mut deadline = operation_deadline.map_or(short_deadline,|limit|limit.min(short_deadline));
+    let client = build_model_client(5, false)?;
+    let mut cancel_sent = false;
+    let mut cancellation_deadline = None;
+    let mut interval = Duration::from_millis(350);
+    while Instant::now() < deadline {
+        let current = lifecycle.read()?;
+        // A concurrent original response can finish while this lookup is open.
+        // Historical cancellation does not make an already terminal call active.
+        if matches!(current.state,RequestState::Completed|RequestState::Cancelled) {
+            settle_persisted_model_usage(&current)?;
+            return Ok(if current.state == RequestState::Completed {
+                current.response.zip(current.http_status)
+            } else { None });
+        }
+        // Check the same operation's blocked/deadline state without renewing it.
+        if let Some(budget) = budget { deadline = deadline.min(budget.recovery_deadline()?); }
+        if current.cancel_requested && !accounting_only {
+            let end = *cancellation_deadline.get_or_insert_with(|| Instant::now() + Duration::from_secs(15));
+            deadline = deadline.min(end);
+        }
+        if current.cancel_requested && !cancel_sent && !accounting_only {
+            if deadline.saturating_duration_since(Instant::now()).is_zero() { break; }
+            // An acknowledgement of receiving a cancellation is not proof of
+            // cancellation. Only the bound state query can confirm that state.
+            let _ = client.post(adapter.url(&original.request_id,true)?).bearer_auth(authorization)
+                .json(&json!({"requestId":original.request_id,"requestDigest":original.request_digest}))
+                .timeout(deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(5))).send().await;
+            cancel_sent = true;
+        }
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() { break; }
+        let response = client.get(adapter.url(&original.request_id,false)?).bearer_auth(authorization)
+            .header("x-opsark-client-request-id",&original.request_id).header("x-opsark-request-digest",&original.request_digest)
+            .timeout(timeout.min(Duration::from_secs(5))).send().await;
+        if let Ok(mut response) = response {
+            if response.status().as_u16() != 200 {
+                lifecycle.observe(RequestState::Unknown,"adapter_status_unavailable",None,None,json!({"statusQueryHttpStatus":response.status().as_u16()}))?;
+                break;
+            }
+            let mut bytes = Vec::new();
+            let mut complete = false;
+            while let Ok(chunk) = response.chunk().await {
+                let Some(chunk) = chunk else { complete = true; break; };
+                if bytes.len() + chunk.len() > 8*1024*1024 { break; }
+                bytes.extend_from_slice(&chunk);
+            }
+            if !complete {
+                lifecycle.observe(RequestState::Unknown,"adapter_status_incomplete",None,None,json!({}))?;
+                break;
+            }
+            let Ok(payload) = serde_json::from_slice::<Value>(&bytes) else {
+                lifecycle.observe(RequestState::Unknown,"adapter_status_invalid",None,None,json!({}))?;
+                break;
+            };
+            if payload["protocol"] != "opsark-local-v1" || payload["requestId"] != original.request_id
+                || payload["requestDigest"] != original.request_digest {
+                lifecycle.observe(RequestState::Unknown,"adapter_identity_conflict",None,None,json!({"statusQueryHttpStatus":200}))?;
+                break;
+            }
+            let state = match payload["state"].as_str() {
+                Some("queued" | "running") => RequestState::Accepted,
+                Some("completed") => RequestState::Completed,
+                Some("cancelled") => RequestState::Cancelled,
+                Some("not_accepted") => RequestState::NotDispatched,
+                Some("unknown") => RequestState::Unknown,
+                _ => {
+                    lifecycle.observe(RequestState::Unknown,"adapter_state_invalid",None,None,json!({}))?;
+                    break;
+                },
+            };
+            let status = payload["httpStatus"].as_u64().filter(|s| (200..600).contains(s)).map(|s|s as u16);
+            let reason = payload["reason"].as_str().filter(|reason| !reason.is_empty() && reason.len()<=96
+                && reason.bytes().all(|byte|byte.is_ascii_alphanumeric() || byte==b'_'));
+            let result = payload.get("response").filter(|p|p.is_object() && matches!(state,RequestState::Completed|RequestState::Cancelled)).cloned();
+            if state == RequestState::Completed && (status.is_none() || result.is_none()) {
+                lifecycle.observe(RequestState::Unknown,"adapter_result_incomplete",None,None,json!({}))?;
+                break;
+            }
+            let record = lifecycle.observe(state,payload["state"].as_str().unwrap(),status,result.clone(),
+                json!({"source":"bound_adapter_status","timing":payload.get("timing"),
+                    "adapterReason":reason,
+                    "reportedUsage":payload.get("usage"),
+                    "usage":if matches!(state,RequestState::Completed|RequestState::Cancelled) {payload.get("usage")} else {None}}))?;
+            if let Some(attempt_id) = record.attempt_ids.last().filter(|_| record.task_id.is_some()) {
+                let mut attempt = crate::task_model_budget::TaskAttemptBudget::reopen(&record.request_id,attempt_id)?;
+                if state == RequestState::NotDispatched { attempt.not_dispatched()?; }
+                else if state == RequestState::Completed { if let Some(response) = &result { attempt.settle(response)?; } }
+                else if state == RequestState::Cancelled { if let Some(usage) = payload.get("usage") { attempt.settle(&json!({"usage":usage}))?; } }
+            }
+            if state == RequestState::Completed { return Ok(Some((result.unwrap(),status.unwrap()))); }
+            if matches!(state,RequestState::Cancelled | RequestState::NotDispatched | RequestState::Unknown) { return Ok(None); }
+            if state == RequestState::Accepted && !record.cancel_requested {
+                // Only a fresh authenticated, identity-bound queued/running
+                // receipt extends a synchronous lookup to its ORIGINAL budget.
+                if let Some(limit) = operation_deadline {
+                    deadline = cancellation_deadline.map_or(limit,|cancel_limit|limit.min(cancel_limit));
+                }
+            }
+        } else {
+            // Losing reliable status is not permission to keep assuming running.
+            lifecycle.observe(RequestState::Unknown,"adapter_status_transport_failed",None,None,json!({}))?;
+            break;
+        }
+        let pause_until = (Instant::now() + interval).min(deadline);
+        // Wake promptly on cancellation without changing the polling backoff or
+        // permitting sleeps past the original operation deadline.
+        while Instant::now() < pause_until {
+            if let Some(budget) = budget { budget.recovery_deadline()?; }
+            tokio::time::sleep(pause_until.saturating_duration_since(Instant::now()).min(Duration::from_millis(100))).await;
+            if cancellation_deadline.is_none() && lifecycle.read()?.cancel_requested { break; }
+        }
+        interval = (interval * 2).min(Duration::from_secs(2));
+    }
+    Ok(None)
+}
+
+struct AdapterCancelWatch(Option<tokio::task::JoinHandle<()>>);
+impl Drop for AdapterCancelWatch { fn drop(&mut self) { if let Some(handle) = &self.0 { handle.abort(); } } }
+fn watch_adapter_cancellation(lifecycle: &RequestHandle, authorization: &str) -> Result<AdapterCancelWatch,String> {
+    let original = lifecycle.read()?;
+    let Some(adapter) = original.adapter else { return Ok(AdapterCancelWatch(None)); };
+    let handle = lifecycle.clone();
+    let authorization = authorization.to_owned();
+    Ok(AdapterCancelWatch(Some(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let Ok(record) = handle.read() else { return; };
+            if matches!(record.state,RequestState::Completed|RequestState::Cancelled) { return; }
+            if record.cancel_requested {
+                if let (Ok(client),Ok(url)) = (build_model_client(5,false),adapter.url(&record.request_id,true)) {
+                    // Keep the original generation socket alive for its usage and
+                    // result. Only this request's adapter gets a cancel request.
+                    let response = client.post(url).bearer_auth(&authorization)
+                        .json(&json!({"requestId":record.request_id,"requestDigest":record.request_digest})).send().await;
+                    if let Ok(current) = handle.read() {
+                        let _ = handle.observe(current.state,&current.phase,None,None,json!({"source":"cancel_transport",
+                            "cancelHttpStatus":response.ok().map(|response|response.status().as_u16()),"providerConfirmed":false}));
+                    }
+                }
+                return;
+            }
+        }
+    }))))
+}
+
+fn settle_persisted_model_usage(record: &crate::model_request_lifecycle::RequestRecord) -> Result<(),String> {
+    if let Some(attempt_id) = record.attempt_ids.last().filter(|_| record.task_id.is_some()) {
+        let mut attempt = crate::task_model_budget::TaskAttemptBudget::reopen(&record.request_id,attempt_id)?;
+        if record.state == RequestState::NotDispatched { attempt.not_dispatched()?; }
+        else if record.state == RequestState::Completed {
+            if let Some(response) = &record.response { attempt.settle(response)?; }
+        } else if record.state == RequestState::Cancelled {
+            if let Some(usage) = &record.usage { attempt.settle(&json!({"usage":usage}))?; }
+        }
+    }
+    Ok(())
+}
+
+/// Explicit recovery records evidence and usage only. The caller must not apply
+/// a cancelled or obsolete completion to a newer task/round.
+pub(crate) async fn recover_persisted_model_request(task_id:&str,request_id:&str,url:&str,api_key:&str) -> Result<Value,String> {
+    lookup_persisted_model_request(task_id,request_id,url,api_key,false).await
+}
+
+pub(crate) async fn lookup_persisted_model_request(task_id:&str,request_id:&str,url:&str,api_key:&str,accounting_only:bool) -> Result<Value,String> {
+    let authorization = crate::account::authorization(url,api_key).await.map_err(|_|transport_error(
+        "MODEL_AUTH_UNAVAILABLE","request_lifecycle","原模型请求的账号授权不可用，未发出恢复查询",request_id,None,false,
+        &json!({"dispatchCertainty":"not_dispatched"})))?;
+    let handle = RequestHandle::reopen(task_id,request_id,url,&authorization)?;
+    let before = handle.read()?;
+    if before.adapter.is_none() {
+        return Err(transport_error("MODEL_RECOVERY_UNSUPPORTED","request_recovery","当前接口不提供受信任的原结果领取能力；原记录保持不变",request_id,None,false,&json!({})));
+    }
+    if !matches!(before.state,RequestState::Completed|RequestState::Cancelled) {
+        if accounting_only {
+            // Accounting is GET-only, even after local cancellation. No stale
+            // business result is returned to a model consumer or executor.
+            recover_local_adapter_with_budget(&handle,&authorization,Duration::from_secs(5),None,true).await?;
+        } else { recover_local_adapter(&handle,&authorization,15).await?; }
+    }
+    let record = handle.read()?;
+    settle_persisted_model_usage(&record)?;
+    Ok(json!(record))
+}
+
+/// Configuration probes have their own persistent scope, without a task budget.
+/// Recovery only records the original result; it never validates or executes it.
+pub(crate) async fn recover_persisted_model_probe(probe_id:&str,request_id:&str,url:&str,api_key:&str) -> Result<Value,String> {
+    let authorization = crate::account::authorization(url,api_key).await.map_err(|_|transport_error(
+        "MODEL_AUTH_UNAVAILABLE","request_lifecycle","原模型测试账号授权不可用，未发出恢复查询",request_id,None,false,
+        &json!({"dispatchCertainty":"not_dispatched"})))?;
+    let handle=RequestHandle::reopen_probe(probe_id,request_id,url,&authorization)?;
+    let before=handle.read()?;
+    if !matches!(before.state,RequestState::Completed|RequestState::Cancelled) {
+        if before.adapter.is_none() {
+            return Err(transport_error("MODEL_RECOVERY_UNSUPPORTED","request_recovery","当前接口不提供原结果查询；取消只隔离本地结果，不能证明服务方停止",request_id,None,false,&json!({})));
+        }
+        recover_local_adapter(&handle,&authorization,15).await?;
+    }
+    Ok(json!(handle.read()?))
 }
 
 async fn recover_uncertain_request(
@@ -845,7 +1192,50 @@ async fn recover_uncertain_request(
     original_diagnostic: &Value,
     budget: &crate::model_budget::OperationBudget,
     attempt: &mut crate::model_budget::AttemptBudget,
-) -> String {
+    task_attempt: &mut Option<crate::task_model_budget::TaskAttemptBudget>,
+    lifecycle: &RequestHandle,
+) -> Result<(Value, u16, Value), String> {
+    lifecycle.observe(RequestState::Unknown, "transport_uncertain", http_status, None, original_diagnostic.clone())?;
+    if lifecycle.read()?.adapter.is_some() {
+        let recovered = await_local_adapter(lifecycle, authorization,budget).await;
+        let record = lifecycle.read()?;
+        // A persisted receipt does not hide a failed durable usage settlement.
+        if let Err(error)=&recovered {
+            if !matches!(record.state,RequestState::Completed|RequestState::Cancelled|RequestState::NotDispatched) { budget.block_recovery(); }
+            return Err(error.clone());
+        }
+        if let Some(payload) = &record.response {
+            if record.state == RequestState::Completed { attempt.settle(payload); }
+        }
+        if record.state == RequestState::NotDispatched { attempt.not_dispatched(); }
+        // The adapter recovery settles the original persistent task attempt,
+        // including after restarts. Never reserve or settle a new attempt here.
+        lifecycle.assert_deliverable()?;
+        if record.state == RequestState::Cancelled { return Err(crate::model_request_lifecycle::cancel_error(request_id)); }
+        if record.state == RequestState::NotDispatched {
+            let reason = record.events.iter().rev().find(|event|event["detail"]["source"]=="bound_adapter_status")
+                .and_then(|event|event["detail"]["adapterReason"].as_str());
+            let busy = http_status==Some(429) || record.http_status==Some(429) || reason==Some("QUEUE_FULL");
+            return Err(transport_error(if busy {"MODEL_ADAPTER_BUSY"} else {"MODEL_REQUEST_NOT_ACCEPTED"},"request_recovery",
+                if busy {"适配器队列繁忙，已确认原请求未受理；可显式重试，未自动重新派发"} else {"适配器确认原请求未受理，未自动重新派发"},
+                request_id,http_status.or(record.http_status),gateway,
+                &json!({"dispatchCertainty":"not_dispatched","statusQueryHttpStatus":200,"adapterHttpStatus":record.http_status,
+                    "providerCode":reason,"adapterReason":reason})));
+        }
+        match recovered {
+            Ok(Some((payload, status))) if (200..300).contains(&status) =>
+                { budget.recovery_deadline()?; return Ok((payload,status,json!({"requestKey":request_id,
+                    "callId":record.attempt_ids.last(),"dispatchCertainty":"response_received",
+                    "recoveredOriginal":true,"recoverySource":"bound_adapter_status"}))); },
+            Ok(Some((payload,status))) => return Err(model_error_with_context(
+                http_model_error(StatusCode::from_u16(status).map_err(|e|e.to_string())?,&payload,"原模型请求",false),
+                budget,Some(&json!({"requestKey":request_id,"dispatchCertainty":"response_received"})))),
+            Ok(None) => {},
+            Err(error) => return Err(error),
+        }
+        budget.block_recovery();
+        return Err(transport_error("MODEL_DISPATCH_UNKNOWN","request_recovery","原适配请求仍未完成或不可领取，已保留身份并停止重发",request_id,http_status,gateway,&json!({})));
+    }
     let mut diagnostic = json!({});
     crate::model_request_status::copy_diagnostics(&mut diagnostic, original_diagnostic);
     if official {
@@ -853,8 +1243,10 @@ async fn recover_uncertain_request(
             crate::model_request_status::recover(url, authorization, request_id, budget).await;
         if recovered.not_dispatched {
             attempt.not_dispatched();
+            if let Some(task_attempt) = task_attempt.as_mut() { task_attempt.not_dispatched()?; }
         } else if let Some(actual) = recovered.diagnostic["actual"].as_u64() {
             attempt.settle_total(actual);
+            if let Some(task_attempt) = task_attempt.as_mut() { task_attempt.settle_total(actual)?; }
         }
         if let Some(fields) = recovered.diagnostic.as_object() {
             for (key, value) in fields {
@@ -862,7 +1254,12 @@ async fn recover_uncertain_request(
             }
         }
         budget.block_recovery();
-        transport_error(
+        let state = if recovered.not_dispatched { RequestState::NotDispatched }
+            else if recovered.code == "MODEL_RESULT_UNAVAILABLE" || recovered.code == "MODEL_REQUEST_FAILED" { RequestState::Completed }
+            else { RequestState::Unknown };
+        lifecycle.observe(state,"official_status",http_status,None,diagnostic.clone())?;
+        lifecycle.assert_deliverable()?;
+        Err(transport_error(
             recovered.code,
             "request_recovery",
             recovered.message,
@@ -870,12 +1267,13 @@ async fn recover_uncertain_request(
             http_status,
             gateway,
             &diagnostic,
-        )
+        ))
     } else {
         budget.block_recovery();
-        transport_error("MODEL_DISPATCH_UNKNOWN", "request_recovery",
+        lifecycle.assert_deliverable()?;
+        Err(transport_error("MODEL_DISPATCH_UNKNOWN", "request_recovery",
             "模型请求可能已被处理，但未收到可确认的结果；当前接口没有受信任的状态恢复协议，已停止自动重发",
-            request_id, http_status, gateway, &diagnostic)
+            request_id, http_status, gateway, &diagnostic))
     }
 }
 
@@ -887,6 +1285,7 @@ async fn send_model_request(
     timeout_seconds: u64,
     developer_log_path: Option<&Path>,
     budget: &crate::model_budget::OperationBudget,
+    initial_system_contract: &mut Option<Vec<(usize, Value)>>,
 ) -> Result<(Value, u16, Value), String> {
     // Capture authorization once. Recovery uses this exact account credential;
     // it never falls through to the newly selected account or a redirected origin.
@@ -906,7 +1305,7 @@ async fn send_model_request(
                 None,
             )
         })?;
-    send_model_request_authorized(
+    send_model_request_authorized_with_system_contract(
         url,
         api_key,
         &authorization,
@@ -916,10 +1315,14 @@ async fn send_model_request(
         timeout_seconds,
         developer_log_path,
         budget,
+        initial_system_contract,
     )
     .await
 }
 
+// Existing isolated transport tests send one request, without the operation's
+// output-repair loop. Keep their entry point and the same initial projection.
+#[cfg(test)]
 async fn send_model_request_authorized(
     url: &str,
     api_key: &str,
@@ -931,15 +1334,102 @@ async fn send_model_request_authorized(
     developer_log_path: Option<&Path>,
     budget: &crate::model_budget::OperationBudget,
 ) -> Result<(Value, u16, Value), String> {
+    let mut initial_system_contract = None;
+    send_model_request_authorized_with_system_contract(
+        url, api_key, authorization, official, body, request_name, timeout_seconds,
+        developer_log_path, budget, &mut initial_system_contract,
+    ).await
+}
+
+fn retain_initial_system_contract(
+    body: &mut Value,
+    initial: &mut Option<Vec<(usize, Value)>>,
+) -> Result<(), String> {
+    let scope_error = || crate::model_compatibility::output_error(
+        &crate::model_compatibility::OutputDiagnostic::new(
+            "MODEL_RECOVERY_SCOPE_REJECTED", "format_repair_scope",
+            "格式恢复不能删除原系统合同或改变其消息角色",
+        ), None,
+    );
+    let Some(messages) = body["messages"].as_array_mut() else {
+        return if initial.as_ref().is_some_and(|messages| !messages.is_empty()) {
+            Err(scope_error())
+        } else { Ok(()) };
+    };
+    if let Some(initial) = initial {
+        for (index, contract) in initial {
+            let message = messages.get_mut(*index).ok_or_else(scope_error)?;
+            if message["role"] != "system" { return Err(scope_error()); }
+            *message = contract.clone();
+        }
+    } else {
+        *initial = Some(messages.iter().enumerate()
+            .filter(|(_, message)| message["role"] == "system")
+            .map(|(index, message)| (index, message.clone())).collect());
+    }
+    Ok(())
+}
+
+async fn send_model_request_authorized_with_system_contract(
+    url: &str,
+    api_key: &str,
+    authorization: &str,
+    official: bool,
+    body: &Value,
+    request_name: &str,
+    timeout_seconds: u64,
+    developer_log_path: Option<&Path>,
+    budget: &crate::model_budget::OperationBudget,
+    initial_system_contract: &mut Option<Vec<(usize, Value)>>,
+) -> Result<(Value, u16, Value), String> {
     // Account credentials and explicit OpsArk model keys identify a gateway
     // before inspecting its response. Only accounts have the status-query API.
     let gateway = official || api_key.starts_with("omk_");
     let configured_body = crate::model_parameters::prepare(body)?;
-    let (prepared_body, mut log_context) = crate::prompt_layers::prepare_request(&configured_body);
+    let (mut prepared_body, mut log_context) = crate::prompt_layers::prepare_request(&configured_body);
+    retain_initial_system_contract(&mut prepared_body, initial_system_contract)
+        .map_err(|error| model_error_with_context(error, budget, None))?;
     let capability_revision = configured_body["_opsarkProtocolConfig"]["capabilitiesV2"]["revision"].as_str().map(str::to_owned);
-    let prepared_body = crate::model_protocol::wire(&prepared_body)?;
+    let mut prepared_body = crate::model_protocol::wire(&prepared_body)?;
+    let mut context: Value = serde_json::from_str(configured_body["_opsarkContext"].as_str().unwrap_or("{}")).unwrap_or_default();
+    let task_budget = crate::task_model_budget::TaskBudget::for_context(&context)?;
+    let output_budget_adjustment = match (task_budget.as_ref(), output_budget::minimum(&configured_body["_opsarkBudgetOutputPolicy"], &prepared_body)) {
+        (Some(task_budget), Some(minimum)) => task_budget.fit_output_cap(&mut prepared_body, minimum)?,
+        _ => None,
+    };
     let generation = budget.start_generation(&prepared_body)?;
-    let request_id = &generation.request_id;
+    let (operation_id, started_at_ms) = budget.lifecycle_identity();
+    // Use the budget's already validated private identity. prepare() correctly
+    // removed _modelRecovery from the provider context; reconstructing it from
+    // that projection previously fabricated zero start times in real requests.
+    context.as_object_mut().ok_or_else(|| transport_error("MODEL_REQUEST_INVALID","request_lifecycle",
+        "模型请求上下文不是合法对象",&generation.request_id,None,gateway,&json!({"dispatchCertainty":"not_dispatched"})))?
+        .insert("_modelRecovery".into(),json!({"operationId":operation_id,"startedAtMs":started_at_ms}));
+    let operation_id = operation_id.as_str();
+    let lifecycle = RequestHandle::prepare(developer_log_path,&context,url,authorization,&prepared_body,
+        operation_id,generation.generation_index)?;
+    let request_id = &lifecycle.id;
+    let original = lifecycle.read()?;
+    let _cancel_watch = watch_adapter_cancellation(&lifecycle,authorization)?;
+    if original.state != RequestState::NotDispatched {
+        lifecycle.assert_deliverable()?;
+        settle_persisted_model_usage(&original)?;
+        if original.state == RequestState::Completed {
+            if let (Some(payload),Some(status)) = (original.response,original.http_status) {
+                if (200..300).contains(&status) { return Ok((payload,status,json!({"requestKey":request_id,"callId":original.attempt_ids.last(),
+                    "recoveredOriginal":true,"recoverySource":"persisted_original"}))); }
+            }
+        }
+        if original.adapter.is_some() {
+            if let Some((payload,status)) = await_local_adapter(&lifecycle,authorization,budget).await? {
+                lifecycle.assert_deliverable()?;
+                budget.recovery_deadline()?;
+                if (200..300).contains(&status) { return Ok((payload,status,json!({"requestKey":request_id,"callId":lifecycle.read()?.attempt_ids.last(),
+                    "recoveredOriginal":true,"recoverySource":"bound_adapter_status"}))); }
+            }
+        }
+        return Err(transport_error("MODEL_DISPATCH_UNKNOWN","request_recovery","原模型请求已登记且可能派发，禁止重复发送",request_id,None,gateway,&json!({})));
+    }
     log_context["requestId"] = json!(request_id);
     let body = &prepared_body;
     for attempt_index in 1..=MODEL_RESPONSE_ATTEMPTS {
@@ -967,13 +1457,42 @@ async fn send_model_request_authorized(
                 })?;
         // No token or dispatch charge until immediately before sending this POST.
         let mut attempt_budget = generation.start_attempt()?;
+        let mut task_attempt = match task_budget.as_ref().map(|budget| budget.reserve(request_id,&call_id,operation_id,&prepared_body)).transpose() {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                attempt_budget.not_dispatched();
+                let diagnostic = error.strip_prefix(crate::MODEL_TRACE_ERROR_PREFIX)
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .and_then(|payload| payload.get("modelError").cloned());
+                append_model_log(developer_log_path, json!({
+                    "event":"task_budget_rejected","timestampMs":unix_millis(),
+                    "requestId":request_id,"callId":call_id,"requestName":request_name,
+                    "dispatchCertainty":"not_dispatched","diagnostic":diagnostic,
+                    "contextMetrics":crate::prompt_layers::request_metrics(body),
+                    "contextProjection":log_context.get("contextProjection"),
+                    "toolDirectoryProjection":log_context.get("toolDirectoryProjection"),
+                    "outputBudgetAdjustment":output_budget_adjustment,
+                    "wireDigest":format!("{:x}",Sha256::digest(body.to_string().as_bytes())),
+                    "budget":budget.snapshot(),
+                }), &log_context);
+                return Err(error);
+            }
+        };
+        if let Err(error) = lifecycle.dispatch(&call_id) {
+            attempt_budget.not_dispatched();
+            if let Some(attempt) = task_attempt.as_mut() { attempt.not_dispatched()?; }
+            return Err(error);
+        }
         append_model_log(
             developer_log_path,
             json!({
                 "event":"request_sent", "callId":call_id,"timestampMs":unix_millis(),
                 "requestName":request_name,"attempt":attempt_index,"url":safe_model_url(url),
                 "timeoutSeconds":effective_timeout,"request":body,
-                "contextMetrics":crate::prompt_layers::request_metrics(body),"budget":budget.snapshot(),
+                "contextMetrics":crate::prompt_layers::request_metrics(body),
+                "contextProjection":log_context.get("contextProjection"),"budget":budget.snapshot(),
+                "toolDirectoryProjection":log_context.get("toolDirectoryProjection"),
+                "outputBudgetAdjustment":output_budget_adjustment,
             }),
             &log_context,
         );
@@ -993,12 +1512,23 @@ async fn send_model_request_authorized(
                 effective_timeout.saturating_sub(2).max(1).to_string(),
             )
             .header(reqwest::header::ACCEPT, "application/json")
-            .json(body);
+            .header(reqwest::header::CONTENT_TYPE,"application/json")
+            .body(body.to_string());
+        if original.adapter.is_some() {
+            request = request.header("x-opsark-client-request-id",request_id)
+                .header("x-opsark-request-digest",&original.request_digest);
+        }
         if gateway {
             if let Some(revision) = &capability_revision { request = request.header("X-Opsark-Expected-Capability-Revision", revision); }
         }
         if attempt_index > 1 {
             request = request.header(reqwest::header::ACCEPT_ENCODING, "identity");
+        }
+        if let Err(error)=lifecycle.assert_deliverable() {
+            attempt_budget.not_dispatched();
+            if let Some(attempt)=task_attempt.as_mut() { attempt.not_dispatched()?; }
+            lifecycle.observe(RequestState::NotDispatched,"cancelled_before_send",None,None,json!({}))?;
+            return Err(error);
         }
         let response = match request.send().await {
             Ok(response) => response,
@@ -1016,6 +1546,9 @@ async fn send_model_request_authorized(
                 );
                 if definitely_not_dispatched {
                     attempt_budget.not_dispatched();
+                    if let Some(attempt) = task_attempt.as_mut() { attempt.not_dispatched()?; }
+                    lifecycle.observe(RequestState::NotDispatched,"connect_failed",None,None,json!({"attemptId":call_id}))?;
+                    lifecycle.assert_deliverable()?;
                     if attempt_index < MODEL_RESPONSE_ATTEMPTS {
                         wait_before_model_retry(attempt_index).await;
                         continue;
@@ -1030,7 +1563,7 @@ async fn send_model_request_authorized(
                         &json!({"dispatchCertainty":"not_dispatched"}),
                     ));
                 }
-                return Err(recover_uncertain_request(
+                return recover_uncertain_request(
                     url,
                     authorization,
                     request_id,
@@ -1040,8 +1573,10 @@ async fn send_model_request_authorized(
                     &json!({}),
                     budget,
                     &mut attempt_budget,
+                    &mut task_attempt,
+                    &lifecycle,
                 )
-                .await);
+                .await;
             }
         };
         let status = response.status();
@@ -1075,7 +1610,7 @@ async fn send_model_request_authorized(
         let response_bytes = match response.bytes().await {
             Ok(bytes) => bytes,
             Err(_) => {
-                return Err(recover_uncertain_request(
+                return recover_uncertain_request(
                     url,
                     authorization,
                     request_id,
@@ -1085,8 +1620,10 @@ async fn send_model_request_authorized(
                     &transport,
                     budget,
                     &mut attempt_budget,
+                    &mut task_attempt,
+                    &lifecycle,
                 )
-                .await)
+                .await
             }
         };
         let mut payload: Value = match serde_json::from_slice(&response_bytes) {
@@ -1094,22 +1631,25 @@ async fn send_model_request_authorized(
             Err(error) => {
                 // A complete, malformed envelope is not a repairable assistant JSON
                 // response. Never regenerate from this boundary failure.
-                if official {
-                    return Err(recover_uncertain_request(
+                if official || original.adapter.is_some() {
+                    return recover_uncertain_request(
                         url,
                         authorization,
                         request_id,
-                        true,
+                        official,
                         gateway,
                         Some(status.as_u16()),
                         &transport,
                         budget,
                         &mut attempt_budget,
+                        &mut task_attempt,
+                        &lifecycle,
                     )
-                    .await);
+                    .await;
                 }
                 if status.is_success() {
                     budget.block_recovery();
+                    lifecycle.observe(RequestState::Unknown,"invalid_response",Some(status.as_u16()),None,json!({"bodyBytes":response_bytes.len()}))?;
                     let mut diagnostic = crate::model_compatibility::OutputDiagnostic::new(
                         "MODEL_RESPONSE_INVALID",
                         "response_envelope",
@@ -1129,7 +1669,25 @@ async fn send_model_request_authorized(
                 payload_error_value(status, request_name)
             }
         };
+        let standard_completion = payload["choices"].is_array()
+            || payload["object"] == "response" && payload["output"].is_array();
+        if original.adapter.is_some() && (!status.is_success() || status == StatusCode::ACCEPTED
+            || payload["protocol"] == "opsark-local-v1" || !standard_completion) {
+            let accepted = payload["protocol"] == "opsark-local-v1" && payload["requestId"] == original.request_id
+                && payload["requestDigest"] == original.request_digest && matches!(payload["state"].as_str(),Some("queued"|"running"));
+            lifecycle.observe(if accepted {RequestState::Accepted} else {RequestState::Unknown},"adapter_post_ack",Some(status.as_u16()),None,
+                json!({"identityVerified":accepted,"phase":payload.get("state")}))?;
+            // Queue receipts and adapter HTTP errors are not assistant
+            // completions. Only its bound original ledger can decide whether
+            // this was rejected, cancelled, unknown, or actually completed.
+            return recover_uncertain_request(url,authorization,request_id,official,gateway,Some(status.as_u16()),&transport,
+                budget,&mut attempt_budget,&mut task_attempt,&lifecycle).await;
+        }
+        // Store the complete original envelope before cost settlement, so even a
+        // budget-storage failure cannot discard a late result or its real usage.
+        lifecycle.observe(RequestState::Unknown,"http_response_received",Some(status.as_u16()),Some(payload.clone()),json!({"upstreamRequestId":upstream_request_id}))?;
         attempt_budget.settle(&payload);
+        if let Some(attempt) = task_attempt.as_mut() { attempt.settle(&payload)?; }
         append_model_log(
             developer_log_path,
             json!({
@@ -1141,6 +1699,8 @@ async fn send_model_request_authorized(
             &log_context,
         );
         if status.is_success() {
+            lifecycle.observe(RequestState::Completed,"response_received",Some(status.as_u16()),Some(payload.clone()),json!({"upstreamRequestId":upstream_request_id}))?;
+            lifecycle.assert_deliverable()?;
             return Ok((payload, status.as_u16(), transport));
         }
         if !gateway {
@@ -1168,6 +1728,7 @@ async fn send_model_request_authorized(
         crate::model_request_status::copy_diagnostics(&mut diagnostic, &payload["error"]);
         if gateway && diagnostic["dispatchCertainty"] == "not_dispatched" {
             attempt_budget.not_dispatched();
+            if let Some(attempt) = task_attempt.as_mut() { attempt.not_dispatched()?; }
         }
         let code = payload
             .pointer("/error/code")
@@ -1178,24 +1739,26 @@ async fn send_model_request_authorized(
             && (diagnostic["dispatchCertainty"] == "may_have_dispatched"
                 || status == StatusCode::CONFLICT
                 || retryable_http_status(status) && diagnostic["dispatchCertainty"].is_null());
-        if official && uncertain {
-            return Err(recover_uncertain_request(
+        if (official || original.adapter.is_some()) && uncertain {
+            return recover_uncertain_request(
                 url,
                 authorization,
                 request_id,
-                true,
+                official,
                 gateway,
                 Some(status.as_u16()),
                 &diagnostic,
                 budget,
                 &mut attempt_budget,
+                &mut task_attempt,
+                &lifecycle,
             )
-            .await);
+            .await;
         }
         // Direct endpoints and omk keys do not establish idempotent replay. A 5xx
         // response with no dispatch evidence cannot authorize another POST.
         if !official && retryable_http_status(status) && (!gateway || uncertain) {
-            return Err(recover_uncertain_request(
+            return recover_uncertain_request(
                 url,
                 authorization,
                 request_id,
@@ -1205,9 +1768,14 @@ async fn send_model_request_authorized(
                 &diagnostic,
                 budget,
                 &mut attempt_budget,
+                &mut task_attempt,
+                &lifecycle,
             )
-            .await);
+            .await;
         }
+        lifecycle.observe(if gateway && diagnostic["dispatchCertainty"] == "not_dispatched" { RequestState::NotDispatched } else { RequestState::Completed },
+            "http_error",Some(status.as_u16()),Some(payload.clone()),diagnostic.clone())?;
+        lifecycle.assert_deliverable()?;
         if let Some(error) = payload.get_mut("error").and_then(Value::as_object_mut) {
             error.insert(
                 if gateway {

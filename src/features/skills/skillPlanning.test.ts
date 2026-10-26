@@ -101,11 +101,50 @@ describe("evidence-driven Skill projection", () => {
     ["/app/README.md", '{"scripts":{"build":"vite build"}}', false],
     ["/app/package.json", "{}", false],
     ["/app/package.json", "not json", false],
-    ["/app/package.json", '{"scripts":{"build":"vite build"}}', true],
-  ])("does not advance from unsupported or partial content at %s (%s, partial=%s)", (path, content, truncated) => {
+    ["/app/交接资料.txt", "使用 Python 3.6，安装离线依赖后由指定 systemd 服务启动。", false],
+    ["/app/compose.yaml", "services:\n  api:\n    image: example/app:2", false],
+  ])("restores full guidance without promoting unclassified content at %s", (path, content, truncated) => {
     const current = task();
     current.plan = [read(current, path, content, truncated)];
+    const before = structuredClone(current);
+    const definition = skill();
+    const projected = planningSkills(current, [definition])[0];
+    expect(projected.instructions).toContain(definition.instructions);
+    expect(projected.instructions).not.toContain("建议阶段 discover");
+    expect(projected.planningEvidence).toMatchObject({ stageId: "full-context", observed: [{ kind: "file_content", scope: path }] });
+    expect(projected.planningEvidence!.observed.some(item => item.kind === "project_manifest")).toBe(false);
+    expect(projected.allowedToolIds).toEqual(definition.allowedToolIds);
+    expect(current).toEqual(before);
+  });
+
+  it.each([true, false])("incomplete or empty files do not claim full read evidence (partial=%s)", truncated => {
+    const current = task();
+    current.plan = [read(current, "/app/交接资料.txt", truncated ? "partial" : "", truncated)];
     expect(planningSkills(current, [skill()])[0].instructions).toContain("建议阶段 discover");
+  });
+
+  it("a latest partial receipt supersedes the full read fallback and stale targets cannot activate it", () => {
+    const current = task();
+    const full = read(current, "/app/交接资料.txt", "Python deployment");
+    const partial = read(current, "/app/交接资料.txt", "changed", true);
+    partial.id = "later";
+    current.plan = [full, partial];
+    expect(planningSkills(current, [skill()])[0].instructions).toContain("建议阶段 discover");
+    current.plan = [{ ...full, attemptContext: "other-server" }];
+    expect(planningSkills(current, [skill()])[0].instructions).toContain("建议阶段 discover");
+    current.plan = [{ ...full, evidence: [] }];
+    expect(planningSkills(current, [skill()])[0].instructions).toContain("建议阶段 discover");
+  });
+
+  it("exposes the complete fallback and original receipt in the actual adjustment context", () => {
+    const current = task();
+    current.plan = [read(current, "/srv/release/运维交接.txt", "Python application; existing service and data must be retained.")];
+    const definition = skill();
+    const context = buildAdjustmentContext({ task: current, skills: [definition], tools: [], secretMetadata: [],
+      metrics: { cpu: 0, memory: 0, disk: 0, networkIn: 0, networkOut: 0, sampledAt: "now" } });
+    expect(context.activeSkills[0].instructions).toContain(definition.instructions);
+    expect(JSON.stringify(context)).toContain("/srv/release/运维交接.txt");
+    expect(JSON.stringify(context)).toContain("full-context");
   });
 
   it("rejects unlinked facts and observations from another target", () => {
