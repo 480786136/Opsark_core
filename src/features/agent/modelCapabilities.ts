@@ -3,6 +3,22 @@ import { validateRequestParameters } from "./modelParameters";
 import { executionDigest } from "./planPreparation";
 import { hasMatchingPresetIdentity } from "./modelPresets";
 
+export const DEFAULT_MODEL_OUTPUT_BUDGET = 16_384;
+
+/** Migrate only the identifiable implicit ceiling; preserve declared limits and budgets. */
+export function normalizeModelOutputLimit(model: ModelProfile): ModelProfile {
+  const caps = model.capabilitiesV2;
+  if (model.source === "official" || caps?.revision !== "custom-unverified-v2"
+    || caps.evidence.source !== "unknown" || caps.maxOutputTokens !== 16_384) return model;
+  const migrated = { ...model, capabilitiesV2: { ...caps, revision: "custom-unverified-v3" } };
+  delete migrated.capabilitiesV2.maxOutputTokens;
+  if (model.capabilities?.version === "direct-v1" && model.capabilities.maxOutputTokens === 16_384) {
+    migrated.capabilities = { ...model.capabilities };
+    delete migrated.capabilities.maxOutputTokens;
+  }
+  return migrated;
+}
+
 export function parameterRules(caps?: ModelCapabilities | ModelCapabilitiesV2): ModelCapabilitiesV2["parameterRules"] {
   if (caps?.parameterRules) return caps.parameterRules;
   if (caps?.version === "model-capabilities@2") return undefined;
@@ -84,8 +100,10 @@ export function validateCapabilitiesV2(value?: ModelCapabilitiesV2) {
     || !value.outputModes || !supportStates.includes(value.outputModes.json_object) || !supportStates.includes(value.outputModes.json_schema)
     || !["portable", "deepseek", "qwen", "openai", "gateway"].includes(value.parameterAdapter)
     || !["max_tokens", "max_completion_tokens", "max_output_tokens"].includes(value.tokenField)
-    || !Number.isInteger(value.defaultOutputTokens) || !Number.isInteger(value.maxOutputTokens)
-    || value.defaultOutputTokens < 1 || value.maxOutputTokens < value.defaultOutputTokens || value.maxOutputTokens > 1_000_000
+    || !Number.isInteger(value.defaultOutputTokens) || value.defaultOutputTokens < 1 || value.defaultOutputTokens > 1_000_000
+    || value.maxOutputTokens !== undefined && (!Number.isInteger(value.maxOutputTokens)
+      || value.maxOutputTokens < value.defaultOutputTokens || value.maxOutputTokens > 1_000_000)
+    || value.parameterAdapter === "gateway" && value.maxOutputTokens === undefined
     || !value.evidence || !["documented", "locally_tested", "upstream_tested", "unknown", "user_declared", "legacy"].includes(value.evidence.source)
     || value.strictFlag !== undefined && !["required", "optional", "unsupported"].includes(value.strictFlag)
     || value.store !== undefined && !["supported", "unsupported", "unknown"].includes(value.store)
@@ -113,9 +131,9 @@ export function migratedModelIntegration(model: Pick<ModelProfile, "capabilities
 }
 
 export function newModelCapabilities(protocol: ModelApiProtocol = "chat_completions"): ModelCapabilitiesV2 {
-  return { version: "model-capabilities@2", revision: "custom-unverified-v2", supportedProtocols: [protocol], preferredProtocol: protocol,
+  return { version: "model-capabilities@2", revision: "custom-unverified-v3", supportedProtocols: [protocol], preferredProtocol: protocol,
     outputModes: { json_object: "unknown", json_schema: "unknown" }, parameterAdapter: "portable",
-    tokenField: protocol === "responses" ? "max_output_tokens" : "max_tokens", defaultOutputTokens: 5000, maxOutputTokens: 16384,
+    tokenField: protocol === "responses" ? "max_output_tokens" : "max_tokens", defaultOutputTokens: 5000,
     evidence: { source: "unknown" }, budgetSemantics: "unknown", store: "unknown" };
 }
 
@@ -139,7 +157,7 @@ export function directCapabilities(adapter: Exclude<ModelCapabilities["parameter
   return { protocol: "chat_completions", version: "direct-v1", parameterAdapter: adapter,
     structuredOutput: adapter === "openai" ? "json_schema" : "json_object",
     tokenField: adapter === "openai" ? "max_completion_tokens" : "max_tokens",
-    defaultOutputTokens: 5000, maxOutputTokens: 16384 };
+    defaultOutputTokens: 5000 };
 }
 
 export function validateCapabilities(value?: ModelCapabilities) {
@@ -148,8 +166,10 @@ export function validateCapabilities(value?: ModelCapabilities) {
     || !["unknown", "json_object", "json_schema"].includes(value.structuredOutput)
     || !["portable", "deepseek", "qwen", "openai", "gateway"].includes(value.parameterAdapter)
     || !["max_tokens", "max_completion_tokens"].includes(value.tokenField)
-    || !Number.isInteger(value.defaultOutputTokens) || !Number.isInteger(value.maxOutputTokens)
-    || value.defaultOutputTokens < 1 || value.maxOutputTokens < value.defaultOutputTokens || value.maxOutputTokens > 1_000_000) {
+    || !Number.isInteger(value.defaultOutputTokens) || value.defaultOutputTokens < 1 || value.defaultOutputTokens > 1_000_000
+    || value.maxOutputTokens !== undefined && (!Number.isInteger(value.maxOutputTokens)
+      || value.maxOutputTokens < value.defaultOutputTokens || value.maxOutputTokens > 1_000_000)
+    || value.parameterAdapter === "gateway" && value.maxOutputTokens === undefined) {
     throw new Error("模型能力配置无效：请检查协议、输出模式和预算。");
   }
   const rules = value.parameterRules;

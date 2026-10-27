@@ -61,8 +61,8 @@ function keyboard(event: KeyboardEvent) {
         <ModelManagementView embedded @editing="editing = $event" @saved="emit('saved')"/>
         <form v-if="showLocalBudget" class="budget-settings" @submit.prevent="saveLimits">
           <h3>{{ locale.startsWith('zh') ? '自配模型规划输出预算' : 'Custom model planning output budget' }}</h3>
-          <label>{{ t('settings.compactOutputTokens') }}<input v-model.number="outputBudget" type="number" min="256" max="1000000" step="1" :placeholder="locale.startsWith('zh') ? '留空使用接入上限' : 'Empty: use connection limit'"/></label>
-          <p>{{ locale.startsWith('zh') ? '默认留空，使用接入声明的输出上限。仅影响自配模型，单个模型的预算可覆盖此值。官方模型由平台统一配置，无需设置参数。' : 'Leave empty to use the declared connection limit. Applies only to custom models; per-model budgets take precedence. Official models are configured by the platform.' }}</p>
+          <label>{{ t('settings.compactOutputTokens') }}<input v-model.number="outputBudget" type="number" min="256" max="1000000" step="1" :placeholder="locale.startsWith('zh') ? '留空默认 16384' : 'Empty: default 16384'"/></label>
+          <p>{{ locale.startsWith('zh') ? '留空时单次生成默认使用 16384 Token；已知接入上限更低时使用该上限。仅影响自配模型，单个模型的预算可覆盖此值。官方模型由平台统一配置。' : 'Empty uses 16384 tokens per generation, capped by a lower confirmed connection limit. Applies only to custom models; per-model budgets take precedence. Official models are configured by the platform.' }}</p>
           <label class="compact-toggle"><input v-model="limits.limitOutput" type="checkbox"/>{{ t('settings.enableCompactLimits') }}</label>
           <div v-if="limits.limitOutput" class="budget-grid">
             <label>{{ t('settings.compactMaxSteps') }}<input v-model.number="limits.maxPlanSteps" type="number" min="1" step="1" required/></label>

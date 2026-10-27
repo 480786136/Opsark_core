@@ -2,6 +2,42 @@
 use super::*;
 use std::io::{Read, Write};
 
+#[test]
+fn unknown_output_ceiling_preserves_explicit_budgets_in_both_wire_protocols() {
+    for protocol in ["chat_completions", "responses"] {
+        let body = with_context(request(protocol, "json_only"), |context| {
+            context["_modelIntegration"]["capabilitiesV2"].as_object_mut().unwrap().remove("maxOutputTokens");
+            context["_requestParameters"] = json!({"outputBudget":30000});
+        });
+        let preview = preview_model_request("https://example.test/v1", &body, "计划生成", false).unwrap();
+        let field = if protocol == "responses" { "max_output_tokens" } else { "max_completion_tokens" };
+        assert_eq!(preview["request"][field], 30000);
+        assert!(preview["request"].get("max_tokens").is_none());
+        let known = with_context(body, |context| {
+            context["_modelIntegration"]["capabilitiesV2"]["maxOutputTokens"] = json!(16384);
+        });
+        assert_eq!(error_code(&preview_model_request("https://example.test/v1", &known, "计划生成", false).unwrap_err()), "MODEL_OUTPUT_BUDGET_INVALID");
+    }
+}
+
+#[test]
+fn automatic_output_budget_is_independent_of_the_provider_ceiling() {
+    for protocol in ["chat_completions", "responses"] {
+        for (limit, expected) in [(None, 16384), (Some(65536), 16384), (Some(8000), 8000)] {
+            let mut body = with_context(request(protocol, "json_only"), |context| {
+                let caps = context["_modelIntegration"]["capabilitiesV2"].as_object_mut().unwrap();
+                caps.remove("maxOutputTokens");
+                if let Some(limit) = limit { caps.insert("maxOutputTokens".into(), json!(limit)); }
+                context.as_object_mut().unwrap().remove("_requestParameters");
+            });
+            body.as_object_mut().unwrap().remove("max_tokens");
+            let preview = preview_model_request("https://example.test/v1", &body, "计划生成", false).unwrap();
+            let field = if protocol == "responses" { "max_output_tokens" } else { "max_completion_tokens" };
+            assert_eq!(preview["request"][field], expected);
+        }
+    }
+}
+
 fn capabilities(protocol: &str) -> Value {
     json!({"version":"model-capabilities@2","revision":"test-v2","supportedProtocols":[protocol],"preferredProtocol":protocol,
         "outputModes":{"json_object":"supported","json_schema":"supported"},"parameterAdapter":"openai",

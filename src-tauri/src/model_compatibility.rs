@@ -15,7 +15,8 @@ pub(crate) struct Capabilities {
     parameter_adapter: String,
     token_field: String,
     default_output_tokens: u64,
-    max_output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,9 +59,10 @@ pub(crate) fn public_capabilities(value: &Value) -> Option<Value> {
             "max_tokens" | "max_completion_tokens"
         )
         || caps.default_output_tokens == 0
-        || caps.max_output_tokens == 0
-        || caps.default_output_tokens > caps.max_output_tokens
-        || caps.max_output_tokens > 1_000_000
+        || caps.default_output_tokens > 1_000_000
+        || caps.max_output_tokens.is_some_and(|limit| limit == 0
+            || caps.default_output_tokens > limit || limit > 1_000_000)
+        || caps.parameter_adapter == "gateway" && caps.max_output_tokens.is_none()
     {
         return None;
     }
@@ -489,13 +491,17 @@ pub(crate) fn prepare(
     if let Some(value) = body.as_object_mut().unwrap().remove(other) {
         body[field] = value;
     }
-    let connection_limit = caps["maxOutputTokens"].as_u64().unwrap_or(16384);
+    let connection_limit = caps["maxOutputTokens"].as_u64();
+    // The request default is independent of an optional provider ceiling.
+    // Keep the previous 16K request size without assuming every provider has a 16K limit.
+    const DEFAULT_OUTPUT_BUDGET: u64 = 16_384;
+    let default_budget = connection_limit.map_or(DEFAULT_OUTPUT_BUDGET, |limit| limit.min(DEFAULT_OUTPUT_BUDGET));
     let budget = if gateway {
-        connection_limit
+        connection_limit.unwrap_or(DEFAULT_OUTPUT_BUDGET)
     } else {
-        body[field].as_u64().unwrap_or(connection_limit)
+        body[field].as_u64().unwrap_or(default_budget)
     };
-    if budget == 0 || budget > caps["maxOutputTokens"].as_u64().unwrap_or(1_000_000) {
+    if budget == 0 || budget > 1_000_000 || connection_limit.is_some_and(|limit| budget > limit) {
         return Err(error(
             "MODEL_OUTPUT_BUDGET_INVALID",
             "请求输出预算超过模型接入配置上限，请调整预算",

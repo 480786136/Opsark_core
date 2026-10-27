@@ -117,10 +117,11 @@ fn validate_capabilities(caps: &Value, protocol: &str) -> Result<(), String> {
         )
         || (protocol == "responses" && caps["tokenField"] != "max_output_tokens")
         || (protocol == "chat_completions" && caps["tokenField"] == "max_output_tokens")
-        || caps["defaultOutputTokens"].as_u64().is_none_or(|n| n == 0)
-        || caps["maxOutputTokens"].as_u64().is_none_or(|n| {
+        || caps["defaultOutputTokens"].as_u64().is_none_or(|n| n == 0 || n > 1_000_000)
+        || caps.get("maxOutputTokens").is_some_and(|value| value.as_u64().is_none_or(|n| {
             n == 0 || n > 1_000_000 || n < caps["defaultOutputTokens"].as_u64().unwrap_or(u64::MAX)
-        })
+        }))
+        || caps["parameterAdapter"] == "gateway" && caps.get("maxOutputTokens").is_none()
     {
         return Err(invalid());
     }
@@ -237,12 +238,14 @@ pub(crate) fn legacy_capabilities(config: &Value, legacy: Value) -> Result<Value
     } else {
         "unknown"
     };
-    Ok(
-        json!({"protocol":"chat_completions","version":caps["revision"],"structuredOutput":format,
+    let mut result = json!({"protocol":"chat_completions","version":caps["revision"],"structuredOutput":format,
         "parameterAdapter":if caps["parameterAdapter"]=="openai" {json!("portable")} else {caps["parameterAdapter"].clone()},
         "tokenField":if config["apiProtocol"]=="responses" {json!("max_tokens")} else {caps["tokenField"].clone()},
-        "defaultOutputTokens":caps["defaultOutputTokens"],"maxOutputTokens":caps["maxOutputTokens"]}),
-    )
+        "defaultOutputTokens":caps["defaultOutputTokens"]});
+    if let Some(limit) = caps.get("maxOutputTokens") {
+        result["maxOutputTokens"] = limit.clone();
+    }
+    Ok(result)
 }
 
 pub(crate) fn validate_parameters(config: &Value, explicit: &Value) -> Result<(), String> {

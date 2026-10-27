@@ -9,8 +9,8 @@ describe("model capabilities", () => {
     expect(() => validateModelConfiguration(model)).toThrow("thinking");
     expect(model.requestParameters.thinking).toBe("enabled");
     expect(() => validateModelConfiguration({ capabilities: directCapabilities("deepseek"), requestParameters: { reasoning_effort: "medium" } })).toThrow("reasoning_effort");
-    expect(() => validateModelConfiguration({ capabilities: directCapabilities("portable"), requestParameters: { max_tokens: 20000 } })).toThrow("16384");
-    expect(() => validateModelConfiguration({ capabilities: { ...directCapabilities("portable"), parameterAdapter: "gateway", parameterRules: { reasoningEfforts: [], thinkingEnabled: false, frequencyPenalty: true } }, requestParameters: { reasoning_effort: "high" } })).toThrow("reasoning_effort");
+    expect(() => validateModelConfiguration({ capabilities: { ...directCapabilities("portable"), maxOutputTokens: 16384 }, requestParameters: { max_tokens: 20000 } })).toThrow("16384");
+    expect(() => validateModelConfiguration({ capabilities: { ...directCapabilities("portable"), maxOutputTokens: 16384, parameterAdapter: "gateway", parameterRules: { reasoningEfforts: [], thinkingEnabled: false, frequencyPenalty: true } }, requestParameters: { reasoning_effort: "high" } })).toThrow("reasoning_effort");
   });
   it("uses explicit adapters instead of guessing from endpoints", () => {
     for (const adapter of ["portable", "deepseek", "qwen", "openai"] as const) {
@@ -91,7 +91,7 @@ describe("model capabilities", () => {
     expect(() => validateModelConfiguration({ capabilitiesV2: responsesCaps, apiProtocol: "responses", requestParameters: { reasoning_effort: "none", temperature: 0.5 } })).not.toThrow();
     expect(() => validateModelConfiguration({ capabilitiesV2: responsesCaps, apiProtocol: "responses", requestParameters: { reasoning_effort: "none", thinking: "disabled", temperature: 0.5 } })).toThrow();
     expect(() => validateModelConfiguration({ capabilitiesV2: responsesCaps, apiProtocol: "responses", requestParameters: { reasoning_effort: "none", top_p: 0.95 } })).toThrow("top_p");
-    expect(() => validateModelConfiguration({ capabilitiesV2: { ...capabilitiesV2, parameterAdapter: "gateway" },
+    expect(() => validateModelConfiguration({ capabilitiesV2: { ...capabilitiesV2, maxOutputTokens: 16384, parameterAdapter: "gateway" },
       requestParameters: { thinking: "enabled", temperature: 0 } })).not.toThrow();
   });
 });

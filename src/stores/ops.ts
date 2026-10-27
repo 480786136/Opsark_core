@@ -34,7 +34,7 @@ import type { ExecutionIntentSnapshot, PreparedPlan } from "@/types";
 import { effectiveToolSemanticContract, prepareFinalToolArguments, resolveUniqueServer, resolveUniqueServerEndpoint } from "@/features/tools/toolPreparation";
 import { createModelRecoveryContext, isExplicitModelPlanningRetryable, isModelRecoveryScopeRejection } from "@/services/modelRecovery";
 import { assertToolStepBoundary, hasToolStepBoundaryConflict, stepOperationText, ToolStepBoundaryError } from "@/features/agent/stepAction";
-import { validateModelConfiguration } from "@/features/agent/modelCapabilities";
+import { normalizeModelOutputLimit, validateModelConfiguration } from "@/features/agent/modelCapabilities";
 import { defineStore } from "pinia";
 import { useAccountStore } from "@/features/account/accountStore";
 import { textFingerprint } from "@/features/agent/longRunningReviewOutput";
@@ -574,7 +574,7 @@ function initialModels(): ModelProfile[] {
       && model.model === "deepseek-v4-flash"
       && model.hasApiKey !== true
     ));
-  return (saved.length ? saved : defaultModels).map((model) => ({ timeoutSeconds: 90, ...model }));
+  return (saved.length ? saved : defaultModels).map((model) => normalizeModelOutputLimit({ timeoutSeconds: 90, ...model }));
 }
 
 function initialSecretMetadata() {

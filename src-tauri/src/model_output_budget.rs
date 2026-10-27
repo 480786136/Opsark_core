@@ -13,7 +13,7 @@ pub(crate) fn policy(context: &Value, original: &Value, prepared: &Value, reques
         && matches!(request_name,"计划生成"|"阶段联合决策"|"阶段格式修复（兼容模式）")) {
         // These builders only place an output field in the original body when
         // AiGenerationSettings explicitly selects it. Automatic mode omits it
-        // and the compatibility compiler supplies the connection ceiling.
+        // and the compatibility compiler supplies a bounded per-request default.
         return None;
     }
     let core_floor = match request_name {

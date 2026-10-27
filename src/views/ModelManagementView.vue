@@ -12,7 +12,7 @@ import type { ModelProbeConnection } from "@/services/backend";
 import { modelRequestStateLabel, type TaskModelRequest } from "@/services/taskModelRequests";
 import { useOpsStore } from "@/stores/ops";
 import { localizeCoreText } from "@/features/preferences/coreText";
-import { directCapabilities, effectiveModelOutput, migratedModelIntegration, modelConfigurationFingerprint, newModelCapabilities, validateModelConfiguration } from "@/features/agent/modelCapabilities";
+import { DEFAULT_MODEL_OUTPUT_BUDGET, directCapabilities, effectiveModelOutput, migratedModelIntegration, modelConfigurationFingerprint, newModelCapabilities, validateModelConfiguration } from "@/features/agent/modelCapabilities";
 import { hasMatchingPresetIdentity, modelPresetConfiguration, modelPresets } from "@/features/agent/modelPresets";
 import { localModelAdapterBase } from "@/features/agent/modelRuntime";
 import type { ModelApiProtocol, ModelProfile, ModelRequestPreview, ModelValidationResult } from "@/types";
@@ -117,7 +117,7 @@ const outputMode = computed(() => draft.value ? effectiveModelOutput(draft.value
 const budget = computed(() => draft.value?.requestParameters?.outputBudget ?? draft.value?.requestParameters?.max_tokens
   ?? draft.value?.requestParameters?.max_completion_tokens ?? "");
 const budgetPlaceholder = computed(() => store.aiGenerationSettings.maxOutputTokens === undefined
-  ? (zh.value ? "留空使用接入上限" : "Empty: use connection limit")
+  ? (zh.value ? `留空默认 ${DEFAULT_MODEL_OUTPUT_BUDGET}（不超过已知接入上限）` : `Empty: default ${DEFAULT_MODEL_OUTPUT_BUDGET} (within any known limit)`)
   : (zh.value ? `留空使用规划预算 ${store.aiGenerationSettings.maxOutputTokens}` : `Empty: use planning budget ${store.aiGenerationSettings.maxOutputTokens}`));
 const capability = computed(() => draft.value?.capabilitiesV2 ?? draft.value?.capabilities);
 const protocolOptions = computed(() => [
@@ -219,6 +219,16 @@ function updateBudget(value: string | number) {
   delete params.max_tokens; delete params.max_completion_tokens; delete params.outputBudget;
   if (value !== "") params.outputBudget = Number(value);
   draft.value.requestParameters = params;
+}
+function updateConnectionLimit(value: string) {
+  const caps = draft.value?.capabilitiesV2 ?? draft.value?.capabilities;
+  if (!caps) return;
+  if (value === "") delete caps.maxOutputTokens;
+  else caps.maxOutputTokens = Number(value);
+  if (draft.value?.capabilitiesV2) {
+    draft.value.capabilitiesV2.revision = `user:${Date.now()}`;
+    draft.value.capabilitiesV2.evidence = { source: "user_declared" };
+  }
 }
 onMounted(() => { void catalog.refresh(); });
 watch(() => account.current?.user.id, id => {
@@ -449,6 +459,7 @@ async function remove() {
                   <label class="full"><span>{{ zh ? '最大生成预算（Token）' : 'Maximum generation budget (tokens)' }}</span><input type="number" aria-label="outputBudget" :placeholder="budgetPlaceholder" :value="budget" min="1" :max="capability?.maxOutputTokens ?? 1000000" step="1" @input="updateBudget(($event.target as HTMLInputElement).value)"/><small>{{ draft.capabilitiesV2?.budgetSemantics === 'total_output' ? (zh ? '包含回答与推理消耗。' : 'Includes visible output and reasoning.') : draft.capabilitiesV2?.budgetSemantics === 'visible_output' ? (zh ? '此接入限制可见回答输出。' : 'This endpoint limits visible output.') : (zh ? '计数含义尚未确认，保留当前预算，不因格式错误自动提高。' : 'Counting semantics are unconfirmed. The configured budget is retained and never increased for format errors.') }}</small></label>
                   <button v-if="draft.requestParameters?.max_tokens !== undefined || draft.requestParameters?.max_completion_tokens !== undefined" type="button" class="button secondary full" @click="updateBudget(budget)">{{ zh ? '将现有预算迁移为通用生成预算' : 'Migrate the current limit to a semantic generation budget' }}</button>
                 </div>
+                <p v-if="capability?.maxOutputTokens === undefined" class="effective-output">{{ zh ? '接入输出上限未知，当前生成预算将交由接口验证。' : 'The provider output ceiling is unknown; the endpoint will validate the requested budget.' }}</p>
                 <p class="effective-output" role="status">{{ zh ? '预期输出方式：' : 'Expected output: ' }}{{ outputMode === 'json_schema' ? (zh ? 'Schema 约束 + 本地业务校验' : 'Schema constraints + local validation') : outputMode === 'json_object' ? (zh ? 'JSON 输出 + 本地业务校验' : 'JSON + local validation') : draft.source === 'official' ? (zh ? '平台尚未确认结构输出能力，请管理员核对接入配置后刷新官方模型。' : 'The platform has not confirmed structured output. Ask the administrator to verify the route, then refresh official models.') : (zh ? '能力待确认；尚未启用结构生成' : 'Unconfirmed; structured generation is not enabled') }}</p>
                 <details class="model-options">
                   <summary><strong>{{ zh ? '高级设置' : 'Advanced settings' }}</strong><span>{{ zh ? '按需调整' : 'Optional' }}</span></summary>
@@ -469,8 +480,7 @@ async function remove() {
                       <label class="full"><span>{{ zh ? '当前接入的能力声明' : 'Declared endpoint capabilities' }}</span><ParameterSelect :model-value="outputMode" :options="formatOptions" :ariaLabel="zh ? '结构输出能力' : 'Structured output capability'" @update:model-value="changeCapability"/><small>{{ zh ? '按这个具体地址、协议和模型的文档填写；选择来源本身不证明 Schema 能力，声明也不等于真实测试通过。' : 'Use documentation for this exact endpoint, protocol and model. Selecting a provider does not prove Schema support, and a declaration is not a completed test.' }}</small></label>
                       <label class="full"><span>{{ zh ? 'Schema 的 strict 参数声明' : 'Schema strict parameter declaration' }}</span><ParameterSelect :model-value="draft.capabilitiesV2 ? (draft.capabilitiesV2.strictFlag ?? '') : (draft.capabilities?.structuredOutput === 'json_schema' ? 'required' : '')" :options="strictFlagOptions" ariaLabel="Schema strict flag" @update:model-value="declareStrictFlag"/><small>{{ zh ? '支持 JSON Schema 不代表接口接受 strict。仅按该模型和 API 文档单独声明；strict 为未知、可选或不支持时均不发送。' : 'JSON Schema support does not establish support for strict. Declare it separately for this model and API; unknown, optional and unsupported all omit the flag.' }}</small></label>
                       <label v-if="draft.capabilitiesV2" class="full"><span>{{ zh ? '能力来源 / 版本' : 'Capability source / revision' }}</span><small>{{ draft.capabilitiesV2.evidence.source }} · {{ draft.capabilitiesV2.revision }}</small></label>
-                      <label v-if="draft.capabilitiesV2"><span>{{ zh ? '接入预算上限' : 'Connection budget limit' }}</span><input v-model.number="draft.capabilitiesV2.maxOutputTokens" type="number" :min="draft.capabilitiesV2.defaultOutputTokens" max="1000000" step="1"/></label>
-                      <label v-else-if="draft.capabilities"><span>{{ zh ? '接入预算上限' : 'Connection budget limit' }}</span><input v-model.number="draft.capabilities.maxOutputTokens" type="number" :min="draft.capabilities.defaultOutputTokens" max="1000000" step="1"/></label>
+                      <label v-if="capability"><span>{{ zh ? '接入预算上限（已确认时填写）' : 'Connection budget limit (if confirmed)' }}</span><input :value="capability.maxOutputTokens ?? ''" aria-label="connectionOutputLimit" type="number" :min="capability.defaultOutputTokens" max="1000000" step="1" :placeholder="zh ? '未知，留空' : 'Unknown; leave empty'" @input="updateConnectionLimit(($event.target as HTMLInputElement).value)"/><small>{{ zh ? '按具体模型和接口文档填写；未知时留空，不以默认值阻止生成预算。' : 'Use documentation for this exact model and endpoint. Leave empty if unknown; no assumed provider ceiling is enforced.' }}</small></label>
                     </div>
                     <details class="parameter-declarations"><summary>{{ zh ? '声明该模型支持的高级参数' : 'Declare supported advanced parameters' }}</summary><p class="compatibility-note">{{ zh ? '仅根据当前模型/模式文档开启；未声明的参数不会发送。已有值仍保留并显示冲突。' : 'Enable only with documentation for this model and mode. Undeclared parameters are not sent; existing conflicting values are retained.' }}</p><div class="declaration-checks"><label v-for="(label, parameter) in {temperature:'temperature',topP:'top_p',presencePenalty:'presence_penalty'}" :key="parameter"><input type="checkbox" :checked="draft.capabilitiesV2?.parameterRules?.[parameter] === 'supported'" @change="declareParameter(parameter, ($event.target as HTMLInputElement).checked)"/>{{ label }}</label><label><input type="checkbox" :checked="draft.capabilitiesV2?.parameterRules?.frequencyPenalty === true" @change="declareParameter('frequencyPenalty', ($event.target as HTMLInputElement).checked)"/>frequency_penalty</label><label><input type="checkbox" :checked="draft.capabilitiesV2?.parameterRules?.thinkingEnabled === true" @change="declareParameter('thinkingEnabled', ($event.target as HTMLInputElement).checked)"/>thinking</label></div><label class="reasoning-declaration">{{ zh ? '支持的推理档位（逗号分隔，留空表示未声明）' : 'Supported reasoning levels (comma separated; empty means undeclared)' }}<input aria-label="Declared reasoning levels" :value="draft.capabilitiesV2?.parameterRules?.reasoningEfforts.join(', ') ?? ''" @input="declareParameter('reasoningEfforts', ($event.target as HTMLInputElement).value)"/></label></details>
                   </details>

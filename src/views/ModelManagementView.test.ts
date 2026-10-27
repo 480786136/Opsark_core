@@ -21,6 +21,27 @@ beforeEach(() => {
   vi.mocked(officialCatalogOrigin).mockReset().mockResolvedValue("https://platform.example.test");
 });
 afterEach(() => { app?.unmount(); document.body.innerHTML = ""; });
+
+it("saves 30000 with an unknown provider ceiling and can declare or clear a known limit", async () => {
+  const store = await mount();
+  store.models[0].capabilitiesV2 = newModelCapabilities();
+  const save = vi.spyOn(store, "saveModelProfile").mockResolvedValue();
+  document.querySelector<HTMLButtonElement>(".model-card")!.click(); await nextTick();
+  const budget = document.querySelector<HTMLInputElement>('input[aria-label="outputBudget"]')!;
+  const limit = document.querySelector<HTMLInputElement>('input[aria-label="connectionOutputLimit"]')!;
+  expect(limit.value).toBe("");
+  expect(document.body.textContent).toContain("Unknown; subject to provider validation");
+  budget.value = "30000"; budget.dispatchEvent(new Event("input")); await nextTick();
+  expect(document.querySelector('.parameter-error')).toBeNull();
+  limit.value = "16384"; limit.dispatchEvent(new Event("input")); await nextTick();
+  expect(document.querySelector('.parameter-error')?.textContent).toContain("16384");
+  limit.value = ""; limit.dispatchEvent(new Event("input")); await nextTick();
+  expect(document.querySelector('.parameter-error')).toBeNull();
+  document.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+  await vi.waitFor(() => expect(save).toHaveBeenCalledOnce());
+  expect(save.mock.calls[0][0].requestParameters).toEqual({ outputBudget: 30000 });
+  expect(save.mock.calls[0][0].capabilitiesV2?.maxOutputTokens).toBeUndefined();
+});
 async function mount() {
   const pinia = createPinia(); setActivePinia(pinia);
   const store = useOpsStore();

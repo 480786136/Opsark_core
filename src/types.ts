@@ -899,7 +899,8 @@ export interface ModelCapabilitiesV2 {
   parameterAdapter: ModelCapabilities["parameterAdapter"];
   tokenField: "max_tokens" | "max_completion_tokens" | "max_output_tokens";
   defaultOutputTokens: number;
-  maxOutputTokens: number;
+  /** Absent when the provider's output ceiling has not been confirmed. */
+  maxOutputTokens?: number;
   budgetSemantics?: "total_output" | "visible_output" | "unknown";
   strictFlag?: "required" | "optional" | "unsupported";
   store?: "supported" | "unsupported" | "unknown";
@@ -939,7 +940,8 @@ export interface ModelCapabilities {
   parameterAdapter: "gateway" | "portable" | "deepseek" | "qwen" | "openai";
   tokenField: "max_tokens" | "max_completion_tokens";
   defaultOutputTokens: number;
-  maxOutputTokens: number;
+  /** Absent when the provider's output ceiling has not been confirmed. */
+  maxOutputTokens?: number;
 }
 
 export interface ModelProfile extends ModelIntegration {
