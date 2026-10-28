@@ -24,6 +24,9 @@ mod model_compatibility;
 mod scoped_model_repair;
 mod model_schema;
 mod plan_contract;
+mod model_output_contract;
+#[cfg(test)]
+mod model_output_contract_tests;
 mod model_budget;
 mod task_model_budget;
 mod model_request_lifecycle;
@@ -216,10 +219,10 @@ struct CommandOutputEvent {
 }
 
 const STRICT_JSON_OUTPUT_RULE: &str = "输出格式是强制协议：必须只返回一个完整、可由标准 JSON 解析器直接解析的对象；禁止 Markdown 代码块、前后说明、注释、尾随逗号、NaN/Infinity 和未转义的反斜杠。必须严格使用系统消息指定的字段、类型和枚举值，不得增加或省略必填字段。返回前请自检 JSON 语法和结构。";
-const PLAN_STEP_OUTPUT_CONTRACT: &str = r#"输出必须是只包含 steps 数组的对象，steps 必须至少有 1 个元素。
-每个元素必须包含 kind、title、description、action、expected、validation、risk。kind 只能选 observe 或 change；risk 只能选 low、medium 或 high。title、description、expected 和 Shell action.command 必须是非空字符串，validation 必须是字符串。以下只读 Shell 示例仅说明格式，实际步骤必须来自当前目标、证据和授权，不得照抄示例替代任务：
-{"steps":[{"kind":"observe","title":"读取运行时间","description":"只读查询当前系统的运行时间和负载","action":{"type":"shell","command":"uptime"},"expected":"获得运行时间和负载信息","validation":"","risk":"low"}]}
-可选字段只允许 executionScope、validationScope、runtimeClass、sessionContextChange 和 recovery；省略时程序使用安全默认值。作用域和运行类型必须遵循下方步骤字段契约。sessionContextChange 仅能与 agent_session 同时使用，可包含绝对 cwd、非敏感 environment、绝对 sourceFiles 和 bash|sh|zsh shell；禁止放入凭据或 ${secret.NAME}。
+const PLAN_STEP_OUTPUT_CONTRACT: &str = r#"{{OPSARK_OUTPUT_CONTRACT}}
+普通计划生成必须提供至少一个真实步骤；联合分类与规划的 steps 数量遵循该操作的分支规则。
+步骤的 kind 只能为 observe 或 change；risk 只能为 low、medium 或 high。title、description、expected 和 Shell action.command 必须非空，validation 必须为字符串。
+步骤元数据 executionScope、validationScope、runtimeClass、sessionContextChange 和 recovery 按当前字段清单提供；省略时程序使用安全默认值。sessionContextChange 仅能与 agent_session 同时使用，可包含绝对 cwd、非敏感 environment、绝对 sourceFiles 和 bash|sh|zsh shell；禁止放入凭据或 ${secret.NAME}。
 recovery 是可选的历史关联元数据，包含 failedStepId（上下文中既有失败 ID）、targetContext（该失败的原始目标上下文）和 purpose（只能选 diagnose、repair 或 verify）。只有当某步确实针对特定失败进行诊断、修复或复验时才提供；普通只读诊断无需为了通过 Core 门禁而附加 recovery。diagnose 必须 observe 且只读，repair 必须 change。历史失败的命令、expected、退出码和输出是不可改写的执行事实，不是后续计划必须逐字复制的验收方法。你可以依据用户目标、当前证据和授权调整后续步骤、剩余计划及验收方法；verify 应说明新证据如何证明目标，不能仅靠修复命令成功宣告目标已验收。Core 不会根据 recovery 关系裁决业务是否完成；不得编造关联 ID/上下文，recovery 关系本身不授权变更，仍须通过安全、授权和真实执行证据检查。
 observe 表示只读查询或诊断：主命令输出和退出状态就是观察证据，validation 必须为空字符串，不得生成第二条重复查询。change 表示会改变目标状态：validation 必须是非空、独立、只读的后置条件。command 和 validation 可以包含换行，但必须按标准 JSON 规则转义。
 diagnose 的 command 必须真正无副作用，禁止 mktemp、写入/删除临时文件和刷新包缓存。不要生成“mktemp→输出落盘→rm”诊断链，修复时需整体移除创建、写入和清理；不能只删 rm，也不能改为 repair 绕过授权。需要截断输出时使用 set -o pipefail，或 out=$(只读命令 2>&1); rc=$?; printf '%s\n' "$out"; exit "$rc"，保留真实退出码。允许 /dev/null 和文件描述符输出；dnf/yum 查询必须使用 --cacheonly/-C，避免刷新缓存。
@@ -238,23 +241,20 @@ const NEXT_STAGE_DECISION_SYSTEM: &str = r#"本调用把阶段结束后的整体
 - 只有结构化成功证据已经充分证明整体目标及全部最终验收条件时才能返回 complete，并且 steps 必须为空数组。
 - 本轮 focus 尚未完成且有合法、有意义的下一步时，在同一个响应中返回当前证据允许的最小下一阶段。本轮已完成时交付结果，其他未完成目标分别保留，不自动重做历史或推进用户暂缓的事项。可直接推进时返回 continue；需要改变方案时返回 adjust。如果目标未完成但当前没有允许或有意义的可执行动作，返回 adjust 且 steps=[]，表示 blocked/no_action，reason 和 summary 必须说明原因；不得为满足非空计划而编造或重复步骤。
 - 缺少必须由用户作出的决定时返回 adjust，steps 中只能有一个 user.request_input 步骤；已有未回答问题时复用原问题，reason 和 summary 说明具体待决事项与等待原因。等待用户不是业务执行失败，不得据此改换目标或生成绕过问题的恢复方案；用户回答只解决对应决定，不证明整体目标完成。"#;
-const NEXT_STAGE_OUTPUT_CONTRACT: &str = r#"输出必须包含 decision、reason、summary、steps；decision 只能选 complete、continue 或 adjust，reason 和 summary 必须是非空字符串，steps 必须是数组。允许 requirementReview、blocking、issueResolutions；按 operationsRecovery 的协议可增加 planUpdate、reconciliation，其余顶层字段禁止。planUpdate 用于局部更新，必须绑定当前 planFingerprint 并明确连续的 replaceStepIds 和 reason；steps 只包含替代步骤。reconciliation 引用事故后同目标只读证据，不得猜测执行结果。
+const NEXT_STAGE_OUTPUT_CONTRACT: &str = r#"{{OPSARK_OUTPUT_CONTRACT}}
+decision 只能选 complete、continue 或 adjust，reason 和 summary 必须是非空字符串，steps 必须是数组。planUpdate/reconciliation 仅按 operationsRecovery 使用；planUpdate 绑定当前 planFingerprint、连续 replaceStepIds 和 reason，steps 只含替换步骤；不得猜测执行结果。
 decision=complete 时 steps 必须严格为空数组。decision=continue 时 steps 必须至少有 1 个元素。decision=adjust 可以返回非空调整计划，也可以在当前无合法动作时返回空 steps；本轮已完成时以 requirementReview.focusOutcome=completed 交付结果；否则空 steps 必须提供具体 blocking，Core 将停止继续生成步骤。
-每个步骤必须包含 kind、title、description、action、expected、validation、risk。kind 只能选 observe 或 change；risk 只能选 low、medium 或 high。title、description、expected 和 Shell action.command 必须是非空字符串，validation 必须是字符串。以下 continue 示例仅说明格式，实际决策和步骤必须来自当前目标、证据和授权，不得照抄示例替代任务：
-{"decision":"continue","reason":"已明确只读查询目标，尚需获取运行时间证据","summary":"查询运行时间和负载后再判断目标是否完成","steps":[{"kind":"observe","title":"读取运行时间","description":"只读查询当前系统的运行时间和负载","action":{"type":"shell","command":"uptime"},"expected":"获得运行时间和负载信息","validation":"","risk":"low"}]}
-可选字段只允许 executionScope、validationScope、runtimeClass、sessionContextChange、recovery 和 retryBasis；retryBasis 按 operationsRecovery 引用重试依据；作用域枚举遵循下方步骤字段契约；独立校验、恢复关系、长任务和进程跟踪要求遵循本系统消息。
+步骤元数据 executionScope、validationScope、runtimeClass、sessionContextChange、recovery 和 retryBasis 按当前字段清单提供；retryBasis 按 operationsRecovery 引用重试依据；作用域枚举遵循下方步骤字段契约；独立校验、恢复关系、长任务和进程跟踪要求遵循本系统消息。
 Shell observe 的 validation 为空字符串，Shell change 的 validation 必须独立只读。工具使用结构化 action，action.type 为 tool，action.toolId 必须来自 context.tools，action.arguments 必须符合对应 inputSchema，validation 为空字符串。只能使用 context.tools 中的工具；standalone 必须是唯一步骤。
 planMode=read_batch 的 observe 工具允许和 Shell、变更在同一计划中按顺序执行，不能并行跨越依赖；前置执行及验收成功后再执行后续步骤，失败立即停止。参数依赖未知输出时另行规划，不预设结果。standalone 工具仍是唯一待执行步骤。planMode、completionMode、executionMode 是工具目录元数据，由编排器读取，禁止复制到 steps 的对象字段中；步骤只能使用输出协议声明的字段。
 工具调用只允许结构化 action，不支持 opsark-tool 命令字符串；禁止在 Shell 或 validation 中嵌入工具调用。
 command 和 validation 中的换行及反斜杠必须按标准 JSON 规则转义。返回前必须同时自检决策分支、所有计划字段和完整 JSON 结构。"#;
-const REQUIREMENT_CLASSIFICATION_CONTRACT: &str = r#"本阶段只做需求分类、任务关系判断、终端上下文判断、执行约束提取和 Skill 选择，禁止输出 steps、command、validation 或执行计划。context.taskGoal.rootGoal 保留任务原始目标供追溯；lifecycle.revision>0 时以当前有效要求和约束为准，已完成历史只作参考。currentInstruction 是上一轮指令。必须判断本次输入与整体目标的关系：new_goal=独立的新执行目标；continue=继续/重试原目标；supplement=为原目标补充条件；side_question=临时咨询且不改变原目标；replace_goal=用户明确放弃原目标并替换；cancel_goal=明确取消原目标。不得仅因用户提出另一个问题就隐式覆盖原目标；新执行目标使用 new_goal，只有明确“改为/不要原目标/替换为”才用 replace_goal。必须先判断回答或计划是否依赖用户之前的终端输入/输出：如依赖且 terminalContext.content 未提供或范围不够，返回 terminal_context，terminalContextLines 必须大于当前 includedLines，且不超过 totalLines 和 400；不依赖则不得请求终端内容。对 execute，constraints.changePolicy 是本轮权威的只读/变更边界：仅查询现状、列表、检查和定位故障且不请求后续变更时为 read_only；用户要求先预览或列出候选、明确确认后再变更时必须为 confirm_changes，不能将条件变更误判为永久只读或立即授权；用户明确要求安装、修改、构建、部署、传输或其他环境变更时为 requested_changes_only；只有用户明确允许为达成目标执行必要的附加变更时才为 allow_necessary_changes。execute 不得返回 unspecified。environmentPolicy、failurePolicy、prohibitedActions、requiredConditions 和 userDirectives 只能来自用户明确表达，不得猜测或自行增加。context.skillDirectory 中的名称、description 和 selectionHints 用于语义选择；category 只用于管理和导航，不得触发 Skill。只选择直接适用于整体目标、本轮显式子目标或已有证据证明必需阶段的 Skill，允许复合需求选择多个 Skill；不得因为目录中存在相近领域或关键词局部相似而强行匹配。零匹配是正常且合法的结果，此时 selectedSkillIds=[]，后续使用通用流程。selectedSkillIds 是本轮完整集合，continue/supplement 也必须移除不再适用或上轮误选的 Skill，程序不会自动并集。以下示例只说明各分支的合法格式，实际分类、关系和约束必须依据用户输入，不得照抄示例作默认决策。
+const REQUIREMENT_CLASSIFICATION_CONTRACT: &str = r#"本阶段只做需求分类、任务关系判断、终端上下文判断、执行约束提取和 Skill 选择，禁止输出 steps、command、validation 或执行计划。context.taskGoal.rootGoal 保留任务原始目标供追溯；lifecycle.revision>0 时以当前有效要求和约束为准，已完成历史只作参考。currentInstruction 是上一轮指令。必须判断本次输入与整体目标的关系：new_goal=独立的新执行目标；continue=继续/重试原目标；supplement=为原目标补充条件；side_question=临时咨询且不改变原目标；replace_goal=用户明确放弃原目标并替换；cancel_goal=明确取消原目标。不得仅因用户提出另一个问题就隐式覆盖原目标；新执行目标使用 new_goal，只有明确“改为/不要原目标/替换为”才用 replace_goal。必须先判断回答或计划是否依赖用户之前的终端输入/输出：如依赖且 terminalContext.content 未提供或范围不够，返回 terminal_context，terminalContextLines 必须大于当前 includedLines，且不超过 totalLines 和 400；不依赖则不得请求终端内容。对 execute，constraints.changePolicy 是本轮权威的只读/变更边界：仅查询现状、列表、检查和定位故障且不请求后续变更时为 read_only；用户要求先预览或列出候选、明确确认后再变更时必须为 confirm_changes，不能将条件变更误判为永久只读或立即授权；用户明确要求安装、修改、构建、部署、传输或其他环境变更时为 requested_changes_only；只有用户明确允许为达成目标执行必要的附加变更时才为 allow_necessary_changes。execute 不得返回 unspecified。environmentPolicy、failurePolicy、prohibitedActions、requiredConditions 和 userDirectives 只能来自用户明确表达，不得猜测或自行增加。context.skillDirectory 中的名称、description 和 selectionHints 用于语义选择；category 只用于管理和导航，不得触发 Skill。只选择直接适用于整体目标、本轮显式子目标或已有证据证明必需阶段的 Skill，允许复合需求选择多个 Skill；不得因为目录中存在相近领域或关键词局部相似而强行匹配。零匹配是正常且合法的结果，此时 selectedSkillIds=[]，后续使用通用流程。selectedSkillIds 是本轮完整集合，continue/supplement 也必须移除不再适用或上轮误选的 Skill，程序不会自动并集。以下示例由当前操作契约生成，不得作为默认决策。
 咨询类 intent 为 answer，relation 只能选 side_question 或 cancel_goal；answer 非空，其余字段按本分支协议输出。示例：
-{"intent":"answer","relation":"side_question","answer":"uptime 用于读取系统运行时间和负载。","constraints":null,"terminalContextLines":0,"selectedSkillIds":[]}
 执行类 intent 为 execute，relation 只能选 new_goal、continue、supplement 或 replace_goal；answer 为空。三个策略字段仅使用上方分类约束共享契约给出的枚举，禁止空字符串。三个约束数组只记录用户明确要求；selectedSkillIds 只包含当前目录中实际匹配的 Skill。首次只读查询且无额外明确约束、无匹配 Skill 时的示例：
-{"intent":"execute","relation":"new_goal","answer":"","constraints":{"changePolicy":"read_only","environmentPolicy":"unspecified","failurePolicy":"unspecified","prohibitedActions":[],"requiredConditions":[],"userDirectives":[]},"terminalContextLines":0,"selectedSkillIds":[]}
 需要更多终端内容时 intent 为 terminal_context，relation 为 null；terminalContextLines 按前述 includedLines、totalLines 和 400 行上限选择，以下 80 仅说明字段类型，不是默认请求行数。示例：
-{"intent":"terminal_context","relation":null,"answer":"","constraints":null,"terminalContextLines":80,"selectedSkillIds":[]}
-顶层允许 intent、relation、answer、constraints、terminalContextLines、selectedSkillIds、requirementUpdate。context.requirementSubmission 存在时，execute 必须提供 requirementUpdate；其他分支不修改需求。"#;
+顶层允许 intent、relation、answer、constraints、terminalContextLines、selectedSkillIds、requirementUpdate。context.requirementSubmission 存在时，execute 必须提供 requirementUpdate；其他分支不修改需求。
+{{OPSARK_OUTPUT_CONTRACT}}"#;
 const SECRET_PLACEHOLDER_RULE: &str = "敏感变量规则：${secret.NAME} 是 Opsark 的执行时传输占位符，不是要保留在远端文件里的字面量。必须原样写成 ${secret.NAME}，绝对不得在美元符号前添加反斜杠。程序会在 SSH 执行前注入真实值，并在输出、日志和模型上下文中脱敏。模型看到的 •••••••• 只表示真实值已被脱敏：它既不是远端文件的实际内容，也不能证明具体密码正确或错误，更不能据此声称占位符未解析。选择变量时名称和说明必须与目标凭据语义一致；若现有变量无法区分目标账户或用途，应使用新的、用途明确的变量名，由界面向用户索取，不能静默借用含义模糊的旧值。写入远端配置后应使用不泄露秘密的功能性后置条件校验；校验命令中仍可使用同一占位符供程序注入。不得要求远端保留 Opsark 占位符，也不得因脱敏标记判定泄露、写入失败或密码错误。除非用户明确禁止持久化密码，不得自行增加该限制。";
 const REVIEW_SECRET_PLACEHOLDER_RULE: &str = "复核上下文中的 ${secret.NAME} 是执行时占位符，•••••••• 表示真实值已脱敏；不得据此判断占位符未解析、执行失败或发生泄露。";
 const GENERAL_PLAN_SYSTEM: &str = r#"角色：通用运维计划器。
@@ -1340,7 +1340,7 @@ fn build_next_stage_request_body(
                 {"role":"system", "content":format!("你在修复缺少 steps 的阶段响应，不是从头规划任务。被拒响应仅供修复，不能作为执行证据。保留 requiredDecision，必须返回非空 steps；证据不足时生成最小只读诊断或真实提问，不得编造事实或扩大授权。只使用基础步骤字段，特殊作用域留待后续完整规划。结构化工具 action 必须独立成步，不能嵌入 Shell 或 validation。{NEXT_STAGE_OUTPUT_CONTRACT}\n{requirement_rule}\n{step_fields}\n{limit_rule}\n{SECRET_PLACEHOLDER_RULE}\n{STRICT_JSON_OUTPUT_RULE}")},
                 {"role":"user", "content":format!("整体用户目标：\n{requirement}\n\n阶段结束决策上下文：\n{compact}")}
             ], "thinking":{"type":"disabled"},
-            "response_format":next_stage_format::response_format(&compact["formatRepair"]["requiredDecision"], &compact["tools"])});
+            "response_format":next_stage_format::response_format(&compact["formatRepair"]["requiredDecision"], &compact)});
         if let Some(limit) = settings.max_output_tokens {
             body["max_tokens"] = json!(limit.max(256));
         }

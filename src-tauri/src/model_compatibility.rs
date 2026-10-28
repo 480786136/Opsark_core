@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub(crate) const OUTPUT_NORMALIZATION_VERSION: &str = "json-wrapper-and-shell-placement@3";
+pub(crate) const OUTPUT_NORMALIZATION_VERSION: &str = "json-wrapper-and-shell-placement@4";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -119,7 +119,7 @@ pub(crate) fn action_schema(tools: &Value) -> Value {
     }
     json!({"anyOf":variants})
 }
-fn step(tools: &Value, evidence_contract: bool) -> Value {
+pub(crate) fn step_schema(tools: &Value, evidence_contract: bool) -> Value {
     let mut schema = object(
         json!({"kind":{"type":"string","enum":["observe","change"]},
         "title":{"type":"string"},"description":{"type":"string"},"action":action_schema(tools),
@@ -146,7 +146,7 @@ pub(crate) fn contract(name: &str, body: &Value) -> Option<Value> {
 pub(crate) fn full_contract(name: &str, body: &Value) -> Option<Value> {
     let context: Value =
         serde_json::from_str(body["_opsarkContext"].as_str().unwrap_or("{}")).unwrap_or(json!({}));
-    let steps = json!({"type":"array","items":step(&context["tools"], context["_planEvidenceContract"]["version"] == 1)});
+    let steps = json!({"type":"array","items":step_schema(&context["tools"], context["_planEvidenceContract"]["version"] == 1)});
     let decision = json!({"type":"string","enum":["continue","adjust","complete"]});
     match name {
         "阶段联合决策" | "阶段格式修复（兼容模式）" => {
@@ -182,7 +182,7 @@ pub(crate) fn full_contract(name: &str, body: &Value) -> Option<Value> {
             let mut schema = object(
             json!({"intent":{"type":"string","enum":["answer","execute","terminal_context"]},
             "answer":{"type":"string"},"selectedSkillIds":strings(),"constraints":nullable(crate::classification_contract::schema())}),
-            json!({"relation":nullable(json!({"type":"string"})),"terminalContextLines":nullable(json!({"type":"integer"})),"requirementUpdate":nullable(crate::requirement_contract::update())}),
+            json!({"relation":nullable(json!({"type":"string"})),"terminalContextLines":nullable(json!({"type":"integer"})),"requirementUpdate":nullable(crate::requirement_contract::update_for_context(&context))}),
             );
             if body["_opsarkOperationContract"] == "requirement.plan@1" {
                 schema["properties"]["steps"] = steps;
@@ -278,6 +278,14 @@ fn omit_optional_nulls(value: &mut Value, schema: &Value) {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct OutputFieldIssue {
+    pub json_pointer: String,
+    pub schema_path: String,
+    pub keyword: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct OutputDiagnostic {
     pub code: String,
     pub stage: String,
@@ -298,6 +306,8 @@ pub(crate) struct OutputDiagnostic {
     pub line: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub column: Option<usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub field_issues: Vec<OutputFieldIssue>,
 }
 
 impl OutputDiagnostic {
@@ -314,6 +324,7 @@ impl OutputDiagnostic {
             keyword: None,
             line: None,
             column: None,
+            field_issues: Vec::new(),
         }
     }
 
@@ -516,12 +527,8 @@ pub(crate) fn prepare(
         budget
     });
     let schema = contract(name, &body);
-    if context["_planEvidenceContract"]["version"] == 1 && matches!(name, "计划生成" | "阶段联合决策" | "阶段格式修复（兼容模式）" | "模型业务测试" | "需求理解") {
-        if let Some(messages) = body["messages"].as_array_mut() {
-            messages.insert(0, json!({"role":"system","content":"若本轮响应含计划步骤，按已协商的证据契约扩展原字段清单与旧示例，每个步骤还必须有 evidenceRequirements 数组：需要文件正文时填 [\"file_content\"] 并选择目录中 providedEvidence 支持该类型的工具；其他步骤及 Shell 填 []。声明不构成验收证据，空数组不得掩盖正文需求。"}));
-        }
-    }
     if let Some(schema) = &schema {
+        crate::model_output_contract::apply(&mut body, schema, &context);
         let use_schema = crate::model_protocol::schema_allowed(&integration, &caps);
         if !use_schema && !crate::model_protocol::json_allowed(&integration) {
             return Err(error("MODEL_CAPABILITY_UNKNOWN", "当前输出策略没有已确认可用的结构输出能力，请配置或测试接入能力"));
@@ -713,8 +720,42 @@ fn check_value(value: &Value, schema: &Value, stage: &str) -> Result<(), OutputD
         diagnostic.json_pointer = Some(issue.instance_path);
         diagnostic.schema_path = Some(issue.schema_path);
         diagnostic.keyword = Some(issue.keyword);
+        diagnostic.field_issues = crate::schema_validation::diagnose_many(schema, value, 16)
+            .into_iter().map(|issue| OutputFieldIssue {
+                json_pointer: issue.instance_path.chars().take(2048).collect(),
+                schema_path: issue.schema_path.chars().take(2048).collect(),
+                keyword: issue.keyword,
+            }).collect();
         diagnostic
     })
+}
+
+/// Remove only an exact duplicate of an already explicit, schema-valid step
+/// declaration. Never move/invent evidence or inspect tool arguments.
+fn normalize_duplicate_evidence(value: &mut Value, schema: &Value) {
+    for (array_path, item_schema_path) in [
+        ("/steps", "/properties/steps/items"),
+        ("/repair/replacementSteps", "/properties/repair/properties/replacementSteps/items"),
+    ] {
+        let Some(rule) = schema.pointer(item_schema_path).and_then(|step| step.pointer("/properties/evidenceRequirements")) else { continue; };
+        let Some(steps) = value.pointer_mut(array_path).and_then(Value::as_array_mut) else { continue; };
+        for step in steps {
+            let Some(declaration) = step.get("evidenceRequirements").cloned() else { continue; };
+            if !validates(&declaration, rule) { continue; }
+            let Some(action) = step.get_mut("action").and_then(Value::as_object_mut) else { continue; };
+            if matches!(action.get("type").and_then(Value::as_str), Some("shell" | "tool"))
+                && action.get("evidenceRequirements") == Some(&declaration) {
+                action.remove("evidenceRequirements");
+            }
+        }
+    }
+}
+
+pub(crate) fn candidate_field_issues(value: &Value, schema: &Value) -> Vec<crate::schema_validation::ValidationIssue> {
+    let mut normalized = value.clone();
+    normalize_shell_execution_scope(&mut normalized, schema);
+    normalize_duplicate_evidence(&mut normalized, schema);
+    crate::schema_validation::diagnose_many(schema, &normalized, 16)
 }
 
 pub(crate) fn normalize_response_with_wire(
@@ -777,6 +818,7 @@ pub(crate) fn normalize_response_with_wire(
         if let Some(issue) = crate::classification_contract::invalid(&value["constraints"]) { return Err(issue); }
     }
     normalize_shell_execution_scope(&mut value, schema);
+    normalize_duplicate_evidence(&mut value, schema);
     if let Some(wire) = wire {
         check_value(&value, wire, "wire_validation")?;
         omit_optional_nulls(&mut value, schema);

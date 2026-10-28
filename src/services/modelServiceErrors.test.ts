@@ -9,6 +9,16 @@ const quota = { httpStatus: 402, code: "INSUFFICIENT_CREDITS", message: "可用�
   details: { available_tokens: 12000, required_tokens: 24000, estimated_input_tokens: 16000,
     max_output_tokens: 8000, estimator: "heuristic", exact: false } };
 
+it("keeps only bounded Core schema locations from a multi-field rejection", () => {
+  const issue = { jsonPointer: "/steps/0/evidenceRequirements", schemaPath: "/properties/steps/items/required", keyword: "required", value: "PRIVATE_REJECTED_BODY" };
+  const modelError = { code: "MODEL_FORMAT_INVALID", origin: "core", stage: "business_validation", message: "字段缺失", fieldIssues: Array(30).fill(issue) };
+  const parsed = modelServiceError(JSON.stringify({ modelError }));
+  expect(parsed?.fieldIssues).toHaveLength(16);
+  expect(parsed?.fieldIssues?.[0]).toEqual({ jsonPointer: issue.jsonPointer, schemaPath: issue.schemaPath, keyword: issue.keyword });
+  expect(JSON.stringify(parsed)).not.toContain("PRIVATE_REJECTED_BODY");
+  expect(modelServiceError(JSON.stringify({ modelError: { ...modelError, origin: "upstream" } }))?.fieldIssues).toBeUndefined();
+});
+
 beforeEach(() => Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true }));
 afterEach(() => { Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); vi.resetAllMocks(); });
 

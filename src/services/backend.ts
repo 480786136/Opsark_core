@@ -215,6 +215,14 @@ function parseModelServiceError(value: unknown): ModelServiceError | undefined {
   for (const key of ["line", "column"] as const) {
     if (typeof item[key] === "number" && Number.isSafeInteger(item[key]) && item[key] >= 0) diagnostic[key] = item[key];
   }
+  if (item.origin === "core" && Array.isArray(item.fieldIssues)) {
+    diagnostic.fieldIssues = item.fieldIssues.slice(0, 16).flatMap((value: unknown) => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+      const issue = value as Record<string, unknown>;
+      if (typeof issue.jsonPointer !== "string" || typeof issue.schemaPath !== "string" || typeof issue.keyword !== "string") return [];
+      return [{ jsonPointer: issue.jsonPointer.slice(0, 2048), schemaPath: issue.schemaPath.slice(0, 2048), keyword: issue.keyword.slice(0, 80) }];
+    });
+  }
   for (const key of ["gatewayHttpStatus", "providerHttpStatus", "statusQueryHttpStatus"] as const) {
     if (typeof item[key] === "number" && Number.isInteger(item[key]) && item[key] >= 100 && item[key] <= 599) diagnostic[key] = item[key];
   }
@@ -592,7 +600,7 @@ export function modelCandidateDiagnostic(error: unknown): Record<string, unknown
   };
   const diagnostic = modelServiceError(error);
   return { code: diagnostic?.code, stage: diagnostic?.stage, jsonPointer: diagnostic?.jsonPointer,
-    schemaPath: diagnostic?.schemaPath, keyword: diagnostic?.keyword, ...cause };
+    schemaPath: diagnostic?.schemaPath, keyword: diagnostic?.keyword, fieldIssues: diagnostic?.fieldIssues, ...cause };
 }
 
 function safeCandidateRejection(error: unknown) {

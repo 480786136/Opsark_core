@@ -1431,7 +1431,7 @@ fn recorded_shell_scope_placement_is_accepted_without_another_model_request_in_b
             assert_eq!(result, expected, "{protocol}/{policy}: only the field location may change");
             assert_eq!(provider.join().unwrap().len(), 1);
             let (prepared, _) = crate::model_compatibility::prepare(&body, "阶段联合决策", false).unwrap();
-            assert_eq!(prepared["_opsarkSchemaCompilation"]["normalizationVersion"], "json-wrapper-and-shell-placement@3");
+            assert_eq!(prepared["_opsarkSchemaCompilation"]["normalizationVersion"], crate::model_compatibility::OUTPUT_NORMALIZATION_VERSION);
         }
     }
 }

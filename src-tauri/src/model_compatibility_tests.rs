@@ -1,5 +1,25 @@
 //! Local fake-provider tests: never send credentials or requests to a real vendor.
 use super::*;
+
+#[test]
+fn coordinated_multi_field_rejection_skips_a_useless_review_patch() {
+    let mut body = with_request_context(request(false), |context| {
+        context["_modelOutputRecovery"] = json!({"strategy":"initial"});
+        context["_planEvidenceContract"] = json!({"version":1});
+        context["taskGoal"] = json!({"lifecycle":{"revision":1,"roundId":"round"}});
+    });
+    body["_opsarkContext"] = json!(crate::model_budget::ensure_context(body["_opsarkContext"].as_str().unwrap()).unwrap());
+    let invalid = json!({"decision":"continue","reason":"Need evidence","summary":"Read status",
+        "steps":[{"kind":"observe","title":"Read","description":"Read status","action":{"type":"shell","command":"uptime"},
+            "expected":"Current status","validation":"","risk":"low"}]});
+    let (url, server) = provider(vec![(200, response(&invalid.to_string(), "stop"))]);
+    let error = run_operation(&url, &body, "阶段联合决策").unwrap_err();
+    assert!(error.contains("requirementReview"), "{error}");
+    assert!(error.contains("evidenceRequirements"), "{error}");
+    let record: Value = serde_json::from_str(error.strip_prefix(crate::MODEL_TRACE_ERROR_PREFIX).unwrap()).unwrap();
+    assert_eq!(record["modelError"]["recoveryBudget"]["fieldRepairs"], 0);
+    assert_eq!(server.join().unwrap().len(), 1);
+}
 use std::io::{Read, Write};
 
 #[test]

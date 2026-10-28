@@ -71,9 +71,7 @@ pub(crate) fn request(
     let contract = REQUIREMENT_CLASSIFICATION_CONTRACT.split("以下示例").next().unwrap()
         .replacen("本阶段只做需求分类、任务关系判断、终端上下文判断、执行约束提取和 Skill 选择，禁止输出 steps、command、validation 或执行计划。",
             "先判断需求分类、关系、终端上下文及执行约束，再在同一对象内提出未执行计划。", 1);
-    let plan_contract = PLAN_STEP_OUTPUT_CONTRACT.replacen(
-        "输出必须是只包含 steps 数组的对象，steps 必须至少有 1 个元素。",
-        "本次联合对象同时包含需求分类字段和 steps：execute且未选Skill时必须有至少一个真实步骤；已选Skill、answer和terminal_context的steps必须为空。", 1);
+    let plan_contract = format!("本次联合对象同时包含需求分类字段和 steps：execute且未选Skill时必须有至少一个真实步骤；已选Skill、answer和terminal_context的steps必须为空。\n{PLAN_STEP_OUTPUT_CONTRACT}");
     let planner = plan_generation_system(false, &plan_contract, &next_stage_limit_rule(settings));
     let instruction = "联合分类与规划：只输出一个对象，保留 intent、relation、answer、constraints、terminalContextLines、selectedSkillIds、requirementUpdate 并增加 steps。仍按skillDirectory语义选择Skill，不得为省调用而漏选。selectedSkillIds为空且intent=execute时，同次提出非空计划；选中任何Skill时steps必须为空，由Core先加载完整Skill规则后独立规划，不能在未读规则时猜测计划。先按本次用户消息投影requirementUpdate，再依据更新后的有效要求和本次constraints规划，不能沿用被替代目标或把旧约束当作本次授权。咨询、取消或需要更多终端内容时steps=[]。所有计划均未执行，仍须本地校验和正常审批；能力、路径、必要输入不明确时先安排取证或user.request_input，不编造结果。无Skill的execute不能用空steps掩盖计划失败。";
     Ok(

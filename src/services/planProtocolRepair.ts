@@ -147,7 +147,9 @@ export function compactProtocolRepairContext<T extends {
   const { previousModelOutput: _fullPlan, progress: _progress, nextStageDecision: _decision, modelRecovery: _modelRecovery, ...feedback } = repair;
   return JSON.stringify({
     ...authority,
-    _planEvidenceContract: steps.length && steps.every(step => step.evidenceRequirements !== undefined) ? { version: 1 } : undefined,
+    _planEvidenceContract: Object.prototype.hasOwnProperty.call(source, "_planEvidenceContract")
+      ? source._planEvidenceContract
+      : steps.length && steps.every(step => step.evidenceRequirements !== undefined) ? { version: 1 } : undefined,
     workflowPhase: "protocol_repair",
     readOnlyPlanProtocol: repair.diagnostic?.code === "OBSERVE_COMMAND_MUTATION"
       || repair.diagnostic?.code === "RECOVERY_DIAGNOSE_MUTATION" ? readOnlyPlanProtocol() : undefined,

@@ -80,13 +80,20 @@ fn prompt_json_examples(prompt: &str) -> Vec<Value> {
         .collect()
 }
 
+fn prepared_prompt_examples(prompt: &str, operation: &str, context: Value) -> Vec<Value> {
+    let body = json!({"_opsarkContext":context.to_string(), "messages":[{"role":"system","content":prompt}]});
+    let (prepared, _) = model_compatibility::prepare(&body, operation, false).unwrap();
+    prepared["messages"].as_array().unwrap().iter().filter(|message| message["role"] == "system")
+        .flat_map(|message| prompt_json_examples(message["content"].as_str().unwrap())).collect()
+}
+
 #[test]
 fn plan_prompt_json_examples_pass_the_actual_operation_contracts() {
     for (prompt, operation) in [
         (PLAN_STEP_OUTPUT_CONTRACT, "计划生成"),
         (NEXT_STAGE_OUTPUT_CONTRACT, "阶段联合决策"),
     ] {
-        let examples = prompt_json_examples(prompt);
+        let examples = prepared_prompt_examples(prompt, operation, json!({}));
         assert_eq!(examples.len(), 1);
         let example = &examples[0];
         let schema = model_compatibility::contract(operation, &json!({})).unwrap();
@@ -103,7 +110,7 @@ fn plan_prompt_json_examples_pass_the_actual_operation_contracts() {
 
 #[test]
 fn classification_prompt_json_examples_pass_each_business_branch() {
-    let examples = prompt_json_examples(REQUIREMENT_CLASSIFICATION_CONTRACT);
+    let examples = prepared_prompt_examples(REQUIREMENT_CLASSIFICATION_CONTRACT, "需求理解", json!({}));
     assert_eq!(examples.len(), 3);
     let schema = model_compatibility::contract("需求理解", &json!({})).unwrap();
     let mut intents = HashSet::new();
@@ -123,7 +130,7 @@ fn focused_repair_prompt_json_preserves_real_actions_and_contract_fields() {
         "_opsarkOperationContract":"plan.repair@1",
         "_opsarkContext":json!({"tools":contracts["tools"]}).to_string(),
     })).unwrap();
-    let base = prompt_json_examples(PLAN_STEP_OUTPUT_CONTRACT).remove(0)["steps"][0].clone();
+    let base = prepared_prompt_examples(PLAN_STEP_OUTPUT_CONTRACT, "计划生成", json!({})).remove(0)["steps"][0].clone();
     let mut shell: AiPlanStep = serde_json::from_value(base.clone()).unwrap();
     shell.action = Some(StepAction::Shell { command: "rm /tmp/example".into() });
     shell.command = "rm /tmp/example".into();
@@ -1403,7 +1410,8 @@ fn plan_generation_retries_use_compact_requests_and_merge_the_original_plan() {
         assert!(system.contains(PLAN_COMPILATION_REPAIR_SYSTEM));
         assert!(!last.to_string().contains("HISTORY_MARKER"));
         if external {
-            assert!(system.contains(PLAN_STEP_OUTPUT_CONTRACT));
+            assert!(system.contains("当前操作的输出契约由实际校验 Schema 生成"));
+            assert!(!system.contains(model_output_contract::MARKER));
         } else {
             assert!(!system.contains(PLAN_STEP_OUTPUT_CONTRACT));
             assert!(last.to_string().contains("replacementSteps"));

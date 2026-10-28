@@ -161,6 +161,14 @@ pub(crate) fn diagnose(schema: &Value, value: &Value) -> Result<(), ValidationIs
     validator.validate(value).map_err(|error| issue_for_error(schema, &error, 0))
 }
 
+/// Bounded, value-free diagnostics for one rejected candidate. Validation and
+/// admission stay unchanged; no defaults or corrections are applied here.
+pub(crate) fn diagnose_many(schema: &Value, value: &Value, limit: usize) -> Vec<ValidationIssue> {
+    let Ok(validator) = compiled(schema) else { return Vec::new(); };
+    validator.iter_errors(value).take(limit.min(16))
+        .map(|error| issue_for_error(schema, &error, 0)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

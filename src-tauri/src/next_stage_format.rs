@@ -44,6 +44,7 @@ pub(crate) fn repair_context(raw: &str) -> Option<Value> {
         "_modelIntegration",
         "_modelRecovery",
         "_modelOutputRecovery",
+        "_planEvidenceContract",
         "taskGoal",
         "server",
         "permission",
@@ -83,32 +84,15 @@ pub(crate) fn repair_context(raw: &str) -> Option<Value> {
     Some(Value::Object(compact))
 }
 
-pub(crate) fn response_format(decision: &Value, tools: &Value) -> Value {
-    let strings = ["title", "description", "expected", "validation"];
-    let mut properties = Map::new();
-    for key in strings {
-        properties.insert(key.into(), json!({"type":"string"}));
-    }
-    properties.insert(
-        "action".into(),
-        crate::model_compatibility::action_schema(tools),
-    );
-    properties.insert(
-        "kind".into(),
-        json!({"type":"string","enum":["observe","change"]}),
-    );
-    properties.insert(
-        "risk".into(),
-        json!({"type":"string","enum":["low","medium","high"]}),
-    );
+pub(crate) fn response_format(decision: &Value, context: &Value) -> Value {
+    let step = crate::model_compatibility::step_schema(
+        &context["tools"], context["_planEvidenceContract"]["version"] == 1);
     json!({"type":"json_schema", "json_schema": {"name":"next_stage_format_repair", "strict":true,
     "schema": {"type":"object", "additionalProperties":false,
         "required":["decision","reason","summary","steps"], "properties": {
             "decision":{"type":"string","enum":[decision]},
             "reason":{"type":"string"}, "summary":{"type":"string"},
-            "steps":{"type":"array", "items":{"type":"object", "additionalProperties":false,
-                "required":["kind","title","description","action","expected","validation","risk"],
-                "properties": properties}}
+            "steps":{"type":"array", "items":step}
         }}}})
 }
 
@@ -240,7 +224,7 @@ mod tests {
         assert!(!repair.to_string().contains("need evidence"));
         assert!(repair.to_string().len() < raw.to_string().len() / 4);
         assert_eq!(
-            response_format(&json!("continue"), &json!([]))["json_schema"]["schema"]["required"],
+            response_format(&json!("continue"), &json!({"tools":[]}))["json_schema"]["schema"]["required"],
             json!(["decision", "reason", "summary", "steps"])
         );
         assert!(repair_context("{}").is_none());

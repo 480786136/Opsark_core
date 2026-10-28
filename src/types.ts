@@ -1018,6 +1018,8 @@ export interface ModelServiceError {
   jsonPointer?: string;
   schemaPath?: string;
   keyword?: string;
+  /** Bounded schema locations only; no rejected values or commands. */
+  fieldIssues?: { jsonPointer: string; schemaPath: string; keyword: string }[];
   line?: number;
   column?: number;
   operation?: string;

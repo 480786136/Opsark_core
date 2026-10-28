@@ -385,6 +385,7 @@ fn format_repair_feedback(
         Some(crate::plan_contract::field_rules())
     } else { None };
     let evidence = json!({"operation":operation,"diagnostic":diagnostic,
+        "fieldIssues":diagnostic.field_issues,
         "requiredDecision":required_decision,"expectedSchema":expected_schema,"stepFieldRules":step_rules,
         "responseFieldSchemas":crate::requirement_contract::response_field_contract(schema)});
     let decision_rule = required_decision.map(|decision| {
@@ -837,7 +838,11 @@ async fn post_model_request_inner(
         let mut feedback_role = "user";
         if scoped_operation && !truncated {
             if let Some(candidate) = &prior_value {
-                let Some(repair) = format_repair::FieldRepair::new(candidate, schema.as_ref().unwrap(), &diagnostic) else {
+                let repair = if output_strategy.is_some()
+                    && format_repair::has_other_invalid_fields(candidate, schema.as_ref().unwrap(), &diagnostic) {
+                    None
+                } else { format_repair::FieldRepair::new(candidate, schema.as_ref().unwrap(), &diagnostic) };
+                let Some(repair) = repair else {
                     let error = with_candidate_rejection(model_error_with_context(compatibility::output_error(&diagnostic, Some(status)), &budget, Some(&transport)), &diagnostic, prior_value.as_ref(), &context);
                     return Err(retain_rejected_requirement_candidate(error, &diagnostic, original_body, &payload, &mut rejected));
                 };

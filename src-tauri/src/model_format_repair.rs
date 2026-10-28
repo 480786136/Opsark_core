@@ -2,6 +2,41 @@
 use crate::model_compatibility::OutputDiagnostic;
 use serde_json::{json, Value};
 
+#[cfg(test)]
+mod contract_regression_tests {
+    use super::*;
+
+    #[test]
+    fn evidence_declarations_cannot_be_removed_as_unknown_fields() {
+        for field in ["evidenceRequirements", "executionScope"] {
+            let mut candidate = json!({"steps":[{"evidenceRequirements":[],"action":{"type":"shell","command":"uptime"}}]});
+            candidate["steps"][0]["action"][field] = json!(["file_content"]);
+            let mut diagnostic = OutputDiagnostic::new("MODEL_FORMAT_INVALID", "business_validation", "fixture");
+            diagnostic.json_pointer = Some(format!("/steps/0/action/{field}"));
+            diagnostic.keyword = Some("additionalProperties".into());
+            assert!(FieldRepair::new(&candidate, &json!({}), &diagnostic).is_none());
+        }
+    }
+
+    #[test]
+    fn a_field_patch_is_not_bought_when_other_frozen_fields_are_invalid() {
+        let schema = json!({"type":"object","required":["requirementReview","steps"],"properties":{
+            "requirementReview":{"type":"object"},"steps":{"type":"array","items":{"type":"object",
+                "required":["evidenceRequirements"],"properties":{"evidenceRequirements":{"type":"array"}}}}}});
+        let mut diagnostic = OutputDiagnostic::new("MODEL_FORMAT_INVALID", "business_validation", "fixture");
+        diagnostic.json_pointer = Some("/requirementReview".into());
+        diagnostic.schema_path = Some("/required".into());
+        diagnostic.keyword = Some("required".into());
+        assert!(has_other_invalid_fields(&json!({"steps":[{}]}), &schema, &diagnostic));
+        let candidate = json!({"steps":[{"evidenceRequirements":[]}]});
+        assert!(!has_other_invalid_fields(&candidate, &schema, &diagnostic));
+        let repair = FieldRepair::new(&candidate, &schema, &diagnostic).expect("single missing field stays repairable");
+        let merged = repair.merge(&json!({"value":{}}), &json!({})).unwrap();
+        assert_eq!(merged["steps"], candidate["steps"]);
+        crate::schema_validation::validate(&schema, &merged).unwrap();
+    }
+}
+
 pub(super) struct FieldRepair {
     candidate: Value,
     parent: String,
@@ -30,6 +65,7 @@ impl FieldRepair {
             && matches!(
                 field.as_str(),
                 "executionScope"
+                    | "evidenceRequirements"
                     | "validationScope"
                     | "runtimeClass"
                     | "sessionContextChange"
@@ -148,6 +184,15 @@ impl FieldRepair {
         }
         Ok(candidate)
     }
+}
+
+/// Only the coordinated output flow skips a known-useless patch. Legacy
+/// bounded multi-field corrections retain their established recovery policy.
+pub(super) fn has_other_invalid_fields(candidate: &Value, schema: &Value, diagnostic: &OutputDiagnostic) -> bool {
+    let Some(path) = diagnostic.json_pointer.as_deref() else { return true; };
+    crate::model_compatibility::candidate_field_issues(candidate, schema).iter().any(|issue| {
+        issue.instance_path != path && !issue.instance_path.starts_with(&format!("{path}/"))
+    })
 }
 
 /// Syntax recovery has no trustworthy action baseline. Its new plan may only

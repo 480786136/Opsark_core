@@ -35,6 +35,12 @@ beforeEach(() => Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {
 afterEach(() => { Reflect.deleteProperty(window, "__TAURI_INTERNALS__"); vi.resetAllMocks(); });
 
 describe("bounded protocol repair", () => {
+  it.each([{ version: 1 }, { version: 99 }, null])("preserves the trusted evidence contract even when the rejected step omitted it: %j", marker => {
+    const repair = repairOf();
+    const projected = JSON.parse(compactProtocolRepairContext(runtime({ _planEvidenceContract: marker }).context, repair));
+    expect(projected._planEvidenceContract).toEqual(marker);
+    expect(projected.planGenerationRepair.previousModelOutput[0].evidenceRequirements).toBeUndefined();
+  });
   it.each([
     { allowedRepairPaths: ["steps[0].command", "steps[0].risk"] },
     { fieldPath: "steps[0].risk" },

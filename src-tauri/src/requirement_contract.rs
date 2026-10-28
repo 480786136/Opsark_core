@@ -44,6 +44,14 @@ pub(crate) fn update() -> Value {
     schema["required"].as_array_mut().unwrap().retain(|field| field != "acceptanceCoverage");
     schema
 }
+
+pub(crate) fn update_for_context(context: &Value) -> Value {
+    let mut schema = update();
+    if context["requirementSubmission"]["acceptanceContractVersion"] == 1 {
+        schema["required"].as_array_mut().unwrap().push(json!("acceptanceCoverage"));
+    }
+    schema
+}
 pub(crate) fn review() -> Value {
     object(
         json!({"baseRevision":{"type":"integer","minimum":0},"roundId":text(),
