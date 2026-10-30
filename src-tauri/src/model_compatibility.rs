@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub(crate) const OUTPUT_NORMALIZATION_VERSION: &str = "json-wrapper-and-shell-placement@4";
+pub(crate) const OUTPUT_NORMALIZATION_VERSION: &str = "json-wrapper-and-shell-placement@5";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -751,10 +751,35 @@ fn normalize_duplicate_evidence(value: &mut Value, schema: &Value) {
     }
 }
 
+/// A continuing stage may reuse its own explanation as a missing display
+/// summary. This does not apply to completion, blocked decisions, field patches
+/// or an explicitly supplied (even invalid) summary. Full validation follows.
+pub(crate) fn uses_continue_summary_compatibility(value: &Value, schema: &Value) -> bool {
+    let Some(required) = schema["required"].as_array() else { return false; };
+    schema["type"] == "object"
+        && ["decision", "reason", "summary", "steps"].iter().all(|field| required.iter().any(|item| item.as_str() == Some(*field)))
+        && schema["properties"]["decision"]["type"] == "string"
+        && schema["properties"]["decision"]["enum"].as_array().is_some_and(|values| values.iter().any(|value| value == "continue"))
+        && schema["properties"]["reason"]["type"] == "string"
+        && schema["properties"]["summary"]["type"] == "string"
+        && schema["properties"]["steps"]["type"] == "array"
+        && value.is_object() && value.get("summary").is_none()
+        && value["decision"] == "continue"
+        && value["steps"].as_array().is_some_and(|steps| !steps.is_empty())
+        && value["reason"].as_str().is_some_and(|reason| !reason.trim().is_empty())
+}
+
+fn normalize_continue_summary(value: &mut Value, schema: &Value) {
+    if uses_continue_summary_compatibility(value, schema) {
+        value["summary"] = value["reason"].clone();
+    }
+}
+
 pub(crate) fn candidate_field_issues(value: &Value, schema: &Value) -> Vec<crate::schema_validation::ValidationIssue> {
     let mut normalized = value.clone();
     normalize_shell_execution_scope(&mut normalized, schema);
     normalize_duplicate_evidence(&mut normalized, schema);
+    normalize_continue_summary(&mut normalized, schema);
     crate::schema_validation::diagnose_many(schema, &normalized, 16)
 }
 
@@ -819,6 +844,7 @@ pub(crate) fn normalize_response_with_wire(
     }
     normalize_shell_execution_scope(&mut value, schema);
     normalize_duplicate_evidence(&mut value, schema);
+    normalize_continue_summary(&mut value, schema);
     if let Some(wire) = wire {
         check_value(&value, wire, "wire_validation")?;
         omit_optional_nulls(&mut value, schema);

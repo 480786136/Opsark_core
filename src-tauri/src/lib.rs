@@ -21,6 +21,8 @@ mod local_terminal;
 mod model_parameters;
 mod model_protocol;
 mod model_compatibility;
+#[cfg(test)]
+mod model_summary_compat_tests;
 mod scoped_model_repair;
 mod model_schema;
 mod plan_contract;

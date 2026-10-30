@@ -1435,3 +1435,149 @@ fn recorded_shell_scope_placement_is_accepted_without_another_model_request_in_b
         }
     }
 }
+
+fn continue_summary_integration_body(protocol: &str, policy: &str) -> (Value, String, String) {
+    crate::task_model_budget::initialize_test_runtime().unwrap();
+    let mut context: Value = serde_json::from_str(&business_context(protocol, 6)).unwrap();
+    let task = crate::task_logs::call_id();
+    let round = format!("continue-summary-{task}");
+    context["_modelIntegration"]["outputPolicy"] = json!(policy);
+    context["_modelOutputRecovery"] = json!({"strategy":"regenerate"});
+    context["_planEvidenceContract"] = json!({"version":1});
+    context["_log"] = json!({"taskId":task,"roundId":round,"serverId":"offline-summary-server","phaseIndex":0});
+    context["_taskModelBudget"] = json!({"version":1,"taskId":task,"roundId":round});
+    context["taskGoal"] = json!({"lifecycle":{"version":1,"revision":3},"currentRoundId":round});
+    context["executionConstraints"] = json!({"changePolicy":"read_only"});
+    context["tools"] = json!([]);
+    crate::task_model_budget::register(crate::task_model_budget::TaskBudgetRegistration {
+        task_id: task.clone(), round_id: round.clone(), max_task_tokens: 250000,
+        max_round_tokens: 250000, safety_reserve_tokens: 0,
+    }).unwrap();
+    let body = crate::build_next_stage_request_body(
+        "offline-model", "Inspect the current target without changes", &context.to_string(), &Default::default());
+    (body, task, round)
+}
+
+fn continue_summary_integration_candidate(round: &str, policy: &str) -> (Value, Value) {
+    let expected = json!({
+        "decision":"continue", "reason":"Current evidence needs inspection; private-summary-marker",
+        "summary":"Current evidence needs inspection; private-summary-marker",
+        "steps":[{"kind":"observe","title":"Read current directory","description":"Inspect current evidence only",
+            "action":{"type":"shell","command":"printf '%s\\n' 'value with \"quotes\"'"},
+            "expected":"Current bounded evidence","evidenceRequirements":[],"validation":"","risk":"low"}],
+        "requirementReview":{"baseRevision":3,"roundId":round,"focusOutcome":"pending","overallOutcome":"pending",
+            "items":[{"requirementId":"goal-current","outcome":"unknown","evidenceIds":[],"reason":"Current target is not yet observed"}]}
+    });
+    let mut raw = expected.clone();
+    raw.as_object_mut().unwrap().remove("summary");
+    if policy == "require_schema" {
+        raw["steps"][0] = wire_step(raw["steps"][0].clone());
+        for field in ["planUpdate", "reconciliation", "blocking", "issueResolutions"] {
+            raw[field] = Value::Null;
+        }
+    }
+    (raw, expected)
+}
+
+fn continue_summary_integration_logs(root: &std::path::Path, task: &str) -> Vec<Value> {
+    let stream = root.join("logs/tasks")
+        .join(format!("task-{:x}", Sha256::digest(task.as_bytes())))
+        .join("model-calls.jsonl");
+    std::fs::read_to_string(stream).unwrap().lines()
+        .map(|line| serde_json::from_str(line).unwrap()).collect()
+}
+
+#[test]
+fn continuing_stage_missing_summary_is_normalized_in_one_post_without_new_repair_budget() {
+    for protocol in ["chat_completions", "responses"] {
+        for policy in ["json_only", "require_schema"] {
+            let (body, task, round) = continue_summary_integration_body(protocol, policy);
+            let (raw, expected) = continue_summary_integration_candidate(&round, policy);
+            let (endpoint, provider) = server(vec![(200, protocol_response(protocol, raw.clone()))]);
+            let url = crate::model_protocol::endpoint(&endpoint, protocol).unwrap();
+            let budget = crate::model_budget::OperationBudget::for_request(&url, "offline-key", &body, 5).unwrap();
+            let identity = budget.lifecycle_identity();
+            let deadline = budget.recovery_deadline().unwrap();
+            let root = std::env::temp_dir().join("opsark-continue-summary").join(&task);
+            std::fs::create_dir_all(&root).unwrap();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let payload = runtime.block_on(post_model_request(
+                &endpoint, "offline-key", &body, "阶段联合决策", 5, Some(&root.join("developer.jsonl")))).unwrap();
+            let actual: Value = serde_json::from_str(message_content(&payload, "missing normalized candidate").unwrap()).unwrap();
+            assert_eq!(actual, expected, "{protocol}/{policy}: only the missing summary may be supplied");
+            assert_eq!(actual["steps"], expected["steps"]);
+            assert_eq!(actual["steps"][0]["action"]["command"], raw["steps"][0]["action"]["command"]);
+            assert_eq!(actual["requirementReview"], raw["requirementReview"]);
+            assert_eq!(payload["usage"]["total_tokens"], 50);
+            assert_eq!(budget.lifecycle_identity(), identity);
+            assert_eq!(budget.recovery_deadline().unwrap(), deadline);
+            let snapshot = budget.snapshot();
+            assert_eq!(snapshot["generations"], 1);
+            assert_eq!(snapshot["transportAttempts"], 1);
+            assert_eq!(snapshot["fieldRepairs"], 0);
+            assert_eq!(snapshot["candidateRegenerations"], 1);
+            assert_eq!(snapshot["knownUsageTokens"], 50);
+            assert_eq!(snapshot["unknownUsageAttempts"], 0);
+            let cost = crate::task_model_budget::query(&task, &round).unwrap();
+            for lane in ["task", "round"] {
+                assert_eq!(cost[lane]["maxTotalTokens"], 250000);
+                assert_eq!(cost[lane]["knownUsageTokens"], 50);
+                assert_eq!(cost[lane]["estimatedReservedTokens"], 0);
+            }
+            let rows = continue_summary_integration_logs(&root, &task);
+            assert!(rows.iter().all(|row| row["taskId"] == task && row["roundId"] == round));
+            let received = rows.iter().find(|row| row["event"] == "response_received").unwrap();
+            let raw_content = if protocol == "responses" {
+                received.pointer("/response/output/1/content/0/text")
+            } else {
+                received.pointer("/response/choices/0/message/content")
+            }.and_then(Value::as_str).unwrap();
+            let recorded: Value = serde_json::from_str(raw_content).unwrap();
+            assert_eq!(recorded, raw, "received response remains the exact unnormalized model candidate");
+            assert!(recorded.get("summary").is_none());
+            let normalized: Vec<_> = rows.iter().filter(|row| row["event"] == "output_normalized").collect();
+            assert_eq!(normalized.len(), 1);
+            let audit = normalized[0];
+            assert_eq!(audit["rule"], "continue-summary-from-reason");
+            assert_eq!(audit["from"], "/reason");
+            assert_eq!(audit["to"], "/summary");
+            assert_eq!(audit["normalizationVersion"], "json-wrapper-and-shell-placement@5");
+            assert!(!audit.to_string().contains("private-summary-marker"));
+            for key in ["request", "response", "content", "reason", "summary"] { assert!(audit.get(key).is_none()); }
+            assert!(!rows.iter().any(|row| row["event"] == "output_validation_failed"));
+            // Reusing the regeneration strategy cannot purchase another model request.
+            let error = runtime.block_on(post_model_request(
+                &endpoint, "offline-key", &body, "阶段联合决策", 5, Some(&root.join("developer.jsonl")))).unwrap_err();
+            assert_eq!(error_code(&error), "MODEL_RECOVERY_BUDGET_EXHAUSTED");
+            assert_eq!(provider.join().unwrap().len(), 1);
+        }
+    }
+}
+
+#[test]
+fn missing_summary_with_another_schema_error_is_not_a_successful_normalization_or_extra_post() {
+    for protocol in ["chat_completions", "responses"] {
+        for policy in ["json_only", "require_schema"] {
+            let (body, task, round) = continue_summary_integration_body(protocol, policy);
+            let (mut raw, _) = continue_summary_integration_candidate(&round, policy);
+            raw["steps"][0]["risk"] = json!("invalid-risk");
+            let (endpoint, provider) = server(vec![(200, protocol_response(protocol, raw))]);
+            let root = std::env::temp_dir().join("opsark-continue-summary-rejected").join(&task);
+            std::fs::create_dir_all(&root).unwrap();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let error = runtime.block_on(post_model_request(
+                &endpoint, "offline-key", &body, "阶段联合决策", 5, Some(&root.join("developer.jsonl")))).unwrap_err();
+            assert_eq!(error_code(&error), "MODEL_FORMAT_INVALID");
+            assert!(error.contains("/steps/0/risk"));
+            let rows = continue_summary_integration_logs(&root, &task);
+            assert!(rows.iter().all(|row| row["taskId"] == task && row["roundId"] == round));
+            assert!(!rows.iter().any(|row| row["event"] == "output_normalized"));
+            assert!(rows.iter().any(|row| row["event"] == "output_validation_failed"));
+            assert_eq!(crate::task_model_budget::query(&task, &round).unwrap()["task"]["knownUsageTokens"], 50);
+            let retry = runtime.block_on(post_model_request(
+                &endpoint, "offline-key", &body, "阶段联合决策", 5, Some(&root.join("developer.jsonl")))).unwrap_err();
+            assert_eq!(error_code(&retry), "MODEL_RECOVERY_BUDGET_EXHAUSTED");
+            assert_eq!(provider.join().unwrap().len(), 1);
+        }
+    }
+}

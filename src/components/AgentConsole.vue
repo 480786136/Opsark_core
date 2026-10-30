@@ -6,7 +6,7 @@ import PreparedExecutionTargets from "./PreparedExecutionTargets.vue";
 import SavedEvidenceViewer from "./SavedEvidenceViewer.vue";
 import { missingInspectionReceipts } from "@/features/agent/executionLedgerRecovery";
 
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, watchEffect } from "vue";
 import {
   ArrowRight,
   Bot,
@@ -64,6 +64,7 @@ import { formatCredits } from "@/features/account/credits";
 import TaskModelAccounting from "./TaskModelAccounting.vue";
 import TaskExecutionTiming from "./TaskExecutionTiming.vue";
 import { createTaskModelBudget } from "@/features/agent/taskModelBudget";
+import { capturePreviousRound } from "@/features/agent/taskGoal";
 
 const props = defineProps<{ serverId: string; active?: boolean }>();
 const showDevelopmentFeatures = import.meta.env.DEV;
@@ -116,14 +117,22 @@ type PendingPreviousPlan = {
   taskId: string;
   messageIds: string[];
   phase: TaskExecutionPhase;
+  round?: TaskPlanHistory;
 };
 type RequirementSubmissionUi = {
   token: symbol;
   taskId: string;
+  visibleTaskId: string;
+  messageIds: string[];
+  sourceMessageId?: string;
+  content: string;
+  createdAt: string;
+  settled?: boolean;
   requirement: string;
   previousPlan?: PendingPreviousPlan;
 };
 const requirementSubmissions = ref(new Map<string, RequirementSubmissionUi>());
+const preservedConversationRounds = ref(new Map<string, TaskPlanHistory>());
 const activeSubmissionOwner = ref<Pick<RequirementSubmissionUi, "token" | "taskId">>();
 const submissionErrorState = ref<{ taskId: string; message: string }>();
 const modelOptions = computed(() => [
@@ -155,10 +164,16 @@ const task = computed(() => serverTasks.value.find((item) => item.id === workspa
 watch(() => task.value?.id, taskId => {
   if (taskId) void store.refreshExecutionLedger(taskId);
 }, { immediate: true });
-const currentRequirementSubmission = computed(() => task.value
-  ? requirementSubmissions.value.get(task.value.id)
-  : undefined);
-const pendingFreshRequirement = computed(() => currentRequirementSubmission.value?.requirement ?? "");
+const currentRequirementSubmission = computed(() => {
+  const current = task.value;
+  return current && [...requirementSubmissions.value.values()].find(submission => submission.visibleTaskId === current.id);
+});
+const pendingFreshRequirement = computed(() => {
+  const submission = currentRequirementSubmission.value;
+  return submission && !submission.settled && submission.visibleTaskId === submission.taskId ? submission.requirement : "";
+});
+const displayedRequirementTitle = computed(() => currentRequirementSubmission.value?.settled
+  ? currentRequirementSubmission.value.content : task.value?.title);
 const pendingPreviousPlan = computed(() => currentRequirementSubmission.value?.previousPlan);
 const submissionError = computed(() => {
   const error = submissionErrorState.value;
@@ -166,7 +181,18 @@ const submissionError = computed(() => {
 });
 const taskListCount = ref<number>();
 watch(() => props.serverId, () => { taskListCount.value = undefined; });
-const conversationRounds = computed(() => task.value ? conversationHistoryRounds(serverTasks.value, task.value) : []);
+const conversationRounds = computed(() => {
+  const rounds = task.value ? conversationHistoryRounds(serverTasks.value, task.value)
+    .map(round => {
+      // Formal archives may belong to this task (supplement) or a linked task
+      // (new goal). Preserve the same known result through either classification.
+      const owner = serverTasks.value.find(item => round.id.startsWith(`${item.id}:`)) ?? task.value!;
+      const preserved = preservedConversationRounds.value.get(`${owner.id}:current-${round.roundId ?? owner.id}`);
+      return preserved ? { ...preserved, id: round.id } : round;
+    }) : [];
+  const previous = pendingPreviousPlan.value?.round;
+  return previous && pendingPreviousPlanIsCurrent.value ? [...rounds, previous] : rounds;
+});
 const canApprovePlan = computed(() => Boolean(task.value
   && task.value.status === "awaiting_plan_approval"
   && !task.value.cancelRequested
@@ -424,6 +450,7 @@ const pendingPreviousPlanIsCurrent = computed(() => {
     && phase.archivedBeforeMessageId === anchor.id
   )));
   return Boolean(current && pending?.taskId === current.id
+    && (!pending.round || pending.round.roundId === current.currentRoundId)
     && current.plan.length === pending.phase.plan.length
     && current.plan.every((step, index) => step.id === pending.phase.plan[index]?.id)
     && !hasArchivedCurrentSubmission);
@@ -431,18 +458,43 @@ const pendingPreviousPlanIsCurrent = computed(() => {
 const currentTimeline = computed(() => {
   const current = task.value;
   const pending = pendingPreviousPlan.value;
-  if (!current || !pending || pending.taskId !== current.id || !pendingPreviousPlanIsCurrent.value) {
-    return current ? currentConversationTimeline(current) : [];
+  if (!current) return [];
+  let entries;
+  if (pending?.round && pendingPreviousPlanIsCurrent.value) {
+    // Freeze the complete previous result above the new user turn while the
+    // model classifies it. This is a UI projection, never an execution round.
+    const previousIds = new Set(pending.messageIds);
+    entries = currentConversationTimeline({
+      ...current,
+      messages: current.messages.filter(message => !previousIds.has(message.id)),
+      phaseHistory: [],
+    });
+  } else if (pending && pending.taskId === current.id && pendingPreviousPlanIsCurrent.value) {
+    const anchor = pendingPreviousPlanAnchor.value;
+    entries = currentConversationTimeline(current, [{
+      ...pending.phase,
+      archivedBeforeMessageId: anchor?.id,
+      completedAt: anchor?.createdAt ?? pending.phase.completedAt,
+    }]);
+  } else {
+    entries = currentConversationTimeline(current);
   }
-  const anchor = pendingPreviousPlanAnchor.value;
-  return currentConversationTimeline(current, [{
-    ...pending.phase,
-    archivedBeforeMessageId: anchor?.id,
-    completedAt: anchor?.createdAt ?? pending.phase.completedAt,
-  }]);
+  const submission = currentRequirementSubmission.value;
+  if (submission && !submission.sourceMessageId) {
+    const id = `pending-user-${submission.taskId}`;
+    entries.push({
+      type: "message", key: `message:${id}`, createdAt: submission.createdAt, sourceIndex: current.messages.length,
+      message: { id, role: "user", kind: "message", content: submission.content, createdAt: submission.createdAt },
+    });
+  }
+  return entries;
 });
 const currentRecords = computed(() => {
   if (!task.value) return [];
+  if (pendingPreviousPlan.value?.round && pendingPreviousPlanIsCurrent.value) {
+    const previousIds = new Set(pendingPreviousPlan.value.messageIds);
+    return task.value.messages.filter(message => message.kind === "event" && !previousIds.has(message.id));
+  }
   const start = currentConversationRoundStartIndex(task.value);
   return task.value.messages.slice(start + 1).filter((message) => message.kind === "event");
 });
@@ -450,6 +502,12 @@ const activeRecordId = computed(() => isBusy.value
   ? currentRecords.value[currentRecords.value.length - 1]?.id
   : undefined);
 const currentRecordPreview = computed(() => currentRecords.value.slice(-3));
+const currentPlanOutputs = computed(() => pendingPreviousPlanIsCurrent.value
+  ? [] : task.value?.plan.filter(step => step.output) ?? []);
+const displayedPlan = computed(() => pendingPreviousPlanIsCurrent.value ? [] : task.value?.plan ?? []);
+const pendingRequirementFailure = computed(() => Boolean(pendingPreviousPlanIsCurrent.value && currentRequirementSubmission.value?.settled));
+const requirementPlanning = computed(() => Boolean(task.value?.requirementProcessing
+  && (!task.value.plan.length || pendingPreviousPlanIsCurrent.value)));
 const archivedOutputSupplements = computed(() => task.value ? missingInspectionReceipts(task.value) : []);
 
 type SummaryBlock =
@@ -488,7 +546,8 @@ watch(needsUserAction, (awaitingUser) => {
 }, { immediate: true });
 
 watch(
-  () => [task.value?.messages.length, task.value?.plan.length, task.value?.phaseHistory?.length, task.value?.status],
+  () => [task.value?.id, task.value?.messages.length, task.value?.plan.length, task.value?.phaseHistory?.length,
+    task.value?.status, currentRequirementSubmission.value?.token],
   async () => {
     if (!panelIsActive()) return;
     await nextTick();
@@ -526,15 +585,66 @@ function ownsLatestSubmission(submission: RequirementSubmissionUi) {
 }
 
 function ownsActiveSubmissionUi(submission: RequirementSubmissionUi) {
-  return ownsLatestSubmission(submission) && workspaceState.activeTaskId === submission.taskId;
+  return ownsLatestSubmission(submission) && workspaceState.activeTaskId === submission.visibleTaskId;
 }
+
+function settleRequirementSubmissionUi(submission: RequirementSubmissionUi) {
+  const tracked = requirementSubmissions.value.get(submission.taskId);
+  if (tracked?.token === submission.token) {
+    const source = store.tasks.find(item => item.id === submission.taskId);
+    const failedBeforeClassification = submission.visibleTaskId === submission.taskId && source?.pendingRequirements?.some(item =>
+      item.state === "failed" && (submission.sourceMessageId ? item.sourceMessageId === submission.sourceMessageId : item.content === submission.content));
+    const round = submission.previousPlan?.round;
+    if (failedBeforeClassification && round) {
+      tracked.settled = true;
+      // Keep the prior result available if a later explicit retry creates a
+      // child task. Failed admissions may already have cleared task.summary.
+      const id = `${submission.taskId}:current-${round.roundId ?? submission.taskId}`;
+      preservedConversationRounds.value.set(id, { ...round, id });
+    } else requirementSubmissions.value.delete(submission.taskId);
+  }
+  if (ownsLatestSubmission(submission)) activeSubmissionOwner.value = undefined;
+}
+
+// Follow only the child which received this submission's immutable user message.
+// The store's global selection also changes for unrelated workspaces and tasks.
+watchEffect(() => {
+  // Message acknowledgement must also work after the user navigates away.
+  // Revoking automatic selection must not leave an extra optimistic bubble.
+  for (const submission of requirementSubmissions.value.values()) {
+    if (submission.sourceMessageId) continue;
+    const source = serverTasks.value.find(item => item.id === submission.taskId);
+    const previousIds = new Set(submission.messageIds);
+    submission.sourceMessageId = source?.messages.find(message => message.role === "user" && message.kind === "message"
+      && !previousIds.has(message.id) && message.content === submission.content)?.id;
+  }
+  const owner = activeSubmissionOwner.value;
+  const submission = owner && requirementSubmissions.value.get(owner.taskId);
+  if (!submission || !ownsActiveSubmissionUi(submission)) return;
+  const source = serverTasks.value.find(item => item.id === submission.taskId);
+  if (!source) return;
+  if (!submission.sourceMessageId || submission.visibleTaskId !== submission.taskId) return;
+  const target = serverTasks.value.find(item => item.id === store.activeTaskId
+    && item.id !== source.id && item.conversationId === (source.conversationId ?? source.id)
+    && item.lastRequirementRelation === "new_goal"
+    && item.messages.some(message => message.id === submission.sourceMessageId && message.role === "user"));
+  if (!target) return;
+  submission.visibleTaskId = target.id;
+  agentWorkspaces.updateServer(props.serverId, { activeTaskId: target.id });
+}, { flush: "sync" });
+
+watch(() => workspaceState.activeTaskId, selectedId => {
+  const owner = activeSubmissionOwner.value;
+  const submission = owner && requirementSubmissions.value.get(owner.taskId);
+  if (submission && selectedId !== submission.visibleTaskId) activeSubmissionOwner.value = undefined;
+}, { flush: "sync" });
 
 async function terminateCurrentRequirement() {
   const current = task.value;
   if (!current) return;
-  const submission = requirementSubmissions.value.get(current.id);
+  const submission = currentRequirementSubmission.value;
   if (submission) {
-    requirementSubmissions.value.delete(current.id);
+    requirementSubmissions.value.delete(submission.taskId);
     if (activeSubmissionOwner.value?.token === submission.token
       && activeSubmissionOwner.value.taskId === submission.taskId) {
       activeSubmissionOwner.value = undefined;
@@ -554,14 +664,16 @@ async function submit() {
     agentWorkspaces.updateServer(props.serverId, { activeTaskId: selectedTask.id });
   }
   if (submissionErrorState.value?.taskId === selectedTask.id) submissionErrorState.value = undefined;
-  const startsAfterFinishedTask = ["completed", "failed", "cancelled"].includes(selectedTask.status);
-  let previousPlan: PendingPreviousPlan | undefined;
-  if (startsAfterFinishedTask) {
-    if (selectedTask.plan.length) {
+  const startsAfterPreviousResult = ["completed", "failed", "cancelled", "needs_adjustment", "awaiting_continuation", "planning_failed"]
+    .includes(selectedTask.status);
+  let previousPlan = currentRequirementSubmission.value?.settled ? currentRequirementSubmission.value.previousPlan : undefined;
+  if (startsAfterPreviousResult && !previousPlan) {
+    if (selectedTask.plan.length || selectedTask.summary || selectedTask.pauseReason) {
       const capturedAt = new Date().toISOString();
       previousPlan = {
         taskId: selectedTask.id,
         messageIds: selectedTask.messages.map(message => message.id),
+        round: capturePreviousRound(selectedTask, capturedAt)?.history,
         phase: {
           id: `pending-phase-${selectedTask.id}-${selectedTask.workflowEpoch ?? 0}`,
           roundId: selectedTask.currentRoundId ?? `pending-round-${selectedTask.id}`,
@@ -581,7 +693,11 @@ async function submit() {
   const submission: RequirementSubmissionUi = {
     token: Symbol(`requirement-${selectedTask.id}`),
     taskId: selectedTask.id,
-    requirement: startsAfterFinishedTask ? value : "",
+    visibleTaskId: selectedTask.id,
+    messageIds: selectedTask.messages.map(message => message.id),
+    content: value,
+    createdAt: new Date().toISOString(),
+    requirement: startsAfterPreviousResult ? value : "",
     previousPlan,
   };
   const referencedTerminal = terminalReference.value;
@@ -599,26 +715,18 @@ async function submit() {
     );
     if (ownsActiveSubmissionUi(submission)) {
       if (terminalReference.value === referencedTerminal) terminalReference.value = "";
-      if (store.activeTaskId && store.activeTaskId !== workspaceState.activeTaskId) {
-        agentWorkspaces.updateServer(props.serverId, { activeTaskId: store.activeTaskId });
-      }
     }
   } catch (error) {
     if (ownsActiveSubmissionUi(submission)) {
       if (!input.value) input.value = value;
       submissionErrorState.value = {
-        taskId: submission.taskId,
+        taskId: submission.visibleTaskId,
         message: error instanceof Error ? error.message : String(error),
       };
     }
     return;
   } finally {
-    if (requirementSubmissions.value.get(submission.taskId)?.token === submission.token) {
-      requirementSubmissions.value.delete(submission.taskId);
-    }
-    if (ownsLatestSubmission(submission)) {
-      activeSubmissionOwner.value = undefined;
-    }
+    settleRequirementSubmissionUi(submission);
   }
 }
 
@@ -626,7 +734,17 @@ async function retryPlanning() {
   const current = task.value;
   if (!current) return;
   if (current.pendingRequirements?.length) {
-    await store.retryModelPlanning(current.id);
+    const submission = currentRequirementSubmission.value;
+    if (!submission?.settled) {
+      await store.retryModelPlanning(current.id);
+      return;
+    }
+    submission.messageIds = current.messages.map(message => message.id);
+    submission.sourceMessageId = undefined;
+    submission.settled = false;
+    activeSubmissionOwner.value = submission;
+    try { await store.retryModelPlanning(current.id); }
+    finally { settleRequirementSubmissionUi(submission); }
     return;
   }
   if (explicitModelRetryAvailable.value) {
@@ -843,7 +961,7 @@ onBeforeUnmount(() => {
     <header class="agent-header">
       <div class="agent-title">
         <span class="agent-title-icon"><Bot :size="17" /></span>
-        <span class="agent-title-copy"><strong>{{ t("agent.title") }}</strong><small v-if="pendingFreshRequirement" :title="pendingFreshRequirement">{{ t("agent.recognizingRequirement", { requirement: pendingFreshRequirement }) }}</small><small v-else-if="task" :title="task.title">{{ task.title }}</small></span>
+        <span class="agent-title-copy"><strong>{{ t("agent.title") }}</strong><small v-if="pendingFreshRequirement" :title="pendingFreshRequirement">{{ t("agent.recognizingRequirement", { requirement: pendingFreshRequirement }) }}</small><small v-else-if="task" :title="displayedRequirementTitle">{{ displayedRequirementTitle }}</small></span>
         <span class="beta">CORE</span>
         <span v-if="isBusy" class="agent-activity"><i></i>{{ statusText(task?.status) }}</span>
         <button
@@ -1084,7 +1202,15 @@ onBeforeUnmount(() => {
             />
           </template>
 
-          <div v-if="(task.plan.length || hasTransportRecovery || needsUserAction) && !pendingPreviousPlanIsCurrent" :class="['plan-card', 'current-plan-card', `task-card-${task.status}`]">
+          <div v-if="requirementPlanning" class="task-message assistant message requirement-planning" role="status">
+            <div class="message-avatar"><Bot :size="15" /></div>
+            <div class="message-body">
+              <div class="message-meta"><strong>Opsark</strong></div>
+              <p><LoaderCircle class="spin" :size="13" /> {{ t("agent.statusPlanning") }}</p>
+            </div>
+          </div>
+
+          <div v-if="displayedPlan.length || ((!pendingPreviousPlanIsCurrent || pendingRequirementFailure) && (hasTransportRecovery || needsUserAction))" :class="['plan-card', 'current-plan-card', `task-card-${task.status}`]">
             <div class="plan-card-head">
               <span class="plan-title-block">
                 <span class="plan-title-line">
@@ -1096,7 +1222,7 @@ onBeforeUnmount(() => {
                     <CheckCircle2 v-else-if="task.status === 'completed'" :size="13" />
                     {{ statusText(task.status, task) }}
                   </span>
-                  <small class="plan-processed">{{ planProgressText(task) }}</small>
+                  <small v-if="!pendingPreviousPlanIsCurrent" class="plan-processed">{{ planProgressText(task) }}</small>
                   <button
                     v-if="canTerminate && !task.requirementProcessing"
                     class="terminate-business"
@@ -1108,7 +1234,7 @@ onBeforeUnmount(() => {
               </span>
             </div>
             <div class="steps">
-              <div v-for="(step, index) in task.plan" :key="step.id" :class="['plan-step', step.status]">
+              <div v-for="(step, index) in displayedPlan" :key="step.id" :class="['plan-step', step.status]">
                 <button class="step-main" @click="toggleStep(step.id)">
                   <span class="step-icon">
                     <CheckCircle2 v-if="step.status === 'completed'" :size="17" />
@@ -1280,7 +1406,7 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <div v-if="currentRecords.length || task.plan.some((step) => step.output) || archivedOutputSupplements.length" class="plan-card execution-record-card">
+          <div v-if="currentRecords.length || currentPlanOutputs.length || (!pendingPreviousPlanIsCurrent && archivedOutputSupplements.length)" class="plan-card execution-record-card">
             <button class="plan-card-head archived-head" @click="toggleRecords('current')">
               <span><LoaderCircle v-if="isBusy" class="spin execution-record-running" :size="15" /><ListTree v-else :size="15" /><span><strong>{{ t("agent.executionRecord") }}</strong><small>{{ t("agent.recordsHint", { count: currentRecords.length }) }}</small></span></span>
               <span><ChevronDown v-if="expandedRecords.includes('current')" :size="15" /><ChevronRight v-else :size="15" /></span>
@@ -1295,11 +1421,11 @@ onBeforeUnmount(() => {
                 <time>{{ new Date(record.createdAt).toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }) }}</time>
                 <span><i v-if="record.id === activeRecordId" class="execution-event-pulse" />{{ coreText(record.content) }}</span>
               </div>
-              <div v-for="step in task.plan.filter((item) => item.output)" :key="`current-output-${step.id}`" class="execution-output">
+              <div v-for="step in currentPlanOutputs" :key="`current-output-${step.id}`" class="execution-output">
                 <strong>{{ step.title }}</strong><code>{{ stepOperationText(step) }}</code><pre>{{ step.output }}</pre>
                 <p v-if="step.review" class="execution-review">{{ t("agent.reviewPrefix", { summary: step.review.summary, reason: step.review.reason }) }}</p>
               </div>
-              <div v-for="receipt in archivedOutputSupplements" :key="receipt.attemptId" class="execution-output archived-output-supplement">
+              <div v-for="receipt in pendingPreviousPlanIsCurrent ? [] : archivedOutputSupplements" :key="receipt.attemptId" class="execution-output archived-output-supplement">
                 <strong>{{ receipt.title }}</strong>
                 <small>{{ locale.startsWith('en') ? 'Earlier saved output' : '较早保存的输出' }}<template v-if="receipt.recordedAt"> · {{ new Date(receipt.recordedAt).toLocaleString(locale) }}</template></small>
                 <SavedEvidenceViewer :task-id="task.id" :evidence-refs="receipt.evidenceRefs" />
@@ -1308,7 +1434,7 @@ onBeforeUnmount(() => {
           </div>
 
           <div
-            v-if="(task.summary || task.pauseReason) && ['completed', 'failed', 'cancelled', 'needs_adjustment', 'awaiting_continuation', 'planning_failed'].includes(task.status)"
+            v-if="(!pendingPreviousPlanIsCurrent || pendingRequirementFailure) && (task.summary || task.pauseReason) && ['completed', 'failed', 'cancelled', 'needs_adjustment', 'awaiting_continuation', 'planning_failed'].includes(task.status)"
             :class="['summary-card', `summary-${task.status}`, { 'summary-progress': normalContinuation }]"
           >
             <div class="summary-card-icon">
@@ -1320,7 +1446,7 @@ onBeforeUnmount(() => {
             <div class="summary-card-content">
               <span class="summary-eyebrow">{{ summaryTitle(task.status, task) }}</span>
               <div class="summary-content">
-                <template v-for="(block, index) in summaryBlocks(coreText(task.summary ?? task.pauseReason))" :key="index">
+                <template v-for="(block, index) in summaryBlocks(coreText(pendingRequirementFailure && task.status === 'planning_failed' ? task.pauseReason : task.summary ?? task.pauseReason))" :key="index">
                   <h4 v-if="block.type === 'heading'">{{ block.text }}</h4>
                   <ul v-else-if="block.type === 'list'"><li v-for="item in block.items" :key="item">{{ item }}</li></ul>
                   <p v-else>{{ block.text }}</p>
@@ -1382,6 +1508,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.requirement-planning p { display: flex; align-items: center; gap: 6px; }
 .user-input-select-field { min-width: 0; display: grid; align-content: start; gap: 5px; }
 .user-input-select-field > small { min-height: 2.7em; color: var(--muted); font-size: 7.5px; line-height: 1.35; }
 .user-input-select-field :deep(summary) { height: 32px; padding: 0 9px; border-radius: 4px; background: var(--surface); font-size: 8px; }

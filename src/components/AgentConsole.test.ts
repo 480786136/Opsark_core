@@ -1516,21 +1516,22 @@ describe("AgentConsole 服务器工作区隔离", () => {
       host.querySelector<HTMLFormElement>(".composer")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
       await nextTick();
       const timeline = host.querySelector<HTMLElement>(".agent-timeline")!;
-      // Before submitRequirement creates the new message, a legacy phase with
-      // no anchor must not satisfy undefined === undefined and hide the snapshot.
-      expect(timeline.querySelectorAll(".phase-history-card")).toHaveLength(2);
+      // The complete prior round stays above the optimistic user turn, including
+      // its real phase history. The final plan must not become a fake replan.
+      expect(timeline.querySelectorAll(".phase-history-card")).toHaveLength(1);
+      expect(timeline.querySelectorAll(".archived-plan")).toHaveLength(1);
       expect(timeline.querySelector(".current-plan-card")).toBeNull();
       pushSubmittedMessage();
       await nextTick();
-      const phases = [...timeline.querySelectorAll<HTMLElement>(".phase-history-card")];
-      const phase = phases[phases.length - 1];
+      const phase = timeline.querySelector<HTMLElement>(".archived-plan")!;
       const continuation = [...timeline.querySelectorAll<HTMLElement>(".task-message.user")]
         .find(element => element.textContent?.includes("继续执行"))!;
       expect(phase).toBeDefined();
       expect(continuation).toBeDefined();
       expect([...timeline.children].indexOf(phase)).toBeLessThan([...timeline.children].indexOf(continuation));
       expect(host.querySelector(".current-plan-card")).toBeNull();
-      expect(phases).toHaveLength(2);
+      expect(timeline.querySelectorAll(".phase-history-card")).toHaveLength(1);
+      expect(timeline.querySelectorAll(".archived-plan")).toHaveLength(1);
       fail();
       await vi.waitFor(() => expect(host.querySelector('[role="alert"]')?.textContent).toContain("规划服务暂时不可用"));
       expect(host.querySelectorAll(".phase-history-card")).toHaveLength(1);

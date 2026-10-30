@@ -1,0 +1,114 @@
+{
+  "initial": {
+    "decision": "continue",
+    "reason": "已完成只读发现：/opt 下不存在 core-case 仓库、git 可用（1.8.3.1）。接下来按原目标克隆仓库并查看项目结构以确定部署方式，尚无任何部署证据，目标未完成。",
+    "requirementReview": {
+      "baseRevision": 6,
+      "focusOutcome": "pending",
+      "items": [
+        {
+          "evidenceIds": [
+            "evidence-main-1793191287074-7setfi",
+            "evidence-main-1793191304670-j69xlz"
+          ],
+          "outcome": "unknown",
+          "reason": "已确认 /opt 无 core-case 仓库且 git 可用，但克隆与部署尚未执行，未取得部署验收证据",
+          "requirementId": "req-pull-deploy-core-case"
+        }
+      ],
+      "overallOutcome": "pending",
+      "roundId": "round-1793191276640-g6kzb9"
+    },
+    "steps": [
+      {
+        "action": {
+          "type": "shell",
+          "command": "cd /opt && test ! -e core-case || { echo 'TARGET_EXISTS_ABORT'; exit 1; }; timeout 300 git clone -- https://gitee.com/Kingzm/core-case.git; rc=$?; echo \"[clone exit: $rc]\"; exit \"$rc\"",
+          "executionScope": "isolated_exec"
+        },
+        "description": "在 /opt 下执行 git clone 拉取用户指定仓库；克隆前再次检查 /opt/core-case 不存在以避免覆盖未知资源，失败立即以真实退出码退出。",
+        "evidenceRequirements": [],
+        "expected": "git clone 真实退出码为 0，/opt/core-case 下生成 .git 目录与项目文件。",
+        "kind": "change",
+        "risk": "medium",
+        "title": "克隆 core-case 仓库到 /opt",
+        "validation": "test -d /opt/core-case/.git && git -C /opt/core-case remote -v | grep -F 'https://gitee.com/Kingzm/core-case.git' && ls /opt/core-case | head -n 20; echo \"[validate exit: $?]\"",
+        "validationScope": "isolated_exec"
+      },
+      {
+        "action": {
+          "type": "tool",
+          "toolId": "files.get_structure",
+          "arguments": {
+            "rootPath": "/opt/core-case",
+            "maxDepth": 2,
+            "maxNodes": 400
+          }
+        },
+        "description": "只读获取克隆后项目根目录两层结构，识别 README、pom.xml/build.gradle 等构建声明与脚本位置。",
+        "evidenceRequirements": [],
+        "expected": "返回 /opt/core-case 的目录树与文件清单，能定位项目说明、构建声明文件和部署线索。",
+        "kind": "observe",
+        "risk": "low",
+        "title": "查看 core-case 项目结构",
+        "validation": ""
+      }
+    ],
+    "summary": "已完成两个只读发现步骤（确认 /opt 无 core-case、git 可用）。下一阶段先克隆仓库并用结构工具识别构建/部署方式，之后再按项目自带的说明与配置执行构建和部署验收。"
+  },
+  "regenerated": {
+    "decision": "continue",
+    "reason": "上一候选计划因验收命令管道到 head 丢失退出码被拒且未执行；/opt 下不存在 core-case 仓库，git 1.8.3.1 可用，需要先完成克隆，再读取项目结构以确定构建与部署方式。",
+    "requirementReview": {
+      "baseRevision": 6,
+      "focusOutcome": "pending",
+      "items": [
+        {
+          "evidenceIds": [
+            "evidence-main-1793191287074-7setfi",
+            "evidence-main-1793191304670-j69xlz"
+          ],
+          "outcome": "unknown",
+          "reason": "已确认 /opt 下无 core-case 仓库且 git 可用，但仓库尚未克隆，部署尚未开始，未取得拉取与部署证据",
+          "requirementId": "req-pull-deploy-core-case"
+        }
+      ],
+      "overallOutcome": "pending",
+      "roundId": "round-1793191276640-g6kzb9"
+    },
+    "steps": [
+      {
+        "action": {
+          "type": "shell",
+          "command": "cd /opt && if [ -e core-case ]; then echo 'TARGET_EXISTS_ABORT'; exit 1; fi; git clone -- https://gitee.com/Kingzm/core-case.git; rc=$?; echo \"[clone exit: $rc]\"; exit \"$rc\""
+        },
+        "description": "在 /opt 下克隆用户指定仓库；执行前再次检查目标路径不存在，已存在则中止不覆盖",
+        "evidenceRequirements": [],
+        "expected": "git clone 真实退出码为 0，/opt/core-case 下生成 .git 目录与项目文件",
+        "kind": "change",
+        "risk": "medium",
+        "title": "克隆 core-case 仓库到 /opt",
+        "validation": "test -d /opt/core-case/.git; rc_d=$?; if [ \"$rc_d\" -ne 0 ]; then echo 'VALIDATE_FAIL: .git 目录不存在'; exit \"$rc_d\"; fi; git -C /opt/core-case remote -v > /tmp/corecase_remote.txt; rc_r=$?; cat /tmp/corecase_remote.txt; rm -f /tmp/corecase_remote.txt; exit \"$rc_r\"",
+        "validationScope": "isolated_exec"
+      },
+      {
+        "action": {
+          "type": "tool",
+          "toolId": "files.get_structure",
+          "arguments": {
+            "rootPath": "/opt/core-case",
+            "maxDepth": 3,
+            "maxNodes": 600
+          }
+        },
+        "description": "只读获取克隆后项目根目录的结构树，用于识别 README、依赖声明与构建脚本位置",
+        "evidenceRequirements": [],
+        "expected": "返回 /opt/core-case 的目录树，能识别出 README、构建/依赖声明文件、CI 或部署脚本的位置",
+        "kind": "observe",
+        "risk": "low",
+        "title": "查看 core-case 项目结构",
+        "validation": ""
+      }
+    ]
+  }
+}

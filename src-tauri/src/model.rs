@@ -718,6 +718,8 @@ async fn post_model_request_inner(
             .filter(|_| body["response_format"]["type"] == "json_schema");
         let repairing_field = field_repair.is_some();
         let active_schema = field_repair.as_ref().map(|repair| &repair.schema).or(schema.as_ref());
+        let mut summary_compatibility = prior_value.as_ref().zip(active_schema)
+            .is_some_and(|(value, schema)| compatibility::uses_continue_summary_compatibility(value, schema));
         let mut invalid = if truncated {
             Some(OutputDiagnostic::new(
                 "MODEL_OUTPUT_TRUNCATED",
@@ -735,6 +737,8 @@ async fn post_model_request_inner(
                 read_only_recovery |= repair.opens_steps;
                 match repair.merge(&corrected, &context) {
                     Ok(merged) => {
+                        summary_compatibility |= schema.as_ref().is_some_and(|schema|
+                            compatibility::uses_continue_summary_compatibility(&merged, schema));
                         payload["choices"][0]["message"]["content"] = json!(merged.to_string());
                         prior_value = Some(merged);
                         invalid = schema.as_ref().and_then(|schema|
@@ -777,10 +781,22 @@ async fn post_model_request_inner(
                 let merged = repair.merge(&fields).map_err(|message| model_error_with_context(
                     compatibility::output_error(&OutputDiagnostic::new("MODEL_FORMAT_INVALID", "scoped_repair_merge", &message), Some(status)),
                     &budget, Some(&transport)))?;
+                summary_compatibility |= full_schema.as_ref().is_some_and(|schema|
+                    compatibility::uses_continue_summary_compatibility(&merged, schema));
                 payload["choices"][0]["message"]["content"] = json!(merged.to_string());
                 compatibility::normalize_response_with_wire(&mut payload, full_schema.as_ref().unwrap(), None)
                     .map_err(|diagnostic| model_error_with_context(
                         compatibility::output_error(&diagnostic, Some(status)), &budget, Some(&transport)))?;
+            }
+            if summary_compatibility {
+                append_model_log(developer_log_path, json!({
+                    "event":"output_normalized", "timestampMs":unix_millis(), "requestName":request_name,
+                    "requestId":transport["requestKey"], "callId":transport["callId"],
+                    "rule":"continue-summary-from-reason",
+                    "from":"/reason", "to":"/summary",
+                    "normalizationVersion":compatibility::OUTPUT_NORMALIZATION_VERSION,
+                    "recoveryBudget":budget.snapshot(),
+                }), &context);
             }
             return Ok(payload);
         };
